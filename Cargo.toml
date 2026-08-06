@@ -9,10 +9,14 @@ crate-type = ["cdylib"]
 [dependencies]
 rbx_dom_weak = "3"
 rbx_binary   = "1"
-eframe       = { version = "0.29", default-features = false, features = ["glow", "android-native-activity"] }
-egui         = "0.29"
+eframe       = { version = "0.34", default-features = false, features = ["glow", "android-native-activity"] }
+egui         = "0.34"
 egui_code_editor = "0.2"
-android-activity = { version = "0.6", features = ["native-activity"] }
+# Get AndroidApp from winit's re-export (not a separate android-activity dep)
+# so it's guaranteed to be the exact same type eframe/winit use internally —
+# depending on android-activity directly here previously caused the crate to
+# appear twice in the dependency graph at two incompatible versions.
+winit        = { version = "0.30", features = ["android-native-activity"] }
 ndk-context  = "0.1"
 jni          = "0.21"
 anyhow       = "1"
