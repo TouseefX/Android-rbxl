@@ -34,7 +34,7 @@ target_sdk_version = 34
 compile_sdk_version = 34
 
 [package.metadata.android.sdk]
-min_sdk_version = 24
+min_sdk_version = 26
 target_sdk_version = 34
 
 [[package.metadata.android.uses_permission]]
@@ -52,6 +52,16 @@ launch_mode = "singleTop"
 config_changes = "orientation|keyboardHidden|screenSize"
 exported = true
 
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "rbxl_editor"
+
 [[package.metadata.android.application.activity.intent_filter]]
 actions = ["android.intent.action.MAIN"]
 categories = ["android.intent.category.LAUNCHER"]
+
+[package.metadata.android.signing.release]
+path = "/home/user/.android/debug.keystore"
+keystore_password = "android"
+key_alias = "androiddebugkey"
+key_password = "android"
