@@ -1,0 +1,45 @@
+[package]
+name = "rbxl-editor"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rbx_dom_weak = "3"
+rbx_binary   = "1"
+eframe       = { version = "0.29", default-features = false, features = ["glow", "android-native-activity"] }
+egui         = "0.29"
+egui_code_editor = "0.2"
+android-activity = { version = "0.6", features = ["native-activity"] }
+ndk-context  = "0.1"
+jni          = "0.21"
+anyhow       = "1"
+log          = "0.4"
+android_logger = "0.14"
+
+[package.metadata.android]
+package = "com.yourname.rbxleditor"
+apk_label = "rbxl Editor"
+java_sources = "java"
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 34
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+
+[[package.metadata.android.application.activity]]
+name = ".MainActivity"
+launch_mode = "singleTop"
+config_changes = "orientation|keyboardHidden|screenSize"
+exported = true
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
