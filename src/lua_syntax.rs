@@ -10,6 +10,7 @@ pub fn luau_syntax() -> Syntax {
         comment: "--",
         comment_multiline: ["--[[", "]]"],
         hyperlinks: BTreeSet::new(),
+        quotes: BTreeSet::from(['"', '\'']),
         keywords: BTreeSet::from([
             "and", "break", "continue", "do", "else", "elseif", "end", "export",
             "false", "for", "function", "goto", "if", "in", "local", "nil",

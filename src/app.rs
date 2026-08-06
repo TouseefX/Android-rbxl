@@ -94,7 +94,7 @@ impl EditorApp {
     }
 
     fn drain_events(&mut self) {
-        while let Ok(event) = jni_bridge::channel().1.try_recv() {
+        for event in jni_bridge::try_recv_all() {
             match event {
                 FileEvent::Opened { uri, data } => match rbxl::load_place(data) {
                     Ok(dom) => {

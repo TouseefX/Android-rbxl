@@ -1,7 +1,7 @@
-use jni::objects::{JByteArray, JClass, JString};
+use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::JNIEnv;
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub enum FileEvent {
     Opened { uri: String, data: Vec<u8> },
@@ -9,61 +9,91 @@ pub enum FileEvent {
     Created { uri: String },
     SaveComplete(bool),
     /// Text came back from an external editor (QuickEdit etc.) for the
-    /// script identified by `script_id` (see EditorApp::request_id below).
+    /// script identified by `script_id` (see EditorApp::next_external_id).
     ExternalEditReturned { script_id: u64, text: String },
 }
 
-static FILE_EVENTS: OnceLock<(mpsc::Sender<FileEvent>, mpsc::Receiver<FileEvent>)> = OnceLock::new();
+// Receiver isn't Sync, so it has to sit behind a Mutex to live in a static.
+static FILE_EVENTS: OnceLock<(mpsc::Sender<FileEvent>, Mutex<mpsc::Receiver<FileEvent>>)> =
+    OnceLock::new();
 
-pub fn channel() -> &'static (mpsc::Sender<FileEvent>, mpsc::Receiver<FileEvent>) {
-    FILE_EVENTS.get_or_init(mpsc::channel)
+pub fn channel() -> &'static (mpsc::Sender<FileEvent>, Mutex<mpsc::Receiver<FileEvent>>) {
+    FILE_EVENTS.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
 }
 
-fn env_and_activity() -> (jni::AttachGuard<'static>, jni::objects::JObject<'static>) {
+/// Drains every pending event without blocking. Call once per frame.
+pub fn try_recv_all() -> Vec<FileEvent> {
+    let (_, rx) = channel();
+    let rx = rx.lock().unwrap();
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        out.push(ev);
+    }
+    out
+}
+
+/// Attaches to the JVM for the duration of `f` and hands back the current
+/// Activity object. No leaking: the JNIEnv only needs to live as long as
+/// this call, so there's no need for the 'static hack the first draft used.
+fn with_activity<R>(f: impl FnOnce(&mut JNIEnv, &JObject) -> R) -> R {
     let ctx = ndk_context::android_context();
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.unwrap();
-    // Leak-free in practice: JNIEnv borrows are per-call, this pattern is the
-    // standard android-activity + jni idiom for one-off calls into Java.
-    let env = Box::leak(Box::new(vm)).attach_current_thread().unwrap();
-    let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
-    (env, activity)
+    let mut env = vm.attach_current_thread().unwrap();
+    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    f(&mut env, &activity)
 }
 
 pub fn trigger_open_document() {
-    let (mut env, activity) = env_and_activity();
-    let _ = env.call_method(&activity, "openDocument", "()V", &[]);
+    with_activity(|env, activity| {
+        let _ = env.call_method(activity, "openDocument", "()V", &[]);
+    });
 }
 
 pub fn trigger_create_document(suggested_name: &str) {
-    let (mut env, activity) = env_and_activity();
-    let name = env.new_string(suggested_name).unwrap();
-    let _ = env.call_method(
-        &activity,
-        "createDocument",
-        "(Ljava/lang/String;)V",
-        &[(&name).into()],
-    );
+    with_activity(|env, activity| {
+        let name = env.new_string(suggested_name).unwrap();
+        let _ = env.call_method(
+            activity,
+            "createDocument",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&name)],
+        );
+    });
 }
 
 pub fn trigger_save(data: &[u8]) {
-    let (mut env, activity) = env_and_activity();
-    let arr = env.byte_array_from_slice(data).unwrap();
-    let _ = env.call_method(&activity, "saveToCurrentDocument", "([B)V", &[(&arr).into()]);
+    with_activity(|env, activity| {
+        let arr = env.byte_array_from_slice(data).unwrap();
+        let _ = env.call_method(
+            activity,
+            "saveToCurrentDocument",
+            "([B)V",
+            &[JValue::Object(&arr)],
+        );
+    });
 }
 
 /// Ask Java to create a standalone temp document for `script_id`, write
 /// `source` into it, then launch a chooser so the user can pick QuickEdit
 /// or any other text-editor app installed.
 pub fn trigger_edit_externally(script_id: u64, name: &str, source: &str) {
-    let (mut env, activity) = env_and_activity();
-    let jname = env.new_string(format!("{name}.lua")).unwrap();
-    let jsource = env.new_string(source).unwrap();
-    let _ = env.call_method(
-        &activity,
-        "editExternally",
-        "(JLjava/lang/String;Ljava/lang/String;)V",
-        &[script_id.into(), (&jname).into(), (&jsource).into()],
-    );
+    with_activity(|env, activity| {
+        let jname = env.new_string(format!("{name}.lua")).unwrap();
+        let jsource = env.new_string(source).unwrap();
+        let _ = env.call_method(
+            activity,
+            "editExternally",
+            "(JLjava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Long(script_id as i64),
+                JValue::Object(&jname),
+                JValue::Object(&jsource),
+            ],
+        );
+    });
 }
 
 #[unsafe(no_mangle)]
