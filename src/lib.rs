@@ -7,7 +7,6 @@ mod rbxl;
 // Pull AndroidApp from winit's re-export, not a direct android-activity
 // dependency -- this keeps the type identical to whatever version
 // winit/eframe use internally (see the comment in Cargo.toml).
-use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::platform::android::activity::AndroidApp;
 
 #[unsafe(no_mangle)]
@@ -20,9 +19,7 @@ fn android_main(android_app: AndroidApp) {
     let _ = jni_bridge::channel();
 
     let options = eframe::NativeOptions {
-        event_loop_builder: Some(Box::new(move |builder| {
-            builder.with_android_app(android_app);
-        })),
+        android_app: Some(android_app),
         ..Default::default()
     };
 
