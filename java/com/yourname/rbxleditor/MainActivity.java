@@ -6,6 +6,7 @@ import android.net.Uri;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 public class MainActivity extends NativeActivity {
     static {
@@ -46,7 +47,7 @@ public class MainActivity extends NativeActivity {
     /**
      * Writes `source` into a brand-new SAF document (so it has a real,
      * shareable content:// URI) and hands it to whatever text editor app
-     * the user picks. We get no callback when they're done — instead we
+     * the user picks. We get no callback when they're done -- instead we
      * re-read this file in onResume() when the user comes back to us.
      */
     public void editExternally(long scriptId, String fileName, String source) {
@@ -87,7 +88,7 @@ public class MainActivity extends NativeActivity {
             if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
             externalEditUri = data.getData();
             persist(externalEditUri);
-            writeBytes(externalEditUri, pendingExternalSource.getBytes());
+            writeBytes(externalEditUri, pendingExternalSource.getBytes(StandardCharsets.UTF_8));
             pendingExternalSource = null;
 
             Intent view = new Intent(Intent.ACTION_VIEW);
@@ -103,7 +104,7 @@ public class MainActivity extends NativeActivity {
         // If we sent a script out for external editing, read it back now.
         if (externalEditUri != null && externalEditScriptId >= 0) {
             byte[] bytes = readBytes(externalEditUri);
-            String text = bytes != null ? new String(bytes) : "";
+            String text = bytes != null ? new String(bytes, StandardCharsets.UTF_8) : "";
             nativeOnExternalEditReturned(externalEditScriptId, text);
             externalEditUri = null;
             externalEditScriptId = -1;
