@@ -35,51 +35,72 @@ impl eframe::App for EditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
 
-        egui::Panel::top("toolbar").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Open .rbxl").clicked() {
-                    jni_bridge::trigger_open_document();
-                }
-                if ui.button("Save").clicked() {
-                    self.save();
-                }
-                if ui.button("+ New Script").clicked() {
-                    self.add_new_script();
-                }
-                if self.is_script_selected() && ui.button("Edit externally").clicked() {
-                    self.edit_externally();
-                }
-                ui.label(&self.status);
+        let top_frame = egui::Frame::side_top_panel(ui.style())
+            .inner_margin(egui::Margin {
+                top: 48,
+                bottom: 8,
+                left: 10,
+                right: 10,
             });
-        });
 
-        egui::Panel::left("explorer").show_inside(ui, |ui| {
-            ui.heading("Explorer");
-            if let Some(dom) = &self.dom {
-                let root = dom.root_ref();
-                explorer::show_tree(ui, dom, root, &mut self.selected);
-            } else {
-                ui.label("Open a place file to browse it.");
-            }
-        });
+        egui::Panel::top("toolbar")
+            .frame(top_frame)
+            .show_inside(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+
+                    if ui.button("Open .rbxl").clicked() {
+                        jni_bridge::trigger_open_document();
+                    }
+                    if ui.button("Save").clicked() {
+                        self.save();
+                    }
+                    if ui.button("+ New Script").clicked() {
+                        self.add_new_script();
+                    }
+                    if self.is_script_selected() && ui.button("Edit externally").clicked() {
+                        self.edit_externally();
+                    }
+                    ui.separator();
+                    ui.label(&self.status);
+                });
+            });
+
+        egui::Panel::left("explorer")
+            .resizable(true)
+            .default_size(150.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::both().show(ui, |ui| {
+                    ui.heading("Explorer");
+                    if let Some(dom) = &self.dom {
+                        let root = dom.root_ref();
+                        explorer::show_tree(ui, dom, root, &mut self.selected);
+                    } else {
+                        ui.label("Open a place file to browse it.");
+                    }
+                });
+            });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            if self.is_script_selected() {
-                CodeEditor::default()
-                    .id_source("script_editor")
-                    .with_rows(30)
-                    .with_fontsize(14.0)
-                    .with_syntax(lua_syntax::luau_syntax())
-                    .with_numlines(true)
-                    .vscroll(true)
-                    .show(ui, &mut self.buffer);
+            egui::ScrollArea::both().show(ui, |ui| {
+                if self.is_script_selected() {
+                    CodeEditor::default()
+                        .id_source("script_editor")
+                        .with_rows(30)
+                        .with_fontsize(14.0)
+                        .with_syntax(lua_syntax::luau_syntax())
+                        .with_numlines(true)
+                        .vscroll(true)
+                        .show(ui, &mut self.buffer);
 
-                if ui.button("Apply to script").clicked() {
-                    self.apply_edit();
+                    if ui.button("Apply to script").clicked() {
+                        self.apply_edit();
+                    }
+                } else {
+                    ui.label("Select a script in the Explorer, or open a place file.");
                 }
-            } else {
-                ui.label("Select a script in the Explorer, or open a place file.");
-            }
+            });
         });
     }
 }
