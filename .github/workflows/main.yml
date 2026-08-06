@@ -16,7 +16,7 @@ on:
 jobs:
   get-data:
     name: Read Cargo TOML
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -35,7 +35,7 @@ jobs:
 
   tag:
     name: Create a tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: get-data
     permissions:
       contents: write
@@ -54,7 +54,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────
   build-android-gui:
     name: Build Android GUI APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: tag
     permissions:
       contents: write
