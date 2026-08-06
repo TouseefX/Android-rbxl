@@ -105,7 +105,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          key: gui-android-apk-${{ hashFiles('topaz-gui/Cargo.toml') }}
+          key: gui-android-apk-${{ hashFiles('Cargo.toml') }}
 
       - name: Install cargo-apk + cargo-ndk
         uses: taiki-e/install-action@v2
@@ -121,7 +121,7 @@ jobs:
           export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$TOOLCHAIN/armv7a-linux-androideabi30-clang
           export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$TOOLCHAIN/x86_64-linux-android30-clang
 
-          cargo apk2 build -p topaz-gui --lib
+          cargo apk2 build --lib
           
           find target -name "*.apk" -type f
 
@@ -129,23 +129,23 @@ jobs:
         shell: bash
         run: |
           set -e
-          APK=$(find target -name "Topaz.apk" -type f | head -n 1)
+          APK=$(find target -name "rbxl-editor.apk" -type f | head -n 1)
           [ -z "$APK" ] && { echo "APK not found!"; exit 1; }
-          cp "$APK" Topaz-debug.apk
-          ls -lh Topaz-debug.apk
+          cp "$APK" rbxl-editor-debug.apk
+          ls -lh rbxl-editor-debug.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Topaz-android.apk
-          path: ./Topaz-debug.apk
+          name: rbxl-editor-android.apk
+          path: ./rbxl-editor-debug.apk
 
       - name: Upload APK to release
         if: github.event.inputs.upload_type == 'release' || github.event.inputs.upload_type == 'both'
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ./Topaz-debug.apk
-          asset_name: Topaz-android.apk
+          file: ./rbxl-editor-debug.apk
+          asset_name: rbxl-editor-android.apk
           tag: ${{ needs.tag.outputs.tag }}
           overwrite: true
