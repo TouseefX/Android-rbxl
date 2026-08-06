@@ -22,7 +22,11 @@ android_logger = "0.14"
 [package.metadata.android]
 package = "com.yourname.rbxleditor"
 apk_label = "rbxl Editor"
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi", "x86_64-linux-android"]
 java_sources = "java"
+min_sdk_version = 24
+target_sdk_version = 34
+compile_sdk_version = 34
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -33,6 +37,9 @@ name = "android.permission.READ_EXTERNAL_STORAGE"
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.WRITE_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
 [[package.metadata.android.application.activity]]
 name = ".MainActivity"
