@@ -32,10 +32,10 @@ impl Default for EditorApp {
 }
 
 impl eframe::App for EditorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open .rbxl").clicked() {
                     jni_bridge::trigger_open_document();
@@ -53,7 +53,7 @@ impl eframe::App for EditorApp {
             });
         });
 
-        egui::SidePanel::left("explorer").show(ctx, |ui| {
+        egui::SidePanel::left("explorer").show(ui, |ui| {
             ui.heading("Explorer");
             if let Some(dom) = &self.dom {
                 let root = dom.root_ref();
@@ -63,7 +63,7 @@ impl eframe::App for EditorApp {
             }
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.is_script_selected() {
                 CodeEditor::default()
                     .id_source("script_editor")
