@@ -22,6 +22,7 @@ android_logger = "0.14"
 [package.metadata.android]
 package = "com.yourname.rbxleditor"
 apk_label = "rbxl Editor"
+apk_name = "rbxleditor"
 build_targets = ["aarch64-linux-android", "armv7-linux-androideabi", "x86_64-linux-android"]
 java_sources = "java"
 min_sdk_version = 24
