@@ -1,4 +1,4 @@
-use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JString, JValue};
 use jni::JNIEnv;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -13,9 +13,10 @@ pub enum FileEvent {
     ExternalEditReturned { script_id: u64, text: String },
 }
 
-// Receiver isn't Sync, so it has to sit behind a Mutex to live in a static.
 static FILE_EVENTS: OnceLock<(mpsc::Sender<FileEvent>, Mutex<mpsc::Receiver<FileEvent>>)> =
     OnceLock::new();
+
+static MAIN_ACTIVITY_CLASS: OnceLock<GlobalRef> = OnceLock::new();
 
 pub fn channel() -> &'static (mpsc::Sender<FileEvent>, Mutex<mpsc::Receiver<FileEvent>>) {
     FILE_EVENTS.get_or_init(|| {
@@ -35,64 +36,118 @@ pub fn try_recv_all() -> Vec<FileEvent> {
     out
 }
 
-/// Attaches to the JVM for the duration of `f` and hands back the current
-/// Activity object. No leaking: the JNIEnv only needs to live as long as
-/// this call, so there's no need for the 'static hack the first draft used.
-fn with_activity<R>(f: impl FnOnce(&mut JNIEnv, &JObject) -> R) -> R {
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _reserved: *mut std::ffi::c_void) -> jni::sys::jint {
+    if let Ok(mut env) = vm.get_env() {
+        if let Ok(class) = env.find_class("com/yourname/rbxleditor/MainActivity") {
+            if let Ok(global) = env.new_global_ref(class) {
+                let _ = MAIN_ACTIVITY_CLASS.set(global);
+                log::info!("JNI_OnLoad: successfully cached MainActivity class");
+            }
+        }
+    }
+    jni::sys::JNI_VERSION_1_6
+}
+
+fn with_env(f: impl FnOnce(&mut JNIEnv, &JClass) -> Result<(), jni::errors::Error>) {
     let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.unwrap();
-    let mut env = vm.attach_current_thread().unwrap();
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    f(&mut env, &activity)
+    let vm = match unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) } {
+        Ok(vm) => vm,
+        Err(e) => {
+            log::error!("Failed to get JavaVM: {e:?}");
+            return;
+        }
+    };
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => {
+            log::error!("Failed to attach current thread: {e:?}");
+            return;
+        }
+    };
+
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+
+    let class_res = if let Some(global) = MAIN_ACTIVITY_CLASS.get() {
+        Ok(unsafe { JClass::from_raw(global.as_raw() as jni::sys::jclass) })
+    } else {
+        env.find_class("com/yourname/rbxleditor/MainActivity")
+    };
+
+    let class = match class_res {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("Failed to find MainActivity class: {e:?}");
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            return;
+        }
+    };
+
+    let result = f(&mut env, &class);
+
+    if env.exception_check().unwrap_or(false) {
+        log::error!("JNI call raised an exception");
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+
+    if let Err(e) = result {
+        log::error!("JNI call error: {e:?}");
+    }
 }
 
 pub fn trigger_open_document() {
-    with_activity(|env, activity| {
-        let _ = env.call_method(activity, "openDocument", "()V", &[]);
+    with_env(|env, class| {
+        let _ = env.call_static_method(class, "openDocumentStatic", "()V", &[])?;
+        Ok(())
     });
 }
 
 pub fn trigger_create_document(suggested_name: &str) {
-    with_activity(|env, activity| {
-        let name = env.new_string(suggested_name).unwrap();
-        let _ = env.call_method(
-            activity,
-            "createDocument",
+    with_env(|env, class| {
+        let name = env.new_string(suggested_name)?;
+        let _ = env.call_static_method(
+            class,
+            "createDocumentStatic",
             "(Ljava/lang/String;)V",
             &[JValue::Object(&name)],
-        );
+        )?;
+        Ok(())
     });
 }
 
 pub fn trigger_save(data: &[u8]) {
-    with_activity(|env, activity| {
-        let arr = env.byte_array_from_slice(data).unwrap();
-        let _ = env.call_method(
-            activity,
-            "saveToCurrentDocument",
+    with_env(|env, class| {
+        let arr = env.byte_array_from_slice(data)?;
+        let _ = env.call_static_method(
+            class,
+            "saveToCurrentDocumentStatic",
             "([B)V",
             &[JValue::Object(&arr)],
-        );
+        )?;
+        Ok(())
     });
 }
 
-/// Ask Java to create a standalone temp document for `script_id`, write
-/// `source` into it, then launch a chooser so the user can pick QuickEdit
-/// or any other text-editor app installed.
 pub fn trigger_edit_externally(script_id: u64, name: &str, source: &str) {
-    with_activity(|env, activity| {
-        let jname = env.new_string(format!("{name}.lua")).unwrap();
-        let jsource = env.new_string(source).unwrap();
-        let _ = env.call_method(
-            activity,
-            "editExternally",
+    with_env(|env, class| {
+        let jname = env.new_string(format!("{name}.lua"))?;
+        let jsource = env.new_string(source)?;
+        let _ = env.call_static_method(
+            class,
+            "editExternallyStatic",
             "(JLjava/lang/String;Ljava/lang/String;)V",
             &[
                 JValue::Long(script_id as i64),
                 JValue::Object(&jname),
                 JValue::Object(&jsource),
             ],
-        );
+        )?;
+        Ok(())
     });
 }
 
@@ -104,7 +159,7 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnDocumen
     data: JByteArray,
 ) {
     let (tx, _) = channel();
-    if uri.is_null() {
+    if uri.is_null() || data.is_null() {
         let _ = tx.send(FileEvent::OpenCancelled);
         return;
     }
@@ -120,6 +175,9 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnDocumen
     uri: JString,
 ) {
     let (tx, _) = channel();
+    if uri.is_null() {
+        return;
+    }
     let uri_str: String = env.get_string(&uri).map(|s| s.into()).unwrap_or_default();
     let _ = tx.send(FileEvent::Created { uri: uri_str });
 }
@@ -142,6 +200,9 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnExterna
     text: JString,
 ) {
     let (tx, _) = channel();
+    if text.is_null() {
+        return;
+    }
     let text_str: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
     let _ = tx.send(FileEvent::ExternalEditReturned {
         script_id: script_id as u64,

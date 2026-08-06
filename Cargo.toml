@@ -12,10 +12,6 @@ rbx_binary   = "1"
 eframe       = { version = "0.34", default-features = false, features = ["glow", "android-native-activity"] }
 egui         = "0.34"
 egui_code_editor = "0.2"
-# Get AndroidApp from winit's re-export (not a separate android-activity dep)
-# so it's guaranteed to be the exact same type eframe/winit use internally —
-# depending on android-activity directly here previously caused the crate to
-# appear twice in the dependency graph at two incompatible versions.
 winit        = { version = "0.30", features = ["android-native-activity"] }
 ndk-context  = "0.1"
 jni          = "0.21"
@@ -49,7 +45,8 @@ name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 [[package.metadata.android.application.activity]]
 name = ".MainActivity"
 launch_mode = "singleTop"
-config_changes = "orientation|keyboardHidden|screenSize"
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode"
+orientation = "sensor"
 exported = true
 
 [[package.metadata.android.application.activity.meta_data]]
