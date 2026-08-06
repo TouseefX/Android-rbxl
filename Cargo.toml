@@ -34,7 +34,7 @@ target_sdk_version = 34
 compile_sdk_version = 34
 
 [package.metadata.android.sdk]
-min_sdk_version = 26
+min_sdk_version = 24
 target_sdk_version = 34
 
 [[package.metadata.android.uses_permission]]
