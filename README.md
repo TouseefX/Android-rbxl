@@ -68,31 +68,3 @@ java/.../MainActivity.java                    SAF file picker + external-edit ro
 5. `app.rs` matches the returned text to the right script via a small
    `id -> Ref` map (`pending_external_edits`), since a `rbx_dom_weak::Ref`
    has no meaningful representation on the Java side.
-
-## CI (GitHub Actions sketch)
-
-```yaml
-name: build-apk
-on: [push]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Android NDK
-        run: |
-          # pin an NDK version known to work with your android-activity version
-          sdkmanager --install "ndk;27.0.12077973"
-      - name: Install cargo-apk2
-        run: cargo install cargo-apk2
-      - name: Build APK
-        run: cargo apk2 build --release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rbxl-editor-apk
-          path: target/release/apk/*.apk
-```
-
-Adjust the NDK version/action to whatever your runner image actually needs —
-this is a starting point, not verified against a live run.
