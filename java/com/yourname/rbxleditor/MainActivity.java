@@ -4,8 +4,12 @@ import android.app.NativeActivity;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.StrictMode;
 import android.util.Log;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
@@ -20,17 +24,27 @@ public class MainActivity extends NativeActivity {
 
     private static final int REQ_OPEN = 1001;
     private static final int REQ_CREATE = 1002;
-    private static final int REQ_EXTERNAL_EDIT_CREATE = 1003;
 
-    private Uri currentDocUri;      // the .rbxl file itself
-    private Uri externalEditUri;    // temp .lua doc handed to another app
-    private long externalEditScriptId = -1;
-    private String pendingExternalSource;
+    private Uri currentDocUri;
+
+    // External edit state
+    private long activeExternalScriptId = -1;
+    private String activeExternalFilePath = null;
+    private long lastExternalModifiedTime = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         sInstance = this;
+
+        // Allow direct file sharing with external editor apps without FileUriExposedException
+        try {
+            StrictMode.VmPolicy.Builder builder = new StrictMode.VmPolicy.Builder();
+            StrictMode.setVmPolicy(builder.build());
+        } catch (Exception e) {
+            Log.w(TAG, "StrictMode config exception", e);
+        }
+
         Log.i(TAG, "MainActivity onCreate: instance registered");
     }
 
@@ -77,6 +91,20 @@ public class MainActivity extends NativeActivity {
             act.editExternally(scriptId, fileName, source);
         } else {
             Log.e(TAG, "editExternallyStatic: MainActivity instance is null");
+        }
+    }
+
+    public static void syncExternalEditsStatic() {
+        MainActivity act = sInstance;
+        if (act != null) {
+            act.checkExternalFileUpdate(true);
+        }
+    }
+
+    public static void finishExternalEditStatic() {
+        MainActivity act = sInstance;
+        if (act != null) {
+            act.finishExternalEdit();
         }
     }
 
@@ -131,23 +159,90 @@ public class MainActivity extends NativeActivity {
         });
     }
 
+    /**
+     * Creates a real .lua script file in app storage and hands it directly to
+     * external editor apps (QuickEdit, Acode, DroidEdit, etc.) without requiring
+     * the user to manually pick a folder.
+     */
     public void editExternally(final long scriptId, final String fileName, final String source) {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    externalEditScriptId = scriptId;
-                    pendingExternalSource = source;
-                    Intent create = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                    create.addCategory(Intent.CATEGORY_OPENABLE);
-                    create.setType("text/plain");
-                    create.putExtra(Intent.EXTRA_TITLE, fileName);
-                    startActivityForResult(create, REQ_EXTERNAL_EDIT_CREATE);
+                    File scriptsDir = getExternalFilesDir("scripts");
+                    if (scriptsDir == null) {
+                        scriptsDir = new File(getFilesDir(), "scripts");
+                    }
+                    if (!scriptsDir.exists()) {
+                        scriptsDir.mkdirs();
+                    }
+
+                    String sanitized = fileName.replaceAll("[^a-zA-Z0-9_.-]", "_");
+                    if (!sanitized.endsWith(".lua")) {
+                        sanitized = sanitized + ".lua";
+                    }
+
+                    File scriptFile = new File(scriptsDir, sanitized);
+                    try (FileOutputStream fos = new FileOutputStream(scriptFile)) {
+                        fos.write(source.getBytes(StandardCharsets.UTF_8));
+                        fos.flush();
+                    }
+
+                    activeExternalScriptId = scriptId;
+                    activeExternalFilePath = scriptFile.getAbsolutePath();
+                    lastExternalModifiedTime = scriptFile.lastModified();
+
+                    Uri fileUri = Uri.fromFile(scriptFile);
+
+                    Intent editIntent = new Intent(Intent.ACTION_VIEW);
+                    editIntent.setDataAndType(fileUri, "text/plain");
+                    editIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+
+                    Intent chooser = Intent.createChooser(editIntent, "Edit Lua script with...");
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(chooser);
+
+                    Log.i(TAG, "editExternally: launched chooser for " + scriptFile.getAbsolutePath());
                 } catch (Exception e) {
                     Log.e(TAG, "editExternally failed", e);
                 }
             }
         });
+    }
+
+    public void checkExternalFileUpdate(boolean force) {
+        try {
+            if (activeExternalFilePath != null && activeExternalScriptId >= 0) {
+                File file = new File(activeExternalFilePath);
+                if (file.exists()) {
+                    long currentMod = file.lastModified();
+                    if (force || currentMod > lastExternalModifiedTime) {
+                        lastExternalModifiedTime = currentMod;
+                        byte[] bytes = readFile(file);
+                        if (bytes != null) {
+                            String text = new String(bytes, StandardCharsets.UTF_8);
+                            Log.i(TAG, "checkExternalFileUpdate: syncing " + text.length() + " chars from " + file.getName());
+                            nativeOnExternalEditReturned(activeExternalScriptId, text);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "checkExternalFileUpdate exception", e);
+        }
+    }
+
+    public void finishExternalEdit() {
+        activeExternalScriptId = -1;
+        activeExternalFilePath = null;
+        lastExternalModifiedTime = 0;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Whenever the user switches back to this app, auto-sync any modified external script
+        checkExternalFileUpdate(false);
     }
 
     @Override
@@ -172,40 +267,9 @@ public class MainActivity extends NativeActivity {
                 persist(uri);
                 currentDocUri = uri;
                 nativeOnDocumentCreated(uri.toString());
-
-            } else if (requestCode == REQ_EXTERNAL_EDIT_CREATE) {
-                if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
-                externalEditUri = data.getData();
-                persist(externalEditUri);
-                if (pendingExternalSource != null) {
-                    writeBytes(externalEditUri, pendingExternalSource.getBytes(StandardCharsets.UTF_8));
-                    pendingExternalSource = null;
-                }
-
-                Intent view = new Intent(Intent.ACTION_VIEW);
-                view.setDataAndType(externalEditUri, "text/plain");
-                view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                startActivity(Intent.createChooser(view, "Edit script with..."));
             }
         } catch (Exception e) {
             Log.e(TAG, "onActivityResult exception", e);
-        }
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        // If we sent a script out for external editing, read it back now.
-        try {
-            if (externalEditUri != null && externalEditScriptId >= 0) {
-                byte[] bytes = readBytes(externalEditUri);
-                String text = bytes != null ? new String(bytes, StandardCharsets.UTF_8) : "";
-                nativeOnExternalEditReturned(externalEditScriptId, text);
-                externalEditUri = null;
-                externalEditScriptId = -1;
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "onResume exception", e);
         }
     }
 
@@ -230,6 +294,21 @@ public class MainActivity extends NativeActivity {
             return buf.toByteArray();
         } catch (Exception e) {
             Log.e(TAG, "readBytes failed", e);
+            return null;
+        }
+    }
+
+    private byte[] readFile(File file) {
+        try (FileInputStream in = new FileInputStream(file)) {
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n;
+            while ((n = in.read(chunk)) != -1) {
+                buf.write(chunk, 0, n);
+            }
+            return buf.toByteArray();
+        } catch (Exception e) {
+            Log.e(TAG, "readFile failed: " + file, e);
             return null;
         }
     }

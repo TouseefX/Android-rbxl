@@ -8,7 +8,7 @@ pub enum FileEvent {
     OpenCancelled,
     Created { uri: String },
     SaveComplete(bool),
-    /// Text came back from an external editor (QuickEdit etc.) for the
+    /// Text came back from an external editor (QuickEdit, Acode etc.) for the
     /// script identified by `script_id` (see EditorApp::next_external_id).
     ExternalEditReturned { script_id: u64, text: String },
 }
@@ -135,7 +135,7 @@ pub fn trigger_save(data: &[u8]) {
 
 pub fn trigger_edit_externally(script_id: u64, name: &str, source: &str) {
     with_env(|env, class| {
-        let jname = env.new_string(format!("{name}.lua"))?;
+        let jname = env.new_string(name)?;
         let jsource = env.new_string(source)?;
         let _ = env.call_static_method(
             class,
@@ -147,6 +147,20 @@ pub fn trigger_edit_externally(script_id: u64, name: &str, source: &str) {
                 JValue::Object(&jsource),
             ],
         )?;
+        Ok(())
+    });
+}
+
+pub fn trigger_sync_external_edits() {
+    with_env(|env, class| {
+        let _ = env.call_static_method(class, "syncExternalEditsStatic", "()V", &[])?;
+        Ok(())
+    });
+}
+
+pub fn trigger_finish_external_edit() {
+    with_env(|env, class| {
+        let _ = env.call_static_method(class, "finishExternalEditStatic", "()V", &[])?;
         Ok(())
     });
 }

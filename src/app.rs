@@ -92,6 +92,9 @@ impl eframe::App for EditorApp {
                     if ui.button("💾 Save").clicked() {
                         self.save();
                     }
+                    if ui.button("💾 Save As...").clicked() {
+                        self.save_as();
+                    }
                     if ui.button("📊 Stats").clicked() {
                         self.show_stats = !self.show_stats;
                     }
@@ -312,8 +315,24 @@ impl EditorApp {
                     ui.label(egui::RichText::new("✓ Saved to DOM").color(egui::Color32::from_rgb(120, 200, 120)));
                 }
 
-                if ui.button("✏️ Edit in External App").clicked() {
+                if ui.button("📱 Edit in External App").clicked() {
                     self.edit_externally();
+                }
+            });
+        }
+
+        // Active External Edit Sync Banner
+        if !self.pending_external_edits.is_empty() {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("🟢 External Sync Active").color(egui::Color32::from_rgb(100, 255, 100)).strong());
+                if ui.button("🔄 Sync Edits Now").clicked() {
+                    jni_bridge::trigger_sync_external_edits();
+                }
+                if ui.button("✖ Stop External Edit").clicked() {
+                    self.pending_external_edits.clear();
+                    jni_bridge::trigger_finish_external_edit();
+                    self.status = "External editing finished".into();
                 }
             });
         }
@@ -783,14 +802,14 @@ impl EditorApp {
                     self.status = if ok { "Saved place successfully".into() } else { "Save failed".into() };
                 }
                 FileEvent::ExternalEditReturned { script_id, text } => {
-                    if let Some(referent) = self.pending_external_edits.remove(&script_id) {
+                    if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
                         if let Some(dom) = self.dom.as_mut() {
                             let _ = rbxl::set_source(dom, referent, text.clone());
                             if self.selected == Some(referent) {
                                 self.buffer = text.clone();
                                 self.buffer_original = text;
                             }
-                            self.status = "Updated from external edit".into();
+                            self.status = "⚡ Synced changes from external editor".into();
                         }
                     }
                 }
@@ -826,5 +845,13 @@ impl EditorApp {
             Ok(bytes) => jni_bridge::trigger_save(&bytes),
             Err(e) => self.status = format!("Serialize failed: {e}"),
         }
+    }
+
+    fn save_as(&mut self) {
+        if self.dom.is_none() {
+            self.status = "No place file open to save".into();
+            return;
+        }
+        jni_bridge::trigger_create_document("place.rbxl");
     }
 }
