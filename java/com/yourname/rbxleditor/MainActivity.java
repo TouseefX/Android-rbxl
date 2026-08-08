@@ -17,6 +17,8 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends NativeActivity {
     private static final String TAG = "rbxl_editor";
@@ -119,6 +121,14 @@ public class MainActivity extends NativeActivity {
         }
     }
 
+    public static String getClipboardTextStatic() {
+        MainActivity act = sInstance;
+        if (act != null) {
+            return act.getClipboardText();
+        }
+        return "";
+    }
+
     // ---- Instance methods running on Android UI Thread ----
 
     public void copyToClipboard(final String text) {
@@ -137,6 +147,39 @@ public class MainActivity extends NativeActivity {
                 }
             }
         });
+    }
+
+    public String getClipboardText() {
+        final String[] result = new String[]{""};
+        final CountDownLatch latch = new CountDownLatch(1);
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    if (clipboard != null && clipboard.hasPrimaryClip()) {
+                        ClipData clip = clipboard.getPrimaryClip();
+                        if (clip != null && clip.getItemCount() > 0) {
+                            CharSequence text = clip.getItemAt(0).coerceToText(MainActivity.this);
+                            if (text != null) {
+                                result[0] = text.toString();
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "getClipboardText failed", e);
+                } finally {
+                    latch.countDown();
+                }
+            }
+        });
+
+        try {
+            latch.await(250, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Log.w(TAG, "getClipboardText latch timeout");
+        }
+        return result[0];
     }
 
     public void openDocument() {

@@ -579,12 +579,30 @@ impl EditorApp {
                     ui.horizontal(|ui| {
                         ui.label("API Key:");
                         ui.add(egui::TextEdit::singleline(&mut self.open_cloud_api_key).password(true).desired_width(180.0));
+                        if ui.button("📥 Paste").clicked() {
+                            let text = jni_bridge::get_clipboard_text();
+                            if !text.is_empty() {
+                                self.open_cloud_api_key = text;
+                            }
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Universe ID:");
-                        ui.add(egui::TextEdit::singleline(&mut self.open_cloud_universe_id).hint_text("e.g. 123456789").desired_width(120.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.open_cloud_universe_id).hint_text("e.g. 123456789").desired_width(110.0));
+                        if ui.button("📥").clicked() {
+                            let text = jni_bridge::get_clipboard_text();
+                            if !text.is_empty() {
+                                self.open_cloud_universe_id = text;
+                            }
+                        }
                         ui.label("Place ID:");
-                        ui.add(egui::TextEdit::singleline(&mut self.open_cloud_place_id).hint_text("e.g. 987654321").desired_width(120.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.open_cloud_place_id).hint_text("e.g. 987654321").desired_width(110.0));
+                        if ui.button("📥").clicked() {
+                            let text = jni_bridge::get_clipboard_text();
+                            if !text.is_empty() {
+                                self.open_cloud_place_id = text;
+                            }
+                        }
                     });
                 });
 
@@ -972,6 +990,15 @@ impl EditorApp {
             if ui.button("📋 Copy Script").clicked() {
                 jni_bridge::trigger_copy_to_clipboard(&tab.buffer);
                 self.status = "Copied script to Android clipboard".into();
+            }
+            if ui.button("📥 Paste from Clipboard").clicked() {
+                let text = jni_bridge::get_clipboard_text();
+                if !text.is_empty() {
+                    tab.buffer.push_str(&text);
+                    self.status = format!("Pasted {} characters from Android clipboard", text.len());
+                } else {
+                    self.status = "Clipboard is empty".into();
+                }
             }
         });
 

@@ -178,6 +178,23 @@ pub fn trigger_copy_to_clipboard(text: &str) {
     });
 }
 
+pub fn get_clipboard_text() -> String {
+    let mut text_out = String::new();
+    with_env(|env, class| {
+        let jval = env.call_static_method(class, "getClipboardTextStatic", "()Ljava/lang/String;", &[])?;
+        if let Ok(jstr_obj) = jval.l() {
+            if !jstr_obj.is_null() {
+                let jstr = JString::from(jstr_obj);
+                if let Ok(s) = env.get_string(&jstr) {
+                    text_out = s.into();
+                }
+            }
+        }
+        Ok(())
+    });
+    text_out
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnDocumentOpened(
     mut env: JNIEnv,
