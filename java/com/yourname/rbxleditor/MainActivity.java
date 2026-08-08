@@ -6,6 +6,7 @@ import android.content.ClipboardManager;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.StrictMode;
 import android.util.Log;
 import android.widget.Toast;
@@ -188,18 +189,29 @@ public class MainActivity extends NativeActivity {
     }
 
     /**
-     * Creates a real .lua script file in app storage and hands it directly to
-     * external editor apps (QuickEdit, Acode, DroidEdit, etc.) without requiring
-     * the user to manually pick a folder.
+     * Creates a real .lua script file in Android/media/ (accessible on Android 13+)
+     * and hands it directly to external editor apps (QuickEdit, Acode, DroidEdit, etc.)
+     * without being blocked by Android 13's Android/data scoped storage restriction.
      */
     public void editExternally(final long scriptId, final String fileName, final String source) {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    File scriptsDir = getExternalFilesDir("scripts");
+                    // Use Android/media/ directory for full Android 13/14 third-party editor access
+                    File scriptsDir = null;
+                    File[] mediaDirs = getExternalMediaDirs();
+                    if (mediaDirs != null && mediaDirs.length > 0 && mediaDirs[0] != null) {
+                        scriptsDir = new File(mediaDirs[0], "scripts");
+                    }
+                    if (scriptsDir == null || !scriptsDir.exists()) {
+                        File mediaRoot = new File(Environment.getExternalStorageDirectory(), "Android/media/com.yourname.rbxleditor/scripts");
+                        if (mediaRoot.exists() || mediaRoot.mkdirs()) {
+                            scriptsDir = mediaRoot;
+                        }
+                    }
                     if (scriptsDir == null) {
-                        scriptsDir = new File(getFilesDir(), "scripts");
+                        scriptsDir = new File(getExternalFilesDir(null), "scripts");
                     }
                     if (!scriptsDir.exists()) {
                         scriptsDir.mkdirs();
@@ -230,7 +242,7 @@ public class MainActivity extends NativeActivity {
                     chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     startActivity(chooser);
 
-                    Log.i(TAG, "editExternally: launched chooser for " + scriptFile.getAbsolutePath());
+                    Log.i(TAG, "editExternally: launched chooser in Android/media/ for " + scriptFile.getAbsolutePath());
                 } catch (Exception e) {
                     Log.e(TAG, "editExternally failed", e);
                 }
