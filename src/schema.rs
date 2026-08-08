@@ -1,0 +1,105 @@
+use rbx_dom_weak::{
+    types::{Ref, Variant},
+    InstanceBuilder, WeakDom,
+};
+use rbx_reflection_database::get as get_reflection_database;
+use std::collections::BTreeMap;
+
+pub struct SchemaClassInfo {
+    pub name: String,
+    pub superclass: Option<String>,
+    pub property_count: usize,
+    pub is_creatable: bool,
+}
+
+/// Search all official Roblox Engine classes from rbx_reflection_database
+pub fn search_engine_classes(query: &str) -> Vec<SchemaClassInfo> {
+    let db = get_reflection_database();
+    let q = query.trim().to_lowercase();
+
+    let mut classes: Vec<SchemaClassInfo> = db
+        .classes
+        .values()
+        .filter(|desc| {
+            let is_not_creatable = desc.tags.contains(&rbx_reflection::ClassTag::NotCreatable)
+                || desc.tags.contains(&rbx_reflection::ClassTag::Service)
+                || desc.tags.contains(&rbx_reflection::ClassTag::Deprecated);
+
+            if q.is_empty() {
+                !is_not_creatable
+            } else {
+                desc.name.to_lowercase().contains(&q)
+            }
+        })
+        .map(|desc| {
+            let is_creatable = !desc.tags.contains(&rbx_reflection::ClassTag::NotCreatable)
+                && !desc.tags.contains(&rbx_reflection::ClassTag::Service);
+
+            SchemaClassInfo {
+                name: desc.name.to_string(),
+                superclass: desc.superclass.as_ref().map(|s| s.to_string()),
+                property_count: desc.properties.len(),
+                is_creatable,
+            }
+        })
+        .collect();
+
+    classes.sort_by(|a, b| a.name.cmp(&b.name));
+    classes
+}
+
+/// Retrieve all available schema properties and their official types for a class
+pub fn get_class_schema_properties(class_name: &str) -> BTreeMap<String, String> {
+    let db = get_reflection_database();
+    let mut out = BTreeMap::new();
+
+    let mut current_class = Some(class_name);
+    while let Some(cls) = current_class {
+        if let Some(desc) = db.classes.get(cls) {
+            for (prop_name, prop_desc) in &desc.properties {
+                let type_name = format!("{:?}", prop_desc.data_type);
+                out.entry(prop_name.to_string()).or_insert(type_name);
+            }
+            current_class = desc.superclass.as_deref();
+        } else {
+            break;
+        }
+    }
+
+    out
+}
+
+/// Retrieve all valid Roblox Enum items for an enum type
+pub fn get_enum_items(enum_name: &str) -> Vec<String> {
+    let db = get_reflection_database();
+    if let Some(enum_desc) = db.enums.get(enum_name) {
+        let mut items: Vec<String> = enum_desc.items.keys().map(|k| k.to_string()).collect();
+        items.sort();
+        items
+    } else {
+        Vec::new()
+    }
+}
+
+/// Instantiates any official Roblox class from the reflection database with default properties
+pub fn create_instance_from_schema(
+    dom: &mut WeakDom,
+    parent: Ref,
+    class_name: &str,
+    name: &str,
+) -> Result<Ref, anyhow::Error> {
+    let db = get_reflection_database();
+    let mut builder = InstanceBuilder::new(class_name).with_name(name);
+
+    if let Some(desc) = db.classes.get(class_name) {
+        for (prop_key, default_val) in &desc.default_properties {
+            builder = builder.with_property(prop_key.as_ref(), default_val.clone());
+        }
+    }
+
+    if matches!(class_name, "Script" | "LocalScript" | "ModuleScript") {
+        builder = builder.with_property("Source", Variant::String(String::new()));
+    }
+
+    Ok(dom.insert(parent, builder))
+}

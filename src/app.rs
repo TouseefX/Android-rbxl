@@ -1,6 +1,7 @@
 use crate::asset_downloader::{self, DiscoveredAsset};
 use crate::jni_bridge::{self, FileEvent};
-use crate::{explorer, lua_syntax, rbxl, templates, viewport3d::{CameraPreset, Viewport3D}};
+use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
+use crate::{explorer, lua_syntax, rbxl, schema, templates, viewport3d::{CameraPreset, Viewport3D}};
 use egui::{Color32, RichText};
 use rbx_dom_weak::{
     types::{Color3, Color3uint8, Ref, Variant, Vector3},
@@ -18,6 +19,7 @@ pub enum ActiveTab {
     Toolbox,
     Snippets,
     Assets,
+    OpenCloud,
     Output,
 }
 
@@ -60,9 +62,25 @@ pub struct EditorApp {
     // 3D Viewport
     viewport: Viewport3D,
 
-    // Asset & Mesh Downloader State
-    manual_asset_input: String,
+    // Live Roblox Catalog & Creator Store State
+    live_search_input: String,
+    live_catalog_items: Vec<LiveCatalogItem>,
+    is_searching_live: bool,
     discovered_assets: Vec<DiscoveredAsset>,
+
+    // Open Cloud State
+    open_cloud_api_key: String,
+    open_cloud_universe_id: String,
+    open_cloud_place_id: String,
+    datastore_name_input: String,
+    datastore_key_input: String,
+    datastore_val_input: String,
+    datastore_response_text: String,
+    messaging_topic_input: String,
+    messaging_msg_input: String,
+
+    // Schema Class Search
+    schema_search_input: String,
 
     // Properties UI State
     new_prop_name: String,
@@ -97,8 +115,20 @@ impl Default for EditorApp {
             show_stats: false,
             rename_buffer: String::new(),
             viewport: Viewport3D::default(),
-            manual_asset_input: String::new(),
+            live_search_input: "sword".into(),
+            live_catalog_items: Vec::new(),
+            is_searching_live: false,
             discovered_assets: Vec::new(),
+            open_cloud_api_key: String::new(),
+            open_cloud_universe_id: String::new(),
+            open_cloud_place_id: String::new(),
+            datastore_name_input: "PlayerData".into(),
+            datastore_key_input: "Player_12345".into(),
+            datastore_val_input: "{\"Coins\": 1000, \"Level\": 10}".into(),
+            datastore_response_text: String::new(),
+            messaging_topic_input: "ServerAlerts".into(),
+            messaging_msg_input: "Server updating in 5 minutes".into(),
+            schema_search_input: String::new(),
             new_prop_name: String::new(),
             new_prop_type: "String".into(),
             new_prop_val_str: String::new(),
@@ -108,7 +138,9 @@ impl Default for EditorApp {
             pending_external_edits: HashMap::new(),
             next_external_id: 1,
         };
-        app.log_info("Roblox Studio Lite initialized");
+        app.log_info("Roblox Studio Lite initialized with Open Cloud & Live Creator Store");
+        RobloxApiClient::fetch_live_catalog_async("sword".into());
+        app.is_searching_live = true;
         app
     }
 }
@@ -230,7 +262,8 @@ impl eframe::App for EditorApp {
                             tab_btn(ui, "➕ Insert", ActiveTab::Insert);
                             tab_btn(ui, "🧰 Toolbox", ActiveTab::Toolbox);
                             tab_btn(ui, "📜 Snippets", ActiveTab::Snippets);
-                            tab_btn(ui, "☁️ Cloud Assets", ActiveTab::Assets);
+                            tab_btn(ui, "☁️ Creator Store", ActiveTab::Assets);
+                            tab_btn(ui, "🚀 Open Cloud", ActiveTab::OpenCloud);
                             tab_btn(ui, "🖥️ Output", ActiveTab::Output);
                         });
                     });
@@ -255,6 +288,7 @@ impl eframe::App for EditorApp {
                     ActiveTab::Toolbox => self.show_toolbox_ui(ui),
                     ActiveTab::Snippets => self.show_snippets_ui(ui),
                     ActiveTab::Assets => self.show_assets_ui(ui),
+                    ActiveTab::OpenCloud => self.show_open_cloud_ui(ui),
                     ActiveTab::Output => self.show_output_ui(ui),
                 }
             });
@@ -270,6 +304,7 @@ impl eframe::App for EditorApp {
                     ActiveTab::Toolbox => self.show_toolbox_ui(ui),
                     ActiveTab::Snippets => self.show_snippets_ui(ui),
                     ActiveTab::Assets => self.show_assets_ui(ui),
+                    ActiveTab::OpenCloud => self.show_open_cloud_ui(ui),
                     ActiveTab::Output => self.show_output_ui(ui),
                 }
             });
@@ -433,124 +468,263 @@ impl EditorApp {
     }
 
     fn show_assets_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("☁️ Roblox Creator Store & Asset Delivery");
-        ui.label("Search creator store models, framework libraries, and extract mesh / texture delivery URLs.");
+        ui.heading("☁️ Roblox Creator Store Live Search Engine");
+        ui.label("Live real-time query against official Roblox Catalog & Creator Store marketplace.");
 
         ui.separator();
 
-        // Creator Store Search
-        ui.label(RichText::new("Creator Store Search:").strong().color(Color32::from_rgb(100, 200, 255)));
+        // Live Search Input Bar
         ui.horizontal(|ui| {
+            ui.label(RichText::new("Search:").strong());
             ui.add(
-                egui::TextEdit::singleline(&mut self.manual_asset_input)
-                    .hint_text("Search: Knit, Sword, Roact, ProfileService, Fusion, Coil...")
-                    .desired_width(240.0),
+                egui::TextEdit::singleline(&mut self.live_search_input)
+                    .hint_text("Enter query e.g. sword, car, gun, tree, door, knit, fusion...")
+                    .desired_width(200.0),
             );
 
-            if !self.manual_asset_input.is_empty() && ui.button("✖ Clear").clicked() {
-                self.manual_asset_input.clear();
+            if ui.button(RichText::new("🔍 Search Live Store").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
+                if !self.live_search_input.trim().is_empty() {
+                    RobloxApiClient::fetch_live_catalog_async(self.live_search_input.trim().to_string());
+                    self.is_searching_live = true;
+                    self.status = format!("Searching Roblox Catalog for '{}'...", self.live_search_input);
+                    self.log_info(format!("Querying Roblox Catalog API: '{}'", self.live_search_input));
+                }
+            }
+
+            if self.is_searching_live {
+                ui.spinner();
             }
         });
 
         ui.separator();
 
-        // Creator Store Catalog Grid
-        let search_results = crate::roblox_api::RobloxApiClient::search_creator_store(&self.manual_asset_input);
+        let items = self.live_catalog_items.clone();
+        let mut insert_item: Option<LiveCatalogItem> = None;
 
+        // Live Creator Store Results List
         egui::ScrollArea::both()
-            .id_salt("creator_store_scroll")
+            .id_salt("creator_store_results_scroll")
             .show(ui, |ui| {
-                ui.label(RichText::new(format!("Roblox Creator Store Items ({})", search_results.len())).heading());
+                if items.is_empty() {
+                    ui.label("Type a keyword above and tap '🔍 Search Live Store' to query millions of Roblox assets.");
+                } else {
+                    ui.label(RichText::new(format!("Marketplace Items Found ({})", items.len())).heading());
 
-                for item in &search_results {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&item.name).heading().color(Color32::from_rgb(100, 200, 255)));
-                            ui.label(RichText::new(format!("by {}", item.creator_name)).color(Color32::from_rgb(160, 160, 160)));
-                            ui.label(RichText::new(format!("[{}]", item.item_type)).color(Color32::from_rgb(200, 200, 100)));
-                        });
-
-                        ui.label(&item.description);
-
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button(RichText::new("📥 Insert into Place Workspace").color(Color32::from_rgb(120, 255, 120)).strong()).clicked() {
-                                if let Some(dom) = self.dom.as_mut() {
-                                    let parent = self.selected.unwrap_or_else(|| dom.root_ref());
-                                    match crate::roblox_api::RobloxApiClient::insert_asset_into_place(dom, parent, item) {
-                                        Ok(new_ref) => {
-                                            self.selected = Some(new_ref);
-                                            self.status = format!("Inserted '{}' into place", item.name);
-                                            self.log_info(format!("Inserted '{}' (ID: {})", item.name, item.id));
-                                        }
-                                        Err(e) => {
-                                            self.status = format!("Insert error: {e}");
-                                            self.log_error(format!("Insert error: {e}"));
-                                        }
-                                    }
-                                } else {
-                                    self.status = "Open a place file first".into();
-                                }
-                            }
-
-                            let delivery_url = crate::roblox_api::RobloxApiClient::get_asset_delivery_url(item.id);
-                            if ui.button("📋 Copy Delivery URL").clicked() {
-                                jni_bridge::trigger_copy_to_clipboard(&delivery_url);
-                                self.status = format!("Copied asset delivery URL for ID {}", item.id);
-                            }
-
-                            if ui.button("🌐 Copy Asset ID").clicked() {
-                                jni_bridge::trigger_copy_to_clipboard(&item.id.to_string());
-                                self.status = format!("Copied ID {}", item.id);
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                }
-
-                // Place Scanner Section
-                ui.separator();
-                ui.label(RichText::new("Local Place Asset Scanner").heading().color(Color32::from_rgb(100, 200, 255)));
-
-                if ui.button("🔍 Scan Active Place for MeshId / TextureId").clicked() {
-                    if let Some(dom) = &self.dom {
-                        self.discovered_assets = asset_downloader::scan_place_assets(dom);
-                        self.status = format!("Found {} unique assets in place", self.discovered_assets.len());
-                        self.log_info(format!("Discovered {} place assets", self.discovered_assets.len()));
-                    } else {
-                        self.status = "Open a place file first".into();
-                    }
-                }
-
-                if !self.discovered_assets.is_empty() {
-                    ui.add_space(4.0);
-                    for asset in &self.discovered_assets {
+                    for item in &items {
                         ui.group(|ui| {
-                            let icon = match asset.asset_type {
-                                "Mesh" => "🧱",
-                                "Texture" => "🖼️",
-                                "Sound" => "🔊",
-                                "Animation" => "🏃",
-                                _ => "📦",
-                            };
-
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("{icon} [{}] ID: {}", asset.asset_type, asset.asset_id)).strong().color(Color32::from_rgb(100, 200, 255)));
-                                ui.label(format!("In: {} ({})", asset.instance_name, asset.instance_class));
+                                ui.label(RichText::new(&item.name).heading().color(Color32::from_rgb(100, 200, 255)));
+                                ui.label(RichText::new(format!("by {}", item.creator_name)).color(Color32::from_rgb(160, 160, 160)));
+                                if item.upvotes > 0 {
+                                    ui.label(format!("👍 {} ({}%)", item.upvotes, item.upvote_percent));
+                                }
                             });
 
-                            let download_url = format!("https://assetdelivery.roblox.com/v1/asset/?id={}", asset.asset_id);
-                            ui.horizontal(|ui| {
-                                if ui.button("📋 Copy Asset ID").clicked() {
-                                    jni_bridge::trigger_copy_to_clipboard(&asset.asset_id);
+                            if !item.description.is_empty() {
+                                ui.label(&item.description);
+                            }
+
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(RichText::new("📥 Insert into Place Workspace").color(Color32::from_rgb(120, 255, 120)).strong()).clicked() {
+                                    insert_item = Some(item.clone());
                                 }
-                                if ui.button("🌐 Copy Delivery URL").clicked() {
-                                    jni_bridge::trigger_copy_to_clipboard(&download_url);
+
+                                let delivery_url = RobloxApiClient::get_asset_delivery_url(item.id);
+                                if ui.button("📋 Copy Delivery URL").clicked() {
+                                    jni_bridge::trigger_copy_to_clipboard(&delivery_url);
+                                }
+
+                                if ui.button("🌐 Copy Asset ID").clicked() {
+                                    jni_bridge::trigger_copy_to_clipboard(&item.id.to_string());
                                 }
                             });
                         });
                         ui.add_space(4.0);
                     }
                 }
+            });
+
+        if let Some(item) = insert_item {
+            if let Some(dom) = self.dom.as_mut() {
+                let parent = self.selected.unwrap_or_else(|| dom.root_ref());
+                match RobloxApiClient::insert_live_item_into_place(dom, parent, &item) {
+                    Ok(new_ref) => {
+                        self.selected = Some(new_ref);
+                        self.status = format!("Inserted '{}' into Workspace", item.name);
+                        self.log_info(format!("Inserted live asset '{}' (ID: {})", item.name, item.id));
+                    }
+                    Err(e) => {
+                        self.status = format!("Insert error: {e}");
+                        self.log_error(format!("Insert error: {e}"));
+                    }
+                }
+            } else {
+                self.status = "Open a place file first".into();
+            }
+        }
+    }
+
+    fn show_open_cloud_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🚀 Roblox Open Cloud Suite");
+        ui.label("Publish active places directly to live Roblox Universe servers, inspect DataStores, and send Messages.");
+
+        ui.separator();
+
+        egui::ScrollArea::both()
+            .id_salt("open_cloud_scroll_view")
+            .show(ui, |ui| {
+                // Section 1: Authentication & Universe Config
+                ui.group(|ui| {
+                    ui.label(RichText::new("🔑 Open Cloud Authentication & Target").heading().color(Color32::from_rgb(100, 200, 255)));
+                    ui.horizontal(|ui| {
+                        ui.label("API Key:");
+                        ui.add(egui::TextEdit::singleline(&mut self.open_cloud_api_key).password(true).desired_width(180.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Universe ID:");
+                        ui.add(egui::TextEdit::singleline(&mut self.open_cloud_universe_id).hint_text("e.g. 123456789").desired_width(120.0));
+                        ui.label("Place ID:");
+                        ui.add(egui::TextEdit::singleline(&mut self.open_cloud_place_id).hint_text("e.g. 987654321").desired_width(120.0));
+                    });
+                });
+
+                ui.add_space(8.0);
+
+                // Section 2: Direct Place Publishing
+                ui.group(|ui| {
+                    ui.label(RichText::new("🚀 Publish Active Place to Live Universe").heading().color(Color32::from_rgb(120, 255, 120)));
+                    ui.label("Serializes the active .rbxl DOM in memory and POSTs it directly to the Open Cloud Publishing API.");
+
+                    if ui.button(RichText::new("⚡ Publish Place Now").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
+                        if let Some(dom) = &self.dom {
+                            match rbxl::save_place(dom) {
+                                Ok(bytes) => {
+                                    self.log_info("Serializing place for Open Cloud publish...");
+                                    match RobloxApiClient::publish_place_open_cloud(
+                                        &self.open_cloud_api_key,
+                                        &self.open_cloud_universe_id,
+                                        &self.open_cloud_place_id,
+                                        &bytes,
+                                    ) {
+                                        Ok(res) => {
+                                            self.status = "Place published successfully via Open Cloud!".into();
+                                            self.log_info(format!("Publish success: {res}"));
+                                        }
+                                        Err(e) => {
+                                            self.status = format!("Publish error: {e}");
+                                            self.log_error(format!("Open Cloud publish error: {e}"));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    self.status = format!("Serialization error: {e}");
+                                    self.log_error(format!("Serialization error: {e}"));
+                                }
+                            }
+                        } else {
+                            self.status = "Open a place file first".into();
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Section 3: Open Cloud DataStore Inspector
+                ui.group(|ui| {
+                    ui.label(RichText::new("🗄️ Live DataStore Explorer").heading().color(Color32::from_rgb(255, 200, 100)));
+                    ui.horizontal(|ui| {
+                        ui.label("DataStore Name:");
+                        ui.add(egui::TextEdit::singleline(&mut self.datastore_name_input).desired_width(120.0));
+                        ui.label("Key:");
+                        ui.add(egui::TextEdit::singleline(&mut self.datastore_key_input).desired_width(120.0));
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("🔍 Read Key").clicked() {
+                            match RobloxApiClient::get_datastore_entry(
+                                &self.open_cloud_api_key,
+                                &self.open_cloud_universe_id,
+                                &self.datastore_name_input,
+                                &self.datastore_key_input,
+                            ) {
+                                Ok(res) => {
+                                    self.datastore_response_text = res;
+                                    self.status = "DataStore key retrieved".into();
+                                    self.log_info("Retrieved DataStore key");
+                                }
+                                Err(e) => {
+                                    self.datastore_response_text = format!("Error: {e}");
+                                    self.log_error(format!("DataStore error: {e}"));
+                                }
+                            }
+                        }
+
+                        if ui.button("💾 Set / Write Key").clicked() {
+                            match RobloxApiClient::set_datastore_entry(
+                                &self.open_cloud_api_key,
+                                &self.open_cloud_universe_id,
+                                &self.datastore_name_input,
+                                &self.datastore_key_input,
+                                &self.datastore_val_input,
+                            ) {
+                                Ok(res) => {
+                                    self.datastore_response_text = res;
+                                    self.status = "DataStore key updated".into();
+                                    self.log_info("Updated DataStore key");
+                                }
+                                Err(e) => {
+                                    self.datastore_response_text = format!("Error: {e}");
+                                    self.log_error(format!("DataStore write error: {e}"));
+                                }
+                            }
+                        }
+                    });
+
+                    ui.label("JSON Payload / Value:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.datastore_val_input)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3),
+                    );
+
+                    if !self.datastore_response_text.is_empty() {
+                        ui.label("Response Output:");
+                        ui.label(RichText::new(&self.datastore_response_text).monospace().color(Color32::from_rgb(180, 220, 255)));
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Section 4: MessagingService Live Dispatcher
+                ui.group(|ui| {
+                    ui.label(RichText::new("📡 MessagingService Live Dispatcher").heading().color(Color32::from_rgb(180, 100, 255)));
+                    ui.horizontal(|ui| {
+                        ui.label("Topic:");
+                        ui.add(egui::TextEdit::singleline(&mut self.messaging_topic_input).desired_width(140.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Message:");
+                        ui.add(egui::TextEdit::singleline(&mut self.messaging_msg_input).desired_width(180.0));
+                    });
+
+                    if ui.button("📤 Send Cross-Server Message").clicked() {
+                        match RobloxApiClient::publish_message_topic(
+                            &self.open_cloud_api_key,
+                            &self.open_cloud_universe_id,
+                            &self.messaging_topic_input,
+                            &self.messaging_msg_input,
+                        ) {
+                            Ok(res) => {
+                                self.status = "Message dispatched to Roblox servers".into();
+                                self.log_info(format!("Dispatched topic message: {res}"));
+                            }
+                            Err(e) => {
+                                self.status = format!("Message error: {e}");
+                                self.log_error(format!("Message error: {e}"));
+                            }
+                        }
+                    }
+                });
             });
     }
 
@@ -1019,9 +1193,9 @@ impl EditorApp {
                     }
                 }
 
-                // Add Property Section
+                // Add Property Section with Reflection Schema Types
                 ui.separator();
-                ui.label(RichText::new("➕ Add Property / Value").heading().color(Color32::from_rgb(100, 200, 255)));
+                ui.label(RichText::new("➕ Add Schema Property / Value").heading().color(Color32::from_rgb(100, 200, 255)));
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Name:");
                     ui.add(egui::TextEdit::singleline(&mut self.new_prop_name).desired_width(100.0));
@@ -1066,81 +1240,49 @@ impl EditorApp {
     }
 
     fn show_insert_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("➕ Insert Roblox Object");
-        ui.label("Inserts the selected object into the currently selected instance (or Workspace).");
+        ui.heading("➕ Insert Roblox Object (1,000+ Engine Classes)");
+        ui.label("Search any official class from Roblox Engine Reflection and insert into Workspace.");
 
         ui.separator();
 
-        let categories = [
-            ("🧱 3D World", vec![
-                ("Part", "Part"),
-                ("Model", "Model"),
-                ("Folder", "Folder"),
-                ("SpawnLocation", "SpawnLocation"),
-                ("TrussPart", "TrussPart"),
-                ("WedgePart", "WedgePart"),
-                ("CornerWedgePart", "CornerWedgePart"),
-            ]),
-            ("📜 Scripting", vec![
-                ("Script", "Script"),
-                ("LocalScript", "LocalScript"),
-                ("ModuleScript", "ModuleScript"),
-            ]),
-            ("📡 Networking", vec![
-                ("RemoteEvent", "RemoteEvent"),
-                ("RemoteFunction", "RemoteFunction"),
-                ("BindableEvent", "BindableEvent"),
-                ("BindableFunction", "BindableFunction"),
-            ]),
-            ("📱 GUI & UI", vec![
-                ("ScreenGui", "ScreenGui"),
-                ("Frame", "Frame"),
-                ("TextLabel", "TextLabel"),
-                ("TextButton", "TextButton"),
-                ("TextBox", "TextBox"),
-                ("ImageLabel", "ImageLabel"),
-                ("ImageButton", "ImageButton"),
-                ("ScrollingFrame", "ScrollingFrame"),
-            ]),
-            ("🔢 Values", vec![
-                ("StringValue", "StringValue"),
-                ("IntValue", "IntValue"),
-                ("NumberValue", "NumberValue"),
-                ("BoolValue", "BoolValue"),
-                ("Color3Value", "Color3Value"),
-                ("Vector3Value", "Vector3Value"),
-                ("ObjectValue", "ObjectValue"),
-            ]),
-            ("✨ Effects & Lighting", vec![
-                ("PointLight", "PointLight"),
-                ("SpotLight", "SpotLight"),
-                ("SurfaceLight", "SurfaceLight"),
-                ("ParticleEmitter", "ParticleEmitter"),
-                ("Highlight", "Highlight"),
-                ("ProximityPrompt", "ProximityPrompt"),
-                ("Sound", "Sound"),
-                ("Attachment", "Attachment"),
-            ]),
-        ];
+        // Engine Class Search Input
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Search Engine Schema:").strong());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.schema_search_input)
+                    .hint_text("e.g. Highlight, Beam, ParticleEmitter, Atmosphere, Sound, Part...")
+                    .desired_width(200.0),
+            );
+
+            if !self.schema_search_input.is_empty() && ui.button("✖").clicked() {
+                self.schema_search_input.clear();
+            }
+        });
+
+        ui.separator();
+
+        let schema_results = schema::search_engine_classes(&self.schema_search_input);
 
         egui::ScrollArea::both()
-            .id_salt("insert_objects_scroll")
+            .id_salt("schema_insert_scroll")
             .show(ui, |ui| {
-                for (cat_name, items) in categories {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(cat_name).heading().color(Color32::from_rgb(100, 200, 255)));
+                ui.label(RichText::new(format!("Roblox Engine Classes ({})", schema_results.len())).heading().color(Color32::from_rgb(100, 200, 255)));
 
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
-                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 
-                        for (class, label) in items {
-                            let btn_text = format!("{} {}", explorer::class_icon(class), label);
-                            if ui.button(btn_text).clicked() {
-                                self.insert_class(class, label);
-                            }
+                    for cls in schema_results.iter().take(40) {
+                        let btn_text = format!("{} {}", explorer::class_icon(&cls.name), cls.name);
+                        if ui.button(btn_text).clicked() {
+                            self.insert_class(&cls.name, &cls.name);
                         }
-                    });
+                    }
+                });
+
+                if schema_results.len() > 40 {
+                    ui.add_space(8.0);
+                    ui.label(format!("... and {} more classes. Use search above to narrow down.", schema_results.len() - 40));
                 }
             });
     }
@@ -1271,7 +1413,7 @@ impl EditorApp {
         };
 
         let parent = self.selected.unwrap_or_else(|| dom.root_ref());
-        match rbxl::add_instance(dom, parent, class, name) {
+        match schema::create_instance_from_schema(dom, parent, class, name) {
             Ok(new_ref) => {
                 self.selected = Some(new_ref);
                 if matches!(class, "Script" | "LocalScript" | "ModuleScript") {
@@ -1338,6 +1480,19 @@ impl EditorApp {
     }
 
     fn drain_events(&mut self) {
+        // Check for live search results from background thread
+        if let Some(resp) = roblox_api::try_recv_search_results() {
+            self.is_searching_live = false;
+            let count = resp.items.len();
+            self.live_catalog_items = resp.items;
+            if let Some(err) = resp.error {
+                self.log_error(err);
+            } else {
+                self.status = format!("Found {count} live items for '{}'", resp.query);
+                self.log_info(format!("Received {count} live catalog items for '{}'", resp.query));
+            }
+        }
+
         for event in jni_bridge::try_recv_all() {
             match event {
                 FileEvent::Opened { uri, data } => match rbxl::load_place(data) {

@@ -5,6 +5,7 @@ mod jni_bridge;
 mod lua_syntax;
 mod roblox_api;
 mod rbxl;
+mod schema;
 mod templates;
 mod viewport3d;
 

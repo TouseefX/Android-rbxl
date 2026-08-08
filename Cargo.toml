@@ -9,7 +9,11 @@ crate-type = ["cdylib"]
 [dependencies]
 rbx_dom_weak = "3"
 rbx_binary   = "1"
-eframe       = { version = "0.34", default-features = false, features = ["wgpu", "android-native-activity"] }
+rbx_reflection = "5"
+rbx_reflection_database = "1.0"
+rbxcloud     = "0.17"
+pollster     = "0.4"
+eframe       = { version = "0.34", default-features = false, features = ["glow", "android-native-activity"] }
 egui         = "0.34"
 egui_code_editor = "0.2"
 winit        = { version = "0.30", features = ["android-native-activity"] }
@@ -34,6 +38,12 @@ min_sdk_version = 26
 target_sdk_version = 34
 
 [[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[[package.metadata.android.uses_permission]]
 name = "android.permission.READ_EXTERNAL_STORAGE"
 
 [[package.metadata.android.uses_permission]]
@@ -41,6 +51,10 @@ name = "android.permission.WRITE_EXTERNAL_STORAGE"
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+[package.metadata.android.application]
+extract_native_libs = true
+uses_cleartext_traffic = true
 
 [[package.metadata.android.application.activity]]
 name = ".MainActivity"
