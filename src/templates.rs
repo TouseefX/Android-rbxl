@@ -201,6 +201,14 @@ pub struct ToolboxPreset {
 
 pub const TOOLBOX_PRESETS: &[ToolboxPreset] = &[
     ToolboxPreset {
+        name: "Suphis Signal Module",
+        category: "Scripting",
+        icon: "📡",
+        description: "High-performance Luau Signal & Connection event architecture by 5uphi",
+        class: "Folder",
+        default_script: None,
+    },
+    ToolboxPreset {
         name: "Leaderstats System",
         category: "Scripting",
         icon: "🏆",

@@ -66,12 +66,15 @@ pub struct EditorApp {
     live_search_input: String,
     live_catalog_items: Vec<LiveCatalogItem>,
     is_searching_live: bool,
+    direct_asset_id_input: String,
+    roblosecurity_cookie: String,
     discovered_assets: Vec<DiscoveredAsset>,
 
     // Open Cloud State
     open_cloud_api_key: String,
     open_cloud_universe_id: String,
     open_cloud_place_id: String,
+    open_cloud_publish_live: bool,
     datastore_name_input: String,
     datastore_key_input: String,
     datastore_val_input: String,
@@ -118,10 +121,13 @@ impl Default for EditorApp {
             live_search_input: "sword".into(),
             live_catalog_items: Vec::new(),
             is_searching_live: false,
+            direct_asset_id_input: "47433".into(),
+            roblosecurity_cookie: String::new(),
             discovered_assets: Vec::new(),
             open_cloud_api_key: String::new(),
             open_cloud_universe_id: String::new(),
             open_cloud_place_id: String::new(),
+            open_cloud_publish_live: true,
             datastore_name_input: "PlayerData".into(),
             datastore_key_input: "Player_12345".into(),
             datastore_val_input: "{\"Coins\": 1000, \"Level\": 10}".into(),
@@ -473,7 +479,78 @@ impl EditorApp {
 
         ui.separator();
 
-        // Live Search Input Bar
+        // 1. Direct Asset ID or URL Inserter Bar
+        ui.group(|ui| {
+            ui.label(RichText::new("📥 Direct Asset ID / URL Inserter").strong().color(Color32::from_rgb(100, 200, 255)));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Asset ID / URL:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.direct_asset_id_input)
+                        .hint_text("e.g. 47433, 142785488, 4842207161, or catalog URL...")
+                        .desired_width(220.0),
+                );
+
+                if ui.button(RichText::new("📥 Download & Insert Full Model (.rbxm / .rbxmx)").strong().color(Color32::from_rgb(100, 255, 140))).clicked() {
+                    let input = self.direct_asset_id_input.trim().to_string();
+                    if !input.is_empty() {
+                        if let Some(dom) = self.dom.as_mut() {
+                            let parent = self.selected.unwrap_or_else(|| dom.root_ref());
+                            match RobloxApiClient::insert_by_asset_id_or_url(dom, parent, &input, Some(&self.roblosecurity_cookie)) {
+                                Ok((new_ref, count, name)) => {
+                                    self.selected = Some(new_ref);
+                                    self.status = format!("✅ Inserted Model '{}' ({} instances) into Workspace", name, count);
+                                    self.log_info(format!("Successfully downloaded and inserted Model '{}' ({} instances: parts, scripts, meshes, sounds) into Workspace!", name, count));
+                                }
+                                Err(e) => {
+                                    self.status = format!("Insert error: {e}");
+                                    self.log_error(format!("Insert error: {e}"));
+                                }
+                            }
+                        } else {
+                            self.status = "Open a place file first".into();
+                        }
+                    }
+                }
+
+                if ui.button("📋 Paste from Clipboard").clicked() {
+                    let clip = jni_bridge::get_clipboard_text();
+                    if !clip.trim().is_empty() {
+                        self.direct_asset_id_input = clip.trim().to_string();
+                        self.status = format!("Pasted asset string: {}", self.direct_asset_id_input);
+                    }
+                }
+            });
+        });
+
+        ui.add_space(4.0);
+
+        // 2. Roblox Session Cookie Authentication (.ROBLOSECURITY)
+        ui.collapsing("🔑 Optional Roblox Account Authentication (.ROBLOSECURITY)", |ui| {
+            ui.label("Providing your .ROBLOSECURITY cookie allows downloading 100% exact raw .rbxm binaries directly from Roblox servers for any asset.");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Cookie:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.roblosecurity_cookie)
+                        .password(true)
+                        .hint_text("Paste .ROBLOSECURITY cookie...")
+                        .desired_width(240.0),
+                );
+                if ui.button("📋 Paste Cookie").clicked() {
+                    let clip = jni_bridge::get_clipboard_text();
+                    if !clip.trim().is_empty() {
+                        self.roblosecurity_cookie = clip.trim().to_string();
+                        self.status = "Configured .ROBLOSECURITY cookie".into();
+                    }
+                }
+                if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
+                    self.roblosecurity_cookie.clear();
+                }
+            });
+        });
+
+        ui.add_space(4.0);
+
+        // 3. Live Creator Store Search Input Bar
         ui.horizontal(|ui| {
             ui.label(RichText::new("Search:").strong());
             ui.add(
@@ -501,7 +578,7 @@ impl EditorApp {
         let items = self.live_catalog_items.clone();
         let mut insert_item: Option<LiveCatalogItem> = None;
 
-        // Live Creator Store Results List
+        // 3. Live Creator Store Results List
         egui::ScrollArea::both()
             .id_salt("creator_store_results_scroll")
             .show(ui, |ui| {
@@ -525,7 +602,7 @@ impl EditorApp {
                             }
 
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button(RichText::new("📥 Insert into Place Workspace").color(Color32::from_rgb(120, 255, 120)).strong()).clicked() {
+                                if ui.button(RichText::new("📥 Insert Full Model into Workspace").color(Color32::from_rgb(120, 255, 120)).strong()).clicked() {
                                     insert_item = Some(item.clone());
                                 }
 
@@ -547,11 +624,11 @@ impl EditorApp {
         if let Some(item) = insert_item {
             if let Some(dom) = self.dom.as_mut() {
                 let parent = self.selected.unwrap_or_else(|| dom.root_ref());
-                match RobloxApiClient::insert_live_item_into_place(dom, parent, &item) {
-                    Ok(new_ref) => {
+                match RobloxApiClient::insert_live_item_into_place(dom, parent, &item, Some(&self.roblosecurity_cookie)) {
+                    Ok((new_ref, count)) => {
                         self.selected = Some(new_ref);
-                        self.status = format!("Inserted '{}' into Workspace", item.name);
-                        self.log_info(format!("Inserted live asset '{}' (ID: {})", item.name, item.id));
+                        self.status = format!("✅ Inserted '{}' ({} instances) into Workspace", item.name, count);
+                        self.log_info(format!("Successfully downloaded and inserted Model '{}' (Asset ID: {}, {} instances: parts, scripts, meshes, sounds) into Workspace!", item.name, item.id, count));
                     }
                     Err(e) => {
                         self.status = format!("Insert error: {e}");
@@ -611,21 +688,24 @@ impl EditorApp {
                 // Section 2: Direct Place Publishing
                 ui.group(|ui| {
                     ui.label(RichText::new("🚀 Publish Active Place to Live Universe").heading().color(Color32::from_rgb(120, 255, 120)));
-                    ui.label("Serializes the active .rbxl DOM in memory and POSTs it directly to the Open Cloud Publishing API.");
+                    ui.label("Serializes the active .rbxl in memory and streams it directly to Roblox Open Cloud API via memory pipe (no /tmp file).");
+
+                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published)");
 
                     if ui.button(RichText::new("⚡ Publish Place Now").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
                         if let Some(dom) = &self.dom {
                             match rbxl::save_place(dom) {
                                 Ok(bytes) => {
-                                    self.log_info("Serializing place for Open Cloud publish...");
+                                    self.log_info("Serializing place in memory for Open Cloud publish...");
                                     match RobloxApiClient::publish_place_open_cloud(
                                         &self.open_cloud_api_key,
                                         &self.open_cloud_universe_id,
                                         &self.open_cloud_place_id,
                                         &bytes,
+                                        self.open_cloud_publish_live,
                                     ) {
                                         Ok(res) => {
-                                            self.status = "Place published successfully via Open Cloud!".into();
+                                            self.status = "✅ Place published successfully via Open Cloud!".into();
                                             self.log_info(format!("Publish success: {res}"));
                                         }
                                         Err(e) => {
@@ -1268,9 +1348,52 @@ impl EditorApp {
 
     fn show_insert_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("➕ Insert Roblox Object (1,000+ Engine Classes)");
-        ui.label("Search any official class from Roblox Engine Reflection and insert into Workspace.");
+        ui.label("Search any official class from Roblox Engine Reflection or insert live assets into Workspace.");
 
         ui.separator();
+
+        // Direct Asset Inserter Quick Bar
+        ui.group(|ui| {
+            ui.label(RichText::new("🌐 Insert by Asset ID or Catalog URL").strong().color(Color32::from_rgb(100, 200, 255)));
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.direct_asset_id_input)
+                        .hint_text("Asset ID e.g. 47433, 142785488, 4842207161...")
+                        .desired_width(180.0),
+                );
+
+                if ui.button(RichText::new("📥 Insert Full Model").strong().color(Color32::from_rgb(100, 255, 140))).clicked() {
+                    let input = self.direct_asset_id_input.trim().to_string();
+                    if !input.is_empty() {
+                        if let Some(dom) = self.dom.as_mut() {
+                            let parent = self.selected.unwrap_or_else(|| dom.root_ref());
+                            match RobloxApiClient::insert_by_asset_id_or_url(dom, parent, &input, Some(&self.roblosecurity_cookie)) {
+                                Ok((new_ref, count, name)) => {
+                                    self.selected = Some(new_ref);
+                                    self.status = format!("✅ Inserted Model '{}' ({} instances) into Workspace", name, count);
+                                    self.log_info(format!("Successfully inserted Model '{}' (Asset ID: {}, {} instances) into Workspace!", name, input, count));
+                                }
+                                Err(e) => {
+                                    self.status = format!("Insert error: {e}");
+                                    self.log_error(format!("Insert error: {e}"));
+                                }
+                            }
+                        } else {
+                            self.status = "Open a place file first".into();
+                        }
+                    }
+                }
+
+                if ui.button("📋 Paste").clicked() {
+                    let clip = jni_bridge::get_clipboard_text();
+                    if !clip.trim().is_empty() {
+                        self.direct_asset_id_input = clip.trim().to_string();
+                    }
+                }
+            });
+        });
+
+        ui.add_space(4.0);
 
         // Engine Class Search Input
         ui.horizontal(|ui| {
@@ -1347,18 +1470,139 @@ impl EditorApp {
         };
 
         let parent = self.selected.unwrap_or_else(|| dom.root_ref());
-        match rbxl::add_instance(dom, parent, preset.class, preset.name) {
-            Ok(new_ref) => {
-                if let Some((script_name, script_code)) = preset.default_script {
-                    let _ = rbxl::add_instance(dom, new_ref, "Script", script_name);
-                    let _ = rbxl::set_source(dom, new_ref, script_code.to_string());
+        match preset.name {
+            "Suphis Signal Module" => {
+                match roblox_api::RobloxApiClient::insert_live_item_into_place(dom, parent, &roblox_api::LiveCatalogItem {
+                    id: 11670710927,
+                    name: "Suphis Signal Module".into(),
+                    description: "Suphis signal and connection data types that works a lot like RBXScriptSignal and RBXScriptConnection".into(),
+                    creator_name: "5uphi".into(),
+                    asset_type_id: 38,
+                    price_robux: Some(0),
+                    upvote_percent: 100,
+                    upvotes: 9800,
+                    script_count: 5,
+                    mesh_part_count: 0,
+                    audio_count: 0,
+                    animation_count: 0,
+                    decal_count: 0,
+                    tool_count: 0,
+                    triangle_count: 0,
+                }, Some(&self.roblosecurity_cookie)) {
+                    Ok((new_ref, count)) => {
+                        self.selected = Some(new_ref);
+                        self.status = format!("✅ Inserted 'Suphis Signal Module' ({} instances) into Workspace", count);
+                        self.log_info(format!("Inserted 'Suphis Signal Module' ({} instances: Connection, GoodSignal, Signal, Types, Demo)", count));
+                    }
+                    Err(e) => {
+                        self.status = format!("Insert failed: {e}");
+                    }
                 }
-                self.selected = Some(new_ref);
-                self.status = format!("Inserted toolbox system '{}'", preset.name);
-                self.log_info(format!("Inserted preset {}", preset.name));
             }
-            Err(e) => {
-                self.status = format!("Insert preset failed: {e}");
+            "KillBrick Hazard" => {
+                let part_builder = rbx_dom_weak::InstanceBuilder::new("Part")
+                    .with_name("KillBrick")
+                    .with_property("Size", Variant::Vector3(Vector3::new(8.0, 1.0, 8.0)))
+                    .with_property("Position", Variant::Vector3(Vector3::new(0.0, 0.5, 0.0)))
+                    .with_property("Color", Variant::Color3(Color3::new(1.0, 0.1, 0.1)))
+                    .with_property("Material", Variant::String("Neon".into()))
+                    .with_property("Anchored", Variant::Bool(true))
+                    .with_property("CanCollide", Variant::Bool(true));
+                let part_ref = dom.insert(parent, part_builder);
+                if let Some((script_name, script_code)) = preset.default_script {
+                    let script_builder = rbx_dom_weak::InstanceBuilder::new("Script")
+                        .with_name(script_name)
+                        .with_property("Source", Variant::String(script_code.into()));
+                    dom.insert(part_ref, script_builder);
+                }
+                self.selected = Some(part_ref);
+                self.active_tab = ActiveTab::Viewport3D;
+                self.status = format!("✅ Inserted '{}' hazard into Workspace", preset.name);
+                self.log_info(format!("Inserted '{}' with neon part & damage script", preset.name));
+            }
+            "Interactive Door" => {
+                let model_builder = rbx_dom_weak::InstanceBuilder::new("Model").with_name("InteractiveDoor");
+                let model_ref = dom.insert(parent, model_builder);
+
+                let frame_builder = rbx_dom_weak::InstanceBuilder::new("Part")
+                    .with_name("DoorFrame")
+                    .with_property("Size", Variant::Vector3(Vector3::new(1.0, 8.0, 1.0)))
+                    .with_property("Position", Variant::Vector3(Vector3::new(-2.5, 4.0, 0.0)))
+                    .with_property("Color", Variant::Color3(Color3::new(0.3, 0.2, 0.1)))
+                    .with_property("Anchored", Variant::Bool(true));
+                dom.insert(model_ref, frame_builder);
+
+                let door_builder = rbx_dom_weak::InstanceBuilder::new("Part")
+                    .with_name("Door")
+                    .with_property("Size", Variant::Vector3(Vector3::new(4.0, 7.8, 0.6)))
+                    .with_property("Position", Variant::Vector3(Vector3::new(0.0, 4.0, 0.0)))
+                    .with_property("Color", Variant::Color3(Color3::new(0.55, 0.35, 0.2)))
+                    .with_property("Anchored", Variant::Bool(true));
+                let door_ref = dom.insert(model_ref, door_builder);
+
+                let prompt_builder = rbx_dom_weak::InstanceBuilder::new("ProximityPrompt")
+                    .with_name("DoorPrompt")
+                    .with_property("ActionText", Variant::String("Open Door".into()))
+                    .with_property("ObjectText", Variant::String("Wooden Door".into()))
+                    .with_property("HoldDuration", Variant::Float32(0.5));
+                dom.insert(door_ref, prompt_builder);
+
+                if let Some((script_name, script_code)) = preset.default_script {
+                    let script_builder = rbx_dom_weak::InstanceBuilder::new("Script")
+                        .with_name(script_name)
+                        .with_property("Source", Variant::String(script_code.into()));
+                    dom.insert(model_ref, script_builder);
+                }
+                self.selected = Some(model_ref);
+                self.active_tab = ActiveTab::Viewport3D;
+                self.status = format!("✅ Inserted '{}' model into Workspace", preset.name);
+                self.log_info(format!("Inserted '{}' with frame, door, prompt & tween script", preset.name));
+            }
+            "Main GUI Framework" => {
+                let gui_builder = rbx_dom_weak::InstanceBuilder::new("ScreenGui").with_name("MainGui");
+                let gui_ref = dom.insert(parent, gui_builder);
+
+                let frame_builder = rbx_dom_weak::InstanceBuilder::new("Frame")
+                    .with_name("MainContainer")
+                    .with_property("BackgroundColor3", Variant::Color3uint8(Color3uint8::new(30, 30, 35)));
+                let frame_ref = dom.insert(gui_ref, frame_builder);
+
+                let label_builder = rbx_dom_weak::InstanceBuilder::new("TextLabel")
+                    .with_name("TitleLabel")
+                    .with_property("Text", Variant::String("Game Menu".into()))
+                    .with_property("TextColor3", Variant::Color3uint8(Color3uint8::new(255, 255, 255)))
+                    .with_property("TextScaled", Variant::Bool(true));
+                dom.insert(frame_ref, label_builder);
+
+                let btn_builder = rbx_dom_weak::InstanceBuilder::new("TextButton")
+                    .with_name("PlayButton")
+                    .with_property("Text", Variant::String("▶ Play Game".into()))
+                    .with_property("BackgroundColor3", Variant::Color3uint8(Color3uint8::new(0, 180, 255)))
+                    .with_property("TextColor3", Variant::Color3uint8(Color3uint8::new(255, 255, 255)))
+                    .with_property("TextScaled", Variant::Bool(true));
+                dom.insert(frame_ref, btn_builder);
+
+                self.selected = Some(gui_ref);
+                self.status = format!("✅ Inserted '{}' into StarterGui", preset.name);
+                self.log_info(format!("Inserted '{}' UI hierarchy", preset.name));
+            }
+            _ => {
+                match rbxl::add_instance(dom, parent, preset.class, preset.name) {
+                    Ok(new_ref) => {
+                        if let Some((script_name, script_code)) = preset.default_script {
+                            let script_builder = rbx_dom_weak::InstanceBuilder::new("Script")
+                                .with_name(script_name)
+                                .with_property("Source", Variant::String(script_code.into()));
+                            dom.insert(new_ref, script_builder);
+                        }
+                        self.selected = Some(new_ref);
+                        self.status = format!("✅ Inserted toolbox system '{}'", preset.name);
+                        self.log_info(format!("Inserted preset {}", preset.name));
+                    }
+                    Err(e) => {
+                        self.status = format!("Insert preset failed: {e}");
+                    }
+                }
             }
         }
     }

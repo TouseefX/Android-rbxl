@@ -447,7 +447,17 @@ impl Viewport3D {
 
                     let is_3d = matches!(
                         inst.class.as_str(),
-                        "Part" | "WedgePart" | "CornerWedgePart" | "TrussPart" | "SpawnLocation"
+                        "Part"
+                            | "WedgePart"
+                            | "CornerWedgePart"
+                            | "TrussPart"
+                            | "SpawnLocation"
+                            | "MeshPart"
+                            | "UnionOperation"
+                            | "Seat"
+                            | "VehicleSeat"
+                            | "FlagStand"
+                            | "Terrain"
                     );
 
                     if is_3d {

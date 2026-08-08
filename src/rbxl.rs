@@ -207,6 +207,125 @@ pub fn calculate_stats(dom: &WeakDom) -> PlaceStats {
     }
 }
 
+/// Recursively copies an instance from `source_dom` (including all properties and child subtrees)
+/// into `target_dom` under `target_parent`.
+pub fn insert_dom_subtree(
+    target_dom: &mut WeakDom,
+    target_parent: Ref,
+    source_dom: &WeakDom,
+    source_ref: Ref,
+) -> Option<Ref> {
+    let source_inst = source_dom.get_by_ref(source_ref)?;
+    let mut builder = InstanceBuilder::new(source_inst.class.as_str())
+        .with_name(&source_inst.name);
+    for (k, v) in &source_inst.properties {
+        builder = builder.with_property(k.as_str(), v.clone());
+    }
+    let new_ref = target_dom.insert(target_parent, builder);
+
+    for &child_ref in source_inst.children() {
+        insert_dom_subtree(target_dom, new_ref, source_dom, child_ref);
+    }
+    Some(new_ref)
+}
+
+/// Inserts all top-level children from `source_dom` into `target_dom` under `target_parent`.
+/// Returns the Ref of the first inserted top-level instance and the total count of all inserted instances.
+pub fn insert_all_root_children(
+    target_dom: &mut WeakDom,
+    target_parent: Ref,
+    source_dom: &WeakDom,
+) -> (Option<Ref>, usize) {
+    let mut first_ref = None;
+    let mut total_count = 0;
+    for &root_child in source_dom.root().children() {
+        if let Some(r) = insert_dom_subtree(target_dom, target_parent, source_dom, root_child) {
+            if first_ref.is_none() {
+                first_ref = Some(r);
+            }
+            total_count += count_instances(target_dom, r);
+        }
+    }
+    (first_ref, total_count)
+}
+
+pub fn count_instances(dom: &WeakDom, root: Ref) -> usize {
+    let mut count = 0;
+    let mut stack = vec![root];
+    while let Some(r) = stack.pop() {
+        if let Some(inst) = dom.get_by_ref(r) {
+            count += 1;
+            stack.extend(inst.children());
+        }
+    }
+    count
+}
+
+/// Decodes any Roblox model payload (.rbxm binary, .rbxmx XML, compressed gzip, or Luau script)
+/// into a `WeakDom` hierarchy.
+pub fn decode_model_bytes(bytes: &[u8]) -> Result<WeakDom> {
+    if bytes.is_empty() {
+        bail!("Cannot decode empty model bytes");
+    }
+
+    // 1. Decompress if gzipped (magic bytes 0x1f 0x8b)
+    let decompressed: Vec<u8>;
+    let payload = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut gz = GzDecoder::new(bytes);
+        let mut buf = Vec::new();
+        if gz.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+            decompressed = buf;
+            &decompressed[..]
+        } else {
+            bytes
+        }
+    } else {
+        bytes
+    };
+
+    // 2. Binary RBXM / RBXL (starts with "<roblox!\x89\xff\r\n\x1a\n" or "<roblox")
+    if payload.starts_with(b"<roblox!") || (payload.len() >= 8 && &payload[0..7] == b"<roblox" && payload.contains(&0x89)) {
+        if let Ok(dom) = rbx_binary::from_reader(Cursor::new(payload)) {
+            return Ok(dom);
+        }
+    }
+
+    // 3. XML RBXMX / RBXLX (starts with "<roblox" or "<?xml")
+    if payload.starts_with(b"<roblox") || payload.starts_with(b"<?xml") || payload.windows(12).any(|w| w == b"<Item class=") {
+        if let Ok(dom) = rbx_xml::from_reader_default(Cursor::new(payload)) {
+            return Ok(dom);
+        }
+    }
+
+    // Try rbx_binary general fallback
+    if let Ok(dom) = rbx_binary::from_reader(Cursor::new(payload)) {
+        return Ok(dom);
+    }
+
+    // Try rbx_xml general fallback
+    if let Ok(dom) = rbx_xml::from_reader_default(Cursor::new(payload)) {
+        return Ok(dom);
+    }
+
+    // 4. Lua / Luau Source Code fallback
+    if let Ok(text) = std::str::from_utf8(payload) {
+        let trimmed = text.trim();
+        if trimmed.starts_with("--") || trimmed.contains("function") || trimmed.contains("local ") || trimmed.contains("return ") || trimmed.contains("game:") {
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let root = dom.root_ref();
+            let builder = InstanceBuilder::new("ModuleScript")
+                .with_name("ScriptAsset")
+                .with_property("Source", Variant::String(text.to_string()));
+            dom.insert(root, builder);
+            return Ok(dom);
+        }
+    }
+
+    bail!("Unsupported Roblox model format or unrecognized payload structure")
+}
+
 /// Serialize the whole DOM to bytes, ready to hand to the JNI bridge for saving.
 pub fn save_place(dom: &WeakDom) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
