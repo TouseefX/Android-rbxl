@@ -165,6 +165,19 @@ pub fn trigger_finish_external_edit() {
     });
 }
 
+pub fn trigger_copy_to_clipboard(text: &str) {
+    with_env(|env, class| {
+        let jtext = env.new_string(text)?;
+        let _ = env.call_static_method(
+            class,
+            "copyToClipboardStatic",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&jtext)],
+        )?;
+        Ok(())
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnDocumentOpened(
     mut env: JNIEnv,

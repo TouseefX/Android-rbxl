@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 rbx_dom_weak = "3"
 rbx_binary   = "1"
-eframe       = { version = "0.34", default-features = false, features = ["glow", "android-native-activity"] }
+eframe       = { version = "0.34", default-features = false, features = ["wgpu", "android-native-activity"] }
 egui         = "0.34"
 egui_code_editor = "0.2"
 winit        = { version = "0.30", features = ["android-native-activity"] }

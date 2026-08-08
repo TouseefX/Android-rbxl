@@ -1,8 +1,12 @@
 mod app;
+mod asset_downloader;
 mod explorer;
 mod jni_bridge;
 mod lua_syntax;
+mod roblox_api;
 mod rbxl;
+mod templates;
+mod viewport3d;
 
 // Pull AndroidApp from winit's re-export, not a direct android-activity
 // dependency -- this keeps the type identical to whatever version

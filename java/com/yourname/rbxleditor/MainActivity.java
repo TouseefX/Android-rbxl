@@ -1,11 +1,14 @@
 package com.yourname.rbxleditor;
 
 import android.app.NativeActivity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.StrictMode;
 import android.util.Log;
+import android.widget.Toast;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -108,7 +111,32 @@ public class MainActivity extends NativeActivity {
         }
     }
 
+    public static void copyToClipboardStatic(final String text) {
+        MainActivity act = sInstance;
+        if (act != null) {
+            act.copyToClipboard(text);
+        }
+    }
+
     // ---- Instance methods running on Android UI Thread ----
+
+    public void copyToClipboard(final String text) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    if (clipboard != null) {
+                        ClipData clip = ClipData.newPlainText("RobloxSnippet", text);
+                        clipboard.setPrimaryClip(clip);
+                        Toast.makeText(MainActivity.this, "Copied to Android Clipboard!", Toast.LENGTH_SHORT).show();
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "copyToClipboard failed", e);
+                }
+            }
+        });
+    }
 
     public void openDocument() {
         runOnUiThread(new Runnable() {
