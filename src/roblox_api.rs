@@ -4,9 +4,6 @@ use rbx_dom_weak::{
     types::{Color3, Color3uint8, Ref, Variant, Vector3},
     InstanceBuilder, WeakDom,
 };
-use rbxcloud::rbx::types::{PlaceId, UniverseId};
-use rbxcloud::rbx::v1::experience::{publish_experience, PublishExperienceParams, PublishVersionType};
-use rbxcloud::rbx::v1::messaging::{publish_message, PublishMessageParams};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
@@ -92,25 +89,40 @@ impl RobloxApiClient {
     }
 
     /// Spawns a background thread to fetch real live items from official Roblox Studio Toolbox Service
+    /// using in-process native Rust HTTP client (reqwest + rustls) - no curl process needed.
     pub fn fetch_live_catalog_async(query: String) {
         let (tx, _) = search_channel();
         let tx = tx.clone();
 
         std::thread::spawn(move || {
+            let client_res = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .user_agent("RobloxStudio/WinInet")
+                .build();
+
+            let client = match client_res {
+                Ok(c) => c,
+                Err(_) => {
+                    let fallback = get_curated_fallback(&query);
+                    let _ = tx.send(LiveSearchResponse {
+                        query,
+                        items: fallback,
+                        error: Some("Showing verified creator store models".into()),
+                    });
+                    return;
+                }
+            };
+
             let encoded_q = urlencoding_simple(&query);
             let search_url = format!(
                 "https://apis.roblox.com/toolbox-service/v1/marketplace/10?keyword={encoded_q}&num=14"
             );
 
-            // 1. Fetch search matching asset IDs
-            let search_output = std::process::Command::new("curl")
-                .args(["-s", "-L", "--max-time", "10", "-H", "User-Agent: RobloxStudio/WinInet", "-H", "Accept: */*", &search_url])
-                .output();
-
             let mut asset_ids = Vec::new();
-            if let Ok(out) = search_output {
-                let body = String::from_utf8_lossy(&out.stdout);
-                asset_ids = extract_ids_from_toolbox_json(&body);
+            if let Ok(resp) = client.get(&search_url).send() {
+                if let Ok(body) = resp.text() {
+                    asset_ids = extract_ids_from_toolbox_json(&body);
+                }
             }
 
             // If search returned IDs, query details endpoint for rich metadata
@@ -121,20 +133,17 @@ impl RobloxApiClient {
                     ids_csv.join(",")
                 );
 
-                let details_output = std::process::Command::new("curl")
-                    .args(["-s", "-L", "--max-time", "10", "-H", "User-Agent: RobloxStudio/WinInet", "-H", "Accept: */*", &details_url])
-                    .output();
-
-                if let Ok(out) = details_output {
-                    let body = String::from_utf8_lossy(&out.stdout);
-                    if let Ok(items) = parse_roblox_details_json(&body) {
-                        if !items.is_empty() {
-                            let _ = tx.send(LiveSearchResponse {
-                                query: query.clone(),
-                                items,
-                                error: None,
-                            });
-                            return;
+                if let Ok(resp) = client.get(&details_url).send() {
+                    if let Ok(body) = resp.text() {
+                        if let Ok(items) = parse_roblox_details_json(&body) {
+                            if !items.is_empty() {
+                                let _ = tx.send(LiveSearchResponse {
+                                    query: query.clone(),
+                                    items,
+                                    error: None,
+                                });
+                                return;
+                            }
                         }
                     }
                 }
@@ -150,114 +159,69 @@ impl RobloxApiClient {
         });
     }
 
-    /// Fetches item metadata from Roblox details endpoint synchronously
+    /// Fetches item metadata from Roblox details endpoint synchronously using native Rust HTTP client
     pub fn fetch_item_details_sync(asset_id: u64) -> Option<LiveCatalogItem> {
-        let details_url = format!("https://apis.roblox.com/toolbox-service/v1/items/details?assetIds={asset_id}");
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-L",
-                "--max-time",
-                "8",
-                "-H",
-                "User-Agent: RobloxStudio/WinInet",
-                "-H",
-                "Accept: */*",
-                &details_url,
-            ])
-            .output()
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .user_agent("RobloxStudio/WinInet")
+            .build()
             .ok()?;
 
-        if output.status.success() && !output.stdout.is_empty() {
-            let body = String::from_utf8_lossy(&output.stdout);
-            if let Ok(items) = parse_roblox_details_json(&body) {
-                return items.into_iter().find(|i| i.id == asset_id);
-            }
-        }
-        None
+        let details_url = format!("https://apis.roblox.com/toolbox-service/v1/items/details?assetIds={asset_id}");
+        let resp = client.get(&details_url).send().ok()?;
+        let body = resp.text().ok()?;
+        let items = parse_roblox_details_json(&body).ok()?;
+        items.into_iter().find(|i| i.id == asset_id)
     }
 
     /// Fetches the raw asset payload bytes directly from Roblox Asset Delivery API
+    /// using in-process native Rust HTTP client (reqwest + rustls) - no curl process needed.
     pub fn fetch_asset_payload_sync(asset_id: u64, cookie_opt: Option<&str>) -> Result<Vec<u8>, String> {
-        let cookie_header = cookie_opt
-            .filter(|c| !c.trim().is_empty())
-            .map(|c| format!("Cookie: .ROBLOSECURITY={}", c.trim()));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("RobloxStudio/WinInet")
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
 
         // Step 1: Query assetdelivery v2 endpoint
-        let v2_url = format!("https://assetdelivery.roblox.com/v2/assetId/{asset_id}");
-        let mut cmd = std::process::Command::new("curl");
-        cmd.args([
-            "-s",
-            "-L",
-            "--max-time",
-            "12",
-            "-H",
-            "User-Agent: RobloxStudio/WinInet",
-            "-H",
-            "Accept: */*",
-        ]);
-        if let Some(ref ch) = cookie_header {
-            cmd.args(["-H", ch]);
+        let mut req = client.get(format!("https://assetdelivery.roblox.com/v2/assetId/{asset_id}"));
+        if let Some(cookie) = cookie_opt.filter(|c| !c.trim().is_empty()) {
+            req = req.header("Cookie", format!(".ROBLOSECURITY={}", cookie.trim()));
         }
-        cmd.arg(&v2_url);
 
-        let v2_output = cmd.output().map_err(|e| format!("curl execution error: {e}"))?;
-
-        if v2_output.status.success() && !v2_output.stdout.is_empty() {
-            let body = String::from_utf8_lossy(&v2_output.stdout);
-            
-            // Check if response contains CDN location
-            if let Some(cdn_url) = extract_location_url_from_v2(&body) {
-                let mut cdn_cmd = std::process::Command::new("curl");
-                cdn_cmd.args([
-                    "-s",
-                    "-L",
-                    "--max-time",
-                    "15",
-                    "-H",
-                    "User-Agent: RobloxStudio/WinInet",
-                    "-H",
-                    "Accept: */*",
-                    &cdn_url,
-                ]);
-                if let Some(ref ch) = cookie_header {
-                    cdn_cmd.args(["-H", ch]);
+        if let Ok(resp) = req.send() {
+            if let Ok(bytes) = resp.bytes() {
+                if let Ok(body_str) = std::str::from_utf8(&bytes) {
+                    if let Some(cdn_url) = extract_location_url_from_v2(body_str) {
+                        let mut cdn_req = client.get(&cdn_url);
+                        if let Some(cookie) = cookie_opt.filter(|c| !c.trim().is_empty()) {
+                            cdn_req = cdn_req.header("Cookie", format!(".ROBLOSECURITY={}", cookie.trim()));
+                        }
+                        if let Ok(cdn_resp) = cdn_req.send() {
+                            if let Ok(cdn_bytes) = cdn_resp.bytes() {
+                                if !cdn_bytes.is_empty() {
+                                    return Ok(cdn_bytes.to_vec());
+                                }
+                            }
+                        }
+                    }
                 }
-                let cdn_output = cdn_cmd.output().map_err(|e| format!("CDN download error: {e}"))?;
-
-                if cdn_output.status.success() && !cdn_output.stdout.is_empty() {
-                    return Ok(cdn_output.stdout);
+                if bytes.starts_with(b"<roblox") || bytes.starts_with(b"<?xml") || (bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
+                    return Ok(bytes.to_vec());
                 }
-            }
-
-            // If response is direct binary or XML
-            if v2_output.stdout.starts_with(b"<roblox") || v2_output.stdout.starts_with(b"<?xml") || (v2_output.stdout.len() >= 2 && v2_output.stdout[0] == 0x1f && v2_output.stdout[1] == 0x8b) {
-                return Ok(v2_output.stdout);
             }
         }
 
         // Step 2: Query assetdelivery v1 fallback endpoint
-        let v1_url = format!("https://assetdelivery.roblox.com/v1/asset/?id={asset_id}");
-        let mut v1_cmd = std::process::Command::new("curl");
-        v1_cmd.args([
-            "-s",
-            "-L",
-            "--max-time",
-            "12",
-            "-H",
-            "User-Agent: RobloxStudio/WinInet",
-            "-H",
-            "Accept: */*",
-        ]);
-        if let Some(ref ch) = cookie_header {
-            v1_cmd.args(["-H", ch]);
+        let mut req_v1 = client.get(format!("https://assetdelivery.roblox.com/v1/asset/?id={asset_id}"));
+        if let Some(cookie) = cookie_opt.filter(|c| !c.trim().is_empty()) {
+            req_v1 = req_v1.header("Cookie", format!(".ROBLOSECURITY={}", cookie.trim()));
         }
-        v1_cmd.arg(&v1_url);
 
-        if let Ok(out) = v1_cmd.output() {
-            if out.status.success() && !out.stdout.is_empty() {
-                if out.stdout.starts_with(b"<roblox") || out.stdout.starts_with(b"<?xml") || (out.stdout.len() >= 2 && out.stdout[0] == 0x1f && out.stdout[1] == 0x8b) {
-                    return Ok(out.stdout);
+        if let Ok(resp) = req_v1.send() {
+            if let Ok(bytes) = resp.bytes() {
+                if bytes.starts_with(b"<roblox") || bytes.starts_with(b"<?xml") || (bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
+                    return Ok(bytes.to_vec());
                 }
             }
         }
@@ -375,9 +339,10 @@ impl RobloxApiClient {
         Ok((inserted_ref, count, name))
     }
 
-    /// Publish place directly to Roblox Open Cloud Experience API via memory-streamed curl or rbxcloud SDK.
+    /// Publish place directly to Roblox Open Cloud Experience API using 100% native Rust HTTP client
+    /// (reqwest + rustls) streaming the in-memory .rbxl bytes.
     /// Supports both versionType=Published (Live to game servers) and versionType=Saved (Version history).
-    /// Avoids /tmp failures on Android by streaming bytes directly via standard input.
+    /// Eliminates all /tmp and curl process errors on Android devices!
     pub fn publish_place_open_cloud(
         api_key: &str,
         universe_id_str: &str,
@@ -393,10 +358,10 @@ impl RobloxApiClient {
             return Err("Open Cloud API key cannot be empty".into());
         }
         if u_id.is_empty() {
-            return Err("Universe ID cannot be empty".into());
+            return Err("Universe ID cannot be empty (must be numeric Universe/Experience ID)".into());
         }
         if p_id.is_empty() {
-            return Err("Place ID cannot be empty".into());
+            return Err("Place ID cannot be empty (must be numeric Place ID)".into());
         }
 
         let version_type = if is_published { "Published" } else { "Saved" };
@@ -405,92 +370,44 @@ impl RobloxApiClient {
             u_id, p_id, version_type
         );
 
-        // 1. In-memory binary streaming directly to Roblox Open Cloud API without needing /tmp
-        let mut child = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-L",
-                "--max-time", "60",
-                "-X", "POST",
-                &url,
-                "-H", &format!("x-api-key: {}", key),
-                "-H", "Content-Type: application/octet-stream",
-                "--data-binary", "@-",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn curl: {e}"))?;
+        // Native in-process HTTP client with rustls TLS (no external curl binary, no /tmp file)
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("HTTP client initialization error: {e}"))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(rbxl_bytes);
-        }
+        let response = client
+            .post(&url)
+            .header("x-api-key", key)
+            .header("Content-Type", "application/octet-stream")
+            .body(rbxl_bytes.to_vec())
+            .send()
+            .map_err(|e| format!("Open Cloud network connection error: {e}"))?;
 
-        let output = child.wait_with_output().map_err(|e| format!("Curl process error: {e}"))?;
-        let resp_body = String::from_utf8_lossy(&output.stdout).to_string();
+        let status = response.status();
+        let resp_body = response.text().unwrap_or_default();
 
-        if output.status.success() && !resp_body.is_empty() {
+        if status.is_success() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp_body) {
                 if let Some(version_num) = v.get("versionNumber").and_then(|n| n.as_u64()) {
                     return Ok(format!(
-                        "Successfully published place to Roblox Open Cloud! Version Number: {} ({})",
+                        "Successfully published place to Roblox Universe! Version Number: {} ({})",
                         version_num, version_type
                     ));
                 }
-                if let Some(err_msg) = v.get("message").and_then(|m| m.as_str()) {
-                    return Err(format!("Roblox Open Cloud API error: {err_msg}"));
-                }
             }
-        }
-
-        // 2. Safe Android cache fallback with rbxcloud SDK
-        let u_num: u64 = u_id.parse().map_err(|_| "Invalid Universe ID (must be numeric)".to_string())?;
-        let p_num: u64 = p_id.parse().map_err(|_| "Invalid Place ID (must be numeric)".to_string())?;
-
-        let safe_paths = [
-            "/Android/media/com.yourname.rbxleditor/scripts/publish_temp.rbxl",
-            "/data/data/com.yourname.rbxleditor/cache/publish_temp.rbxl",
-            "/data/local/tmp/publish_temp.rbxl",
-        ];
-
-        for &sp in &safe_paths {
-            if let Some(parent_dir) = std::path::Path::new(sp).parent() {
-                let _ = std::fs::create_dir_all(parent_dir);
-            }
-            if std::fs::write(sp, rbxl_bytes).is_ok() {
-                let params = PublishExperienceParams {
-                    api_key: key.to_string(),
-                    universe_id: UniverseId(u_num),
-                    place_id: PlaceId(p_num),
-                    version_type: if is_published { PublishVersionType::Published } else { PublishVersionType::Saved },
-                    filename: sp.to_string(),
-                };
-
-                let sdk_result = pollster::block_on(async {
-                    publish_experience(&params).await
-                });
-
-                let _ = std::fs::remove_file(sp);
-
-                if let Ok(resp) = sdk_result {
-                    return Ok(format!(
-                        "Successfully published via rbxcloud SDK! Version: {} ({})",
-                        resp.version_number, version_type
-                    ));
-                }
-            }
-        }
-
-        if !resp_body.is_empty() {
-            Err(format!("Publish response: {resp_body}"))
+            Ok(format!("Successfully published place! Response: {resp_body}"))
         } else {
-            Err("Open Cloud publish request failed. Check API Key and Universe ID permissions.".into())
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp_body) {
+                if let Some(err_msg) = v.get("message").and_then(|m| m.as_str()) {
+                    return Err(format!("Roblox Open Cloud API error (HTTP {status}): {err_msg}"));
+                }
+            }
+            Err(format!("Roblox Open Cloud error (HTTP {status}): {resp_body}"))
         }
     }
 
-    /// Read entry from Roblox Open Cloud DataStore API
+    /// Read entry from Roblox Open Cloud DataStore API using native in-process HTTP client
     pub fn get_datastore_entry(
         api_key: &str,
         universe_id: &str,
@@ -504,26 +421,22 @@ impl RobloxApiClient {
             urlencoding_simple(entry_key.trim())
         );
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-X",
-                "GET",
-                &url,
-                "-H",
-                &format!("x-api-key: {}", api_key.trim()),
-                "--max-time",
-                "15",
-            ])
-            .output();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
 
-        match output {
-            Ok(out) => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
-            Err(e) => Err(format!("DataStore request failed: {e}")),
-        }
+        let response = client
+            .get(&url)
+            .header("x-api-key", api_key.trim())
+            .send()
+            .map_err(|e| format!("DataStore request error: {e}"))?;
+
+        let resp_body = response.text().unwrap_or_default();
+        Ok(resp_body)
     }
 
-    /// Write entry to Roblox Open Cloud DataStore API
+    /// Write entry to Roblox Open Cloud DataStore API using native in-process HTTP client
     pub fn set_datastore_entry(
         api_key: &str,
         universe_id: &str,
@@ -538,30 +451,24 @@ impl RobloxApiClient {
             urlencoding_simple(entry_key.trim())
         );
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-X",
-                "POST",
-                &url,
-                "-H",
-                &format!("x-api-key: {}", api_key.trim()),
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                json_val,
-                "--max-time",
-                "15",
-            ])
-            .output();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
 
-        match output {
-            Ok(out) => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
-            Err(e) => Err(format!("DataStore write failed: {e}")),
-        }
+        let response = client
+            .post(&url)
+            .header("x-api-key", api_key.trim())
+            .header("Content-Type", "application/json")
+            .body(json_val.to_string())
+            .send()
+            .map_err(|e| format!("DataStore write error: {e}"))?;
+
+        let resp_body = response.text().unwrap_or_default();
+        Ok(resp_body)
     }
 
-    /// Publish message using rbxcloud SDK Open Cloud MessagingService API
+    /// Publish message using Roblox Open Cloud MessagingService API using native in-process HTTP client
     pub fn publish_message_topic(
         api_key: &str,
         universe_id_str: &str,
@@ -569,21 +476,33 @@ impl RobloxApiClient {
         message: &str,
     ) -> Result<String, String> {
         let u_id: u64 = universe_id_str.trim().parse().map_err(|_| "Invalid Universe ID (must be numeric)".to_string())?;
+        let url = format!(
+            "https://apis.roblox.com/messaging-service/v1/universes/{}/topics/{}",
+            u_id,
+            urlencoding_simple(topic.trim())
+        );
 
-        let params = PublishMessageParams {
-            api_key: api_key.trim().to_string(),
-            universe_id: UniverseId(u_id),
-            topic: topic.trim().to_string(),
-            message: message.to_string(),
-        };
-
-        let result = pollster::block_on(async {
-            publish_message(&params).await
+        let payload = serde_json::json!({
+            "message": message
         });
 
-        match result {
-            Ok(_) => Ok(format!("Dispatched live message to topic '{topic}'")),
-            Err(e) => Err(format!("rbxcloud MessagingService error: {e}")),
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
+
+        let response = client
+            .post(&url)
+            .header("x-api-key", api_key.trim())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("MessagingService error: {e}"))?;
+
+        if response.status().is_success() {
+            Ok(format!("Dispatched live message to topic '{topic}'"))
+        } else {
+            Err(format!("MessagingService error ({}): {}", response.status(), response.text().unwrap_or_default()))
         }
     }
 }
@@ -1929,6 +1848,27 @@ fn extract_numeric_id(input: &str) -> Option<u64> {
     }
 
     if let Some(pos) = input.find("catalog/") {
+        let num: String = input[pos + 8..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(id) = num.parse::<u64>() {
+            if id > 0 { return Some(id); }
+        }
+    }
+
+    if let Some(pos) = input.find("store/asset/") {
+        let num: String = input[pos + 12..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(id) = num.parse::<u64>() {
+            if id > 0 { return Some(id); }
+        }
+    }
+
+    if let Some(pos) = input.find("marketplace/asset/") {
+        let num: String = input[pos + 18..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(id) = num.parse::<u64>() {
+            if id > 0 { return Some(id); }
+        }
+    }
+
+    if let Some(pos) = input.find("library/") {
         let num: String = input[pos + 8..].chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Ok(id) = num.parse::<u64>() {
             if id > 0 { return Some(id); }
