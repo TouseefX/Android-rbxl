@@ -6,6 +6,7 @@ mod lua_syntax;
 mod roblox_api;
 mod rbxl;
 mod schema;
+mod settings;
 mod templates;
 mod viewport3d;
 
@@ -36,3 +37,5 @@ fn android_main(android_app: AndroidApp) {
         log::error!("eframe::run_native failed: {e:?}");
     }
 }
+
+

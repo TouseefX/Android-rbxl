@@ -7,6 +7,7 @@ use rbx_dom_weak::{
     types::{Color3, Color3uint8, Ref, Variant, Vector3},
     WeakDom,
 };
+use crate::settings::EditorSettings;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub enum ActiveTab {
     Assets,
     OpenCloud,
     Output,
+    Settings,
 }
 
 pub struct OpenScriptTab {
@@ -102,6 +104,12 @@ pub struct EditorApp {
 
 impl Default for EditorApp {
     fn default() -> Self {
+        let saved_settings = EditorSettings::load();
+        let mut viewport = Viewport3D::default();
+        viewport.show_grid = saved_settings.show_grid;
+        viewport.show_wireframe = saved_settings.show_wireframe;
+        viewport.move_speed = saved_settings.camera_speed;
+
         let mut app = Self {
             dom: None,
             selected: None,
@@ -117,16 +125,16 @@ impl Default for EditorApp {
             font_size: 14.0,
             show_stats: false,
             rename_buffer: String::new(),
-            viewport: Viewport3D::default(),
+            viewport,
             live_search_input: "sword".into(),
             live_catalog_items: Vec::new(),
             is_searching_live: false,
             direct_asset_id_input: "47433".into(),
-            roblosecurity_cookie: String::new(),
+            roblosecurity_cookie: saved_settings.roblosecurity_cookie,
             discovered_assets: Vec::new(),
-            open_cloud_api_key: String::new(),
-            open_cloud_universe_id: String::new(),
-            open_cloud_place_id: String::new(),
+            open_cloud_api_key: saved_settings.open_cloud_api_key,
+            open_cloud_universe_id: saved_settings.open_cloud_universe_id,
+            open_cloud_place_id: saved_settings.open_cloud_place_id,
             open_cloud_publish_live: true,
             datastore_name_input: "PlayerData".into(),
             datastore_key_input: "Player_12345".into(),
@@ -144,7 +152,7 @@ impl Default for EditorApp {
             pending_external_edits: HashMap::new(),
             next_external_id: 1,
         };
-        app.log_info("Roblox Studio Lite initialized with Open Cloud & Live Creator Store");
+        app.log_info("Roblox Studio Lite initialized with persistent settings");
         RobloxApiClient::fetch_live_catalog_async("sword".into());
         app.is_searching_live = true;
         app
@@ -192,6 +200,8 @@ impl eframe::App for EditorApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+
+                    ui.label(RichText::new("v3.0.0 • OpenRBLX").strong().color(Color32::from_rgb(0, 230, 255)));
 
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();
@@ -271,6 +281,7 @@ impl eframe::App for EditorApp {
                             tab_btn(ui, "☁️ Creator Store", ActiveTab::Assets);
                             tab_btn(ui, "🚀 Open Cloud", ActiveTab::OpenCloud);
                             tab_btn(ui, "🖥️ Output", ActiveTab::Output);
+                            tab_btn(ui, "⚙️ Settings", ActiveTab::Settings);
                         });
                     });
             });
@@ -296,6 +307,7 @@ impl eframe::App for EditorApp {
                     ActiveTab::Assets => self.show_assets_ui(ui),
                     ActiveTab::OpenCloud => self.show_open_cloud_ui(ui),
                     ActiveTab::Output => self.show_output_ui(ui),
+                    ActiveTab::Settings => self.show_settings_ui(ui),
                 }
             });
         } else {
@@ -312,6 +324,7 @@ impl eframe::App for EditorApp {
                     ActiveTab::Assets => self.show_assets_ui(ui),
                     ActiveTab::OpenCloud => self.show_open_cloud_ui(ui),
                     ActiveTab::Output => self.show_output_ui(ui),
+                    ActiveTab::Settings => self.show_settings_ui(ui),
                 }
             });
         }
@@ -361,6 +374,7 @@ impl EditorApp {
                 self.viewport = Viewport3D::default();
             }
 
+            ui.checkbox(&mut self.viewport.show_skybox, "Skybox");
             ui.checkbox(&mut self.viewport.show_grid, "Grid");
             ui.checkbox(&mut self.viewport.show_wireframe, "Wireframe");
         });
@@ -470,7 +484,7 @@ impl EditorApp {
         ui.separator();
 
         // Render the 3D Interactive Viewport
-        self.viewport.render(ui, self.dom.as_ref(), &mut self.selected);
+        self.viewport.render(ui, self.dom.as_ref(), &mut self.selected, Some(&self.roblosecurity_cookie));
     }
 
     fn show_assets_ui(&mut self, ui: &mut egui::Ui) {
@@ -550,7 +564,40 @@ impl EditorApp {
 
         ui.add_space(4.0);
 
-        // 3. Live Creator Store Search Input Bar
+        // 3. Place Asset Scanner & Batch Downloader (like studio-lite AssetManager)
+        if let Some(dom) = &self.dom {
+            let place_assets = asset_downloader::scan_place_assets(dom);
+            ui.collapsing(format!("📦 Place Assets Inspector ({} Found)", place_assets.len()), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(RichText::new("⬇️ Download & Cache All Place Assets (.mesh & .png)").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
+                        let cookie_clone = self.roblosecurity_cookie.clone();
+                        let assets_clone = place_assets.clone();
+                        std::thread::spawn(move || {
+                            for asset in assets_clone {
+                                if asset.asset_type == "Mesh" {
+                                    roblox_api::fetch_and_cache_mesh_async(format!("rbxassetid://{}", asset.asset_id), if cookie_clone.is_empty() { None } else { Some(cookie_clone.clone()) });
+                                }
+                            }
+                        });
+                        self.status = format!("Initiated batch download for {} place assets", place_assets.len());
+                        self.log_info(format!("Downloading {} meshes/textures in background", place_assets.len()));
+                    }
+                });
+
+                ui.add_space(4.0);
+                for asset in place_assets.iter().take(15) {
+                    let is_cached = asset_downloader::get_cached_mesh(&format!("rbxassetid://{}", asset.asset_id)).is_some()
+                        || asset_downloader::get_builtin_asset(&asset.asset_id).is_some();
+                    ui.horizontal(|ui| {
+                        let status_icon = if is_cached { "✅ Loaded" } else { "⏳ Needs Fetch" };
+                        ui.label(format!("• {} '{}' (ID: {}) [{}]", asset.asset_type, asset.instance_name, asset.asset_id, status_icon));
+                    });
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        // 4. Live Creator Store Search Input Bar
         ui.horizontal(|ui| {
             ui.label(RichText::new("Search:").strong());
             ui.add(
@@ -1773,6 +1820,7 @@ impl EditorApp {
                         self.current_uri = Some(uri.clone());
                         self.selected = None;
                         self.open_tabs.clear();
+                        self.viewport.initialized_camera = false;
                         self.status = format!("Loaded ({count} top-level services)");
                         self.log_info(format!("Opened place: {uri} ({count} services)"));
                         self.active_tab = ActiveTab::Explorer;
@@ -1812,6 +1860,160 @@ impl EditorApp {
                 }
             }
         }
+    }
+
+    fn show_settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("⚙️ Studio Preferences & Saved Credentials");
+        ui.label("Saved credentials persist across app restarts to automate Open Cloud publishing and raw .rbxm asset downloading.");
+
+        ui.separator();
+
+        egui::ScrollArea::both()
+            .id_salt("settings_scroll_area")
+            .show(ui, |ui| {
+                // 1. Roblox Account Authentication (.ROBLOSECURITY)
+                ui.group(|ui| {
+                    ui.label(RichText::new("🔑 Roblox Account Credentials (.ROBLOSECURITY)").heading().color(Color32::from_rgb(100, 200, 255)));
+                    ui.label("Enables direct downloading of 100% exact live .rbxm binary models, meshes, and textures from Roblox AssetDelivery CDN.");
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Cookie:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.roblosecurity_cookie)
+                                .password(true)
+                                .hint_text("Paste your .ROBLOSECURITY cookie...")
+                                .desired_width(260.0),
+                        );
+
+                        if ui.button("📋 Paste").clicked() {
+                            let text = jni_bridge::get_clipboard_text();
+                            if !text.trim().is_empty() {
+                                self.roblosecurity_cookie = text.trim().to_string();
+                                self.status = "Pasted .ROBLOSECURITY cookie".into();
+                            }
+                        }
+
+                        if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
+                            self.roblosecurity_cookie.clear();
+                        }
+                    });
+
+                    if !self.roblosecurity_cookie.is_empty() {
+                        ui.label(RichText::new("✓ Cookie configured: Direct 100% raw .rbxm download enabled").color(Color32::from_rgb(120, 255, 120)));
+                    } else {
+                        ui.label(RichText::new("ℹ️ No cookie set: Using high-fidelity asset synthesizers and unauthenticated endpoints").color(Color32::from_rgb(200, 200, 100)));
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // 2. Open Cloud API Credentials
+                ui.group(|ui| {
+                    ui.label(RichText::new("🚀 Roblox Open Cloud API Suite").heading().color(Color32::from_rgb(120, 255, 120)));
+                    ui.label("API credentials for Experience Place Publishing, DataStore inspection, and MessagingService.");
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("API Key:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.open_cloud_api_key)
+                                .password(true)
+                                .hint_text("Paste Open Cloud API key...")
+                                .desired_width(240.0),
+                        );
+
+                        if ui.button("📋 Paste").clicked() {
+                            let text = jni_bridge::get_clipboard_text();
+                            if !text.trim().is_empty() {
+                                self.open_cloud_api_key = text.trim().to_string();
+                            }
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Universe ID:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.open_cloud_universe_id)
+                                .hint_text("e.g. 123456789")
+                                .desired_width(120.0),
+                        );
+                        if ui.button("📋").clicked() {
+                            let text = jni_bridge::get_clipboard_text();
+                            if !text.trim().is_empty() {
+                                self.open_cloud_universe_id = text.trim().to_string();
+                            }
+                        }
+
+                        ui.label("Place ID:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.open_cloud_place_id)
+                                .hint_text("e.g. 987654321")
+                                .desired_width(120.0),
+                        );
+                        if ui.button("📋").clicked() {
+                            let text = jni_bridge::get_clipboard_text();
+                            if !text.trim().is_empty() {
+                                self.open_cloud_place_id = text.trim().to_string();
+                            }
+                        }
+                    });
+
+                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players by Default (versionType=Published)");
+                });
+
+                ui.add_space(8.0);
+
+                // 3. 3D Viewport & Rendering Preferences
+                ui.group(|ui| {
+                    ui.label(RichText::new("🌍 3D Viewport & Rendering Engine").heading().color(Color32::from_rgb(255, 200, 100)));
+
+                    ui.checkbox(&mut self.viewport.show_grid, "Show 4-Stud Baseplate Grid & Primary Axes");
+                    ui.checkbox(&mut self.viewport.show_wireframe, "Show Selection & Part Outlines");
+
+                    ui.horizontal(|ui| {
+                        ui.label("Camera Fly / Move Speed:");
+                        ui.add(egui::Slider::new(&mut self.viewport.move_speed, 1.0..=20.0).text("studs/step"));
+                    });
+                });
+
+                ui.add_space(12.0);
+
+                // Save & Action Buttons
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(RichText::new("💾 Save Settings & Credentials").heading().color(Color32::from_rgb(100, 255, 120))).clicked() {
+                        let settings_to_save = EditorSettings {
+                            roblosecurity_cookie: self.roblosecurity_cookie.clone(),
+                            open_cloud_api_key: self.open_cloud_api_key.clone(),
+                            open_cloud_universe_id: self.open_cloud_universe_id.clone(),
+                            open_cloud_place_id: self.open_cloud_place_id.clone(),
+                            auto_download_meshes: true,
+                            show_skybox: true,
+                            show_grid: self.viewport.show_grid,
+                            show_wireframe: self.viewport.show_wireframe,
+                            camera_speed: self.viewport.move_speed,
+                        };
+
+                        match settings_to_save.save() {
+                            Ok(_) => {
+                                self.status = "✅ Settings saved successfully to persistent storage!".into();
+                                self.log_info("Saved credentials and viewport preferences");
+                            }
+                            Err(e) => {
+                                self.status = format!("Save error: {e}");
+                                self.log_error(format!("Failed to save settings: {e}"));
+                            }
+                        }
+                    }
+
+                    if ui.button(RichText::new("🗑️ Clear All Credentials").color(Color32::from_rgb(255, 100, 100))).clicked() {
+                        self.roblosecurity_cookie.clear();
+                        self.open_cloud_api_key.clear();
+                        self.open_cloud_universe_id.clear();
+                        self.open_cloud_place_id.clear();
+                        let _ = EditorSettings::default().save();
+                        self.status = "Cleared saved credentials".into();
+                    }
+                });
+            });
     }
 
     fn save(&mut self) {

@@ -1,7 +1,8 @@
+use crate::asset_downloader;
 use crate::rbxl;
 use anyhow::Result;
 use rbx_dom_weak::{
-    types::{Color3, Color3uint8, Ref, Variant, Vector3},
+    types::{Color3, Ref, Variant, Vector3},
     InstanceBuilder, WeakDom,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -49,6 +50,10 @@ pub fn try_recv_search_results() -> Option<LiveSearchResponse> {
     } else {
         None
     }
+}
+
+pub fn fetch_and_cache_mesh_async(mesh_id_str: String, cookie_opt: Option<String>) {
+    RobloxApiClient::fetch_and_cache_mesh_async(mesh_id_str, cookie_opt);
 }
 
 pub struct RobloxApiClient {
@@ -227,6 +232,26 @@ impl RobloxApiClient {
         }
 
         Err(format!("Asset {asset_id} requires authentication or is offline"))
+    }
+
+    /// Fetches a 3D .mesh asset asynchronously in the background and stores it in mesh_cache
+    pub fn fetch_and_cache_mesh_async(mesh_id_str: String, cookie_opt: Option<String>) {
+        if asset_downloader::get_cached_mesh(&mesh_id_str).is_some() {
+            return;
+        }
+
+        std::thread::spawn(move || {
+            let asset_id_opt = asset_downloader::extract_asset_id(&mesh_id_str);
+            if let Some(id_str) = asset_id_opt {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    if let Ok(bytes) = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref()) {
+                        if let Some(mesh) = asset_downloader::parse_roblox_mesh(&bytes) {
+                            asset_downloader::store_cached_mesh(mesh_id_str.clone(), mesh);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Insert any live Roblox Catalog item directly into the active place DOM Workspace.
