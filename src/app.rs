@@ -339,9 +339,7 @@ impl EditorApp {
             // presets, distance/zoom, speed, up/down.
             egui::TopBottomPanel::top("viewport_controls")
                 .show(ctx, |ui| {
-                    egui::ScrollArea::horizontal().show(ui, |ui| {
-                        self.show_viewport_controls(ui, orbit);
-                    });
+                    self.show_viewport_controls(ui, orbit);
                 });
             // Transparent central panel: the Bevy 3D scene shows through and
             // this region senses drag/scroll to orbit the camera.
@@ -377,6 +375,7 @@ impl EditorApp {
     /// Camera control bar (always drawn on a solid panel so it's visible over
     /// the 3D). Steers the Bevy `OrbitCam`.
     fn show_viewport_controls(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
+        // Row 1 (scrollable): label, presets, focus, reset, distance, speed.
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
             ui.label(RichText::new("🧊 3D (Bevy)").strong().color(Color32::from_rgb(0, 230, 255)));
@@ -397,21 +396,23 @@ impl EditorApp {
             if ui.button("🔄 Reset").clicked() { *orbit = crate::bevy_render::OrbitCam::default(); }
 
             ui.separator();
-
             ui.label("📏 Dist:");
             if ui.button("−").clicked() { orbit.dist = (orbit.dist * 0.85).max(2.0); }
             ui.add(egui::Slider::new(&mut orbit.dist, 2.0..=2000.0).show_value(false));
             if ui.button("+").clicked() { orbit.dist = (orbit.dist * 1.15).min(2000.0); }
 
             ui.separator();
-
             let mut speed = self.cam_move_speed;
             ui.label("Speed:");
             ui.add(egui::Slider::new(&mut speed, 1.0..=50.0).show_value(false));
             self.cam_move_speed = speed;
+        });
 
-            if ui.button("⬆️ Up").clicked() { orbit.target[1] += speed; }
-            if ui.button("⬇️ Down").clicked() { orbit.target[1] -= speed; }
+        // Row 2 (always visible, NOT scrolled): camera height Up / Down.
+        ui.horizontal(|ui| {
+            ui.label("Height:");
+            if ui.button("⬆️ Up").clicked() { orbit.target[1] += self.cam_move_speed; }
+            if ui.button("⬇️ Down").clicked() { orbit.target[1] -= self.cam_move_speed; }
         });
     }
 

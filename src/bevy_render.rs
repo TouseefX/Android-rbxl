@@ -14,7 +14,9 @@ use bevy::asset::RenderAssetUsages;
 use bevy::math::Vec3 as BVec3;
 use bevy::mesh::{Indices, Mesh};
 use bevy::prelude::*;
-use bevy::render::render_resource::PrimitiveTopology;
+use bevy::render::render_resource::{
+    Extent3d, PrimitiveTopology, TextureDimension, TextureFormat,
+};
 use rbx_dom_weak::{types::Variant, WeakDom};
 use std::collections::HashMap;
 use std::path::Path;
@@ -39,11 +41,23 @@ use bevy::render::render_resource::{
 };
 use bevy::shader::ShaderRef;
 
-/// Flat unlit material: just a solid `color`. No lighting, no textures, no PBR.
+/// Flat unlit-shader material: solid `color` (+ optional texture) with baked
+/// Lambert lighting computed in the fragment shader. No StandardMaterial, so
+/// it renders on Adreno GPUs that break Bevy's PBR shader.
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 pub struct FlatMaterial {
     #[uniform(0)]
     pub color: LinearRgba,
+    /// Direction the light comes FROM (world space), used for Lambert shading.
+    #[uniform(1)]
+    pub light_dir: Vec4,
+    /// 1.0 = sample the texture, 0.0 = flat colour only.
+    #[uniform(2)]
+    pub has_texture: u32,
+    /// Optional colour texture (e.g. studs / decals / mesh texture).
+    #[texture(3)]
+    #[sampler(4)]
+    pub texture: Option<Handle<Image>>,
 }
 
 impl Material for FlatMaterial {
@@ -623,6 +637,15 @@ fn extract_asset_id(s: &str) -> Option<String> {
     Some(digits.chars().rev().collect())
 }
 
+/// Load a colour texture (PNG/JPG) for a material if it exists in `asset/`.
+fn load_image_rgba(id: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let path = asset_path(id, &["png", "jpg", "jpeg"])?;
+    let img = image::open(&path).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, rgba.into_raw()))
+}
+
 fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     let id = extract_asset_id(id_or_path)?;
     let path = asset_path(&id, &["mesh"])?;
@@ -766,20 +789,45 @@ pub fn rebuild_scene(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<FlatMaterial>,
-    _images: &mut Assets<Image>,
+    images: &mut Assets<Image>,
     dom: &WeakDom,
 ) {
     let parts = extract_geometry(dom);
 
     let root = commands.spawn(RbxSceneRoot).id();
 
-    // Bucket by (color, alpha) ONLY — ignore per-face texture ids. Textured
-    // materials (studs, decals, mesh textures) are skipped for now because on
-    // Android the image assets aren't reliably GPU-ready, which makes Bevy
-    // render those materials as magenta/purple. Rendering solid colours both
-    // fixes the purple AND matches OpenRBLX's flat-coloured look, and merging
-    // by colour collapses many materials into few, cutting draw calls.
-    type Key = ([u8; 3], u8);
+    // Pre-load any colour textures referenced by the geometry (mesh textures,
+    // decals, studs). Keys like "rbxassetid://123" are resolved to the local
+    // asset/<id>.png file and uploaded as Bevy Images.
+    let mut tex_cache: HashMap<String, Handle<Image>> = HashMap::new();
+    let mut texture_ids: HashMap<String, (u32, u32, Vec<u8>)> = HashMap::new();
+    for p in &parts {
+        for t in &p.tris {
+            if let Some(ref k) = t.tex {
+                if let Some(id) = extract_asset_id(k) {
+                    if !texture_ids.contains_key(k) {
+                        if let Some(img) = load_image_rgba(&id) {
+                            texture_ids.insert(k.clone(), img);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (k, (w, h, rgba)) in &texture_ids {
+        let bevy_img = Image::new(
+            Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+            TextureDimension::D2,
+            rgba.clone(),
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        tex_cache.insert(k.clone(), images.add(bevy_img));
+    }
+
+    // Bucket by (color, alpha, texture_key) so each unique look gets one
+    // material + mesh, keeping draw calls low while still supporting textures.
+    type Key = ([u8; 3], u8, Option<String>);
     let mut buckets: HashMap<Key, Vec<Tri>> = HashMap::new();
     for p in &parts {
         let ck = [
@@ -789,12 +837,12 @@ pub fn rebuild_scene(
         ];
         let ak = (p.alpha * 255.0).round() as u8;
         for t in &p.tris {
-            buckets.entry((ck, ak)).or_default().push(t.clone());
+            buckets.entry((ck, ak, t.tex.clone())).or_default().push(t.clone());
         }
     }
     let draw_call_count = buckets.len();
 
-    for ((ck, ak), tris) in buckets {
+    for ((ck, ak, tex_key), tris) in buckets {
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
@@ -816,11 +864,24 @@ pub fn rebuild_scene(
         mesh.insert_indices(Indices::U32(indices));
         let mh = meshes.add(mesh);
 
-        // A custom FlatMaterial whose shader just outputs the colour — this
-        // bypasses Bevy's StandardMaterial shader entirely, which is what was
-        // failing (rendering magenta) on this device's Adreno GPU.
+        // A custom FlatMaterial whose shader outputs a lit colour (and samples
+        // a texture if present). This bypasses Bevy's StandardMaterial shader
+        // entirely, which is what was failing (rendering magenta) on this
+        // device's Adreno GPU.
         let color = LinearRgba::new(ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0, ak as f32 / 255.0);
-        let mth = materials.add(FlatMaterial { color });
+        let (texture, has_texture) = match &tex_key {
+            Some(k) => match tex_cache.get(k) {
+                Some(h) => (Some(h.clone()), 1),
+                None => (None, 0),
+            },
+            None => (None, 0),
+        };
+        let mth = materials.add(FlatMaterial {
+            color,
+            light_dir: Vec4::new(60.0, 90.0, -40.0, 0.0),
+            has_texture,
+            texture,
+        });
 
         commands.entity(root).with_children(|parent| {
             parent.spawn((Mesh3d(mh), MeshMaterial3d(mth), Transform::IDENTITY));
