@@ -91,7 +91,8 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
         brightness: 400.0,
         ..default()
     });
-    bevy_app.insert_resource(ClearColor(Color::srgb(0.35, 0.55, 0.85)));
+    // Roblox-style light blue sky (matches the OpenRBLX reference scene).
+    bevy_app.insert_resource(ClearColor(Color::srgb(0.56, 0.84, 0.97)));
 
     bevy_app.add_systems(Startup, setup_3d);
     // Scene rebuild + camera sync run on the main Update schedule.

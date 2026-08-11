@@ -14,7 +14,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::math::Vec3 as BVec3;
 use bevy::mesh::{Indices, Mesh};
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat};
+use bevy::render::render_resource::PrimitiveTopology;
 use rbx_dom_weak::{types::Variant, WeakDom};
 use std::collections::HashMap;
 use std::path::Path;
@@ -616,30 +616,6 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     None
 }
 
-fn load_image_rgba(id: &str) -> Option<(u32, u32, Vec<u8>)> {
-    let path = asset_path(id, &["png", "jpg", "jpeg"])?;
-    let img = image::open(&path).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    Some((w, h, rgba.into_raw()))
-}
-
-fn tex_key_for_tri(tris: &Vec<Tri>) -> HashMap<String, (u32, u32, Vec<u8>)> {
-    let mut out = HashMap::new();
-    for t in tris {
-        if let Some(ref k) = t.tex {
-            if let Some(id) = extract_asset_id(k) {
-                if !out.contains_key(k) {
-                    if let Some(img) = load_image_rgba(&id) {
-                        out.insert(k.clone(), img);
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
 // ----------------------------------------------------------------------------
 // Editor integration
 // ----------------------------------------------------------------------------
@@ -673,13 +649,20 @@ pub fn spawn_camera_and_light(mut commands: Commands) {
     let (eye_b, target_b) = orbit_eye_target(&cam);
     commands.spawn((
         Camera3d::default(),
+        // CRITICAL for mobile performance: MSAA is on by default (4×). At the
+        // phone's native resolution (e.g. 1440×3200) that is a huge fill-rate
+        // cost for a trivial scene, which is what caused the ~20 fps. Turning
+        // MSAA off is the single biggest perf win on Android.
+        Msaa::Off,
         Transform::from_translation(eye_b).looking_at(target_b, BVec3::Y),
         RbxCamera,
     ));
     commands.spawn((
         DirectionalLight {
             illuminance: 30_000.0,
-            shadows_enabled: true,
+            // Shadows OFF: the shadow pass re-renders the whole scene every
+            // frame and was a major cause of the low frame rate.
+            shadows_enabled: false,
             ..default()
         },
         Transform::from_xyz(60.0, 90.0, -40.0).looking_at(BVec3::ZERO, BVec3::Y),
@@ -706,28 +689,20 @@ pub fn rebuild_scene(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    images: &mut Assets<Image>,
+    _images: &mut Assets<Image>,
     dom: &WeakDom,
 ) {
     let parts = extract_geometry(dom);
-    let mut tex_cache: HashMap<String, Handle<Image>> = HashMap::new();
-    for p in &parts {
-        for (k, (w, h, rgba)) in tex_key_for_tri(&p.tris) {
-            let img = Image::new(
-                Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                TextureDimension::D2,
-                rgba,
-                TextureFormat::Rgba8UnormSrgb,
-                RenderAssetUsages::default(),
-            );
-            tex_cache.entry(k).or_insert_with(|| images.add(img));
-        }
-    }
 
     let root = commands.spawn(RbxSceneRoot).id();
 
-    // Bucket by (tex, color, alpha).
-    type Key = (Option<String>, [u8; 3], u8);
+    // Bucket by (color, alpha) ONLY — ignore per-face texture ids. Textured
+    // materials (studs, decals, mesh textures) are skipped for now because on
+    // Android the image assets aren't reliably GPU-ready, which makes Bevy
+    // render those materials as magenta/purple. Rendering solid colours both
+    // fixes the purple AND matches OpenRBLX's flat-coloured look, and merging
+    // by colour collapses many materials into few, cutting draw calls.
+    type Key = ([u8; 3], u8);
     let mut buckets: HashMap<Key, Vec<Tri>> = HashMap::new();
     for p in &parts {
         let ck = [
@@ -737,11 +712,12 @@ pub fn rebuild_scene(
         ];
         let ak = (p.alpha * 255.0).round() as u8;
         for t in &p.tris {
-            buckets.entry((t.tex.clone(), ck, ak)).or_default().push(t.clone());
+            buckets.entry((ck, ak)).or_default().push(t.clone());
         }
     }
+    let draw_call_count = buckets.len();
 
-    for ((tex, ck, ak), tris) in buckets {
+    for ((ck, ak), tris) in buckets {
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
@@ -765,25 +741,22 @@ pub fn rebuild_scene(
 
         let color = [ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0];
         let alpha = ak as f32 / 255.0;
-        let mut mat = StandardMaterial {
+        // Lit solid colour (no texture, so never magenta). Lighting gives the
+        // shaded, "plastic" look of the OpenRBLX reference scene. With MSAA and
+        // shadows off this is cheap: a single directional-light pass over a few
+        // per-colour draw calls.
+        let mth = materials.add(StandardMaterial {
             base_color: Color::srgba(color[0], color[1], color[2], alpha),
             cull_mode: None,
             ..default()
-        };
-        if let Some(ref k) = tex {
-            if let Some(h) = tex_cache.get(k) {
-                mat.base_color_texture = Some(h.clone());
-                mat.base_color = Color::WHITE.with_alpha(alpha);
-            }
-        }
-        let mth = materials.add(mat);
+        });
 
         commands.entity(root).with_children(|parent| {
             parent.spawn((Mesh3d(mh), MeshMaterial3d(mth), Transform::IDENTITY));
         });
     }
 
-    log::info!("Bevy: rendered {} parts", parts.len());
+    log::info!("Bevy: rendered {} parts, {} draw calls", parts.len(), draw_call_count);
 }
 
 /// Keep the viewport camera in sync with the `OrbitCam` resource each frame.
