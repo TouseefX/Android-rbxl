@@ -1,12 +1,14 @@
 use crate::asset_downloader::{self, DiscoveredAsset};
 use crate::jni_bridge::{self, FileEvent};
 use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
-use crate::{explorer, lua_syntax, rbxl, schema, templates, viewport3d::CameraPreset};
+use crate::{explorer, lua_syntax, rbxl, schema, templates};
 use egui::{Color32, RichText};
 
-// The 3D viewport is rendered by the Bevy engine (GPU), a port of the OpenRBLX
-// renderer. It is the only viewport.
-type Viewport3D = crate::viewport3d_bevy::BevyViewport3D;
+/// Fixed path (shared external storage) where the editor drops the current
+/// place for the standalone Bevy viewer app to pick up.
+pub const VIEWER_PLACE_PATH: &str = "/storage/emulated/0/rbxlviewer/current.rbxl";
+/// Package name of the standalone Bevy viewer app.
+pub const VIEWER_PACKAGE: &str = "com.yourname.rbxlviewer";
 use rbx_dom_weak::{
     types::{Color3, Color3uint8, Ref, Variant, Vector3},
     WeakDom,
@@ -65,9 +67,6 @@ pub struct EditorApp {
     show_stats: bool,
     rename_buffer: String,
 
-    // 3D Viewport
-    viewport: Viewport3D,
-
     // Live Roblox Catalog & Creator Store State
     live_search_input: String,
     live_catalog_items: Vec<LiveCatalogItem>,
@@ -109,10 +108,6 @@ pub struct EditorApp {
 impl Default for EditorApp {
     fn default() -> Self {
         let saved_settings = EditorSettings::load();
-        let mut viewport = Viewport3D::default();
-        viewport.show_grid = saved_settings.show_grid;
-        viewport.show_wireframe = saved_settings.show_wireframe;
-        viewport.move_speed = saved_settings.camera_speed;
 
         let mut app = Self {
             dom: None,
@@ -129,7 +124,6 @@ impl Default for EditorApp {
             font_size: 14.0,
             show_stats: false,
             rename_buffer: String::new(),
-            viewport,
             live_search_input: "sword".into(),
             live_catalog_items: Vec::new(),
             is_searching_live: false,
@@ -337,158 +331,61 @@ impl eframe::App for EditorApp {
 
 impl EditorApp {
     fn show_viewport_ui(&mut self, ui: &mut egui::Ui) {
-        // Camera Toolbar & Presets
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
-
-            if ui.button("🎯 Focus Selected").clicked() {
-                if let (Some(dom), Some(r)) = (&self.dom, self.selected) {
-                    if let Some(inst) = dom.get_by_ref(r) {
-                        if let Some(Variant::Vector3(v)) = inst.properties.get(&rbx_dom_weak::ustr("Position")) {
-                            self.viewport.focus_on([v.x, v.y, v.z]);
-                            self.status = format!("Camera focused on {}", inst.name);
-                        }
-                    }
-                }
-            }
-
-            if ui.button("📐 Iso").clicked() {
-                self.viewport.set_preset(CameraPreset::Isometric);
-            }
-            if ui.button("📐 Top").clicked() {
-                self.viewport.set_preset(CameraPreset::Top);
-            }
-            if ui.button("📐 Front").clicked() {
-                self.viewport.set_preset(CameraPreset::Front);
-            }
-            if ui.button("📐 Side").clicked() {
-                self.viewport.set_preset(CameraPreset::Side);
-            }
-
-            ui.separator();
-
-            if ui.button("🔍+ Zoom In").clicked() && self.viewport.distance > 8.0 {
-                self.viewport.distance -= 6.0;
-            }
-            if ui.button("🔍- Zoom Out").clicked() && self.viewport.distance < 300.0 {
-                self.viewport.distance += 6.0;
-            }
-            if ui.button("🔄 Reset Cam").clicked() {
-                self.viewport = Viewport3D::default();
-            }
-
-            ui.checkbox(&mut self.viewport.show_skybox, "Skybox");
-            ui.checkbox(&mut self.viewport.show_grid, "Grid");
-            ui.checkbox(&mut self.viewport.show_wireframe, "Wireframe");
-        });
-
-        // Fly / Pan Movement Controls for Mobile
+        ui.heading("🌍 3D View in Bevy");
+        ui.label("The 3D viewport is rendered by the separate GPU app \"rbxl Viewer\" "
+            + "(a Bevy port of the OpenRBLX renderer), which opens full-screen on your device.");
         ui.separator();
+
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Camera Move:").strong().color(Color32::from_rgb(100, 200, 255)));
-
-            if ui.button("⬆️ Forward").clicked() {
-                self.viewport.move_forward();
+            if ui.add_enabled(self.dom.is_some(), egui::Button::new("🚀 View in Bevy"))
+                .on_hover_text("Save the current place and open it in the Bevy GPU viewer")
+                .clicked()
+            {
+                self.export_and_launch_viewer();
             }
-            if ui.button("⬇️ Back").clicked() {
-                self.viewport.move_backward();
-            }
-            if ui.button("⬅️ Left").clicked() {
-                self.viewport.move_left();
-            }
-            if ui.button("➡️ Right").clicked() {
-                self.viewport.move_right();
-            }
-            if ui.button("🔼 Up").clicked() {
-                self.viewport.move_up();
-            }
-            if ui.button("🔽 Down").clicked() {
-                self.viewport.move_down();
-            }
-
-            ui.label("Speed:");
-            ui.add(egui::DragValue::new(&mut self.viewport.move_speed).speed(0.5).range(0.5..=20.0));
         });
 
-        // 3D Transform Gizmo bar for selected part
-        let selected_part_data = self.dom.as_ref().and_then(|dom| {
-            self.selected.and_then(|r| dom.get_by_ref(r)).and_then(|inst| {
-                let is_part = matches!(
-                    inst.class.as_str(),
-                    "Part" | "WedgePart" | "CornerWedgePart" | "TrussPart" | "SpawnLocation"
-                );
-                if is_part {
-                    let pos = match inst.properties.get(&rbx_dom_weak::ustr("Position")) {
-                        Some(Variant::Vector3(v)) => [v.x, v.y, v.z],
-                        _ => [0.0, 0.0, 0.0],
-                    };
-                    let size = match inst.properties.get(&rbx_dom_weak::ustr("Size")) {
-                        Some(Variant::Vector3(v)) => [v.x, v.y, v.z],
-                        _ => [4.0, 1.2, 2.0],
-                    };
-                    Some((inst.name.clone(), pos, size))
-                } else {
-                    None
-                }
-            })
-        });
+        ui.separator();
 
-        if let Some((name, pos, size)) = selected_part_data {
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("Selected 3D: {name}")).strong().color(Color32::from_rgb(0, 220, 255)));
-
-                let mut pos_change = None;
-                let mut size_change = None;
-
-                let mut x = pos[0];
-                let mut y = pos[1];
-                let mut z = pos[2];
-
-                ui.label("Pos X:");
-                let cx = ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed();
-                ui.label("Y:");
-                let cy = ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed();
-                ui.label("Z:");
-                let cz = ui.add(egui::DragValue::new(&mut z).speed(0.5)).changed();
-
-                if cx || cy || cz {
-                    pos_change = Some(Vector3::new(x, y, z));
-                }
-
-                let mut sx = size[0];
-                let mut sy = size[1];
-                let mut sz = size[2];
-
-                ui.label("Size X:");
-                let csx = ui.add(egui::DragValue::new(&mut sx).speed(0.5).range(0.2..=500.0)).changed();
-                ui.label("Y:");
-                let csy = ui.add(egui::DragValue::new(&mut sy).speed(0.5).range(0.2..=500.0)).changed();
-                ui.label("Z:");
-                let csz = ui.add(egui::DragValue::new(&mut sz).speed(0.5).range(0.2..=500.0)).changed();
-
-                if csx || csy || csz {
-                    size_change = Some(Vector3::new(sx, sy, sz));
-                }
-
-                if let Some(r) = self.selected {
-                    if let Some(dom) = self.dom.as_mut() {
-                        if let Some(p) = pos_change {
-                            let _ = rbxl::set_property(dom, r, "Position", Variant::Vector3(p));
-                        }
-                        if let Some(s) = size_change {
-                            let _ = rbxl::set_property(dom, r, "Size", Variant::Vector3(s));
-                        }
-                    }
-                }
-            });
+        if self.dom.is_none() {
+            ui.label(RichText::new("Open a .rbxl/.rbxmx file first to enable the viewer.").weak());
+        } else {
+            ui.label(format!(
+                "On tap, the current place is written to\n{} and then \"rbxl Viewer\" is launched.",
+                VIEWER_PLACE_PATH
+            ));
+            ui.label(RichText::new("Make sure \"rbxl Viewer\" is installed, and grant both apps \"All files access\" in Android settings.").weak());
         }
+    }
 
-        ui.separator();
-
-        // Render the 3D Interactive Viewport
-        self.viewport.render(ui, self.dom.as_ref(), &mut self.selected, Some(&self.roblosecurity_cookie));
+    /// Save the current place to the shared path and launch the Bevy viewer app.
+    fn export_and_launch_viewer(&mut self) {
+        let Some(dom) = self.dom.as_ref() else {
+            self.status = "Open a place first".into();
+            return;
+        };
+        match rbxl::save_place(dom) {
+            Ok(bytes) => {
+                // Create the shared directory if needed, then write the place.
+                if let Some(dir) = std::path::Path::new(VIEWER_PLACE_PATH).parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if let Err(e) = std::fs::write(VIEWER_PLACE_PATH, bytes) {
+                    self.status = format!("Export failed: {e}");
+                    return;
+                }
+                self.status = "Place exported — launching Bevy viewer...".into();
+                match jni_bridge::launch_viewer(VIEWER_PACKAGE) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.status = format!("Exported, but could not launch viewer: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                self.status = format!("Export failed: {e}");
+            }
+        }
     }
 
     fn show_assets_ui(&mut self, ui: &mut egui::Ui) {

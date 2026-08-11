@@ -114,6 +114,30 @@ public class MainActivity extends NativeActivity {
         }
     }
 
+    /** Launch the standalone Bevy viewer app by package name. */
+    public static void launchViewerStatic(final String packageName) {
+        MainActivity act = sInstance;
+        if (act == null) {
+            Log.e(TAG, "launchViewerStatic: MainActivity instance is null");
+            return;
+        }
+        act.launchViewer(packageName);
+    }
+
+    private void launchViewer(String packageName) {
+        try {
+            final Intent i = getPackageManager().getLaunchIntentForPackage(packageName);
+            if (i == null) {
+                Log.e(TAG, "launchViewer: no launch intent for " + packageName);
+                return;
+            }
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception e) {
+            Log.e(TAG, "launchViewer failed", e);
+        }
+    }
+
     public static void copyToClipboardStatic(final String text) {
         MainActivity act = sInstance;
         if (act != null) {

@@ -178,6 +178,23 @@ pub fn trigger_copy_to_clipboard(text: &str) {
     });
 }
 
+/// Launch the standalone Bevy viewer app (`package`, e.g. "com.yourname.rbxlviewer")
+/// by asking the Java MainActivity to start its launcher intent. Errors are
+/// logged by `with_env`; returns Ok(()) if the JNI call was dispatched.
+pub fn launch_viewer(package: &str) -> Result<(), String> {
+    with_env(|env, class| {
+        let pkg = env.new_string(package)?;
+        env.call_static_method(
+            class,
+            "launchViewerStatic",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&pkg)],
+        )?;
+        Ok(())
+    });
+    Ok(())
+}
+
 pub fn get_clipboard_text() -> String {
     let mut text_out = String::new();
     with_env(|env, class| {
