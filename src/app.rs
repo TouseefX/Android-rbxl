@@ -118,7 +118,9 @@ impl Default for EditorApp {
             selected: None,
             current_uri: None,
             status: "Ready - Open a .rbxl file to begin".into(),
-            active_tab: ActiveTab::Explorer,
+            // Open straight to the 3D viewport so the scene + camera controls
+            // are visible immediately.
+            active_tab: ActiveTab::Viewport3D,
             open_tabs: Vec::new(),
             active_script_idx: 0,
             find_term: String::new(),
@@ -238,7 +240,7 @@ impl EditorApp {
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
 
-                    ui.label(RichText::new("v3.1.0 • OpenRBLX • Bevy").strong().color(Color32::from_rgb(0, 230, 255)));
+                    ui.label(RichText::new("v3.2-B8 • OpenRBLX • Bevy").strong().color(Color32::from_rgb(0, 230, 255)));
 
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();

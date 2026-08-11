@@ -730,28 +730,12 @@ pub fn rebuild_scene(
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
-        let mut vertex_colors = Vec::new();
         let mut indices = Vec::new();
         let mut idx = 0u32;
-        // Fixed light direction (from origin toward the sun at (60,90,-40)),
-        // used to bake simple Lambert shading into per-vertex colors. This
-        // gives the lit look of the reference WITHOUT relying on Bevy's PBR
-        // shader, which was rendering everything purple on this device.
-        let light = BVec3::new(60.0, 90.0, -40.0).normalize();
-        let base_rgb = [ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0];
         for t in &tris {
-            let n = BVec3::new(t.normal[0], t.normal[1], t.normal[2]);
-            // Lambert with an ambient floor so back/side faces aren't pure black.
-            let lambert = n.dot(light).max(0.0) * 0.7 + 0.3;
-            let c = [
-                (base_rgb[0] * lambert).min(1.0),
-                (base_rgb[1] * lambert).min(1.0),
-                (base_rgb[2] * lambert).min(1.0),
-            ];
             positions.push(t.pos);
             normals.push(t.normal);
             uvs.push(t.uv);
-            vertex_colors.push([c[0], c[1], c[2], 1.0]);
             indices.push(idx);
             indices.push(idx + 1);
             indices.push(idx + 2);
@@ -761,15 +745,16 @@ pub fn rebuild_scene(
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vertex_colors);
         mesh.insert_indices(Indices::U32(indices));
         let mh = meshes.add(mesh);
 
+        // The simplest possible material: flat unlit color. No textures, no
+        // per-vertex colors, no PBR — nothing that could fall back to Bevy's
+        // magenta error color on any GPU. One draw call per color bucket.
+        let color = [ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0];
         let alpha = ak as f32 / 255.0;
-        // unlit shader (robust — no PBR purple) + white base color so the baked
-        // per-vertex Lambert colors show through. Alpha comes from base_color.
         let mth = materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 1.0, 1.0, alpha),
+            base_color: Color::srgba(color[0], color[1], color[2], alpha),
             unlit: true,
             cull_mode: None,
             ..default()
