@@ -20,6 +20,74 @@ use std::collections::HashMap;
 use std::path::Path;
 
 // ----------------------------------------------------------------------------
+// FlatMaterial — a custom material with a trivial shader.
+//
+// Bevy's built-in StandardMaterial shader fails to compile on some Adreno GPUs
+// (e.g. the Galaxy S20 Ultra's Adreno 660), which makes every mesh render as
+// magenta/purple. A custom material whose shader just outputs a solid color
+// bypasses the broken PBR shader entirely, so parts always render in their
+// real colours on any device.
+// ----------------------------------------------------------------------------
+
+use bevy::asset::uuid_handle;
+use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey};
+use bevy::reflect::TypePath;
+use bevy::render::alpha::AlphaMode;
+use bevy::render::render_resource::{
+    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+};
+use bevy::shader::ShaderRef;
+
+/// Flat unlit material: just a solid `color`. No lighting, no textures, no PBR.
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+pub struct FlatMaterial {
+    #[uniform(0)]
+    pub color: LinearRgba,
+}
+
+impl Material for FlatMaterial {
+    // Use Bevy's default vertex shader (just transforms positions); only the
+    // fragment shader is overridden to output a flat color. This avoids any
+    // custom vertex-shader WGSL that could itself fail to compile.
+    fn fragment_shader() -> ShaderRef {
+        FLAT_SHADER_HANDLE.into()
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Opaque
+    }
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = None; // two-sided
+        Ok(())
+    }
+}
+
+/// Handle to the embedded flat-colour shader.
+pub const FLAT_SHADER_HANDLE: Handle<bevy::shader::Shader> =
+    uuid_handle!("9f0123ab-00ff-0002-0000-000000000000");
+
+/// Registers the FlatMaterial and its embedded shader.
+pub struct FlatMaterialPlugin;
+impl Plugin for FlatMaterialPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_plugins(MaterialPlugin::<FlatMaterial>::default());
+        bevy::asset::load_internal_asset!(
+            app,
+            FLAT_SHADER_HANDLE,
+            "flat_material.wgsl",
+            bevy::shader::Shader::from_wgsl
+        );
+    }
+}
+
+
+
+// ----------------------------------------------------------------------------
 // Math (S space, matches the Android software rasterizer)
 // ----------------------------------------------------------------------------
 
@@ -697,7 +765,7 @@ pub fn orbit_eye_target(cam: &OrbitCam) -> (BVec3, BVec3) {
 pub fn rebuild_scene(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<FlatMaterial>,
     _images: &mut Assets<Image>,
     dom: &WeakDom,
 ) {
@@ -748,17 +816,11 @@ pub fn rebuild_scene(
         mesh.insert_indices(Indices::U32(indices));
         let mh = meshes.add(mesh);
 
-        // The simplest possible material: flat unlit color. No textures, no
-        // per-vertex colors, no PBR — nothing that could fall back to Bevy's
-        // magenta error color on any GPU. One draw call per color bucket.
-        let color = [ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0];
-        let alpha = ak as f32 / 255.0;
-        let mth = materials.add(StandardMaterial {
-            base_color: Color::srgba(color[0], color[1], color[2], alpha),
-            unlit: true,
-            cull_mode: None,
-            ..default()
-        });
+        // A custom FlatMaterial whose shader just outputs the colour — this
+        // bypasses Bevy's StandardMaterial shader entirely, which is what was
+        // failing (rendering magenta) on this device's Adreno GPU.
+        let color = LinearRgba::new(ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0, ak as f32 / 255.0);
+        let mth = materials.add(FlatMaterial { color });
 
         commands.entity(root).with_children(|parent| {
             parent.spawn((Mesh3d(mh), MeshMaterial3d(mth), Transform::IDENTITY));

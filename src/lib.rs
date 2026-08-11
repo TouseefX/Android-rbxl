@@ -53,7 +53,7 @@ fn rebuild_scene_system(
     mut commands: Commands,
     mut app: ResMut<EditorApp>,
     mut meshes: ResMut<Assets<bevy::mesh::Mesh>>,
-    mut materials: ResMut<Assets<bevy::pbr::StandardMaterial>>,
+    mut materials: ResMut<Assets<bevy_render::FlatMaterial>>,
     mut images: ResMut<Assets<bevy::image::Image>>,
     old_scene: Query<Entity, With<bevy_render::RbxSceneRoot>>,
 ) {
@@ -96,6 +96,9 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
         ..default()
     }));
     bevy_app.add_plugins(EguiPlugin::default());
+    // Register the custom flat-colour material (bypasses StandardMaterial,
+    // which renders magenta on this device's Adreno GPU).
+    bevy_app.add_plugins(bevy_render::FlatMaterialPlugin);
 
     bevy_app.insert_resource(editor);
     bevy_app.insert_resource(bevy_render::OrbitCam::default());

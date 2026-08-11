@@ -338,9 +338,10 @@ impl EditorApp {
             // SOLID top control bar (guaranteed to render over the 3D): camera
             // presets, distance/zoom, speed, up/down.
             egui::TopBottomPanel::top("viewport_controls")
-                .exact_height(54.0)
                 .show(ctx, |ui| {
-                    self.show_viewport_controls(ui, orbit);
+                    egui::ScrollArea::horizontal().show(ui, |ui| {
+                        self.show_viewport_controls(ui, orbit);
+                    });
                 });
             // Transparent central panel: the Bevy 3D scene shows through and
             // this region senses drag/scroll to orbit the camera.
