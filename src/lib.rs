@@ -33,6 +33,8 @@ fn setup_3d(mut commands: Commands) {
     bevy_render::spawn_camera_and_light(commands);
 }
 
+
+
 /// Draw the egui editor UI each frame (toolbar, tabs, panels) and steer the
 /// Bevy viewport camera from the 3D tab.
 fn draw_editor_ui(
@@ -80,6 +82,17 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
             title: "rbxl Editor".into(),
             ..default()
         }),
+        ..default()
+    }).set(bevy::render::RenderPlugin {
+        // Force the Vulkan backend. On Adreno GPUs (Galaxy S20 Ultra), Bevy
+        // can pick GLES and its shaders fail over GLES, which renders every
+        // mesh magenta. Vulkan is well-supported on Adreno 660 and fixes the
+        // magenta. (If Vulkan isn't available the adapter init will log it.)
+        render_creation: bevy::render::settings::WgpuSettings {
+            backends: Some(bevy::render::settings::Backends::VULKAN),
+            ..default()
+        }
+        .into(),
         ..default()
     }));
     bevy_app.add_plugins(EguiPlugin::default());

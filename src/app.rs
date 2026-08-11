@@ -335,18 +335,28 @@ impl EditorApp {
 
         // Main work area.
         if self.active_tab == ActiveTab::Viewport3D {
+            // SOLID top control bar (guaranteed to render over the 3D): camera
+            // presets, distance/zoom, speed, up/down.
+            egui::TopBottomPanel::top("viewport_controls")
+                .exact_height(54.0)
+                .show(ctx, |ui| {
+                    self.show_viewport_controls(ui, orbit);
+                });
             // Transparent central panel: the Bevy 3D scene shows through and
             // this region senses drag/scroll to orbit the camera.
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
                 .show(ctx, |ui| {
-                    self.show_viewport_ui(ui, orbit);
+                    self.show_viewport_drag(ui, orbit);
                 });
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
                 match self.active_tab {
                     ActiveTab::Explorer => self.show_explorer_ui(ui),
-                    ActiveTab::Viewport3D => self.show_viewport_ui(ui, orbit),
+                    ActiveTab::Viewport3D => {
+                        self.show_viewport_controls(ui, orbit);
+                        self.show_viewport_drag(ui, orbit);
+                    }
                     ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
                     ActiveTab::Properties => self.show_properties_ui(ui),
                     ActiveTab::Insert => self.show_insert_ui(ui),
@@ -363,19 +373,18 @@ impl EditorApp {
 }
 
 impl EditorApp {
-    /// Live 3D viewport. The 3D scene is rendered by Bevy into the window
-    /// behind the egui UI; this tab fills the central area with transparent
-    /// drag/zoom controls that steer the Bevy `OrbitCam` camera.
-    fn show_viewport_ui(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
+    /// Camera control bar (always drawn on a solid panel so it's visible over
+    /// the 3D). Steers the Bevy `OrbitCam`.
+    fn show_viewport_controls(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
-            ui.label(RichText::new("🧊 3D Viewport (Bevy / OpenRBLX)").strong().color(Color32::from_rgb(0, 230, 255)));
+            ui.label(RichText::new("🧊 3D (Bevy)").strong().color(Color32::from_rgb(0, 230, 255)));
 
             if ui.button("📐 Iso").clicked() { orbit.yaw = 0.785; orbit.pitch = 0.45; }
             if ui.button("📐 Top").clicked() { orbit.yaw = 0.0; orbit.pitch = 1.54; }
             if ui.button("📐 Front").clicked() { orbit.yaw = 0.0; orbit.pitch = 0.15; }
             if ui.button("📐 Side").clicked() { orbit.yaw = std::f32::consts::PI * 0.5; orbit.pitch = 0.15; }
-            if ui.button("🎯 Focus Selected").clicked() {
+            if ui.button("🎯 Focus Sel").clicked() {
                 if let (Some(dom), Some(r)) = (&self.dom, self.selected) {
                     if let Some(inst) = dom.get_by_ref(r) {
                         if let Some(Variant::Vector3(v)) = inst.properties.get(&rbx_dom_weak::ustr("Position")) {
@@ -384,13 +393,30 @@ impl EditorApp {
                     }
                 }
             }
-            if ui.button("🔄 Reset Cam").clicked() { *orbit = crate::bevy_render::OrbitCam::default(); }
+            if ui.button("🔄 Reset").clicked() { *orbit = crate::bevy_render::OrbitCam::default(); }
+
+            ui.separator();
+
+            ui.label("📏 Dist:");
+            if ui.button("−").clicked() { orbit.dist = (orbit.dist * 0.85).max(2.0); }
+            ui.add(egui::Slider::new(&mut orbit.dist, 2.0..=2000.0).show_value(false));
+            if ui.button("+").clicked() { orbit.dist = (orbit.dist * 1.15).min(2000.0); }
+
+            ui.separator();
+
+            let mut speed = self.cam_move_speed;
+            ui.label("Speed:");
+            ui.add(egui::Slider::new(&mut speed, 1.0..=50.0).show_value(false));
+            self.cam_move_speed = speed;
+
+            if ui.button("⬆️ Up").clicked() { orbit.target[1] += speed; }
+            if ui.button("⬇️ Down").clicked() { orbit.target[1] -= speed; }
         });
+    }
 
-        ui.separator();
-
-        // Transparent drag area: orbit the Bevy camera. Because this fills the
-        // central panel, the Bevy 3D scene behind shows through.
+    /// Transparent drag area over the Bevy 3D scene: drag to orbit, scroll to
+    /// zoom.
+    fn show_viewport_drag(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
         let (rect, response) = ui.allocate_exact_size(
             ui.available_size().max(egui::vec2(220.0, 300.0)),
             egui::Sense::drag(),
@@ -400,41 +426,17 @@ impl EditorApp {
             orbit.yaw -= d.x * 0.008;
             orbit.pitch = (orbit.pitch + d.y * 0.008).clamp(-1.5, 1.5);
         }
-        // Pinch-zoom via scroll on the viewport.
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.0 {
-            orbit.dist = (orbit.dist - scroll * 0.1).clamp(5.0, 500.0);
+            orbit.dist = (orbit.dist - scroll * 0.1).clamp(2.0, 2000.0);
         }
-        // Paint a subtle border so the user can see the drag area.
+        // Subtle border so the user can see the drag area.
         ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 180, 255, 90)), egui::StrokeKind::Inside);
 
-        ui.separator();
-
-        // Camera control bar: zoom, distance (spacing), up/down, speed.
-        let mut dist = orbit.dist;
-        ui.horizontal_wrapped(|ui| {
-            ui.label("📏 Distance:");
-            if ui.button("−").clicked() { dist = (dist * 0.85).max(2.0); }
-            ui.add(egui::Slider::new(&mut dist, 2.0..=2000.0).text("studs"));
-            if ui.button("+").clicked() { dist = (dist * 1.15).min(2000.0); }
-        });
-        orbit.dist = dist.clamp(2.0, 2000.0);
-
-        // Camera move speed (used by Up/Down and pan) + spacing.
-        let mut speed = self.cam_move_speed;
-        ui.horizontal_wrapped(|ui| {
-            ui.label("🎛️ Speed:");
-            ui.add(egui::Slider::new(&mut speed, 1.0..=50.0).text("studs/step"));
-            ui.separator();
-            if ui.button("⬆️ Up").clicked() { orbit.target[1] += speed; }
-            if ui.button("⬇️ Down").clicked() { orbit.target[1] -= speed; }
-        });
-        self.cam_move_speed = speed;
-
         if self.dom.is_none() {
-            ui.label(RichText::new("Open a .rbxl/.rbxmx file to render its parts here.").weak());
-        } else {
-            ui.label(RichText::new("Drag to orbit · scroll to zoom. The scene is rendered live by the Bevy engine.").weak());
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("Open a .rbxl/.rbxmx file to render its parts here.").color(Color32::WHITE));
+            });
         }
     }
 
