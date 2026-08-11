@@ -1,8 +1,12 @@
 use crate::asset_downloader::{self, DiscoveredAsset};
 use crate::jni_bridge::{self, FileEvent};
 use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
-use crate::{explorer, lua_syntax, rbxl, schema, templates, viewport3d::{CameraPreset, Viewport3D}};
+use crate::{explorer, lua_syntax, rbxl, schema, templates, viewport3d::CameraPreset};
 use egui::{Color32, RichText};
+
+// The 3D viewport is rendered by the Bevy engine (GPU), a port of the OpenRBLX
+// renderer. It is the only viewport.
+type Viewport3D = crate::viewport3d_bevy::BevyViewport3D;
 use rbx_dom_weak::{
     types::{Color3, Color3uint8, Ref, Variant, Vector3},
     WeakDom,

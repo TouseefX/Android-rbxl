@@ -10,6 +10,11 @@ mod settings;
 mod templates;
 mod viewport3d;
 
+// Bevy GPU renderer: the 3D viewport's only renderer (port of the OpenRBLX
+// renderer to the Bevy engine).
+pub mod bevy_rbxl;
+mod viewport3d_bevy;
+
 // Pull AndroidApp from winit's re-export, not a direct android-activity
 // dependency -- this keeps the type identical to whatever version
 // winit/eframe use internally (see the comment in Cargo.toml).

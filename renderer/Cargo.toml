@@ -1,0 +1,33 @@
+# ============================================================================
+# bevy_rbxl — standalone Bevy renderer for .rbxl / .rbxmx / .rbxm places
+# ----------------------------------------------------------------------------
+# A self-contained, desktop-runnable port of OpenRBLX's 3D viewport renderer
+# using the Bevy engine.  It is intentionally independent of the Android app
+# crate (which is a `cdylib` with an `android_main` entry that won't build on a
+# normal OS), so you can validate the Bevy rendering here first.
+#
+# Build & run (from the repo root):
+#   cargo run --release --manifest-path renderer/Cargo.toml -- place.rbxl
+# or copy an .rbxl into renderer/ and:   cargo run --release -p bevy_rbxl
+#
+# Controls: left-drag = orbit, scroll = zoom, WASD/arrows = pan, Q/E = up/down.
+# ============================================================================
+[package]
+name = "bevy_rbxl"
+version = "0.1.0"
+edition = "2021"
+
+# Keep this crate out of the (Android) workspace and standalone.
+[workspace]
+
+[dependencies]
+bevy = "0.17"
+rbx_dom_weak = "3"
+rbx_binary = "1"
+rbx_xml = "1.0.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+flate2 = "1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3

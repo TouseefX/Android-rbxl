@@ -29,11 +29,32 @@ serde = { version = "1.0.229", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
+# Bevy engine: the 3D viewport's only renderer (GPU-accelerated port of the
+# OpenRBLX renderer). No x11/wayland (desktop system libs) and no bevy_winit
+# (eframe owns the window; Bevy renders offscreen), which also avoids a winit
+# version clash between eframe and Bevy.
+bevy = { version = "0.17", default-features = false, features = [
+    "bevy_asset",
+    "bevy_camera",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_image",
+    "bevy_light",
+    "bevy_mesh",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_state",
+    "bevy_window",
+    "multi_threaded",
+    "png",
+    "std",
+] }
+
 [package.metadata.android]
 package = "com.yourname.rbxleditor"
 apk_label = "rbxl Editor v3.0"
 apk_name = "rbxleditor"
-build_targets = ["aarch64-linux-android"]
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
 java_sources = "java"
 min_sdk_version = 24
 target_sdk_version = 34
