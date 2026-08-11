@@ -1,14 +1,9 @@
 use crate::asset_downloader::{self, DiscoveredAsset};
+use crate::bevy_render::OrbitCam;
 use crate::jni_bridge::{self, FileEvent};
 use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
 use crate::{explorer, lua_syntax, rbxl, schema, templates};
 use egui::{Color32, RichText};
-
-/// Fixed path (shared external storage) where the editor drops the current
-/// place for the standalone Bevy viewer app to pick up.
-pub const VIEWER_PLACE_PATH: &str = "/storage/emulated/0/rbxlviewer/current.rbxl";
-/// Package name of the standalone Bevy viewer app.
-pub const VIEWER_PACKAGE: &str = "com.yourname.rbxlviewer";
 use rbx_dom_weak::{
     types::{Color3, Color3uint8, Ref, Variant, Vector3},
     WeakDom,
@@ -45,6 +40,7 @@ pub struct OutputLog {
     pub time: String,
 }
 
+#[derive(bevy::prelude::Resource)]
 pub struct EditorApp {
     dom: Option<WeakDom>,
     selected: Option<Ref>,
@@ -103,6 +99,10 @@ pub struct EditorApp {
     // External edit mapping
     pending_external_edits: HashMap<u64, Ref>,
     next_external_id: u64,
+
+    // Bevy 3D scene rebuild flag: set when the opened place changes, cleared
+    // by the Bevy system that (re)builds the meshes.
+    needs_3d_rebuild: bool,
 }
 
 impl Default for EditorApp {
@@ -149,6 +149,7 @@ impl Default for EditorApp {
             output_logs: Vec::new(),
             pending_external_edits: HashMap::new(),
             next_external_id: 1,
+            needs_3d_rebuild: false,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
         RobloxApiClient::fetch_live_catalog_async("sword".into());
@@ -158,6 +159,33 @@ impl Default for EditorApp {
 }
 
 impl EditorApp {
+    /// Whether the Bevy 3D scene needs rebuilding (a place was just opened).
+    pub fn take_3d_rebuild(&mut self) -> bool {
+        let v = self.needs_3d_rebuild;
+        self.needs_3d_rebuild = false;
+        v
+    }
+
+    /// The currently loaded place (if any), for the Bevy scene builder.
+    pub fn dom(&self) -> Option<&WeakDom> {
+        self.dom.as_ref()
+    }
+
+    /// Load a place from raw file bytes (used at startup / desktop validation).
+    pub fn load_from_bytes(&mut self, bytes: Vec<u8>) {
+        match rbxl::load_place(bytes) {
+            Ok(dom) => {
+                self.dom = Some(dom);
+                self.selected = None;
+                self.needs_3d_rebuild = true;
+                self.status = "Loaded".into();
+            }
+            Err(e) => {
+                self.status = format!("Failed to parse: {e}");
+            }
+        }
+    }
+
     fn log_info(&mut self, msg: impl Into<String>) {
         self.output_logs.push(OutputLog {
             level: "INFO",
@@ -175,31 +203,37 @@ impl EditorApp {
     }
 }
 
-impl eframe::App for EditorApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl EditorApp {
+    /// Render the whole editor UI into the bevy_egui `egui::Context`. `orbit`
+    /// is the Bevy viewport camera, steered by the 3D tab. Runs each frame from
+    /// a Bevy system.
+    pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
         self.drain_events();
 
         // Custom Roblox Studio Lite Theme styling
-        ui.style_mut().visuals.panel_fill = Color32::from_rgb(30, 30, 30);
-        ui.style_mut().visuals.window_fill = Color32::from_rgb(37, 37, 38);
+        ctx.style_mut(|style| {
+            style.visuals.panel_fill = Color32::from_rgb(30, 30, 30);
+            style.visuals.window_fill = Color32::from_rgb(37, 37, 38);
+        });
 
-        let top_frame = egui::Frame::side_top_panel(ui.style())
-            .inner_margin(egui::Margin {
-                top: 48,
-                bottom: 6,
-                left: 10,
-                right: 10,
-            });
+        let style = ctx.style();
+
+        let top_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
+            top: 48,
+            bottom: 6,
+            left: 10,
+            right: 10,
+        });
 
         // Top Studio Toolbar
-        egui::Panel::top("toolbar")
+        egui::TopBottomPanel::top("toolbar")
             .frame(top_frame)
-            .show_inside(ui, |ui| {
+            .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
 
-                    ui.label(RichText::new("v3.0.0 • OpenRBLX").strong().color(Color32::from_rgb(0, 230, 255)));
+                    ui.label(RichText::new("v3.1.0 • OpenRBLX • Bevy").strong().color(Color32::from_rgb(0, 230, 255)));
 
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();
@@ -236,20 +270,18 @@ impl eframe::App for EditorApp {
             });
 
         // Studio Navigation Tabs Bar
-        let available_width = ui.available_width();
-        let is_landscape = available_width > 650.0;
+        let is_landscape = ctx.available_rect().width() > 650.0;
 
-        let nav_frame = egui::Frame::side_top_panel(ui.style())
-            .inner_margin(egui::Margin {
-                top: 4,
-                bottom: 4,
-                left: 10,
-                right: 10,
-            });
+        let nav_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
+            top: 4,
+            bottom: 4,
+            left: 10,
+            right: 10,
+        });
 
-        egui::Panel::top("nav_tabs")
+        egui::TopBottomPanel::top("nav_tabs")
             .frame(nav_frame)
-            .show_inside(ui, |ui| {
+            .show(ctx, |ui| {
                 egui::ScrollArea::horizontal()
                     .id_salt("nav_tabs_scroll")
                     .show(ui, |ui| {
@@ -284,36 +316,30 @@ impl eframe::App for EditorApp {
                     });
             });
 
-        // Main Studio Work Area
+        // Landscape: Explorer on the left.
         if is_landscape {
-            // Landscape layout: Explorer on left, active view on right
-            egui::Panel::left("landscape_left")
+            egui::SidePanel::left("landscape_left")
                 .resizable(true)
-                .default_size(280.0)
-                .show_inside(ui, |ui| {
+                .default_width(280.0)
+                .show(ctx, |ui| {
                     self.show_explorer_ui(ui);
                 });
+        }
 
-            egui::CentralPanel::default().show_inside(ui, |ui| {
-                match self.active_tab {
-                    ActiveTab::Explorer | ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
-                    ActiveTab::Viewport3D => self.show_viewport_ui(ui),
-                    ActiveTab::Properties => self.show_properties_ui(ui),
-                    ActiveTab::Insert => self.show_insert_ui(ui),
-                    ActiveTab::Toolbox => self.show_toolbox_ui(ui),
-                    ActiveTab::Snippets => self.show_snippets_ui(ui),
-                    ActiveTab::Assets => self.show_assets_ui(ui),
-                    ActiveTab::OpenCloud => self.show_open_cloud_ui(ui),
-                    ActiveTab::Output => self.show_output_ui(ui),
-                    ActiveTab::Settings => self.show_settings_ui(ui),
-                }
-            });
+        // Main work area.
+        if self.active_tab == ActiveTab::Viewport3D {
+            // Transparent central panel: the Bevy 3D scene shows through and
+            // this region senses drag/scroll to orbit the camera.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
+                .show(ctx, |ui| {
+                    self.show_viewport_ui(ui, orbit);
+                });
         } else {
-            // Portrait layout: Full-width dedicated tab view
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::CentralPanel::default().show(ctx, |ui| {
                 match self.active_tab {
                     ActiveTab::Explorer => self.show_explorer_ui(ui),
-                    ActiveTab::Viewport3D => self.show_viewport_ui(ui),
+                    ActiveTab::Viewport3D => self.show_viewport_ui(ui, orbit),
                     ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
                     ActiveTab::Properties => self.show_properties_ui(ui),
                     ActiveTab::Insert => self.show_insert_ui(ui),
@@ -330,60 +356,60 @@ impl eframe::App for EditorApp {
 }
 
 impl EditorApp {
-    fn show_viewport_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("🌍 3D View in Bevy");
-        ui.label("The 3D viewport is rendered by the separate GPU app \"rbxl Viewer\", a Bevy port of the OpenRBLX renderer that opens full-screen on your device.");
-        ui.separator();
-
+    /// Live 3D viewport. The 3D scene is rendered by Bevy into the window
+    /// behind the egui UI; this tab fills the central area with transparent
+    /// drag/zoom controls that steer the Bevy `OrbitCam` camera.
+    fn show_viewport_ui(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(self.dom.is_some(), egui::Button::new("🚀 View in Bevy"))
-                .on_hover_text("Save the current place and open it in the Bevy GPU viewer")
-                .clicked()
-            {
-                self.export_and_launch_viewer();
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+            ui.label(RichText::new("🧊 3D Viewport (Bevy / OpenRBLX)").strong().color(Color32::from_rgb(0, 230, 255)));
+
+            if ui.button("📐 Iso").clicked() { orbit.yaw = 0.785; orbit.pitch = 0.45; }
+            if ui.button("📐 Top").clicked() { orbit.yaw = 0.0; orbit.pitch = 1.54; }
+            if ui.button("📐 Front").clicked() { orbit.yaw = 0.0; orbit.pitch = 0.15; }
+            if ui.button("📐 Side").clicked() { orbit.yaw = std::f32::consts::PI * 0.5; orbit.pitch = 0.15; }
+            if ui.button("🎯 Focus Selected").clicked() {
+                if let (Some(dom), Some(r)) = (&self.dom, self.selected) {
+                    if let Some(inst) = dom.get_by_ref(r) {
+                        if let Some(Variant::Vector3(v)) = inst.properties.get(&rbx_dom_weak::ustr("Position")) {
+                            orbit.target = [v.x, v.y, v.z];
+                        }
+                    }
+                }
             }
+            if ui.button("🔄 Reset Cam").clicked() { *orbit = crate::bevy_render::OrbitCam::default(); }
         });
 
         ui.separator();
 
-        if self.dom.is_none() {
-            ui.label(RichText::new("Open a .rbxl/.rbxmx file first to enable the viewer.").weak());
-        } else {
-            ui.label(format!(
-                "On tap, the current place is written to\n{} and then \"rbxl Viewer\" is launched.",
-                VIEWER_PLACE_PATH
-            ));
-            ui.label(RichText::new("Make sure \"rbxl Viewer\" is installed, and grant both apps \"All files access\" in Android settings.").weak());
+        // Transparent drag area: orbit the Bevy camera. Because this fills the
+        // central panel, the Bevy 3D scene behind shows through.
+        let (rect, response) = ui.allocate_exact_size(
+            ui.available_size().max(egui::vec2(220.0, 300.0)),
+            egui::Sense::drag(),
+        );
+        if response.dragged() {
+            let d = response.drag_delta();
+            orbit.yaw -= d.x * 0.008;
+            orbit.pitch = (orbit.pitch + d.y * 0.008).clamp(-1.5, 1.5);
         }
-    }
+        // Pinch-zoom via scroll on the viewport.
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.0 {
+            orbit.dist = (orbit.dist - scroll * 0.1).clamp(5.0, 500.0);
+        }
+        // Paint a subtle border so the user can see the drag area.
+        ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 180, 255, 90)), egui::StrokeKind::Inside);
 
-    /// Save the current place to the shared path and launch the Bevy viewer app.
-    fn export_and_launch_viewer(&mut self) {
-        let Some(dom) = self.dom.as_ref() else {
-            self.status = "Open a place first".into();
-            return;
-        };
-        match rbxl::save_place(dom) {
-            Ok(bytes) => {
-                // Create the shared directory if needed, then write the place.
-                if let Some(dir) = std::path::Path::new(VIEWER_PLACE_PATH).parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if let Err(e) = std::fs::write(VIEWER_PLACE_PATH, bytes) {
-                    self.status = format!("Export failed: {e}");
-                    return;
-                }
-                self.status = "Place exported — launching Bevy viewer...".into();
-                match jni_bridge::launch_viewer(VIEWER_PACKAGE) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        self.status = format!("Exported, but could not launch viewer: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                self.status = format!("Export failed: {e}");
-            }
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("⬆️ Up").clicked() { orbit.target[1] += 4.0; }
+            if ui.button("⬇️ Down").clicked() { orbit.target[1] -= 4.0; }
+        });
+        if self.dom.is_none() {
+            ui.label(RichText::new("Open a .rbxl/.rbxmx file to render its parts here.").weak());
+        } else {
+            ui.label(RichText::new("Drag to orbit · scroll to zoom. The scene is rendered live by the Bevy engine.").weak());
         }
     }
 
@@ -1720,6 +1746,7 @@ impl EditorApp {
                         self.current_uri = Some(uri.clone());
                         self.selected = None;
                         self.open_tabs.clear();
+                        self.needs_3d_rebuild = true;
                         self.status = format!("Loaded ({count} top-level services)");
                         self.log_info(format!("Opened place: {uri} ({count} services)"));
                         self.active_tab = ActiveTab::Explorer;

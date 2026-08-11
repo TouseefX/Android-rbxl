@@ -55,7 +55,7 @@ jobs:
         with:
           tool: cargo-apk2,cargo-ndk
 
-      - name: Build editor APK
+      - name: Build APK (single Bevy app)
         run: |
           export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android30-clang"
           export CC_armv7_linux_androideabi="$TOOLCHAIN/armv7a-linux-androideabi30-clang"
@@ -64,115 +64,26 @@ jobs:
           export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$TOOLCHAIN/armv7a-linux-androideabi30-clang"
           export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TOOLCHAIN/x86_64-linux-android30-clang"
 
-          # egui editor (root crate).
+          # Single app: Bevy owns the window (GPU 3D viewport) and the egui
+          # editor UI runs inside it via bevy_egui.
           cargo apk2 build --lib
 
-      - name: Collect editor APK
+      - name: Collect APK
         shell: bash
         run: |
           set -euo pipefail
           APK="$(find target -type f -name '*.apk' | head -n 1)"
           if [ -z "$APK" ]; then
-            echo "editor APK not found."
+            echo "APK not found."
             exit 1
           fi
           mkdir -p dist
           cp "$APK" dist/rbxleditor.apk
           ls -lh dist/rbxleditor.apk
 
-      # ---- Bevy viewer app (the actual GPU 3D renderer) ----
-      - name: Build Bevy viewer APK
-        run: |
-          export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android30-clang"
-          export CC_armv7_linux_androideabi="$TOOLCHAIN/armv7a-linux-androideabi30-clang"
-          export CC_x86_64_linux_android="$TOOLCHAIN/x86_64-linux-android30-clang"
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/aarch64-linux-android30-clang"
-          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$TOOLCHAIN/armv7a-linux-androideabi30-clang"
-          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TOOLCHAIN/x86_64-linux-android30-clang"
-
-          # Bevy GPU viewer (viewer/ crate). Uses a separate target dir so it
-          # doesn't clash with the editor build.
-          CARGO_TARGET_DIR=target-viewer cargo apk2 build --lib --manifest-path viewer/Cargo.toml
-
-      - name: Collect Bevy viewer APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          APK="$(find target-viewer -type f -name '*.apk' | head -n 1)"
-          if [ -z "$APK" ]; then
-            echo "viewer APK not found."
-            exit 1
-          fi
-          cp "$APK" dist/rbxlviewer.apk
-          ls -lh dist/rbxlviewer.apk
-
-      # ---- Bundle both APKs into a single installable .xapk ----
-      # XAPK = a ZIP that XAPK installer apps (APKPure, APKcombo, XAPK
-      # Installer, etc.) know how to install. It contains both APKs plus a
-      # manifest and icon, so you download ONE file instead of two.
-      - name: Package XAPK
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p xapk
-          cp dist/rbxleditor.apk xapk/rbxleditor.apk
-          cp dist/rbxlviewer.apk xapk/rbxlviewer.apk
-
-          # Generate a simple icon (a valid PNG) so installers are happy.
-          python3 - <<'PY'
-          import zlib, struct, base64
-          # 192x192 RGBA, fill with a blue-ish colour.
-          w = h = 192
-          rows = b""
-          for y in range(h):
-              rows += b"\x00"
-              for x in range(w):
-                  rows += bytes((40, 106, 220, 255))  # (r,g,b,a)
-          def chunk(typ, data):
-              c = struct.pack(">I", len(data)) + typ + data
-              return c + struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff)
-          png = b"\x89PNG\r\n\x1a\n"
-          png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
-          png += chunk(b"IDAT", zlib.compress(rows))
-          png += chunk(b"IEND", b"")
-          open("xapk/icon.png", "wb").write(png)
-          PY
-
-          # XAPK v2 manifest (APKPure-compatible).
-          cat > xapk/manifest.json <<'JSON'
-          {
-            "xapk_version": 2,
-            "package_name": "com.yourname.rbxleditor",
-            "name": "rbxl Editor + Bevy Viewer",
-            "version_code": "1",
-            "version_name": "1.0",
-            "min_sdk_version": "24",
-            "target_sdk_version": "34",
-            "split_apks": ["rbxleditor.apk", "rbxviewer.apk"]
-          }
-          JSON
-
-          # APKPure also accepts manifest.xml; include it for wider compatibility.
-          cat > xapk/manifest.xml <<'XML'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest>
-            <package id="com.yourname.rbxleditor" versionCode="1" versionName="1.0">
-              <splits>
-                <split name="editor" value="rbxleditor.apk"/>
-                <split name="viewer" value="rbxviewer.apk"/>
-              </splits>
-            </package>
-            <uses-sdk minSdkVersion="24" targetSdkVersion="34"/>
-          </manifest>
-          XML
-
-          cd xapk && zip -qr ../dist/rbxleditor-all.xapk .
-          cd ..
-          ls -lh dist/rbxleditor-all.xapk
-
-      - name: Upload APKs
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: apks
-          path: dist/
+          name: rbxleditor.apk
+          path: dist/rbxleditor.apk
           if-no-files-found: error

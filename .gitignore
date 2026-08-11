@@ -1,6 +1,4 @@
 /target
-/target-viewer
 /renderer/target
-/viewer/target
 **/*.rs.bk
 *.apk

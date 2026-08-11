@@ -1,25 +1,21 @@
 // ============================================================================
-// bevy_rbxl — standalone Bevy renderer for Roblox place/model files
+// bevy_render.rs — the Bevy 3D renderer for the editor
 // ----------------------------------------------------------------------------
-// A self-contained port of OpenRBLX's 3D viewport renderer to the Bevy engine.
-// Renders .rbxl / .rbxmx / .rbxm with GPU lighting, correct part shapes,
-// per-face decals and (if the mesh/asset files exist locally) MeshParts.
+// A port of OpenRBLX's 3D viewport renderer to the Bevy engine. Bevy owns the
+// window (so it gets a GPU context on Android) and renders the place geometry
+// with GPU lighting; the egui editor UI is drawn on top via bevy_egui.
 //
-// Coordinate handling matches the Android app: Roblox is left-handed, Bevy is
-// right-handed, so we flip the Z axis on every world vertex/normal and use
-// two-sided materials (cull_mode: None) to avoid winding/backface problems.
+// Coordinate handling: Roblox is left-handed, Bevy is right-handed, so we flip
+// the Z axis on every world vertex/normal and use two-sided materials
+// (cull_mode: None) to avoid winding/backface problems.
 // ============================================================================
 
 use bevy::asset::RenderAssetUsages;
-use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::math::Vec3 as BVec3;
 use bevy::mesh::{Indices, Mesh};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat};
-use rbx_dom_weak::{
-    types::Variant,
-    WeakDom,
-};
+use rbx_dom_weak::{types::Variant, WeakDom};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -186,24 +182,6 @@ fn push_tri(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 3], n: Vec3, uv: [[f32; 
 // ----------------------------------------------------------------------------
 // Place loading
 // ----------------------------------------------------------------------------
-
-fn decode_place(bytes: &[u8]) -> anyhow::Result<WeakDom> {
-    let payload: Vec<u8> = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-        let mut out = Vec::new();
-        let mut dec = flate2::read::GzDecoder::new(bytes);
-        std::io::Read::read_to_end(&mut dec, &mut out)?;
-        out
-    } else {
-        bytes.to_vec()
-    };
-    if let Ok(dom) = rbx_binary::from_reader(std::io::Cursor::new(&payload)) {
-        return Ok(dom);
-    }
-    if let Ok(dom) = rbx_xml::from_reader_default(std::io::Cursor::new(&payload)) {
-        return Ok(dom);
-    }
-    anyhow::bail!("unrecognized roblox file format")
-}
 
 // ----------------------------------------------------------------------------
 // Geometry extraction
@@ -663,83 +641,41 @@ fn tex_key_for_tri(tris: &Vec<Tri>) -> HashMap<String, (u32, u32, Vec<u8>)> {
 }
 
 // ----------------------------------------------------------------------------
-// App
+// Editor integration
 // ----------------------------------------------------------------------------
 
-#[derive(Resource)]
-struct DomResource(WeakDom);
-
+/// Marker for the 3D camera (so the orbit update only affects the viewport cam).
 #[derive(Component)]
-struct SceneRoot;
+pub struct RbxCamera;
 
-#[derive(Resource, Default)]
-struct OrbitCam {
-    yaw: f32,
-    pitch: f32,
-    dist: f32,
-    target: [f32; 3],
+/// Marker for the scene root (so the whole scene can be despawned on reload).
+#[derive(Component)]
+pub struct RbxSceneRoot;
+
+/// Orbit camera state, driven by egui drags on the 3D viewport tab.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct OrbitCam {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub dist: f32,
+    pub target: [f32; 3],
 }
 
-/// Decode a Roblox place/model file and run the Bevy viewer for it.
-pub fn run_game(bytes: &[u8]) {
-    let dom = match decode_place(bytes) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("cannot parse place: {e}");
-            return;
-        }
-    };
-
-    let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "bevy_rbxl — OpenRBLX renderer".into(),
-            resolution: (1280, 800).into(),
-            ..default()
-        }),
-        ..default()
-    }));
-    app.insert_resource(DomResource(dom));
-    app.insert_resource(OrbitCam { yaw: 0.785, pitch: 0.45, dist: 65.0, target: [0.0, 6.0, 0.0] });
-    app.insert_resource(ClearColor(Color::srgb(0.45, 0.66, 0.95)));
-    app.insert_resource(bevy::light::AmbientLight {
-        color: Color::WHITE,
-        brightness: 400.0,
-        ..default()
-    });
-    app.add_systems(Startup, (setup_scene, spawn_camera, spawn_light));
-    app.add_systems(Update, (orbit_input, update_camera));
-    app.run();
+impl Default for OrbitCam {
+    fn default() -> Self {
+        Self { yaw: 0.785, pitch: 0.45, dist: 65.0, target: [0.0, 6.0, 0.0] }
+    }
 }
 
-/// Run an empty viewer window (e.g. when the place file couldn't be read).
-/// Avoids a confusing black screen by showing a dark sky and logging the error.
-pub fn run_empty(message: String) {
-    log::error!("rbxl-viewer: {message}");
-    let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "rbxl-viewer".into(),
-            resolution: (1280, 800).into(),
-            ..default()
-        }),
-        ..default()
-    }));
-    app.insert_resource(OrbitCam { yaw: 0.785, pitch: 0.45, dist: 65.0, target: [0.0, 6.0, 0.0] });
-    app.insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.10)));
-    app.add_systems(Startup, (spawn_camera, spawn_light));
-    app.add_systems(Update, update_camera);
-    app.run();
-}
-
-fn spawn_camera(mut commands: Commands) {
+/// Spawn the viewport camera + sun light. The camera is tagged `RbxCamera`.
+pub fn spawn_camera_and_light(mut commands: Commands) {
+    let cam = OrbitCam::default();
+    let (eye_b, target_b) = orbit_eye_target(&cam);
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(60.0, 30.0, 60.0).looking_at(BVec3::ZERO, BVec3::Y),
+        Transform::from_translation(eye_b).looking_at(target_b, BVec3::Y),
+        RbxCamera,
     ));
-}
-
-fn spawn_light(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             illuminance: 30_000.0,
@@ -750,20 +686,30 @@ fn spawn_light(mut commands: Commands) {
     ));
 }
 
-fn setup_scene(
-    mut commands: Commands,
-    dom: Res<DomResource>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    let parts = extract_geometry(&dom.0);
-    if parts.is_empty() {
-        eprintln!("no renderable parts found");
-        return;
-    }
+/// Convert S-space orbit state to Bevy eye/target (Z-flip).
+pub fn orbit_eye_target(cam: &OrbitCam) -> (BVec3, BVec3) {
+    let (sp, cp) = cam.pitch.sin_cos();
+    let (sy, cy) = cam.yaw.sin_cos();
+    let eye_s = [
+        cam.target[0] + cam.dist * cp * sy,
+        cam.target[1] + cam.dist * sp,
+        cam.target[2] + cam.dist * cp * cy,
+    ];
+    let eye = BVec3::new(eye_s[0], eye_s[1], -eye_s[2]);
+    let target = BVec3::new(cam.target[0], cam.target[1], -cam.target[2]);
+    (eye, target)
+}
 
-    // Pre-load textures used by decals / mesh texture ids.
+/// Despawn the old scene and build fresh meshes for `dom`. Called whenever the
+/// opened place changes.
+pub fn rebuild_scene(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    dom: &WeakDom,
+) {
+    let parts = extract_geometry(dom);
     let mut tex_cache: HashMap<String, Handle<Image>> = HashMap::new();
     for p in &parts {
         for (k, (w, h, rgba)) in tex_key_for_tri(&p.tris) {
@@ -778,7 +724,7 @@ fn setup_scene(
         }
     }
 
-    let root = commands.spawn(SceneRoot).id();
+    let root = commands.spawn(RbxSceneRoot).id();
 
     // Bucket by (tex, color, alpha).
     type Key = (Option<String>, [u8; 3], u8);
@@ -837,64 +783,13 @@ fn setup_scene(
         });
     }
 
-    println!("rendered {} parts", parts.len());
+    log::info!("Bevy: rendered {} parts", parts.len());
 }
 
-fn orbit_input(
-    mut cam: ResMut<OrbitCam>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut motion: EventReader<MouseMotion>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut scroll: EventReader<MouseWheel>,
-    time: Res<Time>,
-) {
-    if buttons.pressed(MouseButton::Left) {
-        for e in motion.read() {
-            cam.yaw -= e.delta.x * 0.005;
-            cam.pitch = (cam.pitch - e.delta.y * 0.005).clamp(-1.5, 1.5);
-        }
-    }
-    for e in scroll.read() {
-        cam.dist = (cam.dist - e.y * 0.5).clamp(5.0, 500.0);
-    }
-    let speed = 30.0 * time.delta_secs();
-    let (sy, cy) = cam.yaw.sin_cos();
-    if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
-        cam.target[0] -= sy * speed;
-        cam.target[2] -= cy * speed;
-    }
-    if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) {
-        cam.target[0] += sy * speed;
-        cam.target[2] += cy * speed;
-    }
-    if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft) {
-        cam.target[0] -= cy * speed;
-        cam.target[2] += sy * speed;
-    }
-    if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
-        cam.target[0] += cy * speed;
-        cam.target[2] -= sy * speed;
-    }
-    if keys.pressed(KeyCode::KeyQ) {
-        cam.target[1] += speed;
-    }
-    if keys.pressed(KeyCode::KeyE) {
-        cam.target[1] -= speed;
-    }
-}
-
-fn update_camera(mut q: Query<&mut Transform, With<Camera3d>>, cam: Res<OrbitCam>) {
-    let (sp, cp) = cam.pitch.sin_cos();
-    let (sy, cy) = cam.yaw.sin_cos();
-    let eye_s = [
-        cam.target[0] + cam.dist * cp * sy,
-        cam.target[1] + cam.dist * sp,
-        cam.target[2] + cam.dist * cp * cy,
-    ];
-    // Z-flip to Bevy world (matches geometry).
-    let eye = BVec3::new(eye_s[0], eye_s[1], -eye_s[2]);
-    let target = BVec3::new(cam.target[0], cam.target[1], -cam.target[2]);
+/// Keep the viewport camera in sync with the `OrbitCam` resource each frame.
+pub fn update_camera(mut q: Query<&mut Transform, With<RbxCamera>>, cam: Res<OrbitCam>) {
+    let (eye_b, target_b) = orbit_eye_target(&cam);
     for mut t in &mut q {
-        *t = Transform::from_translation(eye).looking_at(target, BVec3::Y);
+        *t = Transform::from_translation(eye_b).looking_at(target_b, BVec3::Y);
     }
 }

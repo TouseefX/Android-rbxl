@@ -70,38 +70,44 @@ java/.../MainActivity.java                    SAF file picker + external-edit ro
    has no meaningful representation on the Java side.
 ---
 
-## Bevy 3D Viewer (port of OpenRBLX's renderer)
+## Bevy 3D Viewport (single Bevy app + bevy_egui)
 
-This adds a GPU-accelerated 3D renderer powered by the **Bevy engine**, a direct
-port of the geometry/shape/decal/material logic from **OpenRBLX**
+The whole editor is now **one Bevy app** with a GPU-accelerated 3D viewport, a
+direct port of the geometry/shape/decal/material logic from **OpenRBLX**
 (`TornadoCookie/OpenRBLX`, a C/raylib Roblox-engine recreation).
 
-### Architecture (two apps)
+### Why this architecture
 
-Trying to embed Bevy *inside* the egui editor fails on Android: Bevy can't get
-its own GPU context inside eframe's window. So the renderer is a **separate
-native Bevy app** that opens full-screen, which is the supported way Bevy runs
-on Android (a `NativeActivity`, `android-native-activity` feature, compatible
-with `cargo-apk2`).
+The previous attempts failed because of a fundamental Android constraint:
+
+- Embedding Bevy *inside* an **eframe/egui** window failed — Bevy can't get its
+  own GPU context inside a window eframe already owns.
+- A **two-app** split (editor + separate Bevy viewer) added install/launch
+  friction.
+
+The fix: **Bevy owns the whole app/window** (so it gets a GPU context and
+renders the 3D viewport natively on Android), and the **egui editor UI runs
+inside Bevy** via the `bevy_egui` crate, drawn over the 3D scene. One app.
 
 ```
-┌─────────────── rbxleditor.apk ───────────────┐   ┌──────── rbxlviewer.apk ────────┐
-│  egui editor (script/property editing)        │   │   Bevy GPU renderer            │
-│   "🚀 View in Bevy" button ── writes ────────┼──▶│   full-screen orbit camera      │
-│   current.rbxl to shared storage, then        │   │   (OpenRBLX-style rendering)   │
-│   launches rbxlviewer                         │   │                                │
-└───────────────────────────────────────────────┘   └────────────────────────────────┘
+┌────────────────────── rbxleditor.apk (ONE Bevy app) ──────────────────────┐
+│  bevy_egui editor UI (toolbar · tabs · explorer · properties · scripts)    │
+│  ─────────────── 3D viewport rendered natively by Bevy (GPU) ─────────────  │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### What's where
 
 | File | Purpose |
 | --- | --- |
-| `viewer/` | **Bevy GPU viewer app** (Android, `rbxlviewer.apk`). Owns its own window and renders the place full-screen with orbit controls. The real deliverable. |
-| `viewer/src/render.rs` | The ported OpenRBLX renderer: `WeakDom` → Bevy meshes (Block/Ball/Cylinder/Wedge/CornerWedge/Truss, colours, transparency, per-face decals, MeshParts from local assets). |
-| `renderer/` | **Desktop** version of the same renderer, for validation without a phone. |
-| `src/app.rs` / `src/jni_bridge.rs` / `MainActivity.java` | Editor's "🚀 View in Bevy": exports the current place to `/storage/emulated/0/rbxlviewer/current.rbxl` and launches `rbxlviewer`. |
+| `src/bevy_render.rs` | The ported OpenRBLX renderer: `WeakDom` → Bevy meshes (Block/Ball/Cylinder/Wedge/CornerWedge/Truss, colours, transparency, MeshParts from local assets) + orbit camera. |
+| `src/app.rs` | `EditorApp` (a Bevy `Resource`) with the full egui editor UI. `draw_editor(ctx, orbit)` lays out the panels; the 3D tab is a transparent drag area that steers the Bevy camera. |
+| `src/lib.rs` | Bevy app setup (`DefaultPlugins` + `EguiPlugin` + systems) and `#[bevy_main]` Android entry. |
+| `src/main_desktop.rs` | Desktop runner to validate the whole editor on a normal OS. |
+| `renderer/` | Minimal standalone Bevy renderer (kept for quick headless checks). |
 
-The old CPU software rasterizer and the failed embedded-Bevy experiment are
-removed from the editor.
+`bevy_egui 0.38` + `bevy 0.17` (egui 0.33). `egui` is pinned to the same
+version bevy_egui uses so the editor's egui code resolves to identical types.
 
 ### Coordinate handling
 
@@ -109,56 +115,36 @@ Roblox places are **left-handed**; Bevy is **right-handed**. Every world
 vertex/normal is Z-flipped (`x,y,z → x,y,-z`) to match, and materials are
 two-sided (`cull_mode: None`) so winding/backface issues never appear.
 
-### Validate on desktop (recommended)
+### Validate on desktop
 
 ```sh
-cargo run --release --manifest-path renderer/Cargo.toml -- path/to/place.rbxl
+cargo run --bin rbxl-editor-desktop -- path/to/place.rbxl
 ```
 
-Controls: left-drag = orbit, scroll = zoom, WASD/arrows = pan, Q/E = up/down.
+Opens the full editor (Bezy 3D + egui panels) in a desktop window.
 
 ### Build & install (GitHub Actions — you have no PC)
 
-Run the **Build Android APK** workflow. It produces **three** downloadable
-files:
+Run the **Build Android APK** workflow. It produces **one** file:
+`rbxleditor.apk` (the single Bevy app). Install it normally.
 
-- `rbxleditor.apk` — the egui editor.
-- `rbxviewer.apk` — the Bevy GPU viewer.
-- **`rbxleditor-all.xapk`** — **both apps bundled into ONE file** (see below).
-
-#### Option 1 (single file, easiest): install the XAPK
-`rbxleditor-all.xapk` contains both APKs plus a manifest and icon. Install it
-with a free **XAPK installer** app from the Play Store (e.g. *APKPure*,
-*APKcombo*, or *XAPK Installer*):
-1. Install an XAPK installer app.
-2. Download `rbxleditor-all.xapk` and open it with that installer.
-3. It installs both `rbxl Editor` and `rbxl Viewer`.
-
-> **Caveat:** because these are two *separate* apps, the XAPK bundles them as
-> two install targets — it is **not** a Google-Play-style split APK of one app.
-> Most XAPK installers handle this fine. If your installer refuses, fall back
-> to Option 2.
-
-#### Option 2 (manual): install the two APKs separately
-1. Install `rbxleditor.apk` **and** `rbxviewer.apk`.
-2. Grant **both** apps "All files access" (Settings → Apps → Special access → All files access) — they need it to read/write `/storage/emulated/0/rbxlviewer/current.rbxl`.
-3. Open a `.rbxl`/`.rbxmx` in the editor, tap **🚀 View in Bevy**. The place is saved and `rbxlviewer` opens it full-screen in 3D.
+1. Install `rbxleditor.apk`.
+2. Grant it "All files access" (Settings → Apps → Special access → All files access) if you want to read/write places outside the SAF picker.
+3. Open the app, tap **📂 Open .rbxl** (uses Android's document picker), choose a `.rbxl`/`.rbxmx`.
+4. The **🌍 3D Viewport** tab renders the place live with the Bevy engine (drag to orbit, scroll/pinch to zoom).
 
 ### Build locally
 
 ```sh
-# editor
 cargo apk2 build --lib
-# Bevy viewer
-cd viewer && cargo apk2 build --lib
 ```
 
-> **Compile status.** The Bevy viewer (`viewer/`) and desktop renderer
-> (`renderer/`) type-check against **Bevy 0.17** (`cargo check` passes). The
-> Android *behavior* (NativeActivity + full-screen rendering on a real device)
-> still needs a device test — I can't run an Android GPU here. If the viewer
-> opens but shows nothing, check logcat (`adb logcat`) for the Bevy/render
-> error. If you bump Bevy versions, watch: `Mesh3d`/`MeshMaterial3d`,
-> `Color::srgba`, `Image::new`, `insert_indices`, `AmbientLight`, and the
-> android entry (`#[bevy_main]`). Bevy is heavy; a `--release` build takes
-> several minutes.
+> **Compile status.** The full editor (Bevy 0.17 + bevy_egui 0.38 + egui 0.33)
+> type-checks on desktop via `cargo check --bin rbxl-editor-desktop` (passes).
+> The Android *behavior* (NativeActivity + on-device GPU) still needs a device
+> test — I can't run an Android GPU here. If it opens but the viewport is
+> blank, check logcat (`adb logcat`) for Bevy/render errors. If you bump Bevy
+> versions, watch: `Mesh3d`/`MeshMaterial3d`, `Color::srgba`, `Image::new`,
+> `insert_indices`, `AmbientLight`, the `bevy_egui` pairing, and the android
+> entry (`#[bevy_main]`). Bevy is heavy; a `--release` build takes several
+> minutes.
