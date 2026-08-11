@@ -61,7 +61,12 @@ bevy = { version = "0.17", default-features = false, features = [
 # egui inside Bevy (re-exports its own egui 0.33). 0.38 targets Bevy 0.17.
 # Use `bevy_egui::egui::...` directly — no separate `egui` dependency, so the
 # editor always uses exactly the egui version bevy_egui was built against.
-bevy_egui = { version = "0.38", default-features = false, features = ["default_fonts"] }
+# CRITICAL: `render` must be enabled — that's the feature that actually draws
+# egui to the screen. `bevy_ui` is also part of the default and needed for the
+# egui UI to composite. Without them egui runs but shows nothing (only Bevy's
+# clear color). We skip manage_clipboard/open_url/picking to avoid pulling
+# webbrowser/bevy_picking onto Android.
+bevy_egui = { version = "0.38", default-features = false, features = ["render", "bevy_ui", "default_fonts"] }
 
 # ----------------------------------------------------------------------------
 # Release profile — keeps the APK small WITHOUT losing the ability to debug.
