@@ -104,6 +104,9 @@ pub struct EditorApp {
     // Bevy 3D scene rebuild flag: set when the opened place changes, cleared
     // by the Bevy system that (re)builds the meshes.
     needs_3d_rebuild: bool,
+
+    // 3D viewport camera move speed (studs/step for Up/Down/pan).
+    cam_move_speed: f32,
 }
 
 impl Default for EditorApp {
@@ -151,6 +154,7 @@ impl Default for EditorApp {
             pending_external_edits: HashMap::new(),
             next_external_id: 1,
             needs_3d_rebuild: false,
+            cam_move_speed: 4.0,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
         RobloxApiClient::fetch_live_catalog_async("sword".into());
@@ -403,10 +407,28 @@ impl EditorApp {
         ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 180, 255, 90)), egui::StrokeKind::Inside);
 
         ui.separator();
+
+        // Camera control bar: zoom, distance (spacing), up/down, speed.
+        let mut dist = orbit.dist;
         ui.horizontal_wrapped(|ui| {
-            if ui.button("⬆️ Up").clicked() { orbit.target[1] += 4.0; }
-            if ui.button("⬇️ Down").clicked() { orbit.target[1] -= 4.0; }
+            ui.label("📏 Distance:");
+            if ui.button("−").clicked() { dist = (dist * 0.85).max(2.0); }
+            ui.add(egui::Slider::new(&mut dist, 2.0..=2000.0).text("studs"));
+            if ui.button("+").clicked() { dist = (dist * 1.15).min(2000.0); }
         });
+        orbit.dist = dist.clamp(2.0, 2000.0);
+
+        // Camera move speed (used by Up/Down and pan) + spacing.
+        let mut speed = self.cam_move_speed;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("🎛️ Speed:");
+            ui.add(egui::Slider::new(&mut speed, 1.0..=50.0).text("studs/step"));
+            ui.separator();
+            if ui.button("⬆️ Up").clicked() { orbit.target[1] += speed; }
+            if ui.button("⬇️ Down").clicked() { orbit.target[1] -= speed; }
+        });
+        self.cam_move_speed = speed;
+
         if self.dom.is_none() {
             ui.label(RichText::new("Open a .rbxl/.rbxmx file to render its parts here.").weak());
         } else {
