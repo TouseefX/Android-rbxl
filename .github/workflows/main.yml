@@ -65,13 +65,13 @@ jobs:
           export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TOOLCHAIN/x86_64-linux-android30-clang"
 
           # egui editor (root crate).
-          cargo apk2 build --release --lib
+          cargo apk2 build --lib
 
       - name: Collect editor APK
         shell: bash
         run: |
           set -euo pipefail
-          APK="$(find target -type f -name '*-release.apk' | head -n 1)"
+          APK="$(find target -type f -name '*.apk' | head -n 1)"
           if [ -z "$APK" ]; then
             echo "editor APK not found."
             exit 1

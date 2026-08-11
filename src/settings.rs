@@ -9,9 +9,6 @@ pub struct EditorSettings {
     pub open_cloud_place_id: String,
     pub auto_download_meshes: bool,
     pub show_skybox: bool,
-    pub show_grid: bool,
-    pub show_wireframe: bool,
-    pub camera_speed: f32,
 }
 
 impl Default for EditorSettings {
@@ -23,9 +20,6 @@ impl Default for EditorSettings {
             open_cloud_place_id: String::new(),
             auto_download_meshes: true,
             show_skybox: true,
-            show_grid: true,
-            show_wireframe: true,
-            camera_speed: 4.0,
         }
     }
 }

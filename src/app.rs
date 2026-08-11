@@ -332,8 +332,7 @@ impl eframe::App for EditorApp {
 impl EditorApp {
     fn show_viewport_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("🌍 3D View in Bevy");
-        ui.label("The 3D viewport is rendered by the separate GPU app \"rbxl Viewer\" "
-            + "(a Bevy port of the OpenRBLX renderer), which opens full-screen on your device.");
+        ui.label("The 3D viewport is rendered by the separate GPU app \"rbxl Viewer\", a Bevy port of the OpenRBLX renderer that opens full-screen on your device.");
         ui.separator();
 
         ui.horizontal_wrapped(|ui| {
@@ -1721,7 +1720,6 @@ impl EditorApp {
                         self.current_uri = Some(uri.clone());
                         self.selected = None;
                         self.open_tabs.clear();
-                        self.viewport.initialized_camera = false;
                         self.status = format!("Loaded ({count} top-level services)");
                         self.log_info(format!("Opened place: {uri} ({count} services)"));
                         self.active_tab = ActiveTab::Explorer;
@@ -1863,18 +1861,7 @@ impl EditorApp {
 
                 ui.add_space(8.0);
 
-                // 3. 3D Viewport & Rendering Preferences
-                ui.group(|ui| {
-                    ui.label(RichText::new("🌍 3D Viewport & Rendering Engine").heading().color(Color32::from_rgb(255, 200, 100)));
-
-                    ui.checkbox(&mut self.viewport.show_grid, "Show 4-Stud Baseplate Grid & Primary Axes");
-                    ui.checkbox(&mut self.viewport.show_wireframe, "Show Selection & Part Outlines");
-
-                    ui.horizontal(|ui| {
-                        ui.label("Camera Fly / Move Speed:");
-                        ui.add(egui::Slider::new(&mut self.viewport.move_speed, 1.0..=20.0).text("studs/step"));
-                    });
-                });
+                ui.label(RichText::new("🌍 3D Viewing: opens in the separate \"rbxl Viewer\" GPU app (Bevy / OpenRBLX renderer) via the View tab.").weak());
 
                 ui.add_space(12.0);
 
@@ -1888,9 +1875,6 @@ impl EditorApp {
                             open_cloud_place_id: self.open_cloud_place_id.clone(),
                             auto_download_meshes: true,
                             show_skybox: true,
-                            show_grid: self.viewport.show_grid,
-                            show_wireframe: self.viewport.show_wireframe,
-                            camera_speed: self.viewport.move_speed,
                         };
 
                         match settings_to_save.save() {
