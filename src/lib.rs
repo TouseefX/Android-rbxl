@@ -26,7 +26,7 @@ mod templates;
 
 use app::EditorApp;
 use bevy::prelude::*;
-use bevy_egui::{EguiContexts, EguiPlugin};
+use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 
 /// Spawn the 3D viewport camera + sun light.
 fn setup_3d(mut commands: Commands) {
@@ -94,8 +94,13 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
     bevy_app.insert_resource(ClearColor(Color::srgb(0.35, 0.55, 0.85)));
 
     bevy_app.add_systems(Startup, setup_3d);
-    // draw_editor_ui runs before the camera sync so orbit updates land.
-    bevy_app.add_systems(Update, (rebuild_scene_system, draw_editor_ui, bevy_render::update_camera).chain());
+    // Scene rebuild + camera sync run on the main Update schedule.
+    bevy_app.add_systems(Update, (rebuild_scene_system, bevy_render::update_camera));
+    // IMPORTANT: the egui UI must run in bevy_egui's `EguiPrimaryContextPass`
+    // schedule, NOT `Update`. bevy_egui loads its fonts when it begins its
+    // frame; running the UI in `Update` (before begin-pass) panics with
+    // "No fonts available until first call to Context::run()".
+    bevy_app.add_systems(EguiPrimaryContextPass, draw_editor_ui);
 
     // Make sure the event channel exists before any JNI callback could fire.
     let _ = jni_bridge::channel();
