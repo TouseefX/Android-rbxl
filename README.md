@@ -136,8 +136,17 @@ Run the **Build Android APK** workflow. It produces **one** file:
 ### Build locally
 
 ```sh
-cargo apk2 build --lib
+# ALWAYS build release — the debug profile produces a ~1 GB APK.
+cargo apk2 build --release --lib
 ```
+
+> **APK size.** The workflow and local builds use `--release`. `[profile.release]`
+> in `Cargo.toml` uses `strip = "debuginfo"` (keeps the symbol table so crash
+> backtraces still resolve to function names, but drops the bulky DWARF debug
+> info) plus `lto`/`opt-level`/`codegen-units`, bringing the APK down to ~100 MB.
+> The workflow also uploads `librbxl_editor.so` as a **symbols** artifact so you
+> can `ndk-stack`/`addr2line` crashes offline. To make it even smaller at the
+> cost of losing symbol names, set `strip = "symbols"`.
 
 > **Compile status.** The full editor (Bevy 0.17 + bevy_egui 0.38 + egui 0.33)
 > type-checks on desktop via `cargo check --bin rbxl-editor-desktop` (passes).

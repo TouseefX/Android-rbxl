@@ -111,5 +111,21 @@ fn main() {
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
+
+    // Log any Rust panic (including ones that then abort from a C callback,
+    // like the android-activity resize panic) so the real message shows in
+    // logcat instead of just a silent SIGABRT.
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("===== PANIC =====");
+        log::error!("{}", info);
+        log::error!("location: {:?}", info.location());
+        // Also dump the message alone, which is the most useful bit.
+        if let Some(s) = info.payload().downcast_ref::<&str>() {
+            log::error!("payload: {s}");
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            log::error!("payload: {s}");
+        }
+    }));
+
     run_editor_app(None);
 }

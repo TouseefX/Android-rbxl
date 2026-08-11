@@ -1,5 +1,5 @@
-use egui::text::LayoutJob;
-use egui::{Color32, FontId, TextFormat};
+use bevy_egui::egui::text::LayoutJob;
+use bevy_egui::egui::{Color32, FontId, TextFormat};
 use std::collections::HashSet;
 
 pub fn highlight_lua(text: &str, font_size: f32, search_term: Option<&str>) -> LayoutJob {

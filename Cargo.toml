@@ -59,10 +59,32 @@ bevy = { version = "0.17", default-features = false, features = [
     "x11",
 ] }
 # egui inside Bevy (re-exports its own egui 0.33). 0.38 targets Bevy 0.17.
+# Use `bevy_egui::egui::...` directly — no separate `egui` dependency, so the
+# editor always uses exactly the egui version bevy_egui was built against.
 bevy_egui = { version = "0.38", default-features = false, features = ["default_fonts"] }
-# Pin egui to the SAME version bevy_egui 0.38 uses (0.33) so the editor's
-# existing `use egui::...` code resolves to the identical types bevy_egui uses.
-egui = "0.33"
+
+# ----------------------------------------------------------------------------
+# Release profile — keeps the APK small WITHOUT losing the ability to debug.
+#
+# `strip = "debuginfo"` removes the bulky DWARF debug sections but KEEPS the
+# symbol table, so crash backtraces in logcat still resolve to function names
+# (and you can `addr2line`/`ndk-stack` them). That's the big size saver.
+# opt-level/lto/codegen-units also shrink the code itself.
+#
+# If you want the very smallest APK at the cost of losing symbol names for
+# offline analysis, switch strip to "symbols" (or true).
+# ----------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+debug = false
+panic = "abort"
+
+# Keep dependency crate sizes down too.
+[profile.release.package."*"]
+opt-level = 3
 
 [package.metadata.android]
 package = "com.yourname.rbxleditor"
@@ -113,7 +135,12 @@ actions = ["android.intent.action.MAIN"]
 categories = ["android.intent.category.LAUNCHER"]
 
 [package.metadata.android.signing.release]
-path = "/home/user/.android/debug.keystore"
+# cargo-apk2 joins this against the crate root. In CI the workflow overrides it
+# via CARGO_APK_RELEASE_KEYSTORE (see .github/workflows/main.yml), so this is
+# only a local fallback. Generate it with:
+#   keytool -genkey -v -keystore keystore.jks -storepass android -keypass android \
+#     -alias rbxl -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=rbxl"
+path = "keystore.jks"
 keystore_password = "android"
-key_alias = "androiddebugkey"
+key_alias = "rbxl"
 key_password = "android"

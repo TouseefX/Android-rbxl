@@ -1,4 +1,5 @@
-use egui::{CollapsingHeader, Color32, Ui};
+use bevy_egui::egui;
+use bevy_egui::egui::{CollapsingHeader, Color32, Ui};
 use rbx_dom_weak::{types::Ref, WeakDom};
 
 pub fn show_tree_filtered(

@@ -3,7 +3,8 @@ use crate::bevy_render::OrbitCam;
 use crate::jni_bridge::{self, FileEvent};
 use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
 use crate::{explorer, lua_syntax, rbxl, schema, templates};
-use egui::{Color32, RichText};
+use bevy_egui::egui;
+use bevy_egui::egui::{Color32, RichText};
 use rbx_dom_weak::{
     types::{Color3, Color3uint8, Ref, Variant, Vector3},
     WeakDom,

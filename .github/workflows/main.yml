@@ -55,7 +55,30 @@ jobs:
         with:
           tool: cargo-apk2,cargo-ndk
 
+      # cargo-apk2 signs release APKs with apksigner using the keystore given by
+      # CARGO_APK_RELEASE_KEYSTORE (falling back to the Cargo.toml signing table).
+      # Generate a fresh keystore with a single key so the build never fails for
+      # a missing release key on a fresh runner.
+      - name: Generate release keystore
+        run: |
+          mkdir -p "$RUNNER_TEMP"
+          if [ ! -f "$RUNNER_TEMP/rbxl-release.jks" ]; then
+            keytool -genkey -v \
+              -keystore "$RUNNER_TEMP/rbxl-release.jks" \
+              -storepass android -keypass android \
+              -alias rbxl -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=rbxl, O=rbxl, C=US" \
+              >/dev/null 2>&1
+          fi
+          echo "KEYSTORE=$RUNNER_TEMP/rbxl-release.jks" >> "$GITHUB_ENV"
+          echo "CARGO_APK_RELEASE_KEYSTORE=$RUNNER_TEMP/rbxl-release.jks" >> "$GITHUB_ENV"
+          echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=android" >> "$GITHUB_ENV"
+          ls -lh "$RUNNER_TEMP/rbxl-release.jks"
+
       - name: Build APK (single Bevy app)
+        env:
+          CARGO_APK_RELEASE_KEYSTORE: ${{ env.CARGO_APK_RELEASE_KEYSTORE }}
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ env.CARGO_APK_RELEASE_KEYSTORE_PASSWORD }}
         run: |
           export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android30-clang"
           export CC_armv7_linux_androideabi="$TOOLCHAIN/armv7a-linux-androideabi30-clang"
@@ -66,7 +89,11 @@ jobs:
 
           # Single app: Bevy owns the window (GPU 3D viewport) and the egui
           # editor UI runs inside it via bevy_egui.
-          cargo apk2 build --lib
+          # IMPORTANT: --release. The debug profile produced a ~1 GB APK.
+          # [profile.release] in Cargo.toml strips debug info but keeps the
+          # symbol table, so size drops to ~100 MB while backtraces still
+          # resolve to function names.
+          cargo apk2 build --release --lib
 
       - name: Collect APK
         shell: bash
@@ -81,9 +108,31 @@ jobs:
           cp "$APK" dist/rbxleditor.apk
           ls -lh dist/rbxleditor.apk
 
+      # Keep the built native library as a symbols artifact so crashes can be
+      # symbolized offline with ndk-stack / addr2line.
+      - name: Collect symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          SO="$(find target -type f -name 'librbxl_editor.so' | head -n 1)"
+          if [ -n "$SO" ]; then
+            mkdir -p dist-symbols
+            cp "$SO" dist-symbols/librbxl_editor.so
+            ls -lh dist-symbols/librbxl_editor.so
+          else
+            echo "no .so found; skipping symbols artifact"
+          fi
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: rbxleditor.apk
           path: dist/rbxleditor.apk
           if-no-files-found: error
+
+      - name: Upload symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbols
+          path: dist-symbols/
+          if-no-files-found: warn
