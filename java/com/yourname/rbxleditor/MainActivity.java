@@ -116,8 +116,13 @@ public class MainActivity extends NativeActivity {
 
     /** Return the app's internal files directory as an absolute path string. */
     public static String getFilesDirStatic() {
+        MainActivity act = sInstance;
+        if (act == null) {
+            Log.e(TAG, "getFilesDirStatic: MainActivity instance is null");
+            return null;
+        }
         try {
-            return getFilesDir().getAbsolutePath();
+            return act.getFilesDir().getAbsolutePath();
         } catch (Exception e) {
             Log.e(TAG, "getFilesDir failed", e);
             return null;
