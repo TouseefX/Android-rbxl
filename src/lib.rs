@@ -29,8 +29,13 @@ use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 
 /// Spawn the 3D viewport camera + sun light.
-fn setup_3d(mut commands: Commands) {
-    bevy_render::spawn_camera_and_light(commands);
+fn setup_3d(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<bevy::mesh::Mesh>>,
+    mut sky_materials: ResMut<Assets<bevy_render::SkyMaterial>>,
+) {
+    bevy_render::spawn_camera_and_light(&mut commands);
+    bevy_render::spawn_sky_dome(&mut commands, &mut meshes, &mut sky_materials);
 }
 
 

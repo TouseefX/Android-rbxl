@@ -58,6 +58,8 @@ pub struct FlatMaterial {
     #[texture(3)]
     #[sampler(4)]
     pub texture: Option<Handle<Image>>,
+    /// Whether to use alpha blending (transparent parts).
+    pub transparent: bool,
 }
 
 impl Material for FlatMaterial {
@@ -68,7 +70,11 @@ impl Material for FlatMaterial {
         FLAT_SHADER_HANDLE.into()
     }
     fn alpha_mode(&self) -> AlphaMode {
-        AlphaMode::Opaque
+        if self.transparent {
+            AlphaMode::Blend
+        } else {
+            AlphaMode::Opaque
+        }
     }
     fn specialize(
         _pipeline: &MaterialPipeline,
@@ -85,15 +91,76 @@ impl Material for FlatMaterial {
 pub const FLAT_SHADER_HANDLE: Handle<bevy::shader::Shader> =
     uuid_handle!("9f0123ab-00ff-0002-0000-000000000000");
 
-/// Registers the FlatMaterial and its embedded shader.
+/// Gradient sky-dome material (reuses the same trivial-shader approach).
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+pub struct SkyMaterial {
+    #[uniform(0)]
+    pub sky_top: Vec4,
+    #[uniform(1)]
+    pub sky_horizon: Vec4,
+    #[uniform(2)]
+    pub ground_color: Vec4,
+}
+impl Material for SkyMaterial {
+    fn fragment_shader() -> ShaderRef {
+        SKY_SHADER_HANDLE.into()
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Opaque
+    }
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = Some(bevy::render::render_resource::Face::Front);
+        Ok(())
+    }
+}
+
+pub const SKY_SHADER_HANDLE: Handle<bevy::shader::Shader> =
+    uuid_handle!("9f0123ab-00ff-0003-0000-000000000000");
+
+/// Spawn a large gradient sky dome around the scene (Roblox daytime sky look).
+pub fn spawn_sky_dome(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<SkyMaterial>,
+) {
+    let dome = Mesh::from(bevy::math::primitives::Sphere::new(8000.0).mesh().ico(8).unwrap());
+    let mesh_handle = meshes.add(dome);
+    let mat = materials.add(SkyMaterial {
+        sky_top: Vec4::new(0.30, 0.60, 0.95, 1.0),       // deep blue
+        sky_horizon: Vec4::new(0.72, 0.87, 0.98, 1.0),   // light near horizon
+        ground_color: Vec4::new(0.35, 0.42, 0.35, 1.0),  // muted ground
+    });
+    commands.spawn((
+        Mesh3d(mesh_handle),
+        MeshMaterial3d(mat),
+        Transform::from_translation(BVec3::ZERO),
+        Visibility::default(),
+    ));
+}
+
+/// Registers the FlatMaterial + SkyMaterial and their embedded shaders.
 pub struct FlatMaterialPlugin;
 impl Plugin for FlatMaterialPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(MaterialPlugin::<FlatMaterial>::default());
+        app.add_plugins((
+            MaterialPlugin::<FlatMaterial>::default(),
+            MaterialPlugin::<SkyMaterial>::default(),
+        ));
         bevy::asset::load_internal_asset!(
             app,
             FLAT_SHADER_HANDLE,
             "flat_material.wgsl",
+            bevy::shader::Shader::from_wgsl
+        );
+        bevy::asset::load_internal_asset!(
+            app,
+            SKY_SHADER_HANDLE,
+            "sky_material.wgsl",
             bevy::shader::Shader::from_wgsl
         );
     }
@@ -637,8 +704,22 @@ fn extract_asset_id(s: &str) -> Option<String> {
     Some(digits.chars().rev().collect())
 }
 
-/// Load a colour texture (PNG/JPG) for a material if it exists in `asset/`.
+/// Load a colour texture (PNG/JPG) for a material. Tries the app's built-in /
+/// cached image system first (works on Android without filesystem access, and
+/// uses textures bundled into the APK), then falls back to the local `asset/`
+/// dir on desktop.
 fn load_image_rgba(id: &str) -> Option<(u32, u32, Vec<u8>)> {
+    // 1) Bundled-in-APK images (include_bytes! in asset_downloader).
+    if let Some(bytes) = crate::asset_downloader::get_builtin_image_bytes(id) {
+        if let Some(img) = crate::asset_downloader::decode_image_bytes(bytes) {
+            return Some((img.width as u32, img.height as u32, img.rgba));
+        }
+    }
+    // 2) Already-downloaded/cached images.
+    if let Some(img) = crate::asset_downloader::get_cached_image(id) {
+        return Some((img.width as u32, img.height as u32, img.rgba.clone()));
+    }
+    // 3) Desktop fallback: read from the local asset/ directory.
     let path = asset_path(id, &["png", "jpg", "jpeg"])?;
     let img = image::open(&path).ok()?;
     let rgba = img.to_rgba8();
@@ -735,7 +816,7 @@ impl Default for OrbitCam {
 }
 
 /// Spawn the viewport camera + sun light. The camera is tagged `RbxCamera`.
-pub fn spawn_camera_and_light(mut commands: Commands) {
+pub fn spawn_camera_and_light(commands: &mut Commands) {
     let cam = OrbitCam::default();
     let (eye_b, target_b) = orbit_eye_target(&cam);
     commands.spawn((
@@ -868,7 +949,8 @@ pub fn rebuild_scene(
         // a texture if present). This bypasses Bevy's StandardMaterial shader
         // entirely, which is what was failing (rendering magenta) on this
         // device's Adreno GPU.
-        let color = LinearRgba::new(ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0, ak as f32 / 255.0);
+        let alpha = ak as f32 / 255.0;
+        let color = LinearRgba::new(ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0, alpha);
         let (texture, has_texture) = match &tex_key {
             Some(k) => match tex_cache.get(k) {
                 Some(h) => (Some(h.clone()), 1),
@@ -881,6 +963,7 @@ pub fn rebuild_scene(
             light_dir: Vec4::new(60.0, 90.0, -40.0, 0.0),
             has_texture,
             texture,
+            transparent: alpha < 0.99,
         });
 
         commands.entity(root).with_children(|parent| {
