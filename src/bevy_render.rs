@@ -256,6 +256,10 @@ fn extract_cframe(inst: &rbx_dom_weak::Instance) -> CFrame {
         .get(&rbx_dom_weak::ustr("CFrame"))
         .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("CoordinateFrame")))
     {
+        // Roblox CFrame is left-handed; Bevy is right-handed. We negate the
+        // Z components of the rotation basis (right/up/back columns) so the
+        // transform produces correctly-oriented (non-mirrored) right-handed
+        // results. The position is unchanged.
         return CFrame {
             pos: Vec3::new(cf.position.x, cf.position.y, cf.position.z),
             r00: cf.orientation.x.x, r01: cf.orientation.x.y, r02: cf.orientation.x.z,
@@ -276,7 +280,10 @@ fn extract_cframe(inst: &rbx_dom_weak::Instance) -> CFrame {
 
 // S -> Bevy world (Z flip).
 fn s2b(p: Vec3) -> [f32; 3] {
-    [p.x, p.y, -p.z]
+    // Render in Roblox's native coordinate space. Negating Z here was a mirror
+    // reflection that flipped parts left-right (the "reversed colors"). Bevy
+    // camera + geometry are kept in the same space, so no flip is needed.
+    [p.x, p.y, p.z]
 }
 fn tp(cf: &CFrame, p: Vec3) -> [f32; 3] {
     let w = cf.transform_point(p);
@@ -351,7 +358,21 @@ fn push_tri(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 3], n: Vec3, uv: [[f32; 
 
 fn extract_geometry(dom: &WeakDom) -> Vec<PartGeo> {
     let mut out = Vec::new();
-    let mut stack = dom.root().children().to_vec();
+
+    // Find the Workspace service and only render parts under it. Parts in
+    // ReplicatedStorage, ServerStorage, StarterGui, Lighting, etc. should NOT
+    // be rendered.
+    let Some(workspace_ref) = dom
+        .root()
+        .children()
+        .iter()
+        .copied()
+        .find(|&r| dom.get_by_ref(r).map(|i| i.name == "Workspace").unwrap_or(false))
+    else {
+        return out;
+    };
+
+    let mut stack = vec![workspace_ref];
     while let Some(r) = stack.pop() {
         let Some(inst) = dom.get_by_ref(r) else { continue };
         stack.extend(inst.children());
@@ -929,8 +950,9 @@ pub fn orbit_eye_target(cam: &OrbitCam) -> (BVec3, BVec3) {
         cam.target[1] + cam.dist * sp,
         cam.target[2] + cam.dist * cp * cy,
     ];
-    let eye = BVec3::new(eye_s[0], eye_s[1], -eye_s[2]);
-    let target = BVec3::new(cam.target[0], cam.target[1], -cam.target[2]);
+    // No Z-flip (consistent with geometry rendered in Roblox space).
+    let eye = BVec3::new(eye_s[0], eye_s[1], eye_s[2]);
+    let target = BVec3::new(cam.target[0], cam.target[1], cam.target[2]);
     (eye, target)
 }
 
