@@ -60,6 +60,9 @@ pub struct FlatMaterial {
     pub texture: Option<Handle<Image>>,
     /// Whether to use alpha blending (transparent parts).
     pub transparent: bool,
+    /// Small depth bias to separate coincident/overlapping faces and stop
+    /// z-fighting between parts that sit right next to each other.
+    pub depth_bias: f32,
 }
 
 impl Material for FlatMaterial {
@@ -75,6 +78,9 @@ impl Material for FlatMaterial {
         } else {
             AlphaMode::Opaque
         }
+    }
+    fn depth_bias(&self) -> f32 {
+        self.depth_bias
     }
     fn specialize(
         _pipeline: &MaterialPipeline,
@@ -398,7 +404,12 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     let color = match inst.properties.get(&rbx_dom_weak::ustr("Color")) {
         Some(Variant::Color3(c)) => [c.r as f32, c.g as f32, c.b as f32],
         Some(Variant::Color3uint8(c)) => [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0],
-        _ => [0.7, 0.7, 0.7],
+        _ => match inst.properties.get(&rbx_dom_weak::ustr("BrickColor")) {
+            Some(Variant::BrickColor(bc)) => brick_color_rgb(*bc as u32),
+            Some(Variant::Int32(bc)) => brick_color_rgb(*bc as u32),
+            Some(Variant::Int64(bc)) => brick_color_rgb(*bc as u32),
+            _ => brick_color_rgb(194), // Roblox default "Medium stone grey"
+        },
     };
     let transparency = match inst.properties.get(&rbx_dom_weak::ustr("Transparency")) {
         Some(Variant::Float32(f)) => *f,
@@ -508,6 +519,10 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
             }
             return Some(PartGeo { color, alpha, tris });
         }
+        // A mesh part whose mesh isn't available should be SKIPPED, not rendered
+        // as a generic Block. Rendering it as a Block produced a wrong-shape
+        // spurious part that doesn't exist in Roblox Studio.
+        return None;
     }
 
     let shape = match mesh_type.as_deref() {
@@ -553,6 +568,29 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
 
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// Map a Roblox BrickColor number to RGB (0..1). Covers the common colors plus
+/// a default grey; used when a part stores its color as a BrickColor.
+fn brick_color_rgb(code: u32) -> [f32; 3] {
+    let c = match code {
+        21 => [196.0, 40.0, 28.0],   // Bright red
+        24 => [98.0, 71.0, 50.0],    // Medium brown
+        26 => [75.0, 105.0, 47.0],   // Dark green
+        28 => [194.0, 218.0, 184.0], // Dark green (light)
+        45 => [200.0, 190.0, 170.0], // Pastel brown
+        100 => [252.0, 251.0, 247.0], // White
+        102 => [251.0, 249.0, 240.0], // White
+        104 => [248.0, 244.0, 225.0], // Pastel yellow
+        107 => [214.0, 199.0, 128.0], // Gold
+        119 => [196.0, 140.0, 40.0],  // Bright orange
+        135 => [255.0, 34.0, 14.0],   // Bright red-orange
+        194 => [163.0, 162.0, 165.0], // Medium stone grey
+        199 => [184.0, 184.0, 0.0],   // Dark yellow
+        208 => [53.0, 53.0, 53.0],    // Dark stone grey
+        _ => [163.0, 162.0, 165.0],
+    };
+    [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]
 }
 
 // --- primitive builders (same shapes as the Android app / OpenRBLX) ---
@@ -907,6 +945,11 @@ pub fn spawn_camera_and_light(commands: &mut Commands) {
     let (eye_b, target_b) = orbit_eye_target(&cam);
     commands.spawn((
         Camera3d::default(),
+        // Disable Bevy's tonemapping (default TonyMcMapface) and its default
+        // exposure/color grading. These hue-shift and wash out colors, which is
+        // why parts looked wrong vs. Roblox Studio. Roblox renders in raw sRGB;
+        // Tonemapping::None makes our flat colors match exactly.
+        bevy::core_pipeline::tonemapping::Tonemapping::None,
         // CRITICAL for mobile performance: MSAA is on by default (4×). At the
         // phone's native resolution (e.g. 1440×3200) that is a huge fill-rate
         // cost for a trivial scene, which is what caused the ~20 fps. Turning
@@ -1056,6 +1099,9 @@ pub fn rebuild_scene(
             has_texture,
             texture,
             transparent: alpha < 0.99,
+            // Push surfaces toward the camera so overlapping/adjacent faces
+            // (baseplates, walls through floors) stop z-fighting.
+            depth_bias: 1.0,
         });
 
         commands.entity(root).with_children(|parent| {
