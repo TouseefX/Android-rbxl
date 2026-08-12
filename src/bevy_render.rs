@@ -417,7 +417,13 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
         _ => 0.0,
     };
     let alpha = (1.0 - transparency).clamp(0.0, 1.0);
+    // `Material` deserializes as `Variant::Enum` (a raw u32 index) from a
+    // compiled .rbxl, NEVER as `Variant::String` — that arm only ever matched
+    // hand-built XML doms. Every part was silently defaulting to "Plastic",
+    // which is why grass/concrete/brick/wood never got their procedural
+    // textures in build_block() below.
     let material_str = match inst.properties.get(&rbx_dom_weak::ustr("Material")) {
+        Some(Variant::Enum(e)) => material_name_from_enum(e.clone().to_u32()),
         Some(Variant::String(s)) => s.clone(),
         _ => "Plastic".into(),
     };
@@ -462,12 +468,19 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
         if ch.class == "Decal" || ch.class == "Texture" {
+            // `Face` deserializes as `Variant::Enum` (NormalId) from a compiled
+            // .rbxl, never `Variant::String`/`Int32`/`Int64` — those arms only
+            // matched hand-built XML/synthetic doms. Every decal was silently
+            // defaulting to "Front" regardless of which face it was actually
+            // on, so textures ended up on the wrong side of the part (or
+            // simply didn't line up with what Studio shows).
             let face = match ch.properties.get(&rbx_dom_weak::ustr("Face")) {
+                Some(Variant::Enum(e)) => normal_id_name(e.clone().to_u32()),
                 Some(Variant::String(s)) => match s.as_str() {
                     "Top" => "Top", "Bottom" => "Bottom", "Front" => "Front", "Back" => "Back", "Left" => "Left", "Right" => "Right", _ => "Front",
                 },
-                Some(Variant::Int32(1)) | Some(Variant::Int64(1)) => "Top",
-                Some(Variant::Int32(5)) | Some(Variant::Int64(5)) => "Front",
+                Some(Variant::Int32(v)) => normal_id_name(*v as u32),
+                Some(Variant::Int64(v)) => normal_id_name(*v as u32),
                 _ => "Front",
             };
             if let Some(Variant::String(t)) = ch.properties.get(&rbx_dom_weak::ustr("Texture")) {
@@ -522,6 +535,12 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
         // A mesh part whose mesh isn't available should be SKIPPED, not rendered
         // as a generic Block. Rendering it as a Block produced a wrong-shape
         // spurious part that doesn't exist in Roblox Studio.
+        //
+        // This is silent by design, but silent-and-invisible made it look like
+        // the whole renderer was broken rather than "this one asset isn't
+        // downloaded yet" — log it so it shows up in logcat/Output instead of
+        // just vanishing.
+        log::warn!("Bevy: skipping '{}' — mesh '{}' not in cache/disk (try Download & Cache Place Assets)", inst.name, mid);
         return None;
     }
 
@@ -591,6 +610,41 @@ fn brick_color_rgb(code: u32) -> [f32; 3] {
         _ => [163.0, 162.0, 165.0],
     };
     [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]
+}
+
+/// Map the numeric value of a Roblox `Material` EnumItem to its name.
+/// Values are Roblox's own stable enum indices (create.roblox.com/docs,
+/// checked 2026-08), NOT sequential — e.g. Plastic=256, Grass=1280. Only the
+/// materials `build_block` actually branches on are mapped by name; anything
+/// else returns "Plastic" (matches the old always-Plastic fallback, but now
+/// only for materials that genuinely don't get a procedural texture).
+fn material_name_from_enum(value: u32) -> String {
+    match value {
+        512 => "Wood",
+        528 => "WoodPlanks",
+        800 => "Slate",
+        816 => "Concrete",
+        848 => "Brick",
+        1280 => "Grass",
+        1284 => "LeafyGrass",
+        1376 => "Asphalt",
+        _ => "Plastic",
+    }
+    .into()
+}
+
+/// Map the numeric value of a Roblox `NormalId` EnumItem (used by
+/// Decal/Texture.Face) to its face name. Right=0, Top=1, Back=2, Left=3,
+/// Bottom=4, Front=5 (create.roblox.com/docs, checked 2026-08).
+fn normal_id_name(value: u32) -> &'static str {
+    match value {
+        0 => "Right",
+        1 => "Top",
+        2 => "Back",
+        3 => "Left",
+        4 => "Bottom",
+        _ => "Front", // 5, and any unknown value
+    }
 }
 
 // --- primitive builders (same shapes as the Android app / OpenRBLX) ---
@@ -800,6 +854,33 @@ fn load_image_rgba(id: &str) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
+    // Check the shared asset cache FIRST. This is what `fetch_and_cache_mesh_async`
+    // (the "Download & Cache All Place Assets" button) actually populates, and it
+    // also covers builtin bundled meshes and the real on-device cache paths
+    // (asset_downloader::get_cached_mesh knows about e.g.
+    // /Android/media/com.yourname.rbxleditor/.../asset/<id>.mesh).
+    //
+    // Previously this function ONLY did the disk read below, keyed off
+    // `CARGO_MANIFEST_DIR` (a cargo *build-time* env var) read via
+    // `std::env::var` at *runtime* — which is never set inside a running APK's
+    // process environment. That made every on-device mesh lookup fail
+    // silently, even for meshes the user had just downloaded: the download
+    // path and the render path were two disconnected caches. This is why
+    // MeshParts (signs, vehicles, custom props) never appeared even after
+    // using the batch-download button.
+    if let Some(cached) = crate::asset_downloader::get_cached_mesh(id_or_path) {
+        return Some(MeshData {
+            vertices: cached.vertices,
+            uvs: cached.uvs,
+            faces: cached.faces,
+            aabb_min: cached.aabb_min,
+            aabb_max: cached.aabb_max,
+        });
+    }
+
+    // Desktop-only fallback below (reads repo/asset/<id>.mesh via
+    // CARGO_MANIFEST_DIR) — harmless to keep for `cargo run` on desktop, but
+    // will not fire on Android.
     let id = extract_asset_id(id_or_path)?;
     let path = asset_path(&id, &["mesh"])?;
     let bytes = std::fs::read(path).ok()?;

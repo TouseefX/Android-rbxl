@@ -107,6 +107,12 @@ pub struct EditorApp {
 
     // 3D viewport camera move speed (studs/step for Up/Down/pan).
     cam_move_speed: f32,
+
+    // When Some, drain_events() will flip needs_3d_rebuild back on once this
+    // deadline passes, so meshes/textures that finished downloading in the
+    // background (see auto_download_place_assets) actually get pulled into
+    // the scene instead of only ever showing on the NEXT manual reopen.
+    pending_asset_refresh_at: Option<std::time::Instant>,
 }
 
 impl Default for EditorApp {
@@ -157,6 +163,7 @@ impl Default for EditorApp {
             next_external_id: 1,
             needs_3d_rebuild: false,
             cam_move_speed: 4.0,
+            pending_asset_refresh_at: None,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
         RobloxApiClient::fetch_live_catalog_async("sword".into());
@@ -186,11 +193,47 @@ impl EditorApp {
                 self.selected = None;
                 self.needs_3d_rebuild = true;
                 self.status = "Loaded".into();
+                self.auto_download_place_assets();
             }
             Err(e) => {
                 self.status = format!("Failed to parse: {e}");
             }
         }
+    }
+
+    /// Kick off background downloads for every Mesh/Texture asset referenced
+    /// by the place, without waiting for the user to find and press the
+    /// "Download & Cache All Place Assets" button. Previously a freshly
+    /// opened place had NOTHING cached, so every MeshPart and every real
+    /// (non-procedural) decal texture silently fell back to invisible /
+    /// flat-color on first render — this made the renderer look broken even
+    /// though it was just waiting on assets nobody had triggered a fetch for.
+    /// Meshes and textures pop in via `needs_3d_rebuild` polling once they land
+    /// (see `drain_events`/the 3D tab) rather than all at once.
+    fn auto_download_place_assets(&mut self) {
+        let Some(dom) = &self.dom else { return };
+        let assets = asset_downloader::scan_place_assets(dom);
+        if assets.is_empty() {
+            return;
+        }
+        let cookie = if self.roblosecurity_cookie.is_empty() { None } else { Some(self.roblosecurity_cookie.clone()) };
+        self.log_info(format!("Auto-downloading {} referenced assets in the background", assets.len()));
+        std::thread::spawn(move || {
+            for asset in assets {
+                let id = format!("rbxassetid://{}", asset.asset_id);
+                match asset.asset_type {
+                    "Mesh" => roblox_api::fetch_and_cache_mesh_async(id, cookie.clone()),
+                    "Texture" => roblox_api::fetch_and_cache_image_async(id, cookie.clone()),
+                    _ => {}
+                }
+            }
+        });
+        // fetch_and_cache_*_async are fire-and-forget background threads with
+        // no completion signal, so we can't know exactly when they're done.
+        // 4s is a rough guess generous enough for a city-sized place over
+        // typical mobile data; bump this (or add a real completion channel,
+        // like the existing search_channel pattern) if your assets are bigger.
+        self.pending_asset_refresh_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
     }
 
     fn log_info(&mut self, msg: impl Into<String>) {
@@ -1753,6 +1796,17 @@ impl EditorApp {
     }
 
     fn drain_events(&mut self) {
+        // If a background asset download was started, flip needs_3d_rebuild
+        // back on once its rough deadline passes so downloaded meshes/textures
+        // actually appear in the viewport without the user having to reopen
+        // the file.
+        if let Some(at) = self.pending_asset_refresh_at {
+            if std::time::Instant::now() >= at {
+                self.needs_3d_rebuild = true;
+                self.pending_asset_refresh_at = None;
+            }
+        }
+
         // Check for live search results from background thread
         if let Some(resp) = roblox_api::try_recv_search_results() {
             self.is_searching_live = false;
@@ -1779,6 +1833,7 @@ impl EditorApp {
                         self.status = format!("Loaded ({count} top-level services)");
                         self.log_info(format!("Opened place: {uri} ({count} services)"));
                         self.active_tab = ActiveTab::Explorer;
+                        self.auto_download_place_assets();
                     }
                     Err(e) => {
                         self.status = format!("Failed to parse: {e}");

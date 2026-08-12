@@ -56,6 +56,16 @@ pub fn fetch_and_cache_mesh_async(mesh_id_str: String, cookie_opt: Option<String
     RobloxApiClient::fetch_and_cache_mesh_async(mesh_id_str, cookie_opt);
 }
 
+/// Fetches a Decal/Texture image asynchronously and stores it in the shared
+/// image cache. There was previously no network path for images at all —
+/// only `get_builtin_image_bytes` (bundled-in-APK) and `get_cached_image`'s
+/// on-device path fallbacks existed, so any decal not already bundled or
+/// pre-cached silently fell back to the part's flat base color. This mirrors
+/// `fetch_and_cache_mesh_async` for images.
+pub fn fetch_and_cache_image_async(image_id_str: String, cookie_opt: Option<String>) {
+    RobloxApiClient::fetch_and_cache_image_async(image_id_str, cookie_opt);
+}
+
 pub struct RobloxApiClient {
     pub api_key: String,
     pub universe_id: String,
@@ -247,6 +257,28 @@ impl RobloxApiClient {
                     if let Ok(bytes) = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref()) {
                         if let Some(mesh) = asset_downloader::parse_roblox_mesh(&bytes) {
                             asset_downloader::store_cached_mesh(mesh_id_str.clone(), mesh);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Fetches a Decal/Texture image asynchronously in the background and
+    /// stores it in image_cache, the same cache `asset_downloader::get_cached_image`
+    /// (and therefore `bevy_render::load_image_rgba`) reads from.
+    pub fn fetch_and_cache_image_async(image_id_str: String, cookie_opt: Option<String>) {
+        if asset_downloader::get_cached_image(&image_id_str).is_some() {
+            return;
+        }
+
+        std::thread::spawn(move || {
+            let asset_id_opt = asset_downloader::extract_asset_id(&image_id_str);
+            if let Some(id_str) = asset_id_opt {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    if let Ok(bytes) = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref()) {
+                        if let Some(img) = asset_downloader::decode_image_bytes(&bytes) {
+                            asset_downloader::store_cached_image(image_id_str.clone(), std::sync::Arc::new(img));
                         }
                     }
                 }
