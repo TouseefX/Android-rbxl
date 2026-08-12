@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(target_os = "android")]
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditorSettings {
@@ -26,14 +28,16 @@ impl Default for EditorSettings {
 
 impl EditorSettings {
     pub fn get_settings_path() -> PathBuf {
-        // Try Android external media / scripts folder first, then home dir
-        let android_media = Path::new("/Android/media/com.yourname.rbxleditor/scripts/settings.json");
-        if android_media.parent().map(|p| p.exists()).unwrap_or(false) {
-            return android_media.to_path_buf();
+        // On Android use the app's internal files dir, which is always writable
+        // (no permissions needed). On desktop use the home dir.
+        #[cfg(target_os = "android")]
+        {
+            if let Some(dir) = crate::jni_bridge::files_dir() {
+                return Path::new(&dir).join("settings.json");
+            }
         }
-
-        let home_settings = Path::new("/home/user/settings.json");
-        home_settings.to_path_buf()
+        let home_settings = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+        home_settings.join("rbxl_editor_settings.json")
     }
 
     pub fn load() -> Self {

@@ -128,7 +128,7 @@ pub fn spawn_sky_dome(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<SkyMaterial>,
 ) {
-    let dome = Mesh::from(bevy::math::primitives::Sphere::new(8000.0).mesh().ico(8).unwrap());
+    let dome = Mesh::from(bevy::math::primitives::Sphere::new(400.0).mesh().ico(8).unwrap());
     let mesh_handle = meshes.add(dome);
     let mat = materials.add(SkyMaterial {
         sky_top: Vec4::new(0.30, 0.60, 0.95, 1.0),       // deep blue
@@ -830,8 +830,11 @@ pub fn spawn_camera_and_light(commands: &mut Commands) {
         // see the whole place, and a small near plane means you can go right up
         // to / inside a part without the geometry vanishing.
         Projection::Perspective(PerspectiveProjection {
+            // Tight near/far planes give much better depth precision, which
+            // removes the z-fighting/"glitching" on overlapping parts that a
+            // huge far=20000 plane caused.
             near: 0.1,
-            far: 20000.0,
+            far: 800.0,
             fov: 60f32.to_radians(),
             ..default()
         }),
@@ -960,7 +963,7 @@ pub fn rebuild_scene(
         };
         let mth = materials.add(FlatMaterial {
             color,
-            light_dir: Vec4::new(60.0, 90.0, -40.0, 0.0),
+            light_dir: Vec4::new(60.0, 90.0, 40.0, 0.0),
             has_texture,
             texture,
             transparent: alpha < 0.99,

@@ -253,3 +253,30 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnExterna
         text: text_str,
     });
 }
+
+#[cfg(target_os = "android")]
+/// Get the app.s internal files directory (always writable on Android, no
+/// permissions needed). This is where settings should be persisted.
+pub fn files_dir() -> Option<String> {
+    let ctx = ndk_context::android_context();
+    let vm = match unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) } {
+        Ok(vm) => vm,
+        Err(_) => return None,
+    };
+    let mut env = vm.attach_current_thread().ok()?;
+    let activity = unsafe { jni::objects::JObject::from_raw(ctx.activity().cast()) };
+    if activity.is_null() {
+        return None;
+    }
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    // Call activity.getFilesDir() -> File, then File.getAbsolutePath() -> String.
+    let dir = env.call_method(&activity, "getFilesDir", "()Ljava/io/File;", &[]).ok()?;
+    let dir_obj = dir.l().ok()?;
+    let path = env.call_method(&dir_obj, "getAbsolutePath", "()Ljava/lang/String;", &[]).ok()?;
+    let jstr_obj = path.l().ok()?;
+    let jstr = jni::objects::JString::from(jstr_obj);
+    let s = env.get_string(&jstr).ok()?;
+    Some(s.into())
+}
