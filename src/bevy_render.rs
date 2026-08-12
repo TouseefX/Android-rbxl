@@ -128,6 +128,56 @@ impl Material for SkyMaterial {
 pub const SKY_SHADER_HANDLE: Handle<bevy::shader::Shader> =
     uuid_handle!("9f0123ab-00ff-0003-0000-000000000000");
 
+/// Convert an authored sRGB color into a linear-space Vec4, for packing into
+/// a raw uniform (SkyMaterial's fields aren't `LinearRgba`, just `Vec4`, so
+/// they get no automatic gamma handling from Bevy's `Color` machinery).
+fn srgb_vec4(r: f32, g: f32, b: f32, a: f32) -> Vec4 {
+    let l = Color::srgba(r, g, b, a).to_linear();
+    Vec4::new(l.red, l.green, l.blue, l.alpha)
+}
+
+/// Pull a usable asset-URI string out of any variant shape Roblox uses for
+/// asset-reference properties. A hand-built/XML dom can store these as plain
+/// `Variant::String`, but a real *compiled* `.rbxl` stores them as
+/// `Variant::ContentId` (MeshPart.MeshId/TextureID, SpecialMesh.MeshId/
+/// TextureId — legacy string-backed type) or `Variant::Content`
+/// (Decal/Texture.Texture — modern Uri/Object/None type). Matching only
+/// `Variant::String` matches NEITHER of those, so on every real compiled
+/// place file every mesh, every MeshPart texture, and every Decal/Texture
+/// silently resolved to `None` — nothing ever textured, for the same reason
+/// `Material`/`Face` needed the `Variant::Enum` fix elsewhere in this file.
+fn content_str(v: &Variant) -> Option<String> {
+    match v {
+        Variant::String(s) if !s.is_empty() => Some(s.clone()),
+        Variant::ContentId(c) if !c.as_str().is_empty() => Some(c.as_str().to_string()),
+        Variant::Content(c) => match c.value() {
+            rbx_dom_weak::types::ContentType::Uri(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Map the numeric value of a Roblox `MeshType` EnumItem to its name. Same
+/// story as `Material`/`Face`: `SpecialMesh.MeshType` deserializes as
+/// `Variant::Enum` from a compiled place, never `Variant::String`, so every
+/// SpecialMesh (Sphere/Cylinder/Wedge/etc.) was silently falling through to
+/// the generic Block shape. Values per Roblox's stable MeshType enum
+/// (create.roblox.com/docs, checked 2026-08).
+fn mesh_type_name_from_enum(value: u32) -> String {
+    match value {
+        0 => "Head",
+        1 => "Torso",
+        2 => "Wedge",
+        3 => "Sphere",
+        4 => "Cylinder",
+        5 => "FileMesh",
+        6 => "Brick",
+        _ => "Brick",
+    }
+    .into()
+}
+
 /// Spawn a large gradient sky dome around the scene (Roblox daytime sky look).
 pub fn spawn_sky_dome(
     commands: &mut Commands,
@@ -136,10 +186,15 @@ pub fn spawn_sky_dome(
 ) {
     let dome = Mesh::from(bevy::math::primitives::Sphere::new(500.0).mesh().ico(8).unwrap());
     let mesh_handle = meshes.add(dome);
+    // Same sRGB-as-linear bug as FlatMaterial's color, applied to the sky
+    // dome: these authored 0..1 numbers are sRGB, and were being passed to
+    // the shader's vec4 uniforms with no gamma conversion. That's why the
+    // muted olive `ground_color` came out as the vivid khaki-green band
+    // cutting across the horizon in screenshots — it was never that bright.
     let mat = materials.add(SkyMaterial {
-        sky_top: Vec4::new(0.30, 0.60, 0.95, 1.0),       // deep blue
-        sky_horizon: Vec4::new(0.72, 0.87, 0.98, 1.0),   // light near horizon
-        ground_color: Vec4::new(0.35, 0.42, 0.35, 1.0),  // muted ground
+        sky_top: srgb_vec4(0.30, 0.60, 0.95, 1.0),       // deep blue
+        sky_horizon: srgb_vec4(0.72, 0.87, 0.98, 1.0),   // light near horizon
+        ground_color: srgb_vec4(0.35, 0.42, 0.35, 1.0),  // muted ground
     });
     commands.spawn((
         Mesh3d(mesh_handle),
@@ -435,25 +490,30 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     let mut scale = Vec3::new(1.0, 1.0, 1.0);
     let mut offset = Vec3::new(0.0, 0.0, 0.0);
     if inst.class == "MeshPart" {
-        if let Some(Variant::String(m)) = inst.properties.get(&rbx_dom_weak::ustr("MeshId")) {
-            mesh_id = Some(m.clone());
+        if let Some(m) = inst.properties.get(&rbx_dom_weak::ustr("MeshId")).and_then(content_str) {
+            mesh_id = Some(m);
         }
-        if let Some(Variant::String(t)) = inst.properties.get(&rbx_dom_weak::ustr("TextureID")).or_else(|| inst.properties.get(&rbx_dom_weak::ustr("TextureId"))) {
-            mesh_tex = Some(t.clone());
+        if let Some(t) = inst.properties.get(&rbx_dom_weak::ustr("TextureID"))
+            .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("TextureId")))
+            .and_then(content_str)
+        {
+            mesh_tex = Some(t);
         }
     }
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
         if ch.class == "SpecialMesh" || ch.class == "BlockMesh" {
-            if let Some(Variant::String(m)) = ch.properties.get(&rbx_dom_weak::ustr("MeshId")) {
-                mesh_id = Some(m.clone());
+            if let Some(m) = ch.properties.get(&rbx_dom_weak::ustr("MeshId")).and_then(content_str) {
+                mesh_id = Some(m);
             }
-            if let Some(Variant::String(t)) = ch.properties.get(&rbx_dom_weak::ustr("TextureId")) {
-                mesh_tex = Some(t.clone());
+            if let Some(t) = ch.properties.get(&rbx_dom_weak::ustr("TextureId")).and_then(content_str) {
+                mesh_tex = Some(t);
             }
-            if let Some(Variant::String(mt)) = ch.properties.get(&rbx_dom_weak::ustr("MeshType")) {
-                mesh_type = Some(mt.clone());
-            }
+            mesh_type = match ch.properties.get(&rbx_dom_weak::ustr("MeshType")) {
+                Some(Variant::Enum(e)) => Some(mesh_type_name_from_enum(e.clone().to_u32())),
+                Some(Variant::String(s)) => Some(s.clone()),
+                _ => mesh_type,
+            };
             if let Some(Variant::Vector3(sc)) = ch.properties.get(&rbx_dom_weak::ustr("Scale")) {
                 scale = Vec3::new(sc.x, sc.y, sc.z);
             }
@@ -483,10 +543,8 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
                 Some(Variant::Int64(v)) => normal_id_name(*v as u32),
                 _ => "Front",
             };
-            if let Some(Variant::String(t)) = ch.properties.get(&rbx_dom_weak::ustr("Texture")) {
-                if !t.is_empty() {
-                    decals.insert(face, t.clone());
-                }
+            if let Some(t) = ch.properties.get(&rbx_dom_weak::ustr("Texture")).and_then(content_str) {
+                decals.insert(face, t);
             }
         }
     }
@@ -1166,7 +1224,18 @@ pub fn rebuild_scene(
         // entirely, which is what was failing (rendering magenta) on this
         // device's Adreno GPU.
         let alpha = ak as f32 / 255.0;
-        let color = LinearRgba::new(ck[0] as f32 / 255.0, ck[1] as f32 / 255.0, ck[2] as f32 / 255.0, alpha);
+        // Roblox Color3/BrickColor values are authored in sRGB (gamma) space.
+        // `LinearRgba::new` takes already-linear values with no conversion,
+        // so feeding it raw sRGB numbers skipped gamma correction entirely —
+        // every color rendered brighter/more saturated than Studio, and dark
+        // tones (asphalt, slate, dark glass) were hit hardest, which is why
+        // they came out as vivid teal/mint/blue instead of muted grey.
+        let color = Color::srgba(
+            ck[0] as f32 / 255.0,
+            ck[1] as f32 / 255.0,
+            ck[2] as f32 / 255.0,
+            alpha,
+        ).to_linear();
         let (texture, has_texture) = match &tex_key {
             Some(k) => match tex_cache.get(k) {
                 Some(h) => (Some(h.clone()), 1),

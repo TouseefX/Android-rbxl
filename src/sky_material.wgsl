@@ -17,12 +17,13 @@ fn fragment(
     let dir = normalize(mesh.world_normal);
     let up = dir.y; // -1 (down) .. 1 (up)
 
-    var col: vec3<f32>;
-    if (up < -0.01) {
-        col = ground_color.rgb;
-    } else {
-        let t = clamp(up, 0.0, 1.0);
-        col = mix(sky_horizon.rgb, sky_top.rgb, t);
-    }
+    // Smoothly blend ground -> horizon -> top instead of a hard cutoff at
+    // up == -0.01. The hard `if` produced a visible seam: a flat-colored
+    // band with a sharp edge cutting across the middle of the view wherever
+    // the camera could see below the horizon between/around geometry.
+    let ground_t = smoothstep(-0.06, 0.06, up);
+    let base = mix(ground_color.rgb, sky_horizon.rgb, ground_t);
+    let sky_t = clamp(up, 0.0, 1.0);
+    let col = mix(base, sky_top.rgb, sky_t);
     return vec4<f32>(col, 1.0);
 }

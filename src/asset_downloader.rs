@@ -1,5 +1,5 @@
 use rbx_dom_weak::{
-    types::{Ref, Variant},
+    types::{ContentType, Ref, Variant},
     WeakDom,
 };
 use std::collections::{HashMap, HashSet};
@@ -884,8 +884,24 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
                 };
 
                 if let Some(ty) = asset_type {
-                    if let Variant::String(s) = val {
-                        if let Some(id) = extract_asset_id(s) {
+                    // A compiled .rbxl stores MeshId/TextureID/TextureId as
+                    // `Variant::ContentId` and Decal/Texture.Texture as
+                    // `Variant::Content` — never as `Variant::String` (that
+                    // only ever matched hand-built XML doms). Matching only
+                    // String meant this scanner discovered zero assets on
+                    // any real compiled place, so "Download & Cache Place
+                    // Assets" had nothing to fetch in the first place.
+                    let found = match val {
+                        Variant::String(s) if !s.is_empty() => Some(s.clone()),
+                        Variant::ContentId(c) if !c.as_str().is_empty() => Some(c.as_str().to_string()),
+                        Variant::Content(c) => match c.value() {
+                            ContentType::Uri(s) if !s.is_empty() => Some(s.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(s) = found {
+                        if let Some(id) = extract_asset_id(&s) {
                             if !seen_ids.contains(&id) {
                                 seen_ids.insert(id.clone());
                                 out.push(DiscoveredAsset {
