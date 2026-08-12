@@ -117,7 +117,7 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
 
     bevy_app.add_systems(Startup, setup_3d);
     // Scene rebuild + camera sync run on the main Update schedule.
-    bevy_app.add_systems(Update, (rebuild_scene_system, bevy_render::update_camera));
+    bevy_app.add_systems(Update, (rebuild_scene_system, bevy_render::update_camera, bevy_render::update_sky_dome));
     // IMPORTANT: the egui UI must run in bevy_egui's `EguiPrimaryContextPass`
     // schedule, NOT `Update`. bevy_egui loads its fonts when it begins its
     // frame; running the UI in `Update` (before begin-pass) panics with

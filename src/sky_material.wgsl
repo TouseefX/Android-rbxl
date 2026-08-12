@@ -1,7 +1,8 @@
 // Gradient sky-dome shader. Colors by the fragment's world-space direction:
 // blue near the top, lighter/whiter at the horizon, and a soft ground color
-// below the horizon. This matches the Roblox daytime sky look and, like the
-// FlatMaterial shader, is trivial WGSL that compiles on any GPU (no StandardMaterial).
+// below the horizon. Matches the Roblox daytime sky. Uses the sphere's outward
+// normal (= direction from its centre), so it stays correct even when the dome
+// follows the camera around the scene.
 
 #import bevy_pbr::forward_io::VertexOutput
 
@@ -13,7 +14,7 @@
 fn fragment(
     mesh: VertexOutput,
 ) -> @location(0) vec4<f32> {
-    let dir = normalize(mesh.world_position - vec3<f32>(0.0, 0.0, 0.0));
+    let dir = normalize(mesh.world_normal);
     let up = dir.y; // -1 (down) .. 1 (up)
 
     var col: vec3<f32>;
@@ -21,7 +22,6 @@ fn fragment(
         col = ground_color.rgb;
     } else {
         let t = clamp(up, 0.0, 1.0);
-        // mix horizon -> top as we look up
         col = mix(sky_horizon.rgb, sky_top.rgb, t);
     }
     return vec4<f32>(col, 1.0);

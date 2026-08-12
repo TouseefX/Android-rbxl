@@ -82,7 +82,7 @@ impl Material for FlatMaterial {
         _layout: &MeshVertexBufferLayoutRef,
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        descriptor.primitive.cull_mode = None; // two-sided
+        descriptor.primitive.cull_mode = None; // two-sided (robust to winding)
         Ok(())
     }
 }
@@ -128,7 +128,7 @@ pub fn spawn_sky_dome(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<SkyMaterial>,
 ) {
-    let dome = Mesh::from(bevy::math::primitives::Sphere::new(400.0).mesh().ico(8).unwrap());
+    let dome = Mesh::from(bevy::math::primitives::Sphere::new(500.0).mesh().ico(8).unwrap());
     let mesh_handle = meshes.add(dome);
     let mat = materials.add(SkyMaterial {
         sky_top: Vec4::new(0.30, 0.60, 0.95, 1.0),       // deep blue
@@ -140,7 +140,20 @@ pub fn spawn_sky_dome(
         MeshMaterial3d(mat),
         Transform::from_translation(BVec3::ZERO),
         Visibility::default(),
+        SkyDome,
     ));
+}
+
+/// Keep the sky dome centred on the camera so it stays a background and never
+/// clips through scene geometry (which caused artifacts on large maps).
+pub fn update_sky_dome(
+    mut q: Query<&mut Transform, (With<SkyDome>, Without<RbxCamera>)>,
+    cam: Query<&Transform, (With<RbxCamera>, Without<SkyDome>)>,
+) {
+    let Ok(cam_t) = cam.single() else { return };
+    for mut t in &mut q {
+        t.translation = cam_t.translation;
+    }
 }
 
 /// Registers the FlatMaterial + SkyMaterial and their embedded shaders.
@@ -731,59 +744,109 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     let id = extract_asset_id(id_or_path)?;
     let path = asset_path(&id, &["mesh"])?;
     let bytes = std::fs::read(path).ok()?;
-    // Very small Roblox .mesh binary parser (v1.00/v1.01).
-    let version = String::from_utf8_lossy(&bytes[..8.min(bytes.len())]).into_owned();
-    if version.starts_with("version 1.") {
-        // header size + counts
-        let header_start = 8;
-        if bytes.len() < header_start + 16 {
+
+    // Real Roblox .mesh header is "version 1.00\n" or "version 1.01\n".
+    // The count fields come immediately AFTER the newline:
+    //   version 1.00: 1-byte vertex count, 1-byte face count
+    //   version 1.01: 2-byte (LE) vertex count, 2-byte (LE) face count
+    let version = String::from_utf8_lossy(&bytes[..bytes.len().min(32)]).into_owned();
+    let is_101 = version.starts_with("version 1.01");
+    let is_100 = version.starts_with("version 1.00");
+    if !is_100 && !is_101 {
+        return None;
+    }
+    let header_len = bytes.iter().position(|&b| b == b'\n').map(|i| i + 1)?;
+    let mut cursor = header_len;
+
+    // Read counts.
+    let (vertex_count, face_count) = if is_101 {
+        if cursor + 4 > bytes.len() {
             return None;
         }
-        if version.starts_with("version 1.01") || version.starts_with("version 1.00") {
-            let sizeof_vertex = 32usize;
-            let sizeof_face = 12usize;
-            let nv = u32::from_le_bytes([bytes[header_start + 4], bytes[header_start + 5], bytes[header_start + 6], bytes[header_start + 7]]) as usize;
-            let nf = u32::from_le_bytes([bytes[header_start + 8], bytes[header_start + 9], bytes[header_start + 10], bytes[header_start + 11]]) as usize;
-            let v_start = header_start + 16;
-            let mut vertices = Vec::new();
-            let mut uvs = Vec::new();
-            let mut min = [f32::INFINITY; 3];
-            let mut max = [f32::NEG_INFINITY; 3];
-            for i in 0..nv {
-                let o = v_start + i * sizeof_vertex;
-                if o + 32 > bytes.len() {
-                    break;
-                }
-                let px = f32::from_le_bytes(bytes[o..o + 4].try_into().ok()?);
-                let py = f32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?);
-                let pz = f32::from_le_bytes(bytes[o + 8..o + 12].try_into().ok()?);
-                let u = f32::from_le_bytes(bytes[o + 24..o + 28].try_into().ok()?);
-                let v = f32::from_le_bytes(bytes[o + 28..o + 32].try_into().ok()?);
-                min[0] = min[0].min(px);
-                min[1] = min[1].min(py);
-                min[2] = min[2].min(pz);
-                max[0] = max[0].max(px);
-                max[1] = max[1].max(py);
-                max[2] = max[2].max(pz);
-                vertices.push([px, py, pz]);
-                uvs.push([u, 1.0 - v]);
-            }
-            let f_start = v_start + nv * sizeof_vertex;
-            let mut faces = Vec::new();
-            for i in 0..nf {
-                let o = f_start + i * sizeof_face;
-                if o + 12 > bytes.len() {
-                    break;
-                }
-                let a = u32::from_le_bytes(bytes[o..o + 4].try_into().ok()?);
-                let b = u32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?);
-                let c = u32::from_le_bytes(bytes[o + 8..o + 12].try_into().ok()?);
-                faces.push([a, b, c]);
-            }
-            return Some(MeshData { vertices, uvs, faces, aabb_min: min, aabb_max: max });
+        let vc = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        let fc = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]) as usize;
+        (vc, fc)
+    } else {
+        if cursor + 2 > bytes.len() {
+            return None;
+        }
+        (bytes[cursor] as usize, bytes[cursor + 1] as usize)
+    };
+
+    // Sanity limits: reject absurd counts that would make us read garbage as
+    // vertices (the cause of the "spikes" on large maps).
+    if vertex_count == 0 || vertex_count > 500_000 || face_count > 1_000_000 {
+        return None;
+    }
+
+    const VERTEX_STRIDE: usize = 32; // pos(12) + normal(12) + uv(8)
+    if bytes.len() < cursor + vertex_count * VERTEX_STRIDE {
+        return None;
+    }
+
+    let mut vertices = Vec::with_capacity(vertex_count);
+    let mut uvs = Vec::with_capacity(vertex_count);
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for i in 0..vertex_count {
+        let o = cursor + i * VERTEX_STRIDE;
+        let px = f32::from_le_bytes(bytes[o..o + 4].try_into().ok()?);
+        let py = f32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?);
+        let pz = f32::from_le_bytes(bytes[o + 8..o + 12].try_into().ok()?);
+        let u = f32::from_le_bytes(bytes[o + 24..o + 28].try_into().ok()?);
+        let v = f32::from_le_bytes(bytes[o + 28..o + 32].try_into().ok()?);
+        // Skip NaN/inf vertices (would create spikes).
+        if !(px.is_finite() && py.is_finite() && pz.is_finite()) {
+            return None;
+        }
+        min[0] = min[0].min(px);
+        min[1] = min[1].min(py);
+        min[2] = min[2].min(pz);
+        max[0] = max[0].max(px);
+        max[1] = max[1].max(py);
+        max[2] = max[2].max(pz);
+        vertices.push([px, py, pz]);
+        uvs.push([u, 1.0 - v]);
+    }
+    cursor += vertex_count * VERTEX_STRIDE;
+
+    // Faces: 1.00 uses 3×u32 (12 bytes), 1.01 uses 3×u16 (6 bytes).
+    // Pick whichever the remaining data can hold.
+    let remaining = bytes.len().saturating_sub(cursor);
+    let face_stride = if remaining >= face_count * 12 {
+        12
+    } else if remaining >= face_count * 6 {
+        6
+    } else {
+        return None;
+    };
+
+    let mut faces = Vec::with_capacity(face_count);
+    for i in 0..face_count {
+        let o = cursor + i * face_stride;
+        let (a, b, c) = if face_stride == 12 {
+            (
+                u32::from_le_bytes(bytes[o..o + 4].try_into().ok()?),
+                u32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?),
+                u32::from_le_bytes(bytes[o + 8..o + 12].try_into().ok()?),
+            )
+        } else {
+            (
+                u32::from_le_bytes(bytes[o..o + 2].try_into().ok()?),
+                u32::from_le_bytes(bytes[o + 2..o + 4].try_into().ok()?),
+                u32::from_le_bytes(bytes[o + 4..o + 6].try_into().ok()?),
+            )
+        };
+        // Skip faces referencing out-of-range vertices (would create spikes).
+        if a < vertex_count as u32 && b < vertex_count as u32 && c < vertex_count as u32 {
+            faces.push([a, b, c]);
         }
     }
-    None
+
+    if faces.is_empty() {
+        return None;
+    }
+    Some(MeshData { vertices, uvs, faces, aabb_min: min, aabb_max: max })
 }
 
 // ----------------------------------------------------------------------------
@@ -797,6 +860,10 @@ pub struct RbxCamera;
 /// Marker for the scene root (so the whole scene can be despawned on reload).
 #[derive(Component)]
 pub struct RbxSceneRoot;
+
+/// Marker for the gradient sky dome (follows the camera so it never clips the scene).
+#[derive(Component)]
+pub struct SkyDome;
 
 /// Orbit camera state, driven by egui drags on the 3D viewport tab.
 #[derive(Resource, Clone, Copy, Debug)]
@@ -828,11 +895,13 @@ pub fn spawn_camera_and_light(commands: &mut Commands) {
         // see the whole place, and a small near plane means you can go right up
         // to / inside a part without the geometry vanishing.
         Projection::Perspective(PerspectiveProjection {
-            // Tight near/far planes give much better depth precision, which
-            // removes the z-fighting/"glitching" on overlapping parts that a
-            // huge far=20000 plane caused.
+            // near/far tuned for large maps: far enough to see the whole place
+            // (parts beyond the far plane pop in/out = flicker), while keeping
+            // the near/far ratio reasonable for depth precision. Far=20000 was
+            // too large (z-fighting); far=800 was too small (distant parts
+            // clipped). 2000 balances both.
             near: 0.1,
-            far: 800.0,
+            far: 2000.0,
             fov: 60f32.to_radians(),
             ..default()
         }),
