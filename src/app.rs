@@ -344,7 +344,7 @@ impl EditorApp {
             // Transparent central panel: the Bevy 3D scene shows through and
             // this region senses drag/scroll to orbit the camera.
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
+                .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                 .show(ctx, |ui| {
                     self.show_viewport_drag(ui, orbit);
                 });
@@ -433,7 +433,7 @@ impl EditorApp {
             orbit.dist = (orbit.dist - scroll * 0.1).clamp(2.0, 2000.0);
         }
         // Subtle border so the user can see the drag area.
-        ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 180, 255, 90)), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(rect, 0.0_f32, egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(120, 180, 255, 90)), egui::StrokeKind::Inside);
 
         if self.dom.is_none() {
             ui.centered_and_justified(|ui| {

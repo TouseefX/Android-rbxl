@@ -114,6 +114,16 @@ public class MainActivity extends NativeActivity {
         }
     }
 
+    /** Return the app's internal files directory as an absolute path string. */
+    public static String getFilesDirStatic() {
+        try {
+            return getFilesDir().getAbsolutePath();
+        } catch (Exception e) {
+            Log.e(TAG, "getFilesDir failed", e);
+            return null;
+        }
+    }
+
     /** Launch the standalone Bevy viewer app by package name. */
     public static void launchViewerStatic(final String packageName) {
         MainActivity act = sInstance;

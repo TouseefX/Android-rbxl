@@ -733,8 +733,6 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     let bytes = std::fs::read(path).ok()?;
     // Very small Roblox .mesh binary parser (v1.00/v1.01).
     let version = String::from_utf8_lossy(&bytes[..8.min(bytes.len())]).into_owned();
-    let mut sizeof_vertex = 0usize;
-    let mut sizeof_face = 0usize;
     if version.starts_with("version 1.") {
         // header size + counts
         let header_start = 8;
@@ -742,8 +740,8 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
             return None;
         }
         if version.starts_with("version 1.01") || version.starts_with("version 1.00") {
-            sizeof_vertex = 32;
-            sizeof_face = 12;
+            let sizeof_vertex = 32usize;
+            let sizeof_face = 12usize;
             let nv = u32::from_le_bytes([bytes[header_start + 4], bytes[header_start + 5], bytes[header_start + 6], bytes[header_start + 7]]) as usize;
             let nf = u32::from_le_bytes([bytes[header_start + 8], bytes[header_start + 9], bytes[header_start + 10], bytes[header_start + 11]]) as usize;
             let v_start = header_start + 16;
