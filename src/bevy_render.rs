@@ -449,7 +449,51 @@ fn extract_geometry(dom: &WeakDom) -> Vec<PartGeo> {
             "Part" | "WedgePart" | "CornerWedgePart" | "TrussPart" | "SpawnLocation" | "MeshPart" | "Seat" | "VehicleSeat" | "UnionOperation"
         );
         if is_3d {
-            if let Some(g) = extract_part(dom, inst) {
+            if let Some(mut g) = extract_part(dom, inst) {
+                // Classic Roblox builds routinely have parts that genuinely
+                // interpenetrate on purpose — a wall sunk slightly into a
+                // floor, a pillar through a decorative ball, stacked blocks
+                // — real, intentional overlapping geometry (confirmed on a
+                // real map: 20+ significantly-overlapping part pairs, not a
+                // data bug). Two overlapping opaque surfaces tie the GPU
+                // depth test at their crossing plane, and which one "wins"
+                // there gets resolved by floating-point rounding that shifts
+                // with camera angle/distance — so the visible color at that
+                // spot flickered as the camera moved. A per-*material*
+                // `depth_bias` can't fix this: overlapping parts very often
+                // share the same color (a classic build reuses a handful of
+                // BrickColors constantly), landing in the same material
+                // bucket and getting pushed by the exact same amount, so
+                // they stay exactly as tied. Baking a distinct, stable
+                // per-part epsilon straight into vertex positions (real
+                // world-space geometry, not a rasterizer trick) makes every
+                // part very slightly different in size, so any crossing
+                // plane resolves the same way from every angle.
+                // IMPORTANT: seed from data that comes straight out of the
+                // file bytes (name, the part's own transformed geometry,
+                // color) — NOT `r`. rbx_types::Ref is explicitly documented
+                // as randomly generated per parse (`Ref::new()`), so hashing
+                // it would make this epsilon (and therefore which part wins
+                // an overlap) different on every single load — reintroducing
+                // exactly the "changes every time I open it" symptom this
+                // whole thread has been chasing, just moved to a new spot.
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&inst.name, &mut hasher);
+                if let Some(t0) = g.tris.first() {
+                    for c in t0.pos {
+                        std::hash::Hash::hash(&c.to_bits(), &mut hasher);
+                    }
+                }
+                for c in g.color {
+                    std::hash::Hash::hash(&c.to_bits(), &mut hasher);
+                }
+                let hv = std::hash::Hasher::finish(&hasher);
+                let eps = 0.0003 + (hv % 997) as f32 / 997.0 * 0.0007; // ~0.0003..0.001 studs
+                for t in &mut g.tris {
+                    t.pos[0] += t.normal[0] * eps;
+                    t.pos[1] += t.normal[1] * eps;
+                    t.pos[2] += t.normal[2] * eps;
+                }
                 out.push(g);
             }
         }
