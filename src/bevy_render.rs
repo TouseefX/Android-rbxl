@@ -1278,9 +1278,19 @@ pub fn rebuild_scene(
             texture,
             tint_texture,
             transparent: alpha < 0.99,
-            // Push surfaces toward the camera so overlapping/adjacent faces
-            // (baseplates, walls through floors) stop z-fighting.
-            depth_bias: 1.0,
+            // Was a flat `1.0` for every material. That pushes ALL surfaces
+            // toward the camera by the same amount, so two coincident/
+            // overlapping parts (a decal-carrying part stacked directly on
+            // a plain one, a duplicate baseplate, etc. — common when a
+            // template map is assembled from stacked pre-made pieces) stay
+            // exactly as tied as before. With truly equal depth, the GPU's
+            // depth test is resolved by floating-point rounding that shifts
+            // with view angle/distance, so which surface "wins" — and which
+            // color you see — flickered as the camera moved. Giving
+            // textured/decorated surfaces a consistently higher bias than
+            // flat-color ones means real ties now resolve the same way
+            // every time, independent of camera position.
+            depth_bias: if has_texture == 1 { 2.0 } else { 1.0 },
         });
 
         commands.entity(root).with_children(|parent| {
