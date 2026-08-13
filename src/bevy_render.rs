@@ -58,6 +58,13 @@ pub struct FlatMaterial {
     #[texture(3)]
     #[sampler(4)]
     pub texture: Option<Handle<Image>>,
+    /// 1 = multiply the sampled texture by `color` (procedural material
+    /// patterns like studs/brick/grass, which are generated as neutral
+    /// greyscale and rely on this to pick up the part's actual BrickColor).
+    /// 0 = use the sampled texture as-is (real downloaded Decal/MeshPart
+    /// textures — Roblox doesn't tint these by the part's Color).
+    #[uniform(5)]
+    pub tint_texture: u32,
     /// Whether to use alpha blending (transparent parts).
     pub transparent: bool,
     /// Small depth bias to separate coincident/overlapping faces and stop
@@ -1255,11 +1262,21 @@ pub fn rebuild_scene(
             },
             None => (None, 0),
         };
+        // Procedural material-pattern keys (studs/brick/grass/etc.) all use
+        // the "__name" convention set in asset_downloader.rs's
+        // get_cached_image — those should tint. Anything else (a real
+        // rbxassetid/content-id key) is a downloaded Decal/MeshPart texture
+        // and should render as-is.
+        let tint_texture: u32 = match &tex_key {
+            Some(k) if k.starts_with("__") => 1,
+            _ => 0,
+        };
         let mth = materials.add(FlatMaterial {
             color,
             light_dir: Vec4::new(60.0, 90.0, 40.0, 0.0),
             has_texture,
             texture,
+            tint_texture,
             transparent: alpha < 0.99,
             // Push surfaces toward the camera so overlapping/adjacent faces
             // (baseplates, walls through floors) stop z-fighting.

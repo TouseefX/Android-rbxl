@@ -10,6 +10,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> has_texture: u32;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var tex_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(5) var<uniform> tint_texture: u32;
 
 @fragment
 fn fragment(
@@ -20,7 +21,22 @@ fn fragment(
 
     if (has_texture == 1u) {
         var tex_col = textureSample(tex, tex_sampler, mesh.uv);
-        out_rgb = out_rgb * tex_col.rgb;
+        // Procedural material patterns (studs/brick/grass/etc., generated in
+        // asset_downloader.rs) are deliberately greyscale/neutral and MEANT
+        // to be multiplied by the part's BrickColor — that's how a red brick
+        // gets red studs instead of always-grey studs. Real downloaded
+        // Decal/MeshPart textures are different: Roblox doesn't tint those
+        // by the part's Color, the image shows as-is. Without this
+        // distinction, every real texture got multiplied by whatever
+        // (usually non-white, often default grey 194) BrickColor the part
+        // had — invisible before the texture finished downloading (nothing
+        // to multiply against yet), then a visible muddy/grey tint the
+        // moment it landed a few seconds later.
+        if (tint_texture == 1u) {
+            out_rgb = out_rgb * tex_col.rgb;
+        } else {
+            out_rgb = tex_col.rgb;
+        }
         out_alpha = tex_col.a * material_color.a;
     }
 
