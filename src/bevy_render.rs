@@ -18,7 +18,7 @@ use bevy::render::render_resource::{
     Extent3d, PrimitiveTopology, TextureDimension, TextureFormat,
 };
 use rbx_dom_weak::{types::Variant, WeakDom};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 // ----------------------------------------------------------------------------
@@ -1182,8 +1182,20 @@ pub fn rebuild_scene(
 
     // Bucket by (color, alpha, texture_key) so each unique look gets one
     // material + mesh, keeping draw calls low while still supporting textures.
+    //
+    // BTreeMap, not HashMap: Rust's default HashMap hasher is randomly seeded
+    // per process, so a HashMap with identical contents iterates in a
+    // *different order* on every app launch. That randomized order became
+    // the entity-spawn order, which became draw-call submission order. For
+    // any coincident/overlapping geometry (duplicate or stacked parts,
+    // decals sitting flush on their base part) the depth test ties and the
+    // GPU keeps whichever surface was drawn *last* — so the "winning" color
+    // for those spots flipped on every relaunch of the exact same file.
+    // Semi-transparent surfaces (glass, alpha decals) blend back-to-front
+    // and were affected the same way. BTreeMap always iterates in sorted key
+    // order, so the same file now produces the same draw order every time.
     type Key = ([u8; 3], u8, Option<String>);
-    let mut buckets: HashMap<Key, Vec<Tri>> = HashMap::new();
+    let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
     for p in &parts {
         let ck = [
             (p.color[0] * 255.0).round() as u8,
