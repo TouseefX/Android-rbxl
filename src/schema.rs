@@ -5,6 +5,23 @@ use rbx_dom_weak::{
 use rbx_reflection_database::get as get_reflection_database;
 use std::collections::BTreeMap;
 
+/// In newer `rbx_reflection_database`, `get()` returns a `Result` because the
+/// embedded database can (theoretically) fail to load. On every shipped build
+/// it resolves, so fall back to an empty database on error — callers treat a
+/// missing class/enum the same as "not found".
+fn database() -> &'static rbx_reflection::ReflectionDatabase<'static> {
+    match get_reflection_database() {
+        Ok(db) => db,
+        Err(_) => {
+            // No global const empty database is exposed; use a leaked empty one
+            // so the signature stays a simple shared reference.
+            static EMPTY: std::sync::OnceLock<rbx_reflection::ReflectionDatabase<'static>> =
+                std::sync::OnceLock::new();
+            EMPTY.get_or_init(rbx_reflection::ReflectionDatabase::new)
+        }
+    }
+}
+
 pub struct SchemaClassInfo {
     pub name: String,
     pub superclass: Option<String>,
@@ -14,7 +31,7 @@ pub struct SchemaClassInfo {
 
 /// Search all official Roblox Engine classes from rbx_reflection_database
 pub fn search_engine_classes(query: &str) -> Vec<SchemaClassInfo> {
-    let db = get_reflection_database();
+    let db = database();
     let q = query.trim().to_lowercase();
 
     let mut classes: Vec<SchemaClassInfo> = db
@@ -50,7 +67,7 @@ pub fn search_engine_classes(query: &str) -> Vec<SchemaClassInfo> {
 
 /// Retrieve all available schema properties and their official types for a class
 pub fn get_class_schema_properties(class_name: &str) -> BTreeMap<String, String> {
-    let db = get_reflection_database();
+    let db = database();
     let mut out = BTreeMap::new();
 
     let mut current_class = Some(class_name);
@@ -71,7 +88,7 @@ pub fn get_class_schema_properties(class_name: &str) -> BTreeMap<String, String>
 
 /// Retrieve all valid Roblox Enum items for an enum type
 pub fn get_enum_items(enum_name: &str) -> Vec<String> {
-    let db = get_reflection_database();
+    let db = database();
     if let Some(enum_desc) = db.enums.get(enum_name) {
         let mut items: Vec<String> = enum_desc.items.keys().map(|k| k.to_string()).collect();
         items.sort();
@@ -88,12 +105,12 @@ pub fn create_instance_from_schema(
     class_name: &str,
     name: &str,
 ) -> Result<Ref, anyhow::Error> {
-    let db = get_reflection_database();
+    let db = database();
     let mut builder = InstanceBuilder::new(class_name).with_name(name);
 
     if let Some(desc) = db.classes.get(class_name) {
         for (prop_key, default_val) in &desc.default_properties {
-            builder = builder.with_property(prop_key.as_ref(), default_val.clone());
+            builder = builder.with_property::<&str, Variant>(prop_key.as_ref(), default_val.clone());
         }
     }
 

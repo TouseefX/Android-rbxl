@@ -261,58 +261,110 @@ pub fn count_instances(dom: &WeakDom, root: Ref) -> usize {
     count
 }
 
-/// Decodes any Roblox model payload (.rbxm binary, .rbxmx XML, compressed gzip, or Luau script)
-/// into a `WeakDom` hierarchy.
+/// The 8-byte magic header of every raw binary Roblox model (.rbxm) and place
+/// (.rbxl) file: `<roblox!` followed by `\x89\xFF\x0D\x0A\x1A\x0A`. This is
+/// exactly what a local .rbxm saved by Studio starts with.
+const BINARY_HEADER: [u8; 8] = *b"<roblox!";
+
+/// Decodes any Roblox model payload into a `WeakDom` hierarchy.
+///
+/// Accepts, in order:
+/// * raw binary `.rbxm` / `.rbxl` (`<roblox!…` magic) — this is what **local**
+///   model files use, with no gzip/wrapper around them;
+/// * gzip- or zstd-wrapped binary/XML (Creator Store / Asset Delivery payloads);
+/// * XML `.rbxmx` / `.rbxlx`;
+/// * plain Lua/Luau source (wrapped in a `ModuleScript`).
+///
+/// Unlike the previous implementation, every parser failure is **recorded** and
+/// surfaced in the final error instead of being silently swallowed, so a file
+/// that the parser genuinely can't read (e.g. produced by a newer Studio than
+/// the bundled reflection database) produces an actionable message rather than
+/// a generic "unsupported format".
 pub fn decode_model_bytes(bytes: &[u8]) -> Result<WeakDom> {
     if bytes.is_empty() {
         bail!("Cannot decode empty model bytes");
     }
 
-    // 1. Decompress if gzipped (magic bytes 0x1f 0x8b)
+    // Peel off any compression wrapper. gzip (0x1F 0x8B) is used by the classic
+    // AssetDelivery v1 endpoint; zstd (0x28 0xB5 0x2F 0xFD) is used by newer
+    // CDN responses. Local .rbxm files are NOT compressed, so this is a no-op
+    // for them.
     let decompressed: Vec<u8>;
-    let payload = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+    let payload: &[u8] = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
         use flate2::read::GzDecoder;
         use std::io::Read;
-        let mut gz = GzDecoder::new(bytes);
         let mut buf = Vec::new();
-        if gz.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-            decompressed = buf;
-            &decompressed[..]
-        } else {
-            bytes
+        match GzDecoder::new(bytes).read_to_end(&mut buf) {
+            Ok(_) if !buf.is_empty() => {
+                decompressed = buf;
+                &decompressed[..]
+            }
+            _ => bytes,
+        }
+    } else if bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xb5 && bytes[2] == 0x2f && bytes[3] == 0xfd {
+        // zstd magic — rbx_binary itself also understands chunk-level zstd, but
+        // a whole-file zstd wrapper needs explicit decompression first.
+        match zstd_decode_all(bytes) {
+            Some(buf) if !buf.is_empty() => {
+                decompressed = buf;
+                &decompressed[..]
+            }
+            _ => bytes,
         }
     } else {
         bytes
     };
 
-    // 2. Binary RBXM / RBXL (starts with "<roblox!\x89\xff\r\n\x1a\n" or "<roblox")
-    if payload.starts_with(b"<roblox!") || (payload.len() >= 8 && &payload[0..7] == b"<roblox" && payload.contains(&0x89)) {
-        if let Ok(dom) = rbx_binary::from_reader(Cursor::new(payload)) {
-            return Ok(dom);
+    // Some providers/pickers prepend a UTF-8 BOM or stray whitespace; trim it
+    // before signature matching (never mutates the actual parsed bytes).
+    let trimmed = skip_leading_whitespace_and_bom(payload);
+
+    let mut binary_err: Option<String> = None;
+    let mut xml_err: Option<String> = None;
+
+    // 1. Raw binary .rbxm / .rbxl — exact 8-byte signature.
+    if trimmed.starts_with(&BINARY_HEADER) {
+        match rbx_binary::from_reader(Cursor::new(trimmed)) {
+            Ok(dom) => return Ok(dom),
+            Err(e) => binary_err = Some(format!("rbx_binary: {e}")),
         }
     }
 
-    // 3. XML RBXMX / RBXLX (starts with "<roblox" or "<?xml")
-    if payload.starts_with(b"<roblox") || payload.starts_with(b"<?xml") || payload.windows(12).any(|w| w == b"<Item class=") {
-        if let Ok(dom) = rbx_xml::from_reader_default(Cursor::new(payload)) {
-            return Ok(dom);
+    // 2. XML .rbxmx / .rbxlx.
+    let looks_like_xml = trimmed.starts_with(b"<roblox")
+        || trimmed.starts_with(b"<?xml")
+        || trimmed.windows(12).any(|w| w == b"<Item class=");
+    if looks_like_xml {
+        match rbx_xml::from_reader_default(Cursor::new(trimmed)) {
+            Ok(dom) => return Ok(dom),
+            Err(e) => xml_err = Some(format!("rbx_xml: {e}")),
         }
     }
 
-    // Try rbx_binary general fallback
-    if let Ok(dom) = rbx_binary::from_reader(Cursor::new(payload)) {
-        return Ok(dom);
+    // 3. General fallbacks: a file may have a weird/extensionless header yet
+    //    still be parseable. Try both parsers and remember their errors.
+    if binary_err.is_none() {
+        match rbx_binary::from_reader(Cursor::new(trimmed)) {
+            Ok(dom) => return Ok(dom),
+            Err(e) => binary_err = Some(format!("rbx_binary: {e}")),
+        }
+    }
+    if xml_err.is_none() {
+        match rbx_xml::from_reader_default(Cursor::new(trimmed)) {
+            Ok(dom) => return Ok(dom),
+            Err(e) => xml_err = Some(format!("rbx_xml: {e}")),
+        }
     }
 
-    // Try rbx_xml general fallback
-    if let Ok(dom) = rbx_xml::from_reader_default(Cursor::new(payload)) {
-        return Ok(dom);
-    }
-
-    // 4. Lua / Luau Source Code fallback
-    if let Ok(text) = std::str::from_utf8(payload) {
-        let trimmed = text.trim();
-        if trimmed.starts_with("--") || trimmed.contains("function") || trimmed.contains("local ") || trimmed.contains("return ") || trimmed.contains("game:") {
+    // 4. Lua / Luau source fallback.
+    if let Ok(text) = std::str::from_utf8(trimmed) {
+        let t = text.trim();
+        if t.starts_with("--")
+            || t.contains("function")
+            || t.contains("local ")
+            || t.contains("return ")
+            || t.contains("game:")
+        {
             let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
             let root = dom.root_ref();
             let builder = InstanceBuilder::new("ModuleScript")
@@ -323,7 +375,55 @@ pub fn decode_model_bytes(bytes: &[u8]) -> Result<WeakDom> {
         }
     }
 
-    bail!("Unsupported Roblox model format or unrecognized payload structure")
+    // Build a diagnostic that actually tells the user (and us) what happened.
+    let head: String = trimmed
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut msg = format!(
+        "Could not decode Roblox model/place ({} bytes, first bytes: {head}).",
+        trimmed.len()
+    );
+    if let Some(e) = &binary_err {
+        msg.push_str(&format!("\n  • Binary (.rbxm) parser: {e}"));
+    }
+    if let Some(e) = &xml_err {
+        msg.push_str(&format!("\n  • XML (.rbxmx) parser: {e}"));
+    }
+    msg.push_str(
+        "\nIf this is a .rbxm saved by a very recent Roblox Studio, updating the \
+         rbx_binary/rbx_reflection_database crates may be required.",
+    );
+    bail!(msg)
+}
+
+/// Skip ASCII whitespace and an optional UTF-8 BOM at the start of `bytes`.
+fn skip_leading_whitespace_and_bom(mut bytes: &[u8]) -> &[u8] {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes = &bytes[3..];
+    }
+    while let Some((&b, rest)) = bytes.split_first() {
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+/// Decompress a whole-file zstd stream (used by newer AssetDelivery CDN
+/// responses). Local `.rbxm` files are never zstd-wrapped, so this only fires
+/// for downloaded payloads. Returns `None` if the stream isn't valid zstd, in
+/// which case the caller passes the raw bytes through to the parsers.
+fn zstd_decode_all(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut dec = zstd::Decoder::new(bytes).ok()?;
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 /// Serialize the whole DOM to bytes, ready to hand to the JNI bridge for saving.

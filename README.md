@@ -132,6 +132,11 @@ Run the **Build Android APK** workflow. It produces **one** file:
 2. Grant it "All files access" (Settings → Apps → Special access → All files access) if you want to read/write places outside the SAF picker.
 3. Open the app, tap **📂 Open .rbxl** (uses Android's document picker), choose a `.rbxl`/`.rbxmx`.
 4. The **🌍 3D Viewport** tab renders the place live with the Bevy engine (drag to orbit, scroll/pinch to zoom).
+5. To insert a model from your device (not just the Creator Store), open a place first,
+   then tap **📥 Import Local .rbxm** in the toolbar (or the **📁 Import Local Model File**
+   group in the ☁️ Creator Store tab). Pick any `.rbxm`/`.rbxmx` (gzipped models and `.lua`/
+   `.luau` source files are also accepted); it is decoded and merged into the active place
+   under the current Explorer selection (or the place root if nothing is selected).
 
 ### Build locally
 
