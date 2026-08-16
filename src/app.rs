@@ -288,6 +288,9 @@ impl EditorApp {
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();
                     }
+                    if ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
+                        self.prompt_import_local_model();
+                    }
                     if ui.button(RichText::new("💾 Save").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
                         self.save();
                     }
@@ -530,6 +533,31 @@ impl EditorApp {
                         self.direct_asset_id_input = clip.trim().to_string();
                         self.status = format!("Pasted asset string: {}", self.direct_asset_id_input);
                     }
+                }
+            });
+        });
+
+        ui.add_space(4.0);
+
+        // 1b. Local Model File Inserter — the off-line counterpart to the
+        // network inserter above. Picks a .rbxm/.rbxmx (or gzipped/Luau) file
+        // from the device and inserts its hierarchy into the active place,
+        // under the current Explorer selection (or the place root).
+        ui.group(|ui| {
+            ui.label(RichText::new("📁 Import Local Model File (.rbxm / .rbxmx)").strong().color(Color32::from_rgb(100, 200, 255)));
+            ui.label("Insert a model saved on your device — no download or Creator Store required. Supports binary .rbxm, XML .rbxmx, gzipped, and .lua/.luau source.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(RichText::new("📂 Choose Local .rbxm/.rbxmx & Insert").strong().color(Color32::from_rgb(100, 255, 140))).clicked() {
+                    self.prompt_import_local_model();
+                }
+                if self.dom.is_none() {
+                    ui.label(RichText::new("(open a .rbxl place first)").color(Color32::from_rgb(200, 200, 100)));
+                } else if let Some(dom) = &self.dom {
+                    let parent = self.selected.and_then(|r| dom.get_by_ref(r));
+                    match parent {
+                        Some(inst) => ui.label(format!("Will insert under: {} ({})", inst.name, inst.class)),
+                        None => ui.label("Will insert under: place root (DataModel)"),
+                    };
                 }
             });
         });
@@ -1840,6 +1868,9 @@ impl EditorApp {
                         self.log_error(format!("Failed to parse rbxl: {e}"));
                     }
                 },
+                FileEvent::ModelOpened { uri, data } => {
+                    self.insert_local_model(uri, data);
+                }
                 FileEvent::OpenCancelled => {
                     self.status = "Open cancelled".into();
                 }
@@ -2032,5 +2063,75 @@ impl EditorApp {
             return;
         }
         jni_bridge::trigger_create_document("place.rbxl");
+    }
+
+    /// Launch the Android file picker for a local .rbxm/.rbxmx model file. The
+    /// picked file is decoded and inserted as a subtree into the active place
+    /// under the current selection (or the place root if nothing is selected),
+    /// the exact same way a Creator Store download is inserted. This is the
+    /// local-file counterpart to the "📥 Download & Insert Full Model" button.
+    fn prompt_import_local_model(&mut self) {
+        if self.dom.is_none() {
+            self.status = "Open a .rbxl place first, then import a model into it".into();
+            self.log_error("Cannot import local model: no place file open");
+            return;
+        }
+        self.status = "Pick a local .rbxm / .rbxmx file to insert...".into();
+        self.log_info("Opening system file picker for local .rbxm/.rbxmx model");
+        jni_bridge::trigger_open_model_document();
+    }
+
+    /// Decode local model bytes (binary .rbxm, XML .rbxmx, gzipped, or Luau
+    /// source — all handled by `rbxl::decode_model_bytes`) and merge every
+    /// top-level instance into the active place under the current selection.
+    fn insert_local_model(&mut self, uri: String, data: Vec<u8>) {
+        let Some(dom) = self.dom.as_mut() else {
+            self.status = "Open a .rbxl place first, then import a model into it".into();
+            return;
+        };
+
+        // Snapshot the selection/root before borrowing dom mutably for decode.
+        let parent = self
+            .selected
+            .and_then(|r| {
+                // Only allow insertion under an instance that still exists and
+                // can logically contain children (root DataModel always can).
+                if dom.get_by_ref(r).is_some() {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| dom.root_ref());
+
+        match rbxl::decode_model_bytes(&data) {
+            Ok(source_dom) => {
+                let (first_ref, count) = rbxl::insert_all_root_children(dom, parent, &source_dom);
+                if count == 0 || first_ref.is_none() {
+                    self.status = "Model file contained no insertable instances".into();
+                    self.log_error(format!("Local model '{uri}' decoded but had 0 instances"));
+                    return;
+                }
+                let first_ref = first_ref.unwrap();
+                let name = dom
+                    .get_by_ref(first_ref)
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| "Model".to_string());
+                self.selected = Some(first_ref);
+                self.needs_3d_rebuild = true;
+                self.status =
+                    format!("✅ Inserted local model '{name}' ({count} instances) from {uri}");
+                self.log_info(format!(
+                    "Imported local model '{name}' ({count} instances) from {uri}"
+                ));
+            }
+            Err(e) => {
+                self.status = format!("Failed to decode local model: {e}");
+                self.log_error(format!(
+                    "Failed to decode local model '{uri}': {e}. \
+                     Supported: .rbxm (binary), .rbxmx (XML), gzipped, or .lua/.luau source."
+                ));
+            }
+        }
     }
 }

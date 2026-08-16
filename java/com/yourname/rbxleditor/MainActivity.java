@@ -30,6 +30,10 @@ public class MainActivity extends NativeActivity {
 
     private static final int REQ_OPEN = 1001;
     private static final int REQ_CREATE = 1002;
+    // Separate request code so a picked local .rbxm/.rbxmx is routed through
+    // the model-import path (decoded + inserted into the active place) instead
+    // of being treated as a whole .rbxl place file.
+    private static final int REQ_OPEN_MODEL = 1003;
 
     private Uri currentDocUri;
 
@@ -70,6 +74,16 @@ public class MainActivity extends NativeActivity {
             act.openDocument();
         } else {
             Log.e(TAG, "openDocumentStatic: MainActivity instance is null");
+        }
+    }
+
+    /** Called from Rust to launch the system file picker filtered to local model files. */
+    public static void openModelDocumentStatic() {
+        MainActivity act = sInstance;
+        if (act != null) {
+            act.openModelDocument();
+        } else {
+            Log.e(TAG, "openModelDocumentStatic: MainActivity instance is null");
         }
     }
 
@@ -239,6 +253,45 @@ public class MainActivity extends NativeActivity {
         });
     }
 
+    /**
+     * Launch the Storage Access Framework picker for a local Roblox MODEL file
+     * (.rbxm binary or .rbxmx XML). Unlike {@link #openDocument()} this does NOT
+     * replace the currently-open place — the bytes are sent back through the
+     * REQ_OPEN_MODEL channel and inserted as a subtree into the active place.
+     *
+     * We don't rely on a single MIME type because Android file managers report
+     * wildly different types for .rbxm/.rbxmx (often application/octet-stream,
+     * text/xml, or nothing at all), so we accept all openable documents and let
+     * the Rust decoder validate the payload by magic bytes.
+     */
+    public void openModelDocument() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("*/*");
+                    // On providers that honour it, narrow the list to the two
+                    // Roblox model extensions. Harmless on providers that don't.
+                    intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                        "application/octet-stream",
+                        "application/x-rbxm",
+                        "application/x-roblox",
+                        "model/rbxm",
+                        "text/xml",
+                        "application/xml",
+                    });
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivityForResult(intent, REQ_OPEN_MODEL);
+                } catch (Exception e) {
+                    Log.e(TAG, "openModelDocument startActivityForResult failed", e);
+                    nativeOnModelOpened(null, null);
+                }
+            }
+        });
+    }
+
     public void createDocument(final String suggestedName) {
         runOnUiThread(new Runnable() {
             @Override
@@ -383,6 +436,24 @@ public class MainActivity extends NativeActivity {
                 byte[] bytes = readBytes(uri);
                 nativeOnDocumentOpened(uri.toString(), bytes);
 
+            } else if (requestCode == REQ_OPEN_MODEL) {
+                // Local .rbxm/.rbxmx picked: do NOT touch currentDocUri (that is
+                // the open place's save target); just hand the bytes to Rust to
+                // decode and insert as a subtree.
+                if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+                    nativeOnModelOpened(null, null);
+                    return;
+                }
+                Uri uri = data.getData();
+                try {
+                    final int flags = Intent.FLAG_GRANT_READ_URI_PERMISSION;
+                    getContentResolver().takePersistableUriPermission(uri, flags);
+                } catch (Exception e) {
+                    Log.w(TAG, "takePersistableUriPermission (read) failed (non-fatal)", e);
+                }
+                byte[] bytes = readBytes(uri);
+                nativeOnModelOpened(uri.toString(), bytes);
+
             } else if (requestCode == REQ_CREATE) {
                 if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
                 Uri uri = data.getData();
@@ -449,6 +520,7 @@ public class MainActivity extends NativeActivity {
 
     // ---- implemented in Rust (src/jni_bridge.rs) ----
     private native void nativeOnDocumentOpened(String uri, byte[] data);
+    private native void nativeOnModelOpened(String uri, byte[] data);
     private native void nativeOnDocumentCreated(String uri);
     private native void nativeOnSaveComplete(boolean success);
     private native void nativeOnExternalEditReturned(long scriptId, String text);

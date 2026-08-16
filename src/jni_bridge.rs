@@ -5,6 +5,10 @@ use std::sync::{Mutex, OnceLock};
 
 pub enum FileEvent {
     Opened { uri: String, data: Vec<u8> },
+    /// A local .rbxm/.rbxmx model file was picked for INSERTION into the
+    /// currently-open place (as opposed to Opened, which replaces the whole
+    /// place). Mirrors the Creator Store download path but for local files.
+    ModelOpened { uri: String, data: Vec<u8> },
     OpenCancelled,
     Created { uri: String },
     SaveComplete(bool),
@@ -103,6 +107,17 @@ fn with_env(f: impl FnOnce(&mut JNIEnv, &JClass) -> Result<(), jni::errors::Erro
 pub fn trigger_open_document() {
     with_env(|env, class| {
         let _ = env.call_static_method(class, "openDocumentStatic", "()V", &[])?;
+        Ok(())
+    });
+}
+
+/// Launch the Android file picker for a local .rbxm/.rbxmx MODEL file. The
+/// picked bytes come back as a [`FileEvent::ModelOpened`] and are inserted as
+/// a subtree into the active place, unlike `trigger_open_document` which
+/// replaces the whole place.
+pub fn trigger_open_model_document() {
+    with_env(|env, class| {
+        let _ = env.call_static_method(class, "openModelDocumentStatic", "()V", &[])?;
         Ok(())
     });
 }
@@ -210,6 +225,23 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnDocumen
     let uri_str: String = env.get_string(&uri).map(|s| s.into()).unwrap_or_default();
     let bytes: Vec<u8> = env.convert_byte_array(data).unwrap_or_default();
     let _ = tx.send(FileEvent::Opened { uri: uri_str, data: bytes });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnModelOpened(
+    mut env: JNIEnv,
+    _class: JClass,
+    uri: JString,
+    data: JByteArray,
+) {
+    let (tx, _) = channel();
+    if uri.is_null() || data.is_null() {
+        let _ = tx.send(FileEvent::OpenCancelled);
+        return;
+    }
+    let uri_str: String = env.get_string(&uri).map(|s| s.into()).unwrap_or_default();
+    let bytes: Vec<u8> = env.convert_byte_array(data).unwrap_or_default();
+    let _ = tx.send(FileEvent::ModelOpened { uri: uri_str, data: bytes });
 }
 
 #[unsafe(no_mangle)]
