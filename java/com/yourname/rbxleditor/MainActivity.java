@@ -7,6 +7,10 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Looper;
+import android.view.View;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputMethodManager;
 import android.os.Environment;
 import android.os.StrictMode;
 import android.util.Log;
@@ -39,6 +43,7 @@ public class MainActivity extends NativeActivity {
     private static final int REQ_OPEN_MODEL = 1003;
 
     private Uri currentDocUri;
+    private View inputTarget;
 
     // External edit state
     private long activeExternalScriptId = -1;
@@ -59,6 +64,57 @@ public class MainActivity extends NativeActivity {
         }
 
         Log.i(TAG, "MainActivity onCreate: instance registered");
+
+        // A focusable, invisible View whose InputConnection forwards
+        // soft-keyboard / Gboard events (including paste) to Rust.
+        inputTarget = new View(this);
+        inputTarget.setFocusable(true);
+        inputTarget.setFocusableInTouchMode(true);
+        inputTarget.setOnLongClickListener(v -> {
+            // Long-press in a text field: show the IME / paste menu.
+            showIme();
+            return true;
+        });
+        // IMPORTANT: do NOT call setContentView — that would replace
+        // the NativeActivity surface used by Bevy. We only need a
+        // focusable View to host the InputConnection; add it on top.
+        addContentView(inputTarget, new android.widget.FrameLayout.LayoutParams(1, 1));
+        inputTarget.requestFocus();
+    }
+
+    public static void showImeStatic() {
+        MainActivity act = sInstance;
+        if (act != null) act.showIme();
+    }
+
+    public void showIme() {
+        inputTarget.requestFocus();
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) {
+            imm.showSoftInput(inputTarget, InputMethodManager.SHOW_FORCED);
+        }
+    }
+
+    public static void hideImeStatic() {
+        MainActivity act = sInstance;
+        if (act != null) act.hideIme();
+    }
+
+    public void hideIme() {
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) imm.hideSoftInputFromWindow(inputTarget.getWindowToken(), 0);
+    }
+
+    @Override
+    public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+        if (inputTarget != null) {
+            outAttrs.inputType = EditorInfo.TYPE_CLASS_TEXT
+                    | EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE
+                    | EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+            outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE;
+            return new RbxInputConnection(inputTarget);
+        }
+        return super.onCreateInputConnection(outAttrs);
     }
 
     @Override

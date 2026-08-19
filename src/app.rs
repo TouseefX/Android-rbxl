@@ -199,6 +199,8 @@ pub struct EditorApp {
     command_history_idx: usize,
     /// Last system clipboard text we pushed into egui.
     last_clipboard: String,
+    /// Last focused egui Id, used to show/hide the IME.
+    last_focused: Option<egui::Id>,
     command_output: Vec<lua_runtime::OutputLine>,
     command_run_target_studio: bool,
 
@@ -284,6 +286,7 @@ impl Default for EditorApp {
             command_history: Vec::new(),
             command_history_idx: 0,
             last_clipboard: String::new(),
+            last_focused: None,
             command_output: Vec::new(),
             command_run_target_studio: false,
             plugin_index: plugins::load_index(),
@@ -403,6 +406,7 @@ impl EditorApp {
     /// a Bevy system.
     pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
         self.drain_events();
+        self.drain_ime(ctx);
         // Keep egui's internal clipboard in sync with the Android system
         // clipboard. arboard (egui's default backend) doesn't work on
         // Android, and there's no native EditText long-press menu, so we
@@ -410,6 +414,18 @@ impl EditorApp {
         // copy internally (it sets system clipboard via our JNI when the
         // user copies), so we only need to push here.
         self.sync_clipboard(ctx);
+        // Show/hide the soft keyboard when focus moves.
+        let focused = ctx.memory(|m| m.focused());
+        if focused != self.last_focused {
+            self.last_focused = focused;
+            if focused.is_some() {
+                #[cfg(target_os = "android")]
+                jni_bridge::request_show_ime();
+            } else {
+                #[cfg(target_os = "android")]
+                jni_bridge::request_hide_ime();
+            }
+        }
         // Pump any completed thumbnail downloads into GPU textures.
         crate::thumbnails::pump(ctx);
 
@@ -2142,36 +2158,74 @@ ui.label("Place ID:");
     ///   * if the system clipboard changed *and* a text field currently
     ///     has focus, emit an Event::Paste so the long-press / hardware
     ///     paste reaches the focused widget.
+    /// Keep egui's internal clipboard in sync with the Android system
+    /// clipboard (read-only). Actual paste from Gboard / long-press comes
+    /// through the InputConnection (see `drain_ime`) as a commitText
+    /// event; we no longer auto-paste here because that would duplicate
+    /// the text the IME is already committing.
     fn sync_clipboard(&mut self, ctx: &egui::Context) {
         let system = jni_bridge::get_clipboard_text();
-
-        // Read input state we need.
-        let wants_paste = ctx.input(|i| {
-            i.events.iter().any(|e| matches!(e,
-                egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
-                if (modifiers.ctrl || modifiers.command) && !modifiers.shift
-            ))
-        });
-        let focus = ctx.memory(|m| m.focused());
-
-        // When the clipboard content changes, store it so future
-        // explicit pastes use the new string.
         if system != self.last_clipboard {
             self.last_clipboard = system.clone();
-            ctx.copy_text(system.clone());
-            // If a widget is focused, immediately deliver the new
-            // clipboard text as a Paste event (this is what a native
-            // EditText long-press Paste would do).
-            if focus.is_some() && !system.is_empty() {
-                ctx.input_mut(|i| i.events.push(egui::Event::Paste(system)));
-            }
+            ctx.copy_text(system);
         }
+    }
 
-        // Hardware Ctrl+V: egui normally handles this but reads the
-        // (empty) arboard clipboard, so do it ourselves.
-        if wants_paste && focus.is_some() && !self.last_clipboard.is_empty() {
-            let text = self.last_clipboard.clone();
-            ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
+    /// Pull IME events (typing, paste, backspace, enter) from the
+    /// Android soft-keyboard bridge and feed them to egui. This is what
+    /// makes Gboard clipboard-paste and on-screen typing actually reach
+    /// egui's self-rendered TextEdits on Android.
+    fn drain_ime(&mut self, ctx: &egui::Context) {
+        use jni_bridge::ImeInput;
+        for ev in jni_bridge::drain_ime() {
+            match ev {
+                ImeInput::Commit(text) => {
+                    ctx.input_mut(|i| {
+                        i.events.push(if text.chars().count() > 1 {
+                            egui::Event::Paste(text)
+                        } else {
+                            egui::Event::Text(text)
+                        });
+                    });
+                }
+                ImeInput::DeleteSurrounding { before, .. } => {
+                    for _ in 0..before.max(1) {
+                        ctx.input_mut(|i| i.events.push(egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }));
+                    }
+                }
+                ImeInput::KeyDown { keycode, unicode, shift } => {
+                    if let Some(key) = android_keycode_to_egui(keycode) {
+                        let mods = egui::Modifiers { shift, ..Default::default() };
+                        ctx.input_mut(|i| {
+                            i.events.push(egui::Event::Key {
+                                key, physical_key: None, pressed: true,
+                                repeat: false, modifiers: mods,
+                            });
+                            if unicode != 0 {
+                                if let Some(ch) = char::from_u32(unicode as u32) {
+                                    if !ch.is_control() {
+                                        i.events.push(egui::Event::Text(ch.to_string()));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                ImeInput::KeyUp { .. } => {}
+                ImeInput::EditorAction(_) | ImeInput::FinishComposing => {
+                    ctx.input_mut(|i| i.events.push(egui::Event::Key {
+                        key: egui::Key::Enter, physical_key: None,
+                        pressed: true, repeat: false, modifiers: Default::default(),
+                    }));
+                }
+                ImeInput::ShowIme | ImeInput::HideIme => {}
+            }
         }
     }
 
@@ -3508,3 +3562,27 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         }
     }
 }
+
+/// Map an Android KeyEvent keycode to an egui Key (for the small
+/// subset of keys the soft keyboard actually sends; most text comes
+/// through commitText instead).
+fn android_keycode_to_egui(keycode: i32) -> Option<egui::Key> {
+    use egui::Key;
+    // android.view.KeyEvent.KEYCODE_*
+    Some(match keycode {
+        67 => Key::Backspace,        // KEYCODE_DEL
+        66 => Key::Enter,            // KEYCODE_ENTER
+        61 => Key::Tab,              // KEYCODE_TAB
+        112 => Key::ArrowUp,         // DPAD_UP / KEYCODE_DPAD_UP
+        113 => Key::ArrowLeft,
+        114 => Key::ArrowDown,
+        115 => Key::ArrowRight,
+        19 => Key::ArrowUp,
+        20 => Key::ArrowDown,
+        21 => Key::ArrowLeft,
+        22 => Key::ArrowRight,
+        111 => Key::Escape,
+        _ => return None,
+    })
+}
+
