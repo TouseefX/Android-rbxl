@@ -6,6 +6,7 @@ import android.content.ClipboardManager;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Looper;
 import android.os.Environment;
 import android.os.StrictMode;
 import android.util.Log;
@@ -187,54 +188,71 @@ public class MainActivity extends NativeActivity {
     // ---- Instance methods running on Android UI Thread ----
 
     public void copyToClipboard(final String text) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-                    if (clipboard != null) {
-                        ClipData clip = ClipData.newPlainText("RobloxSnippet", text);
-                        clipboard.setPrimaryClip(clip);
-                        Toast.makeText(MainActivity.this, "Copied to Android Clipboard!", Toast.LENGTH_SHORT).show();
-                    }
-                } catch (Exception e) {
-                    Log.e(TAG, "copyToClipboard failed", e);
-                }
+        // ClipboardManager must be touched on the UI thread. Bevy/egui input
+        // callbacks already run on the UI thread, so posting + waiting would
+        // deadlock; run inline when we're already there.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            doCopyToClipboard(text);
+        } else {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() { doCopyToClipboard(text); }
+            });
+        }
+    }
+
+    private void doCopyToClipboard(String text) {
+        try {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard != null) {
+                ClipData clip = ClipData.newPlainText("RobloxSnippet", text);
+                clipboard.setPrimaryClip(clip);
             }
-        });
+        } catch (Exception e) {
+            Log.e(TAG, "copyToClipboard failed", e);
+        }
     }
 
     public String getClipboardText() {
+        // Same reasoning as copyToClipboard: run inline on the UI thread
+        // instead of posting a Runnable and blocking the thread that is
+        // supposed to run it.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return doGetClipboardText();
+        }
         final String[] result = new String[]{""};
         final CountDownLatch latch = new CountDownLatch(1);
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                try {
-                    ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-                    if (clipboard != null && clipboard.hasPrimaryClip()) {
-                        ClipData clip = clipboard.getPrimaryClip();
-                        if (clip != null && clip.getItemCount() > 0) {
-                            CharSequence text = clip.getItemAt(0).coerceToText(MainActivity.this);
-                            if (text != null) {
-                                result[0] = text.toString();
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    Log.e(TAG, "getClipboardText failed", e);
-                } finally {
-                    latch.countDown();
-                }
+                result[0] = doGetClipboardText();
+                latch.countDown();
             }
         });
-
         try {
-            latch.await(250, TimeUnit.MILLISECONDS);
+            latch.await(1, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
-            Log.w(TAG, "getClipboardText latch timeout");
+            Log.w(TAG, "getClipboardText interrupted");
         }
         return result[0];
+    }
+
+    private String doGetClipboardText() {
+        try {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard != null && clipboard.hasPrimaryClip()) {
+                ClipData clip = clipboard.getPrimaryClip();
+                if (clip != null && clip.getItemCount() > 0) {
+                    CharSequence text = clip.getItemAt(0).coerceToText(MainActivity.this);
+                    if (text != null) {
+                        return text.toString();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "getClipboardText failed", e);
+        }
+        return "";
     }
 
     public void openDocument() {

@@ -197,6 +197,8 @@ pub struct EditorApp {
     command_input: String,
     command_history: Vec<String>,
     command_history_idx: usize,
+    /// Last system clipboard text we pushed into egui.
+    last_clipboard: String,
     command_output: Vec<lua_runtime::OutputLine>,
     command_run_target_studio: bool,
 
@@ -281,6 +283,7 @@ impl Default for EditorApp {
             command_input: String::new(),
             command_history: Vec::new(),
             command_history_idx: 0,
+            last_clipboard: String::new(),
             command_output: Vec::new(),
             command_run_target_studio: false,
             plugin_index: plugins::load_index(),
@@ -400,6 +403,13 @@ impl EditorApp {
     /// a Bevy system.
     pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
         self.drain_events();
+        // Keep egui's internal clipboard in sync with the Android system
+        // clipboard. arboard (egui's default backend) doesn't work on
+        // Android, and there's no native EditText long-press menu, so we
+        // copy the system text into egui each frame. egui handles its own
+        // copy internally (it sets system clipboard via our JNI when the
+        // user copies), so we only need to push here.
+        self.sync_clipboard(ctx);
         // Pump any completed thumbnail downloads into GPU textures.
         crate::thumbnails::pump(ctx);
 
@@ -577,6 +587,18 @@ impl EditorApp {
                 }
             });
         }
+
+        // Drain egui output commands. In particular, when the user
+        // copies text inside an egui widget (Ctrl+C / selection), egui
+        // emits OutputCommand::CopyText; forward it to the Android
+        // clipboard so the system paste menu actually has our text.
+        ctx.output(|out| {
+            for cmd in out.commands.iter() {
+                if let egui::OutputCommand::CopyText(text) = cmd {
+                    jni_bridge::trigger_copy_to_clipboard(text);
+                }
+            }
+        });
     }
 }
 
@@ -690,14 +712,7 @@ impl EditorApp {
                     }
                 }
 
-                if ui.button("📋 Paste from Clipboard").clicked() {
-                    let clip = jni_bridge::get_clipboard_text();
-                    if !clip.trim().is_empty() {
-                        self.direct_asset_id_input = clip.trim().to_string();
-                        self.status = format!("Pasted asset string: {}", self.direct_asset_id_input);
-                    }
-                }
-            });
+});
         });
 
         ui.add_space(4.0);
@@ -738,14 +753,7 @@ impl EditorApp {
                         .hint_text("Paste .ROBLOSECURITY cookie...")
                         .desired_width(240.0),
                 );
-                if ui.button("📋 Paste Cookie").clicked() {
-                    let clip = jni_bridge::get_clipboard_text();
-                    if !clip.trim().is_empty() {
-                        self.roblosecurity_cookie = clip.trim().to_string();
-                        self.status = "Configured .ROBLOSECURITY cookie".into();
-                    }
-                }
-                if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
+if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                     self.roblosecurity_cookie.clear();
                 }
             });
@@ -923,31 +931,13 @@ impl EditorApp {
                     ui.horizontal(|ui| {
                         ui.label("API Key:");
                         ui.add(egui::TextEdit::singleline(&mut self.open_cloud_api_key).password(true).desired_width(180.0));
-                        if ui.button("📥 Paste").clicked() {
-                            let text = jni_bridge::get_clipboard_text();
-                            if !text.is_empty() {
-                                self.open_cloud_api_key = text;
-                            }
-                        }
-                    });
+});
                     ui.horizontal(|ui| {
                         ui.label("Universe ID:");
                         ui.add(egui::TextEdit::singleline(&mut self.open_cloud_universe_id).hint_text("e.g. 123456789").desired_width(110.0));
-                        if ui.button("📥").clicked() {
-                            let text = jni_bridge::get_clipboard_text();
-                            if !text.is_empty() {
-                                self.open_cloud_universe_id = text;
-                            }
-                        }
-                        ui.label("Place ID:");
+ui.label("Place ID:");
                         ui.add(egui::TextEdit::singleline(&mut self.open_cloud_place_id).hint_text("e.g. 987654321").desired_width(110.0));
-                        if ui.button("📥").clicked() {
-                            let text = jni_bridge::get_clipboard_text();
-                            if !text.is_empty() {
-                                self.open_cloud_place_id = text;
-                            }
-                        }
-                    });
+});
                 });
 
                 ui.add_space(8.0);
@@ -1346,16 +1336,7 @@ impl EditorApp {
                 jni_bridge::trigger_copy_to_clipboard(&tab.buffer);
                 self.status = "Copied script to Android clipboard".into();
             }
-            if ui.button("📥 Paste from Clipboard").clicked() {
-                let text = jni_bridge::get_clipboard_text();
-                if !text.is_empty() {
-                    tab.buffer.push_str(&text);
-                    self.status = format!("Pasted {} characters from Android clipboard", text.len());
-                } else {
-                    self.status = "Clipboard is empty".into();
-                }
-            }
-        });
+});
 
         // Quick Lua Symbol Bar
         ui.separator();
@@ -1748,13 +1729,7 @@ impl EditorApp {
                     }
                 }
 
-                if ui.button("📋 Paste").clicked() {
-                    let clip = jni_bridge::get_clipboard_text();
-                    if !clip.trim().is_empty() {
-                        self.direct_asset_id_input = clip.trim().to_string();
-                    }
-                }
-            });
+});
         });
 
         ui.add_space(4.0);
@@ -2149,6 +2124,18 @@ impl EditorApp {
             matches!(i.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
                 || i.properties.contains_key(&rbx_dom_weak::Ustr::from("Source"))
         })
+    }
+
+    /// Copy the Android system clipboard into egui's internal clipboard
+    /// so that Ctrl+V (and egui's paste menu) works even though arboard
+    /// is unavailable on Android. We only push when the text changed to
+    /// avoid fighting egui's own copy handling.
+    fn sync_clipboard(&mut self, ctx: &egui::Context) {
+        let system = jni_bridge::get_clipboard_text();
+        if system != self.last_clipboard {
+            self.last_clipboard = system.clone();
+            ctx.copy_text(system);
+        }
     }
 
     fn drain_events(&mut self) {
@@ -3212,15 +3199,7 @@ impl EditorApp {
                                 .desired_width(260.0),
                         );
 
-                        if ui.button("📋 Paste").clicked() {
-                            let text = jni_bridge::get_clipboard_text();
-                            if !text.trim().is_empty() {
-                                self.roblosecurity_cookie = text.trim().to_string();
-                                self.status = "Pasted .ROBLOSECURITY cookie".into();
-                            }
-                        }
-
-                        if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
+if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             self.roblosecurity_cookie.clear();
                         }
                     });
@@ -3244,16 +3223,9 @@ impl EditorApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.open_cloud_api_key)
                                 .password(true)
-                                .hint_text("Paste Open Cloud API key...")
+                                .hint_text("Open Cloud API key")
                                 .desired_width(240.0),
                         );
-
-                        if ui.button("📋 Paste").clicked() {
-                            let text = jni_bridge::get_clipboard_text();
-                            if !text.trim().is_empty() {
-                                self.open_cloud_api_key = text.trim().to_string();
-                            }
-                        }
                     });
 
                     ui.horizontal_wrapped(|ui| {
@@ -3263,12 +3235,6 @@ impl EditorApp {
                                 .hint_text("e.g. 123456789")
                                 .desired_width(120.0),
                         );
-                        if ui.button("📋").clicked() {
-                            let text = jni_bridge::get_clipboard_text();
-                            if !text.trim().is_empty() {
-                                self.open_cloud_universe_id = text.trim().to_string();
-                            }
-                        }
 
                         ui.label("Place ID:");
                         ui.add(
@@ -3276,12 +3242,6 @@ impl EditorApp {
                                 .hint_text("e.g. 987654321")
                                 .desired_width(120.0),
                         );
-                        if ui.button("📋").clicked() {
-                            let text = jni_bridge::get_clipboard_text();
-                            if !text.trim().is_empty() {
-                                self.open_cloud_place_id = text.trim().to_string();
-                            }
-                        }
                     });
 
                     ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players by Default (versionType=Published)");
