@@ -2126,15 +2126,52 @@ ui.label("Place ID:");
         })
     }
 
-    /// Copy the Android system clipboard into egui's internal clipboard
-    /// so that Ctrl+V (and egui's paste menu) works even though arboard
-    /// is unavailable on Android. We only push when the text changed to
-    /// avoid fighting egui's own copy handling.
+    /// Wire the Android system clipboard into egui.
+    ///
+    /// On Android, arboard (egui's default clipboard backend) is a
+    /// no-op and NativeActivity has no native EditText, so paste does
+    /// not work out of the box. The fix (standard in eframe-on-android
+    /// projects) is to read the system clipboard via JNI and feed it to
+    /// egui each frame:
+    ///   * set egui's internal clipboard text with `ctx.copy_text`,
+    ///     which makes a hardware Ctrl+V deliver the right string once
+    ///     egui routes the Paste event,
+    ///   * detect a Ctrl+V / ⌘V key press ourselves and emit an
+    ///     explicit `Event::Paste` (egui's own Ctrl+V handling reads
+    ///     the arboard clipboard, which is empty on Android),
+    ///   * if the system clipboard changed *and* a text field currently
+    ///     has focus, emit an Event::Paste so the long-press / hardware
+    ///     paste reaches the focused widget.
     fn sync_clipboard(&mut self, ctx: &egui::Context) {
         let system = jni_bridge::get_clipboard_text();
+
+        // Read input state we need.
+        let wants_paste = ctx.input(|i| {
+            i.events.iter().any(|e| matches!(e,
+                egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
+                if (modifiers.ctrl || modifiers.command) && !modifiers.shift
+            ))
+        });
+        let focus = ctx.memory(|m| m.focused());
+
+        // When the clipboard content changes, store it so future
+        // explicit pastes use the new string.
         if system != self.last_clipboard {
             self.last_clipboard = system.clone();
-            ctx.copy_text(system);
+            ctx.copy_text(system.clone());
+            // If a widget is focused, immediately deliver the new
+            // clipboard text as a Paste event (this is what a native
+            // EditText long-press Paste would do).
+            if focus.is_some() && !system.is_empty() {
+                ctx.input_mut(|i| i.events.push(egui::Event::Paste(system)));
+            }
+        }
+
+        // Hardware Ctrl+V: egui normally handles this but reads the
+        // (empty) arboard clipboard, so do it ourselves.
+        if wants_paste && focus.is_some() && !self.last_clipboard.is_empty() {
+            let text = self.last_clipboard.clone();
+            ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
         }
     }
 
