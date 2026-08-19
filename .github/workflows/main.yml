@@ -99,7 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          APK="$(find target -type f -name '*-release.apk' | head -n 1)"
+          APK="$(find target -type f -name 'rbxleditor.apk' | head -n 1)"
           if [ -z "$APK" ]; then
             echo "APK not found."
             exit 1
