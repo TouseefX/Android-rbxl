@@ -25,8 +25,8 @@ use crate::rbxl;
 use anyhow::{anyhow, Context, Result};
 use rbx_dom_weak::{types::Ref, InstanceBuilder, WeakDom};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+
+use std::path::PathBuf;
 
 /// Metadata for one installed plugin, persisted in `plugins_index.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

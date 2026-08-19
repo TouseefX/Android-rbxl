@@ -3440,7 +3440,7 @@ impl EditorApp {
                 publish_live,
             );
             match result {
-                Ok(msg) => jni_bridge::queue_publish_result(format!("place {place}"), Ok(())),
+                Ok(_msg) => jni_bridge::queue_publish_result(format!("place {place}"), Ok(())),
                 Err(e) => jni_bridge::queue_publish_result(format!("place {place}"), Err(e)),
             }
         });

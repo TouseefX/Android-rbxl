@@ -767,7 +767,7 @@ fn install_command_globals(lua: &Lua, dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult
     };
     let sel_set = {
         let sel = selection.clone();
-        lua.create_function(move |lua, (_this, items): (Table, Value)| {
+        lua.create_function(move |_lua, (_this, items): (Table, Value)| {
             // Selection:Set accepts an array table of Instances (Studio API),
             // but we also tolerate being passed instances as varargs.
             let mut refs = Vec::new();
@@ -801,7 +801,7 @@ fn install_command_globals(lua: &Lua, dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult
     };
     let sel_add = {
         let sel = selection.clone();
-        lua.create_function(move |lua, (_this, item): (Table, Table)| {
+        lua.create_function(move |_lua, (_this, item): (Table, Table)| {
             if let Some(r) = table_to_ref(&item)? {
                 let mut s = sel.borrow_mut();
                 if !s.contains(&r) { s.push(r); }
@@ -811,7 +811,7 @@ fn install_command_globals(lua: &Lua, dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult
     };
     let sel_remove = {
         let sel = selection.clone();
-        lua.create_function(move |lua, (_this, item): (Table, Table)| {
+        lua.create_function(move |_lua, (_this, item): (Table, Table)| {
             if let Some(r) = table_to_ref(&item)? {
                 sel.borrow_mut().retain(|x| *x != r);
             }

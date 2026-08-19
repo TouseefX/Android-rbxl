@@ -166,7 +166,7 @@ pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _reserved: *mut std::ffi::c_v
     jni::sys::JNI_VERSION_1_6
 }
 
-fn with_env(f: impl FnOnce(&mut JNIEnv, &JClass) -> Result<(), jni::errors::Error>) {
+pub fn with_env(f: impl FnOnce(&mut JNIEnv, &JClass) -> Result<(), jni::errors::Error>) {
     let ctx = ndk_context::android_context();
     let vm = match unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) } {
         Ok(vm) => vm,
