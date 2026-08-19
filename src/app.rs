@@ -1,6 +1,9 @@
 use crate::asset_downloader::{self, DiscoveredAsset};
 use crate::bevy_render::OrbitCam;
 use crate::jni_bridge::{self, FileEvent};
+use crate::live_session;
+use crate::lua_runtime;
+use crate::plugins;
 use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
 use crate::{explorer, lua_syntax, rbxl, schema, templates};
 use bevy_egui::egui;
@@ -11,6 +14,55 @@ use rbx_dom_weak::{
 };
 use crate::settings::EditorSettings;
 use std::collections::HashMap;
+use std::sync::mpsc::{channel, Receiver, Sender};
+
+/// Log line emitted by a background plugin run.
+enum PluginLogLine {
+    Output(lua_runtime::OutputLine),
+    Error(String),
+    Done(usize),
+}
+/// Background plugin run channel. A single mpsc pair, created lazily.
+static PLUGIN_LOG: OnceLock<(Sender<PluginLogLine>, Mutex<Receiver<PluginLogLine>>)> = OnceLock::new();
+static PLUGIN_RUNNING: OnceLock<(Sender<String>, Mutex<Receiver<String>>)> = OnceLock::new();
+fn plugin_log_channel() -> (&'static Sender<PluginLogLine>, &'static Mutex<Receiver<PluginLogLine>>) {
+    let (tx, rx) = PLUGIN_LOG.get_or_init(|| {
+        let (tx, rx) = channel();
+        (tx, Mutex::new(rx))
+    });
+    (tx, rx)
+}
+fn plugin_running_channel() -> (&'static Sender<String>, &'static Mutex<Receiver<String>>) {
+    let (tx, rx) = PLUGIN_RUNNING.get_or_init(|| {
+        let (tx, rx) = channel();
+        (tx, Mutex::new(rx))
+    });
+    (tx, rx)
+}
+use std::sync::{Mutex, OnceLock};
+
+/// Background channel for catalog search-result thumbnail URLs.
+static CATALOG_THUMBNAIL_TX: OnceLock<Sender<HashMap<u64, String>>> = OnceLock::new();
+static CATALOG_THUMBNAIL_RX: OnceLock<Mutex<Receiver<HashMap<u64, String>>>> = OnceLock::new();
+
+static PLUGIN_THUMBNAIL: OnceLock<(Sender<HashMap<u64,String>>, Mutex<Receiver<HashMap<u64,String>>>)> = OnceLock::new();
+fn plugin_thumb_tx() -> &'static Sender<HashMap<u64,String>> {
+    let (tx, _) = PLUGIN_THUMBNAIL.get_or_init(|| { let (t,r) = channel(); (t, Mutex::new(r)) });
+    tx
+}
+fn plugin_thumb_rx() -> &'static Mutex<Receiver<HashMap<u64,String>>> {
+    let (_, rx) = PLUGIN_THUMBNAIL.get_or_init(|| { let (t,r) = channel(); (t, Mutex::new(r)) });
+    rx
+}
+
+fn catalog_thumbnail_channel() -> (&'static Sender<HashMap<u64, String>>, &'static Mutex<Receiver<HashMap<u64, String>>>) {
+    let tx = CATALOG_THUMBNAIL_TX.get_or_init(|| {
+        let (tx, rx) = channel();
+        let _ = CATALOG_THUMBNAIL_RX.set(Mutex::new(rx));
+        tx
+    });
+    (tx, CATALOG_THUMBNAIL_RX.get().unwrap())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
@@ -23,7 +75,10 @@ pub enum ActiveTab {
     Snippets,
     Assets,
     OpenCloud,
+    Plugins,
+    Browse,
     Output,
+    Command,
     Settings,
 }
 
@@ -41,11 +96,25 @@ pub struct OutputLog {
     pub time: String,
 }
 
+/// Actions the Plugins tab can request; processed after the UI closes to
+/// avoid borrow conflicts.
+enum PluginAction {
+    Toggle(String),
+    Run(String),
+    Stop,
+    Insert(String),
+    Delete(String),
+    OpenScript(String, String),
+}
+
 #[derive(bevy::prelude::Resource)]
 pub struct EditorApp {
     dom: Option<WeakDom>,
     selected: Option<Ref>,
     current_uri: Option<String>,
+    /// On-disk format of the currently-open place (binary .rbxl or XML .rbxlx),
+    /// so Save preserves the format the user opened.
+    place_format: rbxl::PlaceFormat,
     status: String,
     active_tab: ActiveTab,
 
@@ -67,8 +136,14 @@ pub struct EditorApp {
     // Live Roblox Catalog & Creator Store State
     live_search_input: String,
     live_catalog_items: Vec<LiveCatalogItem>,
+    /// Thumbnail URLs keyed by catalog item id.
+    catalog_thumbnails: HashMap<u64, String>,
+    plugin_thumbnails: HashMap<u64, String>,
+    catalog_thumbs_fetched_for: String,
     is_searching_live: bool,
     direct_asset_id_input: String,
+    /// Place ID typed in the toolbar "🌐 Open from Roblox" field.
+    open_place_id_input: String,
     roblosecurity_cookie: String,
     discovered_assets: Vec<DiscoveredAsset>,
 
@@ -113,6 +188,40 @@ pub struct EditorApp {
     // background (see auto_download_place_assets) actually get pulled into
     // the scene instead of only ever showing on the NEXT manual reopen.
     pending_asset_refresh_at: Option<std::time::Instant>,
+
+    // Command bar: a one-line Luau prompt that runs against the embedded
+    // luaur VM with a tiny `game`/`workspace`/`script`-style surface so users
+    // can run quick snippets the way they do in Studio's command bar. When
+    // a Live Session is connected, the user can opt to send commands to
+    // real Studio instead.
+    command_input: String,
+    command_history: Vec<String>,
+    command_history_idx: usize,
+    command_output: Vec<lua_runtime::OutputLine>,
+    command_run_target_studio: bool,
+
+    // Installed plugins (persisted on disk in the app's files dir).
+    plugin_index: plugins::PluginIndex,
+    // Asset-id input for downloading a plugin from the Creator Store.
+    plugin_asset_id_input: String,
+
+    // Browse Roblox tab (groups / universes / places).
+    browse_group_id: String,
+    browse_universes: Vec<roblox_api::GroupUniverse>,
+    browse_thumbnails: HashMap<u64, String>,
+    browse_selected_universe: Option<u64>,
+    browse_places: Vec<(u64, String)>,
+    browse_status: String,
+
+    // Plugin sandbox run state. A running plugin is identified by its
+    // record id; the atomic flag lets the Stop button cancel scripts
+    // mid-run (checked between scripts in the batch, and exposed to
+    // long-running Luau via a hook if needed).
+    running_plugin_id: Option<String>,
+    plugin_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    // Live Session bridge state.
+    live_session: live_session::LiveSessionState,
 }
 
 impl Default for EditorApp {
@@ -123,6 +232,7 @@ impl Default for EditorApp {
             dom: None,
             selected: None,
             current_uri: None,
+            place_format: rbxl::PlaceFormat::Binary,
             status: "Ready - Open a .rbxl file to begin".into(),
             // Open straight to the 3D viewport so the scene + camera controls
             // are visible immediately.
@@ -138,8 +248,12 @@ impl Default for EditorApp {
             rename_buffer: String::new(),
             live_search_input: "sword".into(),
             live_catalog_items: Vec::new(),
+            catalog_thumbnails: HashMap::new(),
+            plugin_thumbnails: HashMap::new(),
+            catalog_thumbs_fetched_for: String::new(),
             is_searching_live: false,
             direct_asset_id_input: "47433".into(),
+            open_place_id_input: String::new(),
             roblosecurity_cookie: saved_settings.roblosecurity_cookie,
             discovered_assets: Vec::new(),
             open_cloud_api_key: saved_settings.open_cloud_api_key,
@@ -164,8 +278,28 @@ impl Default for EditorApp {
             needs_3d_rebuild: false,
             cam_move_speed: 4.0,
             pending_asset_refresh_at: None,
+            command_input: String::new(),
+            command_history: Vec::new(),
+            command_history_idx: 0,
+            command_output: Vec::new(),
+            command_run_target_studio: false,
+            plugin_index: plugins::load_index(),
+            plugin_asset_id_input: String::new(),
+            browse_group_id: String::new(),
+            browse_universes: Vec::new(),
+            browse_thumbnails: HashMap::new(),
+            browse_selected_universe: None,
+            browse_places: Vec::new(),
+            browse_status: String::new(),
+            running_plugin_id: None,
+            plugin_stop_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_session: live_session::LiveSessionState::default(),
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
+        app.log_info(&format!(
+            "Loaded {} installed plugin(s)",
+            app.plugin_index.plugins.len()
+        ));
         RobloxApiClient::fetch_live_catalog_async("sword".into());
         app.is_searching_live = true;
         app
@@ -187,12 +321,15 @@ impl EditorApp {
 
     /// Load a place from raw file bytes (used at startup / desktop validation).
     pub fn load_from_bytes(&mut self, bytes: Vec<u8>) {
+        self.place_format = rbxl::PlaceFormat::detect(&bytes);
         match rbxl::load_place(bytes) {
             Ok(dom) => {
                 self.dom = Some(dom);
                 self.selected = None;
                 self.needs_3d_rebuild = true;
-                self.status = "Loaded".into();
+                self.status = format!("Loaded ({})", self.place_format.label());
+                // New document → fresh undo history.
+                lua_runtime::reset_command_history();
                 self.auto_download_place_assets();
             }
             Err(e) => {
@@ -224,6 +361,10 @@ impl EditorApp {
                 match asset.asset_type {
                     "Mesh" => roblox_api::fetch_and_cache_mesh_async(id, cookie.clone()),
                     "Texture" => roblox_api::fetch_and_cache_image_async(id, cookie.clone()),
+                    "Sound" => roblox_api::fetch_and_cache_audio_async(id, cookie.clone()),
+                    // Animations are rbxm model files, not raw binaries;
+                    // they'll be fetched on demand when inserted.
+                    "Animation" => {}
                     _ => {}
                 }
             }
@@ -259,6 +400,8 @@ impl EditorApp {
     /// a Bevy system.
     pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
         self.drain_events();
+        // Pump any completed thumbnail downloads into GPU textures.
+        crate::thumbnails::pump(ctx);
 
         // Custom Roblox Studio Lite Theme styling
         ctx.style_mut(|style| {
@@ -288,6 +431,17 @@ impl EditorApp {
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();
                     }
+                    // Open a place directly from Roblox by place ID using the
+                    // cookie-authenticated web client. Downloads the .rbxl then
+                    // loads it exactly like a local file open.
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.open_place_id_input)
+                            .hint_text("place ID")
+                            .desired_width(90.0),
+                    );
+                    if ui.button("🌐 Open from Roblox").clicked() {
+                        self.open_place_from_roblox();
+                    }
                     if ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
                         self.prompt_import_local_model();
                     }
@@ -296,6 +450,9 @@ impl EditorApp {
                     }
                     if ui.button("💾 Save As...").clicked() {
                         self.save_as();
+                    }
+                    if ui.button(RichText::new("🚀 Publish to Roblox").color(Color32::from_rgb(255, 180, 80))).clicked() {
+                        self.publish_place_to_roblox();
                     }
                     if ui.button("📊 Stats").clicked() {
                         self.show_stats = !self.show_stats;
@@ -362,7 +519,10 @@ impl EditorApp {
                             tab_btn(ui, "🧰 Toolbox", ActiveTab::Toolbox);
                             tab_btn(ui, "📜 Snippets", ActiveTab::Snippets);
                             tab_btn(ui, "☁️ Creator Store", ActiveTab::Assets);
+                            tab_btn(ui, "🧩 Plugins", ActiveTab::Plugins);
+                            tab_btn(ui, "🌐 Browse Roblox", ActiveTab::Browse);
                             tab_btn(ui, "🚀 Open Cloud", ActiveTab::OpenCloud);
+                            tab_btn(ui, "▶ Command Bar", ActiveTab::Command);
                             tab_btn(ui, "🖥️ Output", ActiveTab::Output);
                             tab_btn(ui, "⚙️ Settings", ActiveTab::Settings);
                         });
@@ -409,6 +569,9 @@ impl EditorApp {
                     ActiveTab::Snippets => self.show_snippets_ui(ui),
                     ActiveTab::Assets => self.show_assets_ui(ui),
                     ActiveTab::OpenCloud => self.show_open_cloud_ui(ui),
+                    ActiveTab::Plugins => self.show_plugins_ui(ui),
+                    ActiveTab::Browse => self.show_browse_ui(ui),
+                    ActiveTab::Command => self.show_command_ui(ui),
                     ActiveTab::Output => self.show_output_ui(ui),
                     ActiveTab::Settings => self.show_settings_ui(ui),
                 }
@@ -602,6 +765,12 @@ impl EditorApp {
                             for asset in assets_clone {
                                 if asset.asset_type == "Mesh" {
                                     roblox_api::fetch_and_cache_mesh_async(format!("rbxassetid://{}", asset.asset_id), if cookie_clone.is_empty() { None } else { Some(cookie_clone.clone()) });
+                                    if asset.asset_type == "Sound" {
+                                        roblox_api::fetch_and_cache_audio_async(
+                                            format!("rbxassetid://{}", asset.asset_id),
+                                            if cookie_clone.is_empty() { None } else { Some(cookie_clone.clone()) },
+                                        );
+                                    }
                                 }
                             }
                         });
@@ -663,11 +832,36 @@ impl EditorApp {
                     for item in &items {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(&item.name).heading().color(Color32::from_rgb(100, 200, 255)));
-                                ui.label(RichText::new(format!("by {}", item.creator_name)).color(Color32::from_rgb(160, 160, 160)));
-                                if item.upvotes > 0 {
-                                    ui.label(format!("👍 {} ({}%)", item.upvotes, item.upvote_percent));
+                                // Thumbnail (downloaded + uploaded to GPU
+                                // asynchronously; spinner until ready).
+                                if let Some(url) = self.catalog_thumbnails.get(&item.id) {
+                                    match crate::thumbnails::get_or_load(ui.ctx(), url) {
+                                        Some(tex) => {
+                                            ui.add(
+                                                egui::Image::from_texture(&tex)
+                                                    .fit_to_exact_size(egui::vec2(64.0, 64.0))
+                                                    .corner_radius(egui::CornerRadius::same(4)),
+                                            );
+                                        }
+                                        None => {
+                                            ui.add_space(64.0);
+                                            ui.spinner();
+                                        }
+                                    }
                                 }
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&item.name).heading().color(Color32::from_rgb(100, 200, 255)));
+                                        ui.label(RichText::new(format!("by {}", item.creator_name)).color(Color32::from_rgb(160, 160, 160)));
+                                        if item.upvotes > 0 {
+                                            ui.label(format!("👍 {} ({}%)", item.upvotes, item.upvote_percent));
+                                        }
+                                    });
+
+                                    if !item.description.is_empty() {
+                                        ui.label(&item.description);
+                                    }
+                                });
                             });
 
                             if !item.description.is_empty() {
@@ -934,6 +1128,14 @@ impl EditorApp {
                 }
                 if ui.button("🌍 View 3D").clicked() {
                     self.active_tab = ActiveTab::Viewport3D;
+                }
+                // Play button for Sounds: looks up the SoundId, fetches
+                // if needed, and plays via the platform audio backend.
+                if ui.button("🔊 Play").clicked() {
+                    self.play_selected_sound();
+                }
+                if ui.button("⏹ Stop").clicked() {
+                    crate::audio::stop();
                 }
                 if ui.button("📋 Duplicate").clicked() {
                     self.duplicate_selected();
@@ -1270,7 +1472,7 @@ impl EditorApp {
                 ui.separator();
                 ui.label(RichText::new("Properties").heading().color(Color32::from_rgb(100, 200, 255)));
 
-                let mut prop_updates = Vec::new();
+                let mut prop_updates: Vec<(String, Variant)> = Vec::new();
                 let mut prop_deletes = Vec::new();
 
                 for (key, val) in &properties {
@@ -1286,78 +1488,167 @@ impl EditorApp {
                         continue;
                     }
 
+                    // If the reflection DB knows this property is a Roblox enum,
+                    // render a proper dropdown with all valid item names instead
+                    // of an opaque raw integer.
+                    let enum_info = schema::resolve_enum(&inst_class, key_str);
+
                     ui.horizontal(|ui| {
                         ui.label(format!("{key_str}:"));
 
-                        match val {
+                        let changed = match val {
+                            Variant::Enum(e) => {
+                                let current = e.to_u32();
+                                let mut new_val = current;
+                                let mut did_change = false;
+                                if let Some((enum_name, items)) = &enum_info {
+                                    let current_name = items
+                                        .iter()
+                                        .find(|(_, v)| *v == current)
+                                        .map(|(n, _)| n.as_str())
+                                        .unwrap_or("Unknown");
+                                    egui::ComboBox::from_id_salt(format!("enum_{key_str}"))
+                                        .selected_text(format!("{current_name} [{current}]"))
+                                        .width(180.0)
+                                        .show_ui(ui, |ui| {
+                                            for (name, value) in items {
+                                                if ui.selectable_label(*value == current, format!("{name} [{value}]")).clicked() {
+                                                    new_val = *value;
+                                                    did_change = true;
+                                                }
+                                            }
+                                        });
+                                    ui.label(RichText::new(enum_name).weak());
+                                } else {
+                                    // Unknown enum: allow editing as a raw u32.
+                                    let mut raw = current as i32;
+                                    if ui.add(egui::DragValue::new(&mut raw).speed(1).range(0..=i32::MAX)).changed() {
+                                        new_val = raw as u32;
+                                        did_change = true;
+                                    }
+                                }
+                                did_change.then(|| Variant::Enum(rbx_dom_weak::types::Enum::from_u32(new_val)))
+                            }
                             Variant::String(s) => {
                                 let mut text = s.clone();
-                                if ui.text_edit_singleline(&mut text).changed() {
-                                    prop_updates.push((key_str.to_string(), Variant::String(text)));
-                                }
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut text)
+                                        .desired_width(200.0)
+                                        .clip_text(true),
+                                )
+                                .changed()
+                                .then(|| Variant::String(text))
+                            }
+                            Variant::ContentId(c) => {
+                                let mut text = c.as_str().to_string();
+                                if ui.add(egui::TextEdit::singleline(&mut text).hint_text("rbxassetid://...").desired_width(200.0)).changed() {
+                                    Some(Variant::ContentId(text.into()))
+                                } else { None }
                             }
                             Variant::Bool(b) => {
                                 let mut val_bool = *b;
-                                if ui.checkbox(&mut val_bool, "").changed() {
-                                    prop_updates.push((key_str.to_string(), Variant::Bool(val_bool)));
-                                }
+                                ui.checkbox(&mut val_bool, "").changed().then(|| Variant::Bool(val_bool))
                             }
                             Variant::Float32(f) => {
                                 let mut val_f = *f;
-                                if ui.add(egui::DragValue::new(&mut val_f).speed(0.1)).changed() {
-                                    prop_updates.push((key_str.to_string(), Variant::Float32(val_f)));
-                                }
+                                ui.add(egui::DragValue::new(&mut val_f).speed(0.1)).changed().then(|| Variant::Float32(val_f))
                             }
                             Variant::Float64(f) => {
                                 let mut val_f = *f;
-                                if ui.add(egui::DragValue::new(&mut val_f).speed(0.1)).changed() {
-                                    prop_updates.push((key_str.to_string(), Variant::Float64(val_f)));
-                                }
+                                ui.add(egui::DragValue::new(&mut val_f).speed(0.1)).changed().then(|| Variant::Float64(val_f))
                             }
                             Variant::Int32(i) => {
                                 let mut val_i = *i;
-                                if ui.add(egui::DragValue::new(&mut val_i).speed(1)).changed() {
-                                    prop_updates.push((key_str.to_string(), Variant::Int32(val_i)));
-                                }
+                                ui.add(egui::DragValue::new(&mut val_i).speed(1)).changed().then(|| Variant::Int32(val_i))
                             }
                             Variant::Int64(i) => {
                                 let mut val_i = *i;
-                                if ui.add(egui::DragValue::new(&mut val_i).speed(1)).changed() {
-                                    prop_updates.push((key_str.to_string(), Variant::Int64(val_i)));
-                                }
+                                ui.add(egui::DragValue::new(&mut val_i).speed(1)).changed().then(|| Variant::Int64(val_i))
+                            }
+                            Variant::Vector2(v) => {
+                                let (mut x, mut y) = (v.x, v.y);
+                                ui.label("X"); ui.add(egui::DragValue::new(&mut x).speed(0.2));
+                                ui.label("Y"); let cy = ui.add(egui::DragValue::new(&mut y).speed(0.2)).changed();
+                                (x != v.x || cy).then(|| Variant::Vector2(rbx_dom_weak::types::Vector2::new(x, y)))
                             }
                             Variant::Vector3(v) => {
-                                let mut x = v.x;
-                                let mut y = v.y;
-                                let mut z = v.z;
-                                ui.label("X");
-                                let cx = ui.add(egui::DragValue::new(&mut x).speed(0.2)).changed();
-                                ui.label("Y");
-                                let cy = ui.add(egui::DragValue::new(&mut y).speed(0.2)).changed();
-                                ui.label("Z");
-                                let cz = ui.add(egui::DragValue::new(&mut z).speed(0.2)).changed();
-                                if cx || cy || cz {
-                                    prop_updates.push((key_str.to_string(), Variant::Vector3(Vector3::new(x, y, z))));
-                                }
+                                let (mut x, mut y, mut z) = (v.x, v.y, v.z);
+                                ui.label("X"); let cx = ui.add(egui::DragValue::new(&mut x).speed(0.2)).changed();
+                                ui.label("Y"); let cy = ui.add(egui::DragValue::new(&mut y).speed(0.2)).changed();
+                                ui.label("Z"); let cz = ui.add(egui::DragValue::new(&mut z).speed(0.2)).changed();
+                                (cx || cy || cz).then(|| Variant::Vector3(Vector3::new(x, y, z)))
                             }
                             Variant::Color3(c) => {
                                 let mut rgb = [c.r, c.g, c.b];
-                                if ui.color_edit_button_rgb(&mut rgb).changed() {
-                                    prop_updates.push((key_str.to_string(), Variant::Color3(Color3::new(rgb[0], rgb[1], rgb[2]))));
-                                }
+                                ui.color_edit_button_rgb(&mut rgb).changed().then(|| Variant::Color3(Color3::new(rgb[0], rgb[1], rgb[2])))
                             }
                             Variant::Color3uint8(c) => {
                                 let mut srgb = [c.r, c.g, c.b];
-                                if ui.color_edit_button_srgb(&mut srgb).changed() {
-                                    prop_updates.push((key_str.to_string(), Variant::Color3uint8(Color3uint8::new(srgb[0], srgb[1], srgb[2]))));
+                                ui.color_edit_button_srgb(&mut srgb).changed().then(|| Variant::Color3uint8(Color3uint8::new(srgb[0], srgb[1], srgb[2])))
+                            }
+                            Variant::UDim(u) => {
+                                let (mut scale, mut offset) = (u.scale, u.offset);
+                                ui.label("S"); ui.add(egui::DragValue::new(&mut scale).speed(0.01));
+                                ui.label("O"); let co = ui.add(egui::DragValue::new(&mut offset).speed(1)).changed();
+                                (scale != u.scale || co).then(|| Variant::UDim(rbx_dom_weak::types::UDim::new(scale, offset)))
+                            }
+                            Variant::UDim2(u) => {
+                                let (mut xs, mut xo, mut ys, mut yo) = (u.x.scale, u.x.offset, u.y.scale, u.y.offset);
+                                ui.label("X{S,O}");
+                                ui.add(egui::DragValue::new(&mut xs).speed(0.01));
+                                let cxo = ui.add(egui::DragValue::new(&mut xo).speed(1)).changed();
+                                ui.label("Y{S,O}");
+                                ui.add(egui::DragValue::new(&mut ys).speed(0.01));
+                                let cyo = ui.add(egui::DragValue::new(&mut yo).speed(1)).changed();
+                                (xs != u.x.scale || ys != u.y.scale || cxo || cyo).then(|| {
+                                    Variant::UDim2(rbx_dom_weak::types::UDim2::new(
+                                        rbx_dom_weak::types::UDim::new(xs, xo),
+                                        rbx_dom_weak::types::UDim::new(ys, yo),
+                                    ))
+                                })
+                            }
+                            Variant::NumberRange(n) => {
+                                let (mut mn, mut mx) = (n.min, n.max);
+                                ui.label("min"); ui.add(egui::DragValue::new(&mut mn).speed(0.1));
+                                ui.label("max"); let c = ui.add(egui::DragValue::new(&mut mx).speed(0.1)).changed();
+                                (mn != n.min || c).then(|| Variant::NumberRange(rbx_dom_weak::types::NumberRange::new(mn, mx)))
+                            }
+                            Variant::BrickColor(b) => {
+                                let mut n = *b as u16;
+                                if ui.add(egui::DragValue::new(&mut n).speed(1).range(0..=1032)).changed() {
+                                    rbx_dom_weak::types::BrickColor::from_number(n).map(Variant::BrickColor)
+                                } else { None }
+                            }
+                            Variant::Ref(r) => {
+                                let is_null = r.is_none();
+                                if is_null {
+                                    ui.label(RichText::new("(none)").weak());
+                                } else {
+                                    ui.label(RichText::new(format!("{r}")).weak());
                                 }
+                                None
+                            }
+                            Variant::SharedString(s) => {
+                                let preview = String::from_utf8_lossy(s.data());
+                                ui.label(RichText::new(format!("{} bytes: {}", s.data().len(), &preview[..preview.len().min(40)])).weak());
+                                None
+                            }
+                            Variant::BinaryString(b) => {
+                                let bytes: &[u8] = b.as_ref();
+                                ui.label(RichText::new(format!("{} binary bytes", bytes.len())).weak());
+                                None
                             }
                             _ => {
-                                ui.label(format!("{val:?}"));
+                                ui.label(RichText::new(format!("{val:?}")).weak());
+                                None
                             }
+                        };
+
+                        if let Some(new_variant) = changed {
+                            prop_updates.push((key_str.to_string(), new_variant));
                         }
 
-                        if ui.small_button("🗑").clicked() {
+                        if ui.small_button("🗑").on_hover_text("Remove this property").clicked() {
                             prop_deletes.push(key_str.to_string());
                         }
                     });
@@ -1778,6 +2069,43 @@ impl EditorApp {
         }
     }
 
+    /// If the selected instance is a Sound, fetch (if necessary) and
+    /// play its SoundId.
+    fn play_selected_sound(&mut self) {
+        let Some(dom) = &self.dom else { return; };
+        let Some(r) = self.selected else { return; };
+        let Some(inst) = dom.get_by_ref(r) else { return; };
+        if inst.class != "Sound" {
+            self.status = "Select a Sound instance to play it".into();
+            return;
+        }
+        // Find the SoundId property (ContentId/Content/String variants).
+        let id_str = inst.properties.iter().find_map(|(k, v)| {
+            if k.as_str().eq_ignore_ascii_case("SoundId") {
+                match v {
+                    Variant::String(s) => Some(s.clone()),
+                    Variant::ContentId(c) => Some(c.as_str().to_string()),
+                    Variant::Content(c) => c.as_uri().map(|s| s.to_string()),
+                    _ => None,
+                }
+            } else { None }
+        });
+        let Some(raw) = id_str else {
+            self.status = "Sound has no SoundId".into();
+            return;
+        };
+        let Some(asset_id) = crate::asset_downloader::extract_asset_id(&raw) else {
+            self.status = format!("Can't parse SoundId: {raw}");
+            return;
+        };
+        let key = format!("rbxassetid://{asset_id}");
+        let cookie = if self.roblosecurity_cookie.is_empty() { None } else { Some(self.roblosecurity_cookie.clone()) };
+        match crate::audio::play_cached_or_fetch(&key, cookie) {
+            Ok(()) => self.status = format!("Playing {key}"),
+            Err(msg) => self.status = format!("Audio: {msg}"),
+        }
+    }
+
     fn duplicate_selected(&mut self) {
         let (Some(dom), Some(r)) = (self.dom.as_mut(), self.selected) else {
             return;
@@ -1824,6 +2152,32 @@ impl EditorApp {
     }
 
     fn drain_events(&mut self) {
+        // Poll the live-session bridge (connected Studio companion plugin).
+        self.drain_live_session_events();
+        // Drain any background plugin-run log lines / completion.
+        self.pump_plugin_logs();
+        self.pump_plugin_thumbnails();
+
+        // Any plugin downloads that finished on a background thread.
+        for install in jni_bridge::try_recv_plugins() {
+            match install.result {
+                Ok(bytes) => self.install_plugin_bytes(
+                    &install.name_hint,
+                    plugins::PluginSource::CreatorStore,
+                    // If the hint is asset_<id>, parse the id back out.
+                    install
+                        .name_hint
+                        .strip_prefix("asset_")
+                        .and_then(|s| s.parse::<u64>().ok()),
+                    &bytes,
+                ),
+                Err(e) => {
+                    self.log_error(format!("Plugin download failed: {e}"));
+                    self.status = format!("Plugin download failed: {e}");
+                }
+            }
+        }
+
         // If a background asset download was started, flip needs_3d_rebuild
         // back on once its rough deadline passes so downloaded meshes/textures
         // actually appear in the viewport without the user having to reopen
@@ -1848,28 +2202,138 @@ impl EditorApp {
             }
         }
 
+        // Pull in any catalog thumbnail URLs that finished loading.
+        if let Some(rx) = CATALOG_THUMBNAIL_RX.get() {
+            if let Ok(rx) = rx.lock() {
+                while let Ok(map) = rx.try_recv() {
+                    self.catalog_thumbnails.extend(map);
+                }
+            }
+        }
+
+        // When a new result set arrives, fetch its thumbnails once.
+        let query_signature = self
+            .live_catalog_items
+            .iter()
+            .map(|i| i.id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if !query_signature.is_empty() && query_signature != self.catalog_thumbs_fetched_for {
+            self.catalog_thumbs_fetched_for = query_signature;
+            let ids: Vec<u64> = self.live_catalog_items.iter().map(|i| i.id).collect();
+            let tx = catalog_thumbnail_channel().0.clone();
+            std::thread::spawn(move || {
+                // The public thumbnails endpoint doesn't require a cookie;
+                // pass "" so WebClient skips the Cookie header.
+                if let Ok(client) = RobloxApiClient::web_client("") {
+                    if let Ok(map) = client.thumbnails_batch(&ids, "Asset", "150x150") {
+                        let _ = tx.send(map);
+                    }
+                }
+            });
+        }
+
         for event in jni_bridge::try_recv_all() {
             match event {
-                FileEvent::Opened { uri, data } => match rbxl::load_place(data) {
-                    Ok(dom) => {
-                        let count = dom.root().children().len();
-                        self.dom = Some(dom);
-                        self.current_uri = Some(uri.clone());
-                        self.selected = None;
-                        self.open_tabs.clear();
-                        self.needs_3d_rebuild = true;
-                        self.status = format!("Loaded ({count} top-level services)");
-                        self.log_info(format!("Opened place: {uri} ({count} services)"));
-                        self.active_tab = ActiveTab::Explorer;
-                        self.auto_download_place_assets();
+                FileEvent::Opened { uri, data } => {
+                    let format = rbxl::PlaceFormat::detect(&data);
+                    match rbxl::load_place(data) {
+                        Ok(dom) => {
+                            let count = dom.root().children().len();
+                            self.place_format = format;
+                            self.dom = Some(dom);
+                            self.current_uri = Some(uri.clone());
+                            self.selected = None;
+                            self.open_tabs.clear();
+                            self.needs_3d_rebuild = true;
+                            self.status =
+                                format!("Loaded {} ({count} top-level services)", format.label());
+                            self.log_info(format!(
+                                "Opened place: {uri} ({} format, {count} services)",
+                                format.label()
+                            ));
+                            self.active_tab = ActiveTab::Explorer;
+                            lua_runtime::reset_command_history();
+                            self.auto_download_place_assets();
+                        }
+                        Err(e) => {
+                            self.status = format!("Failed to parse: {e}");
+                            self.log_error(format!("Failed to parse rbxl/rbxlx: {e}"));
+                        }
+                    }
+                }
+                FileEvent::ModelOpened { uri, data } => {
+                    if jni_bridge::take_next_is_plugin() {
+                        self.install_plugin_bytes(
+                            &uri,
+                            plugins::PluginSource::Local,
+                            None,
+                            &data,
+                        );
+                    } else {
+                        self.insert_local_model(uri, data);
+                    }
+                }
+                FileEvent::PlaceBytes { uri, data } => {
+                    // A place downloaded from Roblox: replace the open
+                    // document exactly as if the user picked it locally.
+                    match rbxl::load_place(data) {
+                        Ok(dom) => {
+                            let count = dom.root().children().len();
+                            self.place_format = rbxl::PlaceFormat::Binary;
+                            self.dom = Some(dom);
+                            self.current_uri = Some(uri.clone());
+                            self.selected = None;
+                            self.open_tabs.clear();
+                            self.needs_3d_rebuild = true;
+                            self.status = format!("Opened place from Roblox ({count} services)");
+                            self.log_info(format!("Opened downloaded place: {uri} ({count} services)"));
+                            self.active_tab = ActiveTab::Explorer;
+                            lua_runtime::reset_command_history();
+                            self.auto_download_place_assets();
+                        }
+                        Err(e) => {
+                            self.status = format!("Failed to parse downloaded place: {e}");
+                            self.log_error(format!("Downloaded place parse error: {e}"));
+                        }
+                    }
+                }
+                FileEvent::PlaceError { uri, error } => {
+                    self.status = format!("Download failed: {error}");
+                    self.log_error(format!("Place download {uri}: {error}"));
+                }
+                FileEvent::PublishResult { uri, result } => match result {
+                    Ok(()) => {
+                        self.status = format!("Published {uri} to Roblox");
+                        self.log_info(format!("Published {uri} successfully"));
                     }
                     Err(e) => {
-                        self.status = format!("Failed to parse: {e}");
-                        self.log_error(format!("Failed to parse rbxl: {e}"));
+                        self.status = format!("Publish failed: {e}");
+                        self.log_error(format!("Publish {uri}: {e}"));
                     }
                 },
-                FileEvent::ModelOpened { uri, data } => {
-                    self.insert_local_model(uri, data);
+                FileEvent::GroupUniverses { group_id, universes, thumbs } => {
+                    self.browse_group_id = group_id.to_string();
+                    self.browse_universes = universes;
+                    self.browse_thumbnails.extend(thumbs);
+                    self.browse_selected_universe = None;
+                    self.browse_places.clear();
+                    self.browse_status = format!(
+                        "Loaded {} experience(s) from group {group_id}",
+                        self.browse_universes.len()
+                    );
+                }
+                FileEvent::UniversePlaces { universe_id, places } => {
+                    self.browse_selected_universe = Some(universe_id);
+                    self.browse_places = places;
+                    self.browse_status = format!(
+                        "{} place(s) in universe {universe_id}",
+                        self.browse_places.len()
+                    );
+                }
+                FileEvent::BrowseError { message } => {
+                    self.browse_status = format!("Error: {message}");
+                    self.log_error(format!("Browse: {message}"));
                 }
                 FileEvent::OpenCancelled => {
                     self.status = "Open cancelled".into();
@@ -1899,6 +2363,828 @@ impl EditorApp {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Command bar
+    // ------------------------------------------------------------------
+    fn show_command_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("▶ Command Bar");
+        ui.label(RichText::new(
+            "Run Luau snippets in the embedded luaur VM. The command bar has \
+             print/warn/pcall, task.*, Vector3/Color3/CFrame/UDim2, Enum.*, and a \
+             stubbed plugin/script. It can't touch the live DataModel — for that, \
+             connect a Live Session (companion Studio plugin) and the command will \
+             execute inside real Studio instead.",
+        ).weak());
+
+        ui.separator();
+
+        // Where to run: local VM or connected Studio.
+        ui.horizontal(|ui| {
+            let connected =
+                self.live_session.status == live_session::SessionStatus::Connected;
+            ui.label("Target:");
+            let mut in_studio = self.command_run_target_studio;
+            ui.add_enabled(connected, egui::Checkbox::new(&mut in_studio, "Live Studio session"));
+            if !connected && in_studio {
+                self.command_run_target_studio = false;
+            } else {
+                self.command_run_target_studio = in_studio;
+            }
+            if connected {
+                ui.label(RichText::new("● connected").color(Color32::from_rgb(100, 255, 120)));
+            } else {
+                ui.label(RichText::new("● local VM").color(Color32::from_rgb(160, 160, 160)));
+            }
+        });
+
+        ui.add_space(4.0);
+
+        // Input line. Use a code font and submit on Enter (Shift+Enter for newline).
+        let mut submitted = false;
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.command_input)
+                .font(egui::FontId::monospace(14.0))
+                .hint_text(">  print('hello')   —   Enter to run, ↑/↓ for history")
+                .desired_width(f32::INFINITY)
+                .lock_focus(true),
+        );
+        if response.ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !self.command_history.is_empty() {
+            if self.command_history_idx > 0 {
+                self.command_history_idx -= 1;
+            }
+            if let Some(s) = self.command_history.get(self.command_history_idx) {
+                self.command_input = s.clone();
+            }
+        }
+        if response.ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            if self.command_history_idx + 1 < self.command_history.len() {
+                self.command_history_idx += 1;
+                self.command_input = self.command_history[self.command_history_idx].clone();
+            } else {
+                self.command_history_idx = self.command_history.len();
+                self.command_input.clear();
+            }
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.command_input.trim().is_empty() {
+            submitted = true;
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("▶ Run").clicked() && !self.command_input.trim().is_empty() {
+                submitted = true;
+            }
+            if ui.button("Clear Output").clicked() {
+                self.command_output.clear();
+            }
+        });
+
+        if submitted {
+            let src = self.command_input.trim().to_string();
+            // Push onto history (dedupe consecutive duplicates).
+            if self.command_history.last().map(String::as_str) != Some(src.as_str()) {
+                self.command_history.push(src.clone());
+            }
+            self.command_history_idx = self.command_history.len();
+
+            self.command_output.push(lua_runtime::OutputLine {
+                level: lua_runtime::Level::Info,
+                text: format!("> {src}"),
+            });
+
+            if self.command_run_target_studio {
+                self.live_session.run_in_studio(&src);
+                self.command_output.push(lua_runtime::OutputLine {
+                    level: lua_runtime::Level::Info,
+                    text: "(sent to Studio; result will appear in its Output window)".into(),
+                });
+            } else if self.dom.is_some() {
+                // Run against the REAL loaded DataModel.
+                use std::cell::RefCell;
+                use std::rc::Rc;
+                let taken = self.dom.take().unwrap();
+                let rc = Rc::new(RefCell::new(taken));
+                match lua_runtime::run_command(rc.clone(), &src, "=command") {
+                    Ok(outcome) => {
+                        for line in lua_runtime::take_command_log() {
+                            self.command_output.push(line);
+                        }
+                        // Always rebuild because even a pure property change
+                        // can affect rendering; Undo/Redo definitely do.
+                        self.needs_3d_rebuild = true;
+
+                        // Surface selection changes from Selection service.
+                        if let Some(first) = outcome.selected.first().copied() {
+                            self.selected = Some(first);
+                        } else if outcome.undo || outcome.redo {
+                            // After undo/redo the old selection may point at
+                            // an instance that no longer exists; clear it.
+                            self.selected = None;
+                        }
+
+                        if outcome.undo {
+                            self.command_output.push(lua_runtime::OutputLine {
+                                level: lua_runtime::Level::Info,
+                                text: "↶ undo".into(),
+                            });
+                        } else if outcome.redo {
+                            self.command_output.push(lua_runtime::OutputLine {
+                                level: lua_runtime::Level::Info,
+                                text: "↷ redo".into(),
+                            });
+                        }
+
+                        if outcome.created.is_empty()
+                            && outcome.mutated == 0
+                            && outcome.selected.is_empty()
+                            && !outcome.undo
+                            && !outcome.redo
+                        {
+                            self.command_output.push(lua_runtime::OutputLine {
+                                level: lua_runtime::Level::Info,
+                                text: "(no changes)".into(),
+                            });
+                        } else {
+                            let mut parts = vec![format!(
+                                "created {} instance(s), mutated {} propert(y/ies)",
+                                outcome.created.len(),
+                                outcome.mutated
+                            )];
+                            if !outcome.selected.is_empty() {
+                                parts.push(format!("selected {}", outcome.selected.len()));
+                            }
+                            self.command_output.push(lua_runtime::OutputLine {
+                                level: lua_runtime::Level::Info,
+                                text: parts.join(", "),
+                            });
+                        }
+                        let back = Rc::try_unwrap(rc).ok().expect("rc leaked").into_inner();
+                        self.dom = Some(back);
+                    }
+                    Err(e) => {
+                        for line in lua_runtime::take_command_log() {
+                            self.command_output.push(line);
+                        }
+                        self.command_output.push(lua_runtime::OutputLine {
+                            level: lua_runtime::Level::Error, text: e,
+                        });
+                        let back = Rc::try_unwrap(rc).ok().expect("rc leaked").into_inner();
+                        self.dom = Some(back);
+                    }
+                }
+            } else {
+                let result = lua_runtime::run_source(&src, "=command");
+                for line in result.lines { self.command_output.push(line); }
+            }
+            self.command_input.clear();
+        }
+
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("command_output_scroll")
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.command_output.is_empty() {
+                    ui.label(RichText::new("(no output yet)").weak());
+                }
+                for line in &self.command_output {
+                    let (prefix, color) = match line.level {
+                        lua_runtime::Level::Print => ("", Color32::from_rgb(220, 220, 220)),
+                        lua_runtime::Level::Warn => ("⚠ ", Color32::from_rgb(255, 210, 120)),
+                        lua_runtime::Level::Error => ("✗ ", Color32::from_rgb(255, 110, 110)),
+                        lua_runtime::Level::Info => ("", Color32::from_rgb(150, 180, 220)),
+                    };
+                    ui.label(RichText::new(format!("{prefix}{}", line.text)).color(color).monospace());
+                }
+            });
+    }
+
+    // ------------------------------------------------------------------
+    // Plugins tab
+    // ------------------------------------------------------------------
+    fn show_plugins_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🧩 Plugin Manager");
+        ui.label(RichText::new(
+            "Plugins are .rbxm/.rbxmx files (the root is typically a Script or \
+             ModuleScript). Install them from your device or by Creator Store asset \
+             ID. Plugins run in the embedded luaur sandbox with a plugin:CreateToolbar \
+             /CreateDockWidgetPluginGui surface; their widgets show up in the GUI tree \
+             preview below. For full engine access, connect a Live Session to real \
+             Studio.",
+        ).weak());
+
+        ui.separator();
+
+        // Toolbar: import local, download by ID, refresh.
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(RichText::new("📂 Install local .rbxm/.rbxmx").strong()).clicked() {
+                self.prompt_import_local_plugin();
+            }
+            ui.label("Asset ID:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.plugin_asset_id_input)
+                    .hint_text("e.g. 123456789")
+                    .desired_width(140.0),
+            );
+            if ui.button("⬇️ Download & Install").clicked() {
+                self.install_plugin_from_asset_id();
+            }
+            if ui.button("🔄 Reload list").clicked() {
+                self.plugin_index = plugins::load_index();
+            }
+            // Stop a running sandbox plugin.
+            if self.running_plugin_id.is_some() {
+                if ui.button(RichText::new("⏹ Stop running plugin").color(Color32::from_rgb(255,120,120))).clicked() {
+                    self.stop_running_plugin();
+                }
+                if let Some(id) = &self.running_plugin_id {
+                    ui.label(RichText::new(format!("running: {id}")).weak());
+                }
+            }
+        });
+
+        // Fetch thumbnails for all installed plugins that have an icon
+        // asset id, in the background.
+        let plugin_icon_ids: Vec<u64> = self.plugin_index.plugins.iter()
+            .filter_map(|p| p.icon_asset_id)
+            .filter(|id| !self.plugin_thumbnails.contains_key(id))
+            .collect();
+        if !plugin_icon_ids.is_empty() {
+            let ids = plugin_icon_ids.clone();
+            std::thread::spawn(move || {
+                if let Ok(client) = roblox_api::RobloxApiClient::web_client("") {
+                    if let Ok(map) = client.thumbnails_batch(&ids, "Asset", "150x150") {
+                        let _ = plugin_thumb_tx().send(map);
+                    }
+                }
+            });
+        }
+
+        ui.separator();
+
+        // Live session status/control.
+        self.show_live_session_row(ui);
+
+        ui.add_space(8.0);
+
+        // Snapshot running plugin id so the per-card Stop button doesn't
+        // take a &self borrow that conflicts with the mutable actions.
+        let running_id = self.running_plugin_id.clone();
+        // Plugin list.
+        let mut action: Option<PluginAction> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("plugin_list_scroll")
+            .show(ui, |ui| {
+                if self.plugin_index.plugins.is_empty() {
+                    ui.label(RichText::new("No plugins installed yet.").weak());
+                }
+                for rec in &self.plugin_index.plugins {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            // Plugin icon (from Creator Store; local plugins
+                            // show a generic puzzle piece).
+                            if let Some(icon_id) = rec.icon_asset_id {
+                                if let Some(url) = self.plugin_thumbnails.get(&icon_id) {
+                                    match crate::thumbnails::get_or_load(ui.ctx(), url) {
+                                        Some(tex) => {
+                                            ui.add(
+                                                egui::Image::from_texture(&tex)
+                                                    .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                                                    .corner_radius(egui::CornerRadius::same(4)),
+                                            );
+                                        }
+                                        None => {
+                                            ui.add_space(40.0);
+                                            ui.spinner();
+                                        }
+                                    }
+                                }
+                            } else {
+                                ui.label(RichText::new("🧩").size(28.0));
+                            }
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    let status_icon = if rec.enabled { "🟢" } else { "⚪" };
+                                    ui.label(RichText::new(format!("{status_icon} {}", rec.name)).strong().color(Color32::from_rgb(100, 200, 255)));
+                                    ui.label(RichText::new(format!("({})", rec.class())).color(Color32::from_rgb(160, 160, 160)));
+                                    match rec.source {
+                                        plugins::PluginSource::Local => ui.label("📁 local"),
+                                        plugins::PluginSource::CreatorStore => ui.label("☁️ store"),
+                                    };
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!("{} instance(s), {} script(s)", rec.instances, rec.scripts.len()));
+                                    if let Some(id) = rec.asset_id {
+                                        ui.label(format!("asset {id}"));
+                                    }
+                                });
+                            });
+                        });
+                        if !rec.guis.is_empty() {
+                            ui.label(RichText::new(format!("🧱 {} GUI element(s):", rec.guis.len())).weak());
+                            for g in rec.guis.iter().take(6) {
+                                ui.label(format!("   • {} ({}) — {} descendant(s)", g.name, g.class, g.descendants));
+                            }
+                            if rec.guis.len() > 6 {
+                                ui.label(format!("   … and {} more", rec.guis.len() - 6));
+                            }
+                        }
+                        if !rec.scripts.is_empty() {
+                            ui.label(RichText::new("📜 scripts:").weak());
+                            for (name, class) in rec.scripts.iter().take(8) {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("   • {name} ({class})"));
+                                    if ui.small_button("Open").clicked() {
+                                        action = Some(PluginAction::OpenScript(rec.id.clone(), name.clone()));
+                                    }
+                                });
+                            }
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button(if rec.enabled { "Disable" } else { "Enable" }).clicked() {
+                                action = Some(PluginAction::Toggle(rec.id.clone()));
+                            }
+                            let is_running = running_id.as_deref() == Some(rec.id.as_str());
+                            if is_running {
+                                if ui.button(RichText::new("⏹ Stop").color(Color32::from_rgb(255,120,120))).clicked() {
+                                    action = Some(PluginAction::Stop);
+                                }
+                            } else if ui.button("▶ Run in sandbox").clicked() {
+                                action = Some(PluginAction::Run(rec.id.clone()));
+                            }
+                            if ui.button("📥 Insert into place").clicked() {
+                                action = Some(PluginAction::Insert(rec.id.clone()));
+                            }
+                            if ui.small_button("🗑 Remove").clicked() {
+                                action = Some(PluginAction::Delete(rec.id.clone()));
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+
+        match action {
+            Some(PluginAction::Toggle(id)) => {
+                let new_state = self.plugin_index.get(&id).map(|r| !r.enabled).unwrap_or(false);
+                let _ = plugins::set_enabled(&mut self.plugin_index, &id, new_state);
+                self.log_info(format!("Plugin '{id}' enabled={new_state}"));
+            }
+            Some(PluginAction::Run(id)) => {
+                self.run_plugin(&id);
+            }
+            Some(PluginAction::Stop) => {
+                self.stop_running_plugin();
+            }
+            Some(PluginAction::Insert(id)) => {
+                self.insert_plugin_into_place(&id);
+            }
+            Some(PluginAction::Delete(id)) => {
+                if plugins::delete_plugin(&mut self.plugin_index, &id).is_ok() {
+                    self.status = format!("Removed plugin {id}");
+                    self.log_info(format!("Removed plugin {id}"));
+                }
+            }
+            Some(PluginAction::OpenScript(id, name)) => {
+                self.open_plugin_script(&id, &name);
+            }
+            None => {}
+        }
+    }
+
+    fn show_live_session_row(&mut self, ui: &mut egui::Ui) {
+        // Pump server events so the UI reflects connect/disconnect even when
+        // the user isn't on the plugins tab.
+        self.drain_live_session_events();
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🔴 Live Session").strong());
+                let (dot, label) = match self.live_session.status {
+                    live_session::SessionStatus::Stopped => (Color32::from_rgb(180, 180, 180), "stopped"),
+                    live_session::SessionStatus::Listening => (Color32::from_rgb(255, 200, 80), "listening…"),
+                    live_session::SessionStatus::Connected => (Color32::from_rgb(100, 255, 120), "● connected"),
+                };
+                ui.label(RichText::new(label).color(dot));
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Port:");
+                ui.add(egui::DragValue::new(&mut self.live_session.port).range(1024..=65535));
+                match self.live_session.status {
+                    live_session::SessionStatus::Stopped => {
+                        if ui.button("Start").clicked() {
+                            self.live_session.start();
+                        }
+                    }
+                    _ => {
+                        if ui.button("Stop").clicked() {
+                            self.live_session.stop();
+                        }
+                    }
+                }
+                if ui.button("📋 Copy companion plugin .lua").clicked() {
+                    jni_bridge::trigger_copy_to_clipboard(live_session::COMPANION_PLUGIN_SOURCE);
+                    self.status = "Companion plugin source copied to clipboard".into();
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Start the server, then install the companion plugin in Studio \
+                     (Plugins tab → Plugins Folder; paste the .lua there and restart \
+                     Studio). Connected Studio receives run_command / get_selection calls \
+                     from the Command Bar.",
+                )
+                .weak(),
+            );
+
+            for line in self.live_session.log.iter().rev().take(6).collect::<Vec<_>>().iter().rev() {
+                ui.label(RichText::new(line.as_str()).weak().monospace());
+            }
+        });
+    }
+
+    fn drain_live_session_events(&mut self) {
+        let events: Vec<_> = self.live_session.poll_events();
+        for ev in events {
+            if let live_session::SessionEvent::Message(msg) = ev {
+                self.log_info(format!("live: {} {}", msg.method, msg.params));
+            }
+        }
+    }
+
+    fn prompt_import_local_plugin(&mut self) {
+        // Reuse the existing model picker; the file is just routed through
+        // the plugin install path on the way back. We piggy-back on the
+        // model-open picker and tag the URI in jni_bridge so drain_events
+        // knows it's a plugin install, not a place/model insert.
+        jni_bridge::trigger_open_model_for_plugin();
+    }
+
+    fn install_plugin_bytes(&mut self, name_hint: &str, source: plugins::PluginSource, asset_id: Option<u64>, bytes: &[u8]) {
+        match plugins::add_plugin_from_bytes(&mut self.plugin_index, name_hint, source, asset_id, bytes) {
+            Ok(rec) => {
+                self.status = format!("Installed plugin '{}' ({} instances)", rec.name, rec.instances);
+                self.log_info(format!(
+                    "Installed plugin '{}' ({} scripts, {} GUI elements)",
+                    rec.name,
+                    rec.scripts.len(),
+                    rec.guis.len()
+                ));
+            }
+            Err(e) => {
+                self.status = format!("Plugin install failed: {e}");
+                self.log_error(format!("Plugin install failed: {e}"));
+            }
+        }
+    }
+
+    fn install_plugin_from_asset_id(&mut self) {
+        let input = self.plugin_asset_id_input.trim().to_string();
+        let id: u64 = match input.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                self.status = "Enter a numeric asset ID".into();
+                return;
+            }
+        };
+        let cookie = if self.roblosecurity_cookie.is_empty() { None } else { Some(self.roblosecurity_cookie.clone()) };
+        let name_hint = format!("asset_{id}");
+        self.status = format!("Downloading plugin asset {id}...");
+        std::thread::spawn(move || {
+            match RobloxApiClient::fetch_asset_payload_sync(id, cookie.as_deref()) {
+                Ok(bytes) => jni_bridge::queue_plugin_bytes(name_hint, bytes),
+                Err(e) => jni_bridge::queue_plugin_error(name_hint, e),
+            }
+        });
+    }
+
+    fn run_plugin(&mut self, id: &str) {
+        use std::sync::atomic::Ordering;
+        let Some(rec) = self.plugin_index.get(id).cloned() else { return; };
+        if !rec.enabled {
+            self.status = "Enable the plugin before running it".into();
+            return;
+        }
+        if self.running_plugin_id.is_some() {
+            self.status = "A plugin is already running; stop it first".into();
+            return;
+        }
+        // Reset stop flag and mark running.
+        self.plugin_stop_flag.store(false, Ordering::SeqCst);
+        self.running_plugin_id = Some(rec.id.clone());
+
+        let flag = self.plugin_stop_flag.clone();
+        let plugin_id = rec.id.clone();
+        std::thread::spawn(move || {
+            let dom = match plugins::load_plugin_dom(&rec) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = plugin_log_channel().0.send(PluginLogLine::Error(format!("load failed: {e}")));
+                    let _ = plugin_running_channel().0.send(plugin_id);
+                    return;
+                }
+            };
+            let mut ran = 0usize;
+            for &child in dom.root().children() {
+                if flag.load(Ordering::SeqCst) { break; }
+                if let Some(inst) = dom.get_by_ref(child) {
+                    if matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+                        let src = rbxl::get_source(&dom, child).unwrap_or_default();
+                        let result = if inst.class == "ModuleScript" {
+                            lua_runtime::run_module(&src, &rec.name)
+                        } else {
+                            lua_runtime::run_source(&src, &rec.name)
+                        };
+                        for line in result.lines { let _ = plugin_log_channel().0.send(PluginLogLine::Output(line)); }
+                        ran += 1;
+                    }
+                }
+            }
+            let _ = plugin_log_channel().0.send(PluginLogLine::Done(ran));
+            let _ = plugin_running_channel().0.send(plugin_id);
+        });
+        self.active_tab = ActiveTab::Command;
+    }
+
+    fn stop_running_plugin(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.plugin_stop_flag.store(true, Ordering::SeqCst);
+        self.status = "Stopping plugin...".into();
+    }
+
+    fn pump_plugin_thumbnails(&mut self) {
+        if let Ok(rx) = plugin_thumb_rx().lock() {
+            while let Ok(map) = rx.try_recv() {
+                self.plugin_thumbnails.extend(map);
+            }
+        }
+    }
+
+    fn pump_plugin_logs(&mut self) {
+        // If a background plugin run finished, clear the running marker.
+        while let Some(finished_id) = plugin_running_channel().1.lock().ok().and_then(|r| r.try_recv().ok()) {
+            if self.running_plugin_id.as_deref() == Some(&finished_id) {
+                self.running_plugin_id = None;
+            }
+        }
+        // Drain log lines into the command output.
+        while let Some(line) = plugin_log_channel().1.lock().ok().and_then(|r| r.try_recv().ok()) {
+            match line {
+                PluginLogLine::Output(l) => self.command_output.push(l),
+                PluginLogLine::Error(e) => {
+                    self.command_output.push(lua_runtime::OutputLine {
+                        level: lua_runtime::Level::Error,
+                        text: e,
+                    });
+                }
+                PluginLogLine::Done(n) => {
+                    self.log_info(format!("Plugin ran {n} script(s) in sandbox"));
+                }
+            }
+        }
+    }
+
+    fn insert_plugin_into_place(&mut self, id: &str) {
+        let (Some(rec), Some(dom)) = (self.plugin_index.get(id).cloned(), self.dom.as_mut()) else {
+            self.status = "Open a place first".into();
+            return;
+        };
+        let parent = self.selected.unwrap_or_else(|| dom.root_ref());
+        match plugins::insert_into_place(&rec, dom, parent) {
+            Ok((first, count)) => {
+                self.selected = Some(first);
+                self.needs_3d_rebuild = true;
+                self.status = format!("Inserted plugin '{}' ({} instances) into place", rec.name, count);
+                self.log_info(format!("Inserted plugin contents into place: {count} instance(s)"));
+            }
+            Err(e) => {
+                self.status = format!("Insert failed: {e}");
+                self.log_error(format!("Insert plugin failed: {e}"));
+            }
+        }
+    }
+
+    fn open_plugin_script(&mut self, plugin_id: &str, script_name: &str) {
+        let Some(rec) = self.plugin_index.get(plugin_id).cloned() else { return; };
+        let Ok(dom) = plugins::load_plugin_dom(&rec) else { return; };
+        // Find the matching script by name in the plugin DOM.
+        let mut target = None;
+        let mut stack = dom.root().children().to_vec();
+        while let Some(r) = stack.pop() {
+            if let Some(inst) = dom.get_by_ref(r) {
+                if inst.name == script_name {
+                    target = Some(r);
+                    break;
+                }
+                stack.extend(inst.children());
+            }
+        }
+        // We can't edit a plugin's script in place (the plugin DOM is a
+        // separate file), but we can show its source in a read-only buffer by
+        // inserting the script temporarily into the open place. For now just
+        // open the source in the command bar output.
+        if let Some(r) = target {
+            if let Some(src) = rbxl::get_source(&dom, r) {
+                self.command_output.push(lua_runtime::OutputLine {
+                    level: lua_runtime::Level::Info,
+                    text: format!("-- {}.{} --", rec.name, script_name),
+                });
+                for line in src.lines() {
+                    self.command_output.push(lua_runtime::OutputLine {
+                        level: lua_runtime::Level::Print,
+                        text: line.to_string(),
+                    });
+                }
+                self.active_tab = ActiveTab::Command;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Browse Roblox tab: group -> universes -> places, with thumbnails.
+    // ------------------------------------------------------------------
+    fn browse_load_group(&self, group_id: u64) {
+        let cookie = self.roblosecurity_cookie();
+        std::thread::spawn(move || {
+            let cookie_str = cookie.as_deref().unwrap_or("");
+            let client = match roblox_api::RobloxApiClient::web_client(cookie_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    jni_bridge::queue_browse_error(e);
+                    return;
+                }
+            };
+            let universes = match client.group_universes(group_id, 2) {
+                Ok(u) => u,
+                Err(e) => {
+                    jni_bridge::queue_browse_error(e);
+                    return;
+                }
+            };
+            // Batch-fetch GameIcon thumbnails for all universes.
+            let ids: Vec<u64> = universes.iter().map(|u| u.id).collect();
+            let thumbs = client
+                .thumbnails_batch(&ids, "GameIcon", "150x150")
+                .unwrap_or_default();
+            jni_bridge::queue_group_universes(group_id, universes, thumbs);
+        });
+    }
+
+    fn browse_load_universe_places(&self, universe_id: u64) {
+        let cookie = self.roblosecurity_cookie();
+        std::thread::spawn(move || {
+            let cookie_str = cookie.as_deref().unwrap_or("");
+            let client = match roblox_api::RobloxApiClient::web_client(cookie_str) {
+                Ok(c) => c,
+                Err(e) => { jni_bridge::queue_browse_error(e); return; }
+            };
+            // Use the cookie-auth develop endpoint to list places; fall
+            // back to root-place lookup on failure.
+            match client.universe_places(universe_id) {
+                Ok(v) => {
+                    let mut places = Vec::new();
+                    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                        for p in arr {
+                            if let (Some(id), Some(name)) = (
+                                p.get("id").and_then(|i| i.as_u64()),
+                                p.get("name").and_then(|n| n.as_str()),
+                            ) {
+                                places.push((id, name.to_string()));
+                            }
+                        }
+                    }
+                    jni_bridge::queue_universe_places(universe_id, places);
+                }
+                Err(e) => jni_bridge::queue_browse_error(e),
+            }
+        });
+    }
+
+    /// Build a read-only cookie Option for background threads.
+    fn roblosecurity_cookie(&self) -> Option<String> {
+        let c = self.roblosecurity_cookie.trim();
+        if c.is_empty() { None } else { Some(c.to_string()) }
+    }
+
+    fn show_browse_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🌐 Browse Roblox");
+        ui.label(RichText::new(
+            "Browse a group's experiences, see their icons, and open any place by downloading its .rbxl.",
+        ).weak());
+        ui.separator();
+
+        // Group input.
+        ui.horizontal(|ui| {
+            ui.label("Group ID:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.browse_group_id)
+                    .hint_text("e.g. 123456")
+                    .desired_width(160.0),
+            );
+            if ui.button("🔍 Load group").clicked() {
+                if let Ok(id) = self.browse_group_id.trim().parse::<u64>() {
+                    self.browse_status = format!("Loading group {id}...");
+                    self.browse_load_group(id);
+                } else {
+                    self.browse_status = "Enter a numeric group ID".into();
+                }
+            }
+        });
+        if !self.browse_status.is_empty() {
+            ui.label(RichText::new(&self.browse_status).weak());
+        }
+        ui.separator();
+
+        if self.browse_universes.is_empty() {
+            ui.label(RichText::new("No experiences loaded yet.").weak());
+        } else {
+            // Snapshot the data we render so clicking "Open" (which mutates
+            // self) doesn't conflict with the immutable borrow.
+            let universes: Vec<roblox_api::GroupUniverse> = self.browse_universes.clone();
+            let thumbs = self.browse_thumbnails.clone();
+            let selected_universe = self.browse_selected_universe;
+            let places: Vec<(u64, String)> = self.browse_places.clone();
+            let mut open_place: Option<u64> = None;
+            let mut load_places: Option<u64> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("browse_universes_scroll")
+                .show(ui, |ui| {
+                    for univ in &universes {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                // Thumbnail: load/render the image if we
+                                // have a URL; the cache downloads and
+                                // uploads it to the GPU asynchronously.
+                                if let Some(url) = thumbs.get(&univ.id) {
+                                    match crate::thumbnails::get_or_load(ui.ctx(), url) {
+                                        Some(tex) => {
+                                            ui.add(
+                                                egui::Image::from_texture(&tex)
+                                                    .fit_to_exact_size(egui::vec2(96.0, 96.0))
+                                                    .corner_radius(egui::CornerRadius::same(4)),
+                                            );
+                                        }
+                                        None => {
+                                            ui.add_space(96.0);
+                                            ui.spinner();
+                                        }
+                                    }
+                                }
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&univ.name).strong());
+                                    if !univ.description.is_empty() {
+                                        ui.label(RichText::new(&univ.description).weak());
+                                    }
+                                    if let Some(players) = univ.player_count {
+                                        ui.label(format!("👥 {players} playing"));
+                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui.button("📂 Places").clicked() {
+                                            load_places = Some(univ.id);
+                                        }
+                                        if univ.root_place_id.is_some() {
+                                            if ui.button("🌐 Open root place").clicked() {
+                                                if let Some(pid) = univ.root_place_id { open_place = Some(pid); }
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+
+                            // If this universe is selected, show its places.
+                            if selected_universe == Some(univ.id) {
+                                ui.separator();
+                                if places.is_empty() {
+                                    ui.label(RichText::new("Loading places...").weak());
+                                } else {
+                                    for (pid, pname) in &places {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("• {pname}"));
+                                            if ui.button("📂 Open").clicked() {
+                                                self.open_place_id_input = pid.to_string();
+                                                self.open_place_from_roblox();
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                });
+            // Apply any deferred click actions (now that the immutable
+            // borrow of self.browse_* has been dropped).
+            if let Some(uid) = load_places {
+                self.browse_status = format!("Loading places...");
+                self.browse_load_universe_places(uid);
+            }
+            if let Some(pid) = open_place {
+                self.open_place_id_input = pid.to_string();
+                self.open_place_from_roblox();
             }
         }
     }
@@ -2048,7 +3334,7 @@ impl EditorApp {
             self.status = "No file open yet - use Open .rbxl first".into();
             return;
         };
-        match rbxl::save_place(dom) {
+        match rbxl::save_place_as(dom, self.place_format) {
             Ok(bytes) => jni_bridge::trigger_save(&bytes),
             Err(e) => {
                 self.status = format!("Serialize failed: {e}");
@@ -2062,7 +3348,8 @@ impl EditorApp {
             self.status = "No place file open to save".into();
             return;
         }
-        jni_bridge::trigger_create_document("place.rbxl");
+        let name = format!("place.{}", self.place_format.extension());
+        jni_bridge::trigger_create_document(&name);
     }
 
     /// Launch the Android file picker for a local .rbxm/.rbxmx model file. The
@@ -2070,6 +3357,95 @@ impl EditorApp {
     /// under the current selection (or the place root if nothing is selected),
     /// the exact same way a Creator Store download is inserted. This is the
     /// local-file counterpart to the "📥 Download & Insert Full Model" button.
+    /// Download a place's `.rbxl`/`.rbxlx` from Roblox by place ID using the
+    /// configured `.ROBLOSECURITY` cookie, then open it exactly like a local
+    /// file. This works for places you can edit (Team Create or solo); it
+    /// does NOT join a live session — it fetches the latest saved version.
+    fn open_place_from_roblox(&mut self) {
+        let id_str = self.open_place_id_input.trim();
+        let place_id: u64 = match id_str.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                self.status = "Enter a numeric place ID".into();
+                return;
+            }
+        };
+        if self.roblosecurity_cookie.trim().is_empty() {
+            self.status = "Set your .ROBLOSECURITY cookie in Settings first".into();
+            self.log_error("Open from Roblox requires a .ROBLOSECURITY cookie");
+            return;
+        }
+        let cookie = self.roblosecurity_cookie.trim().to_string();
+        self.status = format!("Downloading place {place_id} from Roblox...");
+        self.log_info(format!("Downloading place {place_id} via asset delivery"));
+        std::thread::spawn(move || {
+            match roblox_api::RobloxApiClient::fetch_asset_payload_sync(
+                place_id,
+                Some(&cookie),
+            ) {
+                Ok(bytes) => {
+                    jni_bridge::queue_open_place_bytes(
+                        format!("roblox-place-{place_id}"),
+                        bytes,
+                    );
+                }
+                Err(e) => {
+                    jni_bridge::queue_open_place_error(
+                        format!("place {place_id}"),
+                        e,
+                    );
+                }
+            }
+        });
+    }
+
+    /// Publish the currently-open place to Roblox using Open Cloud (the
+    /// only currently-supported upload path). The legacy ashx cookie
+    /// gateway is gone, so this always talks to apis.roblox.com with the
+    /// API key from Settings.
+    fn publish_place_to_roblox(&mut self) {
+        let Some(dom) = &self.dom else {
+            self.status = "Open a place first".into();
+            return;
+        };
+        if self.open_cloud_api_key.trim().is_empty() {
+            self.status = "Set your Open Cloud API key in the Open Cloud tab".into();
+            self.log_error("Publish requires an Open Cloud API key");
+            return;
+        }
+        // Open Cloud only accepts binary .rbxl; force binary serialization
+        // regardless of the on-disk format.
+        let bytes = match rbxl::save_place(dom) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Serialize failed: {e}");
+                self.log_error(format!("Publish serialize: {e}"));
+                return;
+            }
+        };
+        let api_key = self.open_cloud_api_key.trim().to_string();
+        let universe = self.open_cloud_universe_id.trim().to_string();
+        let place = self.open_cloud_place_id.trim().to_string();
+        let publish_live = self.open_cloud_publish_live;
+        self.status = "Publishing place via Open Cloud...".into();
+        self.log_info(format!(
+            "Publishing place {place} (universe {universe}) via Open Cloud"
+        ));
+        std::thread::spawn(move || {
+            let result = roblox_api::RobloxApiClient::publish_place_open_cloud(
+                &api_key,
+                &universe,
+                &place,
+                &bytes,
+                publish_live,
+            );
+            match result {
+                Ok(msg) => jni_bridge::queue_publish_result(format!("place {place}"), Ok(())),
+                Err(e) => jni_bridge::queue_publish_result(format!("place {place}"), Err(e)),
+            }
+        });
+    }
+
     fn prompt_import_local_model(&mut self) {
         if self.dom.is_none() {
             self.status = "Open a .rbxl place first, then import a model into it".into();

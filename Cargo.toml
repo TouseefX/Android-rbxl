@@ -30,6 +30,10 @@ serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Embedded Luau VM for the script runner / plugin host. Uses TouseefX/luaur — a
+# pure-Rust, full-accuracy Luau port with Android support. `default-features =
+# false` skips the CLI binary and static type checker; we only need the runtime.
+luaur = { git = "https://github.com/TouseefX/luaur", branch = "main", default-features = false, features = [] }
 
 # Bevy owns the whole window (so it gets a GPU context and can render the 3D
 # viewport natively on Android). egui runs INSIDE Bevy via bevy_egui.
@@ -150,3 +154,13 @@ path = "keystore.jks"
 keystore_password = "android"
 key_alias = "rbxl"
 key_password = "android"
+
+[features]
+default = []
+# Enable audio playback on desktop via rodio. Android uses MediaPlayer
+# via JNI regardless of this feature.
+desktop_audio = ["rodio"]
+
+[dependencies.rodio]
+version = "0.20"
+optional = true

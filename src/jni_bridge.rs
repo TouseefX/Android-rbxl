@@ -9,6 +9,18 @@ pub enum FileEvent {
     /// currently-open place (as opposed to Opened, which replaces the whole
     /// place). Mirrors the Creator Store download path but for local files.
     ModelOpened { uri: String, data: Vec<u8> },
+    /// A place file downloaded from Roblox (by place ID) is ready to open.
+    PlaceBytes { uri: String, data: Vec<u8> },
+    /// Downloading a place from Roblox failed.
+    PlaceError { uri: String, error: String },
+    /// A cookie-based publish finished.
+    PublishResult { uri: String, result: Result<(), String> },
+    /// Group universes finished loading (group_id, list, thumbnails id->url).
+    GroupUniverses { group_id: u64, universes: Vec<crate::roblox_api::GroupUniverse>, thumbs: std::collections::HashMap<u64, String> },
+    /// Places under a universe finished (universe_id, list of (place_id, name)).
+    UniversePlaces { universe_id: u64, places: Vec<(u64, String)> },
+    /// A browse/network error happened.
+    BrowseError { message: String },
     OpenCancelled,
     Created { uri: String },
     SaveComplete(bool),
@@ -21,6 +33,27 @@ static FILE_EVENTS: OnceLock<(mpsc::Sender<FileEvent>, Mutex<mpsc::Receiver<File
     OnceLock::new();
 
 static MAIN_ACTIVITY_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+
+/// When true, the next ModelOpened event from the SAF picker should be treated
+/// as a plugin install rather than a "insert into place" action. Toggled by
+/// `trigger_open_model_for_plugin()` and consumed by the app.
+static NEXT_IS_PLUGIN: OnceLock<Mutex<bool>> = OnceLock::new();
+
+fn next_is_plugin_flag() -> &'static Mutex<bool> {
+    NEXT_IS_PLUGIN.get_or_init(|| Mutex::new(false))
+}
+
+/// Background-thread channel for completed plugin downloads. Plugin bytes are
+/// large (hundreds of KB) and we don't want them mixed with the UI event
+/// stream, so they get their own queue and the app polls it.
+static PLUGIN_BYTES: OnceLock<(mpsc::Sender<PluginInstall>, Mutex<mpsc::Receiver<PluginInstall>>)> =
+    OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct PluginInstall {
+    pub name_hint: String,
+    pub result: Result<Vec<u8>, String>,
+}
 
 pub fn channel() -> &'static (mpsc::Sender<FileEvent>, Mutex<mpsc::Receiver<FileEvent>>) {
     FILE_EVENTS.get_or_init(|| {
@@ -38,6 +71,86 @@ pub fn try_recv_all() -> Vec<FileEvent> {
         out.push(ev);
     }
     out
+}
+
+fn plugin_channel() -> &'static (mpsc::Sender<PluginInstall>, Mutex<mpsc::Receiver<PluginInstall>>) {
+    PLUGIN_BYTES.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+/// Drain any plugin bytes produced by background download threads.
+pub fn try_recv_plugins() -> Vec<PluginInstall> {
+    let (_, rx) = plugin_channel();
+    let rx = rx.lock().unwrap();
+    let mut out = Vec::new();
+    while let Ok(p) = rx.try_recv() {
+        out.push(p);
+    }
+    out
+}
+
+/// Background threads call this when a place finishes downloading
+/// from Roblox, delivered on the event thread as a `PlaceBytes` event.
+pub fn queue_open_place_bytes(uri: String, data: Vec<u8>) {
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::PlaceBytes { uri, data });
+}
+
+pub fn queue_open_place_error(uri: String, error: String) {
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::PlaceError { uri, error });
+}
+
+/// Background thread reports the result of a cookie-based publish.
+pub fn queue_publish_result(uri: String, result: Result<(), String>) {
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::PublishResult { uri, result });
+}
+
+/// Background thread reports a group's universe list + thumbnails.
+pub fn queue_group_universes(
+    group_id: u64,
+    universes: Vec<crate::roblox_api::GroupUniverse>,
+    thumbs: std::collections::HashMap<u64, String>,
+) {
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::GroupUniverses { group_id, universes, thumbs });
+}
+
+pub fn queue_universe_places(universe_id: u64, places: Vec<(u64, String)>) {
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::UniversePlaces { universe_id, places });
+}
+
+pub fn queue_browse_error(message: String) {
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::BrowseError { message });
+}
+
+
+/// Background threads call this when a plugin finishes downloading.
+pub fn queue_plugin_bytes(name_hint: String, data: Vec<u8>) {
+    let (tx, _) = plugin_channel();
+    let _ = tx.send(PluginInstall { name_hint, result: Ok(data) });
+}
+
+pub fn queue_plugin_error(name_hint: String, err: String) {
+    let (tx, _) = plugin_channel();
+    let _ = tx.send(PluginInstall { name_hint, result: Err(err) });
+}
+
+/// Open the model picker but tag the result as a plugin install, not a
+/// place-insert.
+pub fn trigger_open_model_for_plugin() {
+    *next_is_plugin_flag().lock().unwrap() = true;
+    trigger_open_model_document();
+}
+
+/// Read and reset the "next picker result is a plugin" flag.
+pub fn take_next_is_plugin() -> bool {
+    std::mem::take(&mut *next_is_plugin_flag().lock().unwrap())
 }
 
 #[unsafe(no_mangle)]

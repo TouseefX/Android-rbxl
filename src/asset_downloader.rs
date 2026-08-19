@@ -37,6 +37,10 @@ pub struct DecodedImage {
 
 static MESH_CACHE: OnceLock<Mutex<HashMap<String, MeshData>>> = OnceLock::new();
 static IMAGE_CACHE: OnceLock<Mutex<HashMap<String, Arc<DecodedImage>>>> = OnceLock::new();
+/// Raw bytes for audio (ogg/mp3) and any other asset that doesn't have a
+/// specialized decoder. Keyed by the same `rbxassetid://<id>` string used by
+/// meshes/images so that callers can look up any downloaded asset by id.
+static RAW_CACHE: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
 
 pub fn mesh_cache() -> &'static Mutex<HashMap<String, MeshData>> {
     MESH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -44,6 +48,20 @@ pub fn mesh_cache() -> &'static Mutex<HashMap<String, MeshData>> {
 
 pub fn image_cache() -> &'static Mutex<HashMap<String, Arc<DecodedImage>>> {
     IMAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn raw_cache() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+    RAW_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn get_cached_raw(id: &str) -> Option<Vec<u8>> {
+    raw_cache().lock().ok()?.get(id).cloned()
+}
+
+pub fn store_cached_raw(id: String, bytes: Vec<u8>) {
+    if let Ok(mut c) = raw_cache().lock() {
+        c.insert(id, bytes);
+    }
 }
 
 pub fn get_builtin_mesh_bytes(id_or_path: &str) -> Option<&'static [u8]> {

@@ -2,6 +2,7 @@ use rbx_dom_weak::{
     types::{Ref, Variant},
     InstanceBuilder, WeakDom,
 };
+use rbx_reflection::DataType;
 use rbx_reflection_database::get as get_reflection_database;
 use std::collections::BTreeMap;
 
@@ -96,6 +97,43 @@ pub fn get_enum_items(enum_name: &str) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// Resolve the official type of a property on a class, walking the superclass
+/// chain. Returns the reflection `DataType` (either a concrete `VariantType` or
+/// a named Roblox `Enum`), so the properties editor can render the right
+/// widget (e.g. a dropdown for enums instead of a raw integer).
+pub fn resolve_property_type(class_name: &str, prop_name: &str) -> Option<DataType<'static>> {
+    let db = database();
+    let mut current_class = Some(class_name);
+    while let Some(cls) = current_class {
+        if let Some(desc) = db.classes.get(cls) {
+            if let Some(pd) = desc.properties.get(prop_name) {
+                return Some(pd.data_type.clone());
+            }
+            current_class = desc.superclass.as_deref();
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+/// If a property resolves to a Roblox enum, return (enum_name, items sorted).
+pub fn resolve_enum(class_name: &str, prop_name: &str) -> Option<(String, Vec<(String, u32)>)> {
+    let db = database();
+    if let DataType::Enum(enum_name) = resolve_property_type(class_name, prop_name)? {
+        if let Some(ed) = db.enums.get(enum_name) {
+            let mut items: Vec<(String, u32)> = ed
+                .items
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect();
+            items.sort_by_key(|(_, v)| *v);
+            return Some((enum_name.to_string(), items));
+        }
+    }
+    None
 }
 
 /// Instantiates any official Roblox class from the reflection database with default properties

@@ -22,8 +22,34 @@ pub struct PlaceStats {
 
 /// Parse a place file already held in memory (bytes come from the JNI bridge,
 /// not a filesystem path — see jni_bridge.rs).
+///
+/// Accepts BOTH binary places (`.rbxl`, header `<roblox!…`) and XML places
+/// (`.rbxlx`, starts with `<roblox`/`<?xml`), auto-detecting from the content
+/// rather than the extension (the SAF picker gives us no reliable MIME type).
 pub fn load_place(bytes: Vec<u8>) -> Result<WeakDom> {
-    rbx_binary::from_reader(Cursor::new(bytes)).context("parsing rbxl")
+    let trimmed = skip_leading_whitespace_and_bom(&bytes);
+
+    // Binary .rbxl
+    if trimmed.starts_with(&BINARY_HEADER) {
+        return rbx_binary::from_reader(Cursor::new(trimmed)).context("parsing rbxl (binary)");
+    }
+
+    // XML .rbxlx
+    if trimmed.starts_with(b"<roblox") || trimmed.starts_with(b"<?xml") {
+        return rbx_xml::from_reader_default(Cursor::new(trimmed)).context("parsing rbxlx (xml)");
+    }
+
+    // Fallbacks: try both parsers and surface whichever error is most useful.
+    match rbx_binary::from_reader(Cursor::new(trimmed)) {
+        Ok(dom) => Ok(dom),
+        Err(bin_err) => match rbx_xml::from_reader_default(Cursor::new(trimmed)) {
+            Ok(dom) => Ok(dom),
+            Err(xml_err) => bail!(
+                "Could not parse place as .rbxl or .rbxlx.\n  \
+                 • Binary: {bin_err}\n  • XML: {xml_err}"
+            ),
+        },
+    }
 }
 
 /// Retrieve the script source text from an instance, supporting String,
@@ -428,7 +454,68 @@ fn zstd_decode_all(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Serialize the whole DOM to bytes, ready to hand to the JNI bridge for saving.
 pub fn save_place(dom: &WeakDom) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    rbx_binary::to_writer(&mut buf, dom, dom.root().children()).context("serializing rbxl")?;
-    Ok(buf)
+    save_place_as(dom, PlaceFormat::Binary)
+}
+
+/// The on-disk format of a place/model file. Tracked so "Save" writes back the
+/// same format the user opened (e.g. an opened `.rbxlx` stays XML).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceFormat {
+    /// Binary `.rbxl` / `.rbxm` (header `<roblox!…`).
+    Binary,
+    /// XML `.rbxlx` / `.rbxmx`.
+    Xml,
+}
+
+impl PlaceFormat {
+    /// Detect the format from raw file bytes.
+    ///
+    /// Both formats begin with `<roblox`, so the discriminator is byte 7:
+    /// binary files have `!` (`<roblox!…`), while XML files have ` ` or `>`
+    /// (`<roblox version="4">` / `<roblox xmlns…`).
+    pub fn detect(bytes: &[u8]) -> PlaceFormat {
+        let t = skip_leading_whitespace_and_bom(bytes);
+        if t.starts_with(&BINARY_HEADER) {
+            PlaceFormat::Binary
+        } else if t.starts_with(b"<?xml") || t.starts_with(b"<roblox") {
+            PlaceFormat::Xml
+        } else {
+            // Unknown header; binary is the modern default.
+            PlaceFormat::Binary
+        }
+    }
+
+    /// Suggested file extension for "Save As".
+    pub fn extension(self) -> &'static str {
+        match self {
+            PlaceFormat::Binary => "rbxl",
+            PlaceFormat::Xml => "rbxlx",
+        }
+    }
+
+    /// Human-readable label for the status bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            PlaceFormat::Binary => ".rbxl binary",
+            PlaceFormat::Xml => ".rbxlx XML",
+        }
+    }
+}
+
+/// Serialize the DOM in the requested format.
+pub fn save_place_as(dom: &WeakDom, format: PlaceFormat) -> Result<Vec<u8>> {
+    let refs: Vec<Ref> = dom.root().children().to_vec();
+    match format {
+        PlaceFormat::Binary => {
+            let mut buf = Vec::new();
+            rbx_binary::to_writer(&mut buf, dom, &refs).context("serializing rbxl (binary)")?;
+            Ok(buf)
+        }
+        PlaceFormat::Xml => {
+            let mut buf = Vec::new();
+            rbx_xml::to_writer_default(Cursor::new(&mut buf), dom, &refs)
+                .context("serializing rbxlx (xml)")?;
+            Ok(buf)
+        }
+    }
 }

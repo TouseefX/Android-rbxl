@@ -14,15 +14,21 @@
 
 mod app;
 mod asset_downloader;
+mod audio;
 mod bevy_render;
 mod explorer;
 mod jni_bridge;
 mod lua_syntax;
 mod roblox_api;
+mod roblox_domains;
 mod rbxl;
 mod schema;
+mod live_session;
+mod lua_runtime;
+mod plugins;
 mod settings;
 mod templates;
+mod thumbnails;
 
 use app::EditorApp;
 use bevy::prelude::*;

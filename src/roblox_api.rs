@@ -66,6 +66,13 @@ pub fn fetch_and_cache_image_async(image_id_str: String, cookie_opt: Option<Stri
     RobloxApiClient::fetch_and_cache_image_async(image_id_str, cookie_opt);
 }
 
+/// Fetches a Sound/audio asset (ogg/mp3) on a background thread and
+/// stashes the raw bytes in the shared raw-asset cache. Mirrors the mesh
+/// and image fetchers.
+pub fn fetch_and_cache_audio_async(audio_id_str: String, cookie_opt: Option<String>) {
+    RobloxApiClient::fetch_and_cache_audio_async(audio_id_str, cookie_opt);
+}
+
 pub struct RobloxApiClient {
     pub api_key: String,
     pub universe_id: String,
@@ -95,8 +102,14 @@ impl Default for RobloxApiClient {
 }
 
 impl RobloxApiClient {
+    /// Build a CSRF-aware authenticated web client from a `.ROBLOSECURITY`
+    /// cookie. Used for the cookie-based publish/avatar/config endpoints.
+    pub fn web_client(cookie: &str) -> Result<WebClient, String> {
+        WebClient::new(cookie)
+    }
+
     pub fn get_asset_delivery_url(asset_id: u64) -> String {
-        format!("https://assetdelivery.roblox.com/v1/asset/?id={asset_id}")
+        crate::roblox_domains::asset_delivery_url(asset_id)
     }
 
     pub fn get_creator_store_url(asset_id: u64) -> String {
@@ -193,55 +206,78 @@ impl RobloxApiClient {
     /// using in-process native Rust HTTP client (reqwest + rustls) - no curl process needed.
     pub fn fetch_asset_payload_sync(asset_id: u64, cookie_opt: Option<&str>) -> Result<Vec<u8>, String> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(30))
             .user_agent("RobloxStudio/WinInet")
+            // Roblox CDNs redirect (302) to c<N>.rbxcdn.com; follow them.
+            .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .map_err(|e| format!("HTTP client build error: {e}"))?;
 
-        // Step 1: Query assetdelivery v2 endpoint
-        let mut req = client.get(format!("https://assetdelivery.roblox.com/v2/assetId/{asset_id}"));
-        if let Some(cookie) = cookie_opt.filter(|c| !c.trim().is_empty()) {
-            req = req.header("Cookie", format!(".ROBLOSECURITY={}", cookie.trim()));
-        }
+        let cookie = cookie_opt
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(|c| format!(".ROBLOSECURITY={c}"));
 
-        if let Ok(resp) = req.send() {
-            if let Ok(bytes) = resp.bytes() {
-                if let Ok(body_str) = std::str::from_utf8(&bytes) {
-                    if let Some(cdn_url) = extract_location_url_from_v2(body_str) {
-                        let mut cdn_req = client.get(&cdn_url);
-                        if let Some(cookie) = cookie_opt.filter(|c| !c.trim().is_empty()) {
-                            cdn_req = cdn_req.header("Cookie", format!(".ROBLOSECURITY={}", cookie.trim()));
-                        }
+        // Try v2 metadata first; it returns JSON with a signed CDN location
+        // that works for audio, meshes, models, places, animations, etc.
+        let v2_url = format!("https://assetdelivery.roblox.com/v2/assetId/{asset_id}");
+        let mut v2_req = client.get(&v2_url);
+        if let Some(ref c) = cookie { v2_req = v2_req.header("Cookie", c.as_str()); }
+        v2_req = v2_req.header("Accept", "application/json");
+
+        if let Ok(resp) = v2_req.send() {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text() {
+                    if let Some(location) = extract_location_url_from_v2(&text) {
+                        let mut cdn_req = client.get(&location);
+                        if let Some(ref c) = cookie { cdn_req = cdn_req.header("Cookie", c.as_str()); }
                         if let Ok(cdn_resp) = cdn_req.send() {
-                            if let Ok(cdn_bytes) = cdn_resp.bytes() {
-                                if !cdn_bytes.is_empty() {
-                                    return Ok(cdn_bytes.to_vec());
+                            if cdn_resp.status().is_success() {
+                                if let Ok(bytes) = cdn_resp.bytes() {
+                                    let v = bytes.to_vec();
+                                    if !v.is_empty() {
+                                        return Ok(v);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                if bytes.starts_with(b"<roblox") || bytes.starts_with(b"<?xml") || (bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
-                    return Ok(bytes.to_vec());
+            }
+        }
+
+        // Fallback: v1 endpoint. For most asset types this 302s straight to
+        // the CDN and returns the raw file bytes (ogg/mp3/mesh/rbxl/etc).
+        let v1_url = format!("https://assetdelivery.roblox.com/v1/asset/?id={asset_id}");
+        let mut v1_req = client.get(&v1_url);
+        if let Some(ref c) = cookie { v1_req = v1_req.header("Cookie", c.as_str()); }
+
+        if let Ok(resp) = v1_req.send() {
+            if resp.status().is_success() {
+                if let Ok(bytes) = resp.bytes() {
+                    let v = bytes.to_vec();
+                    if !v.is_empty() {
+                        return Ok(v);
+                    }
                 }
             }
         }
 
-        // Step 2: Query assetdelivery v1 fallback endpoint
-        let mut req_v1 = client.get(format!("https://assetdelivery.roblox.com/v1/asset/?id={asset_id}"));
-        if let Some(cookie) = cookie_opt.filter(|c| !c.trim().is_empty()) {
-            req_v1 = req_v1.header("Cookie", format!(".ROBLOSECURITY={}", cookie.trim()));
-        }
-
-        if let Ok(resp) = req_v1.send() {
-            if let Ok(bytes) = resp.bytes() {
-                if bytes.starts_with(b"<roblox") || bytes.starts_with(b"<?xml") || (bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
-                    return Ok(bytes.to_vec());
+        // Some audio ids are delivered through the "games" CDN. Try the
+        // /v1/asset/ with a download=true hint and the audio accept type.
+        let audio_url = format!("https://assetdelivery.roblox.com/v1/asset/?id={asset_id}&serverPlaceId=0");
+        let mut audio_req = client.get(&audio_url).header("Accept", "audio/*");
+        if let Some(ref c) = cookie { audio_req = audio_req.header("Cookie", c.as_str()); }
+        if let Ok(resp) = audio_req.send() {
+            if resp.status().is_success() {
+                if let Ok(bytes) = resp.bytes() {
+                    let v = bytes.to_vec();
+                    if !v.is_empty() { return Ok(v); }
                 }
             }
         }
 
-        Err(format!("Asset {asset_id} requires authentication or is offline"))
+        Err(format!("Asset {asset_id} could not be fetched (offline, moderated, or requires auth)"))
     }
 
     /// Fetches a 3D .mesh asset asynchronously in the background and stores it in mesh_cache
@@ -255,6 +291,9 @@ impl RobloxApiClient {
             if let Some(id_str) = asset_id_opt {
                 if let Ok(id) = id_str.parse::<u64>() {
                     if let Ok(bytes) = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref()) {
+                        // Always stash raw bytes so callers that just want
+                        // the original file can read it; parse if we can.
+                        asset_downloader::store_cached_raw(format!("rbxassetid://{id}"), bytes.clone());
                         if let Some(mesh) = asset_downloader::parse_roblox_mesh(&bytes) {
                             asset_downloader::store_cached_mesh(mesh_id_str.clone(), mesh);
                         }
@@ -279,6 +318,37 @@ impl RobloxApiClient {
                     if let Ok(bytes) = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref()) {
                         if let Some(img) = asset_downloader::decode_image_bytes(&bytes) {
                             asset_downloader::store_cached_image(image_id_str.clone(), std::sync::Arc::new(img));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Fetch a Sound/audio asset (ogg/mp3) on a background thread and
+    /// stash the raw bytes in the raw-asset cache. Audio doesn't need
+    /// decoding in the editor; playback is delegated to the platform's
+    /// media player (or, on desktop, e.g. rodio).
+    pub fn fetch_and_cache_audio_async(audio_id_str: String, cookie_opt: Option<String>) {
+        if asset_downloader::get_cached_raw(&audio_id_str).is_some() {
+            return;
+        }
+        std::thread::spawn(move || {
+            if let Some(id_str) = asset_downloader::extract_asset_id(&audio_id_str) {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    if let Ok(bytes) = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref()) {
+                        // Heuristic: audio starts with "OggS" (ogg) or "ID3"/0xFF 0xFB (mp3).
+                        let looks_like_audio = bytes.starts_with(b"OggS")
+                            || bytes.starts_with(b"ID3")
+                            || (bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0);
+                        if looks_like_audio {
+                            asset_downloader::store_cached_raw(audio_id_str.clone(), bytes);
+                        } else {
+                            // Even if the magic didn't match, cache it
+                            // anyway — some Roblox audio is served with
+                            // non-standard headers. The caller can decide
+                            // whether the bytes are playable.
+                            asset_downloader::store_cached_raw(audio_id_str, bytes);
                         }
                     }
                 }
@@ -422,9 +492,10 @@ impl RobloxApiClient {
         }
 
         let version_type = if is_published { "Published" } else { "Saved" };
-        let url = format!(
-            "https://apis.roblox.com/universes/v1/{}/places/{}/versions?versionType={}",
-            u_id, p_id, version_type
+        let url = crate::roblox_domains::open_cloud_publish_url(
+            u_id.parse().map_err(|_| "Universe ID must be numeric")?,
+            p_id.parse().map_err(|_| "Place ID must be numeric")?,
+            is_published,
         );
 
         // Native in-process HTTP client with rustls TLS (no external curl binary, no /tmp file)
@@ -2204,4 +2275,437 @@ fn get_curated_fallback(query: &str) -> Vec<LiveCatalogItem> {
             })
             .collect()
     }
+}
+
+// ==========================================================================
+// Authenticated web API (cookie + X-CSRF-Token)
+// ==========================================================================
+
+use std::collections::HashMap;
+
+/// A minimal CSRF-token-aware Roblox web client. All requests carry the
+/// `.ROBLOSECURITY` cookie; POSTs transparently fetch and retry with the
+/// `X-CSRF-Token` returned from a 403 challenge.
+pub struct WebClient {
+    cookie: String,
+    csrf: std::cell::RefCell<Option<String>>,
+    http: reqwest::blocking::Client,
+}
+
+impl WebClient {
+    pub fn new(cookie: impl Into<String>) -> Result<Self, String> {
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("Mozilla/5.0 rbxl-editor")
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| format!("HTTP client build: {e}"))?;
+        Ok(Self {
+            cookie: cookie.into(),
+            csrf: std::cell::RefCell::new(None),
+            http,
+        })
+    }
+
+    /// GET a JSON endpoint with the cookie attached.
+    pub fn get_json(&self, url: &str) -> Result<serde_json::Value, String> {
+        let resp = self
+            .http
+            .get(url)
+            .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
+            .header("Accept", "application/json")
+            .send()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().map_err(|e| format!("read body: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("GET {url} → {status}: {text}"));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("bad JSON from {url}: {e}"))
+    }
+
+    /// POST JSON to an endpoint, handling the CSRF challenge/refresh.
+    pub fn post_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.send_json(url, "POST", body)
+    }
+
+    /// PATCH JSON (used by several avatar/develop endpoints).
+    pub fn patch_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.send_json(url, "PATCH", body)
+    }
+
+    fn send_json(
+        &self,
+        url: &str,
+        method: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // First attempt (possibly without a token).
+        match self.try_send_json(url, method, body, self.csrf.borrow().clone()) {
+            Ok(v) => return Ok(v),
+            Err(SendError::NeedsToken(new_token)) => {
+                // Server told us the correct token; cache and retry once.
+                *self.csrf.borrow_mut() = Some(new_token.clone());
+                self.try_send_json(url, method, body, Some(new_token))
+                    .map_err(|e| match e {
+                        SendError::Http(s) => s,
+                        SendError::NeedsToken(_) => {
+                            "CSRF token rejected on retry".to_string()
+                        }
+                    })
+            }
+            Err(SendError::Http(s)) => Err(s),
+        }
+    }
+
+    fn try_send_json(
+        &self,
+        url: &str,
+        method: &str,
+        body: &serde_json::Value,
+        csrf: Option<String>,
+    ) -> Result<serde_json::Value, SendError> {
+        let mut req = self
+            .http
+            .request(method.parse().map_err(|_| SendError::Http("bad method".into()))?, url)
+            .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json");
+        if let Some(t) = csrf {
+            req = req.header("X-CSRF-Token", t);
+        }
+        let resp = req
+            .json(body)
+            .send()
+            .map_err(|e| SendError::Http(format!("{method} {url}: {e}")))?;
+        let status = resp.status();
+        // The CSRF challenge: 403 with an x-csrf-token header.
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(token) = resp.headers().get("x-csrf-token") {
+                if let Ok(t) = token.to_str() {
+                    return Err(SendError::NeedsToken(t.to_string()));
+                }
+            }
+        }
+        let text = resp
+            .text()
+            .map_err(|e| SendError::Http(format!("read body: {e}")))?;
+        if !status.is_success() {
+            return Err(SendError::Http(format!("{method} {url} → {status}: {text}")));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| SendError::Http(format!("bad JSON from {url}: {e}")))
+    }
+
+    // ---- High-level helpers ------------------------------------------------
+
+    /// Fetch the currently authenticated user's id/username.
+    pub fn whoami(&self) -> Result<(u64, String), String> {
+        let v = self.get_json("https://users.roblox.com/v1/users/authenticated")?;
+        let id = v["id"].as_u64().ok_or("missing id")?;
+        let name = v["name"].as_str().unwrap_or("").to_string();
+        Ok((id, name))
+    }
+
+    /// Download a place/universe's `.rbxl` (or `.rbxlx`) as raw bytes by
+    /// place asset ID. Same endpoint Studio uses; requires the cookie to have
+    /// edit permission for the place.
+    pub fn download_place(&self, place_id: u64) -> Result<Vec<u8>, String> {
+        RobloxApiClient::fetch_asset_payload_sync(place_id, Some(&self.cookie))
+    }
+
+    // ---- Avatar editing ----------------------------------------------------
+
+    /// GET the authenticated user's currently worn avatar asset IDs grouped
+    /// by type (the shape the avatar API uses to set worn items).
+    pub fn avatar_current(&self) -> Result<HashMap<String, serde_json::Value>, String> {
+        let v = self.get_json("https://avatar.roblox.com/v1/avatar")?;
+        Ok(v.as_object().cloned().unwrap_or_default().into_iter().collect())
+    }
+
+    /// Set body colors ( BrickColor values 0-? ) for head/torso/arms/legs.
+    /// Pass the six BrickColor IDs in order: head, leftArm, torso, rightArm,
+    /// leftLeg, rightLeg.
+    pub fn avatar_set_body_colors(&self, ids: [u32; 6]) -> Result<(), String> {
+        let body = serde_json::json!({
+            "headColorId": ids[0],
+            "leftArmColorId": ids[1],
+            "torsoColorId": ids[2],
+            "rightArmColorId": ids[3],
+            "leftLegColorId": ids[4],
+            "rightLegColorId": ids[5],
+        });
+        self.post_json("https://avatar.roblox.com/v1/avatar/set-body-colors", &body)?;
+        Ok(())
+    }
+
+    /// Set body scales (height/width/head/prop/depth/body-type all 0..=100).
+    pub fn avatar_set_scales(&self, scales: serde_json::Value) -> Result<(), String> {
+        self.post_json("https://avatar.roblox.com/v1/avatar/set-scales", &scales)?;
+        Ok(())
+    }
+
+    /// Wear a specific set of asset IDs (hat, face, gear, etc.). The API
+    /// replaces the whole outfit for the given types.
+    pub fn avatar_set_worn_assets(&self, asset_ids: &[u64]) -> Result<(), String> {
+        let body = serde_json::json!({ "assetIds": asset_ids });
+        self.post_json("https://avatar.roblox.com/v2/avatar/set-wearing-assets", &body)?;
+        Ok(())
+    }
+
+    /// Redraw the avatar with the currently-equipped items (forces a refresh).
+    pub fn avatar_redraw(&self) -> Result<(), String> {
+        self.post_json("https://avatar.roblox.com/v1/avatar/redrawThumbnail", &serde_json::json!({}))?;
+        Ok(())
+    }
+
+    // ---- Asset/item configuration metadata -------------------------------
+
+    /// Fetch the tags configured for an asset/place (itemconfiguration
+    /// endpoint). Returns the raw JSON array of {id, name, ...}.
+    pub fn item_tags(&self, item_id: u64) -> Result<serde_json::Value, String> {
+        let url = format!(
+            "https://itemconfiguration.roblox.com/v1/item-tags?itemType=Asset&itemId={item_id}"
+        );
+        self.get_json(&url)
+    }
+
+    /// Fetch metadata for a universe/place via develop.roblox.com (name,
+    /// description, genre, playable devices, etc).
+    pub fn universe_settings(
+        &self,
+        universe_id: u64,
+    ) -> Result<serde_json::Value, String> {
+        self.get_json(&format!(
+            "https://develop.roblox.com/v1/universes/{universe_id}"
+        ))
+    }
+
+    /// Update universe settings (name/description/genre/etc). Pass only the
+    /// fields you want to change as a JSON object; this merges nothing.
+    pub fn update_universe_settings(
+        &self,
+        universe_id: u64,
+        patch: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!("https://develop.roblox.com/v1/universes/{universe_id}");
+        self.patch_json(&url, &patch)
+    }
+
+    /// Fetch the list of places under a universe.
+    pub fn universe_places(
+        &self,
+        universe_id: u64,
+    ) -> Result<serde_json::Value, String> {
+        self.get_json(&format!(
+            "https://develop.roblox.com/v1/universes/{universe_id}/places?sortOrder=Asc&limit=100"
+        ))
+    }
+
+    // ---- Thumbnails (batch) ---------------------------------------------
+
+    /// Fetch a batch of asset/place/user thumbnail URLs in one request.
+    /// kind: "Asset" (catalog items), "GameIcon" (universe icons),
+    /// "AvatarHeadShot" (user avatars), "Badge", "GamePass", "Bundle".
+    /// Returns a map targetId -> image URL.
+    pub fn thumbnails_batch(
+        &self,
+        ids: &[u64],
+        kind: &str,
+        size: &str,
+    ) -> Result<std::collections::HashMap<u64, String>, String> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let mut out = std::collections::HashMap::new();
+        let url = match kind {
+            "GameIcon" | "GameThumbnail" | "GamePass" | "Badge" | "Bundle" => {
+                "https://thumbnails.roblox.com/v1/games/icons"
+            }
+            "AvatarHeadShot" | "AvatarBust" => {
+                "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+            }
+            _ => "https://thumbnails.roblox.com/v1/assets/batch",
+        };
+        for chunk in ids.chunks(100) {
+            let data: Vec<serde_json::Value> = chunk
+                .iter()
+                .map(|id| serde_json::json!({
+                    "requestId": format!("r{id}"),
+                    "targetId": id,
+                    "type": kind,
+                    "size": size,
+                    "format": "Png",
+                    "isCircular": false,
+                }))
+                .collect();
+            let body = serde_json::json!({ "data": data });
+            let resp = self.post_json(url, &body)?;
+            if let Some(arr) = resp.get("data").and_then(|d| d.as_array()) {
+                for entry in arr {
+                    if let (Some(id), Some(img)) = (
+                        entry.get("targetId").and_then(|t| t.as_u64()),
+                        entry.get("imageUrl").and_then(|u| u.as_str()),
+                    ) {
+                        if !img.is_empty() {
+                            out.insert(id, img.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Convenience: one thumbnail URL for an asset/place ID.
+    pub fn thumbnail(&self, id: u64, kind: &str) -> Result<Option<String>, String> {
+        let mut m = self.thumbnails_batch(&[id], kind, "420x420")?;
+        Ok(m.remove(&id))
+    }
+
+    /// Download a thumbnail image to bytes (synchronously).
+    pub fn fetch_thumbnail_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GET {url} -> {}", resp.status()));
+        }
+        let bytes = resp.bytes().map_err(|e| format!("read: {e}"))?;
+        Ok(bytes.to_vec())
+    }
+
+    // ---- Groups / universes browser -------------------------------------
+
+    /// List experiences (universes) under a group, paging through all
+    /// results. `access_filter`: 1=public, 2=all (needs edit permission).
+    pub fn group_universes(
+        &self,
+        group_id: u64,
+        access_filter: u8,
+    ) -> Result<Vec<GroupUniverse>, String> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "https://games.roblox.com/v2/groups/{group_id}/games?accessFilter={access_filter}&limit=100&sortOrder=Asc"
+            );
+            if let Some(c) = &cursor {
+                url.push_str("&cursor=");
+                url.push_str(c);
+            }
+            let v = self.get_json(&url)?;
+            if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                for item in arr {
+                    if let Ok(u) = serde_json::from_value::<GroupUniverse>(item.clone()) {
+                        all.push(u);
+                    }
+                }
+            }
+            cursor = v
+                .get("nextPageCursor")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Find the root place id+name for a universe (the place loaded when
+    /// you press Play).
+    pub fn universe_root_place(
+        &self,
+        universe_id: u64,
+    ) -> Result<Option<(u64, String)>, String> {
+        let v = self.get_json(&format!(
+            "https://develop.roblox.com/v1/universes/{universe_id}/places?sortOrder=Asc&limit=10"
+        ))?;
+        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            for place in arr {
+                if place.get("isRootPlace").and_then(|r| r.as_bool()) == Some(true) {
+                    if let (Some(id), Some(name)) = (
+                        place.get("id").and_then(|i| i.as_u64()),
+                        place.get("name").and_then(|n| n.as_str()),
+                    ) {
+                        return Ok(Some((id, name.to_string())));
+                    }
+                }
+            }
+            if let Some(first) = arr.first() {
+                if let (Some(id), Some(name)) = (
+                    first.get("id").and_then(|i| i.as_u64()),
+                    first.get("name").and_then(|n| n.as_str()),
+                ) {
+                    return Ok(Some((id, name.to_string())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Look up a group by id (name/owner/member count).
+    pub fn group_info(&self, group_id: u64) -> Result<serde_json::Value, String> {
+        self.get_json(&format!("https://groups.roblox.com/v1/groups/{group_id}"))
+    }
+}
+
+// --------------------------------------------------------------------------
+// Open Cloud asset API (apis.roblox.com/cloud/v2/assets) — requires an API
+// key with the "assets" read scope. Note: this returns metadata only; raw
+// bytes still come from assetdelivery.roblox.com (see fetch_asset_payload_sync).
+// --------------------------------------------------------------------------
+
+/// Read one asset's metadata via Open Cloud. `api_key` needs the
+/// `asset:read` operation on the target creator.
+pub fn open_cloud_asset(
+    api_key: &str,
+    asset_id: u64,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let resp = client
+        .get(format!("https://apis.roblox.com/cloud/v2/assets/{asset_id}"))
+        .header("x-api-key", api_key.trim())
+        .send()
+        .map_err(|e| format!("GET: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("asset {asset_id} -> {status}: {body}"));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("bad JSON: {e}"))
+}
+
+
+/// One experience/universe under a group (subset of fields from the
+/// games.roblox.com response).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GroupUniverse {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub player_count: Option<u64>,
+    #[serde(default)]
+    pub root_place_id: Option<u64>,
+}
+
+enum SendError {
+    /// Server returned a 403 with a fresh CSRF token; retry with it.
+    NeedsToken(String),
+    Http(String),
 }

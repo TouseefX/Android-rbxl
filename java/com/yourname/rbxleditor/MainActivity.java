@@ -10,6 +10,8 @@ import android.os.Environment;
 import android.os.StrictMode;
 import android.util.Log;
 import android.widget.Toast;
+import android.media.MediaPlayer;
+import android.media.AudioAttributes;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -516,6 +518,52 @@ public class MainActivity extends NativeActivity {
             Log.e(TAG, "writeBytes failed", e);
             return false;
         }
+    }
+
+    // ---- Audio playback ---------------------------------------------
+    private static MediaPlayer sPlayer;
+
+    /** Called from Rust via JNI to play a cached ogg/mp3 file. */
+    public static void playAudioFile(final String path) {
+        if (sInstance == null) return;
+        sInstance.runOnUiThread(() -> {
+            try {
+                if (sPlayer != null) {
+                    sPlayer.release();
+                    sPlayer = null;
+                }
+                MediaPlayer mp = new MediaPlayer();
+                mp.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build());
+                mp.setDataSource(path);
+                mp.setOnPreparedListener(MediaPlayer::start);
+                mp.setOnErrorListener((p, what, extra) -> {
+                    Log.e(TAG, "MediaPlayer error " + what + "/" + extra);
+                    Toast.makeText(sInstance, "Audio playback failed", Toast.LENGTH_SHORT).show();
+                    return true;
+                });
+                mp.prepareAsync();
+                sPlayer = mp;
+            } catch (Exception e) {
+                Log.e(TAG, "playAudioFile failed: " + path, e);
+            }
+        });
+    }
+
+    /** Stop any currently-playing audio. Called from Rust via JNI. */
+    public static void stopAudio() {
+        if (sInstance == null) return;
+        sInstance.runOnUiThread(() -> {
+            if (sPlayer != null) {
+                try {
+                    if (sPlayer.isPlaying()) sPlayer.stop();
+                    sPlayer.release();
+                } catch (Exception ignored) {}
+                sPlayer = null;
+            }
+        });
     }
 
     // ---- implemented in Rust (src/jni_bridge.rs) ----
