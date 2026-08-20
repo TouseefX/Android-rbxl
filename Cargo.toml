@@ -110,6 +110,15 @@ compile_sdk_version = 34
 min_sdk_version = 26
 target_sdk_version = 34
 
+# Maven dependencies pulled in by cargo-apk2 (resolves against Google
+# Maven). GameActivity is required by the android-game-activity
+# backend; it provides the androidx.games.activity.GameActivity class
+# our MainActivity extends.
+[package.metadata.android.dependencies]
+"androidx.games" = "games-activity:1.2.2"
+"androidx.core" = "core:1.9.0"
+
+
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
 
