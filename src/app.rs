@@ -200,7 +200,6 @@ pub struct EditorApp {
     /// Last system clipboard text we pushed into egui.
     last_clipboard: String,
     /// Last focused egui Id, used to show/hide the IME.
-    last_focused: Option<egui::Id>,
     command_output: Vec<lua_runtime::OutputLine>,
     command_run_target_studio: bool,
 
@@ -286,7 +285,6 @@ impl Default for EditorApp {
             command_history: Vec::new(),
             command_history_idx: 0,
             last_clipboard: String::new(),
-            last_focused: None,
             command_output: Vec::new(),
             command_run_target_studio: false,
             plugin_index: plugins::load_index(),
@@ -406,7 +404,6 @@ impl EditorApp {
     /// a Bevy system.
     pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
         self.drain_events();
-        self.drain_ime(ctx);
         // Keep egui's internal clipboard in sync with the Android system
         // clipboard. arboard (egui's default backend) doesn't work on
         // Android, and there's no native EditText long-press menu, so we
@@ -414,23 +411,7 @@ impl EditorApp {
         // copy internally (it sets system clipboard via our JNI when the
         // user copies), so we only need to push here.
         self.sync_clipboard(ctx);
-        // Show/hide the soft keyboard when focus moves.
-        let focused = ctx.memory(|m| m.focused());
-        if focused != self.last_focused {
-            self.last_focused = focused;
-            // Defer one frame so egui finishes its own click/focus
-            // handling before we ask the native view to focus; this
-            // prevents the keyboard opening then immediately closing
-            // when a TextEdit is tapped.
-            if focused.is_some() {
-                #[cfg(target_os = "android")]
-                jni_bridge::request_show_ime();
-            } else {
-                #[cfg(target_os = "android")]
-                jni_bridge::request_hide_ime();
-            }
-        }
-        // Pump any completed thumbnail downloads into GPU textures.
+// Pump any completed thumbnail downloads into GPU textures.
         crate::thumbnails::pump(ctx);
 
         // Custom Roblox Studio Lite Theme styling
@@ -2163,73 +2144,15 @@ ui.label("Place ID:");
     ///     has focus, emit an Event::Paste so the long-press / hardware
     ///     paste reaches the focused widget.
     /// Keep egui's internal clipboard in sync with the Android system
-    /// clipboard (read-only). Actual paste from Gboard / long-press comes
-    /// through the InputConnection (see `drain_ime`) as a commitText
-    /// event; we no longer auto-paste here because that would duplicate
-    /// the text the IME is already committing.
+    /// clipboard. winit's IME (enabled via `ime_enabled` on the Bevy
+    /// window) delivers Gboard typing/paste as egui Text/Paste events;
+    /// this just makes sure hardware Ctrl+V (which egui handles by
+    /// reading its internal clipboard) also has the system text.
     fn sync_clipboard(&mut self, ctx: &egui::Context) {
         let system = jni_bridge::get_clipboard_text();
         if system != self.last_clipboard {
             self.last_clipboard = system.clone();
             ctx.copy_text(system);
-        }
-    }
-
-    /// Pull IME events (typing, paste, backspace, enter) from the
-    /// Android soft-keyboard bridge and feed them to egui. This is what
-    /// makes Gboard clipboard-paste and on-screen typing actually reach
-    /// egui's self-rendered TextEdits on Android.
-    fn drain_ime(&mut self, ctx: &egui::Context) {
-        use jni_bridge::ImeInput;
-        for ev in jni_bridge::drain_ime() {
-            match ev {
-                ImeInput::Commit(text) => {
-                    ctx.input_mut(|i| {
-                        i.events.push(if text.chars().count() > 1 {
-                            egui::Event::Paste(text)
-                        } else {
-                            egui::Event::Text(text)
-                        });
-                    });
-                }
-                ImeInput::DeleteSurrounding { before, .. } => {
-                    for _ in 0..before.max(1) {
-                        ctx.input_mut(|i| i.events.push(egui::Event::Key {
-                            key: egui::Key::Backspace,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: Default::default(),
-                        }));
-                    }
-                }
-                ImeInput::KeyDown { keycode, unicode, shift } => {
-                    if let Some(key) = android_keycode_to_egui(keycode) {
-                        let mods = egui::Modifiers { shift, ..Default::default() };
-                        ctx.input_mut(|i| {
-                            i.events.push(egui::Event::Key {
-                                key, physical_key: None, pressed: true,
-                                repeat: false, modifiers: mods,
-                            });
-                            if unicode != 0 {
-                                if let Some(ch) = char::from_u32(unicode as u32) {
-                                    if !ch.is_control() {
-                                        i.events.push(egui::Event::Text(ch.to_string()));
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-                ImeInput::KeyUp { .. } => {}
-                ImeInput::EditorAction(_) | ImeInput::FinishComposing => {
-                    ctx.input_mut(|i| i.events.push(egui::Event::Key {
-                        key: egui::Key::Enter, physical_key: None,
-                        pressed: true, repeat: false, modifiers: Default::default(),
-                    }));
-                }
-                ImeInput::ShowIme | ImeInput::HideIme => {}
-            }
         }
     }
 

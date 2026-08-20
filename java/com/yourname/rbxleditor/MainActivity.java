@@ -7,10 +7,6 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Looper;
-import android.view.View;
-import android.view.inputmethod.EditorInfo;
-import android.view.inputmethod.InputConnection;
-import android.view.inputmethod.InputMethodManager;
 import android.os.Environment;
 import android.os.StrictMode;
 import android.util.Log;
@@ -43,7 +39,6 @@ public class MainActivity extends NativeActivity {
     private static final int REQ_OPEN_MODEL = 1003;
 
     private Uri currentDocUri;
-    private InputTargetView inputTarget;
 
     // External edit state
     private long activeExternalScriptId = -1;
@@ -64,53 +59,7 @@ public class MainActivity extends NativeActivity {
         }
 
         Log.i(TAG, "MainActivity onCreate: instance registered");
-
-        // A focusable, invisible View whose InputConnection forwards
-        // soft-keyboard / Gboard events (including paste) to Rust.
-        inputTarget = new InputTargetView(this);
-        // IMPORTANT: do NOT call setContentView — that would replace
-        // the NativeActivity surface used by Bevy. Add a 1px focusable
-        // view on top to host the InputConnection.
-        // Don't requestFocus() here — that would pop the keyboard
-        // open on launch. Rust focuses this view only when an egui
-        // text field gains focus.
-        // The view fills the screen so it's a valid IME target, but
-        // it's transparent and non-clickable so touches pass through
-        // to the Bevy surface underneath.
-        addContentView(inputTarget,
-                new android.widget.FrameLayout.LayoutParams(
-                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
     }
-
-    public static void showImeStatic() {
-        MainActivity act = sInstance;
-        if (act != null) act.showIme();
-    }
-
-    public void showIme() {
-        if (inputTarget != null) inputTarget.showIme();
-    }
-
-    public static void hideImeStatic() {
-        MainActivity act = sInstance;
-        if (act != null) act.hideIme();
-    }
-
-    public void hideIme() {
-        if (inputTarget != null) inputTarget.hideIme();
-    }
-
-
-    @Override
-    protected void onDestroy() {
-        if (sInstance == this) {
-            sInstance = null;
-        }
-        super.onDestroy();
-    }
-
-    // ---- Static entrypoints called FROM Rust JNI ----
 
     public static void openDocumentStatic() {
         MainActivity act = sInstance;
