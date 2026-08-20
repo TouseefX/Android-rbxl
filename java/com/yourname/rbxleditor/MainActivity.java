@@ -1,6 +1,6 @@
 package com.yourname.rbxleditor;
 
-import android.app.NativeActivity;
+import androidx.games.activity.GameActivity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -24,7 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-public class MainActivity extends NativeActivity {
+public class MainActivity extends GameActivity {
     private static final String TAG = "rbxl_editor";
     private static volatile MainActivity sInstance;
 
@@ -40,7 +40,6 @@ public class MainActivity extends NativeActivity {
     private static final int REQ_OPEN_MODEL = 1003;
 
     private Uri currentDocUri;
-    private static ImeBridge imeBridge;
 
     // External edit state
     private long activeExternalScriptId = -1;
@@ -62,31 +61,9 @@ public class MainActivity extends NativeActivity {
 
         Log.i(TAG, "MainActivity onCreate: instance registered");
 
-        // Invisible EditText that owns the soft-keyboard
-        // InputConnection. Added to the content view but never
-        // drawn; Rust focuses it when an egui text field is active
-        // so Gboard typing/paste lands in our bridge.
-        imeBridge = new ImeBridge(this);
-        android.widget.FrameLayout content = findViewById(android.R.id.content);
-        android.widget.FrameLayout.LayoutParams lp =
-                new android.widget.FrameLayout.LayoutParams(1, 1);
-        // Park it off the top-left corner so it can never receive a
-        // touch meant for egui.
-        lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
-        lp.leftMargin = -100;
-        lp.topMargin = -100;
-        content.addView(imeBridge, lp);
-    }
+  }
 
-    public static void showImeStatic() {
-        MainActivity act = sInstance;
-        if (act != null && imeBridge != null) imeBridge.showKeyboard();
-    }
 
-    public static void hideImeStatic() {
-        MainActivity act = sInstance;
-        if (act != null && imeBridge != null) imeBridge.hideKeyboard();
-    }
 
     public static void openDocumentStatic() {
         MainActivity act = sInstance;

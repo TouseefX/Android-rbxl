@@ -93,7 +93,7 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
             title: "rbxl Editor".into(),
             // Enable winit's IME so the soft keyboard / Gboard can
             // commit text (and paste) into egui text fields on Android.
-            ime_enabled: false,
+            ime_enabled: true,
             ..default()
         }),
         ..default()

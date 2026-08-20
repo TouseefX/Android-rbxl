@@ -199,7 +199,6 @@ pub struct EditorApp {
     command_history_idx: usize,
     /// Last system clipboard text we pushed into egui.
     last_clipboard: String,
-    last_focused: Option<egui::Id>,
     /// Last focused egui Id, used to show/hide the IME.
     command_output: Vec<lua_runtime::OutputLine>,
     command_run_target_studio: bool,
@@ -286,7 +285,6 @@ impl Default for EditorApp {
             command_history: Vec::new(),
             command_history_idx: 0,
             last_clipboard: String::new(),
-            last_focused: None,
             command_output: Vec::new(),
             command_run_target_studio: false,
             plugin_index: plugins::load_index(),
@@ -413,20 +411,7 @@ impl EditorApp {
         // copy internally (it sets system clipboard via our JNI when the
         // user copies), so we only need to push here.
         self.sync_clipboard(ctx);
-        self.drain_ime(ctx);
-        // Show/hide IME when egui focus changes.
-        let focused = ctx.memory(|m| m.focused());
-        if focused != self.last_focused {
-            self.last_focused = focused;
-            if focused.is_some() {
-                #[cfg(target_os = "android")]
-                jni_bridge::request_show_ime();
-            } else {
-                #[cfg(target_os = "android")]
-                jni_bridge::request_hide_ime();
-            }
-        }
-// Pump any completed thumbnail downloads into GPU textures.
+        // Pump any completed thumbnail downloads into GPU textures.
         crate::thumbnails::pump(ctx);
 
         // Custom Roblox Studio Lite Theme styling
@@ -2168,63 +2153,6 @@ ui.label("Place ID:");
         if system != self.last_clipboard {
             self.last_clipboard = system.clone();
             ctx.copy_text(system);
-        }
-    }
-
-    /// Drain IME events coming from the invisible ImeBridge EditText
-    /// and turn them into egui events. Multi-char commits are treated
-    /// as Paste (that's how Gboard clipboard / long-press Paste
-    /// arrives), single chars as typed text.
-    fn drain_ime(&mut self, ctx: &egui::Context) {
-        for ev in jni_bridge::drain_ime() {
-            match ev {
-                jni_bridge::ImeInput::Commit(text) => {
-                    ctx.input_mut(|i| {
-                        i.events.push(if text.chars().count() > 1 {
-                            egui::Event::Paste(text)
-                        } else {
-                            egui::Event::Text(text)
-                        });
-                    });
-                }
-                jni_bridge::ImeInput::DeleteSurrounding { before, .. } => {
-                    for _ in 0..before.max(1) {
-                        ctx.input_mut(|i| i.events.push(egui::Event::Key {
-                            key: egui::Key::Backspace,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: Default::default(),
-                        }));
-                    }
-                }
-                jni_bridge::ImeInput::KeyDown { keycode, unicode, shift } => {
-                    if let Some(key) = android_keycode_to_egui(keycode) {
-                        let mods = egui::Modifiers { shift, ..Default::default() };
-                        ctx.input_mut(|i| {
-                            i.events.push(egui::Event::Key {
-                                key, physical_key: None, pressed: true,
-                                repeat: false, modifiers: mods,
-                            });
-                            if unicode != 0 {
-                                if let Some(ch) = char::from_u32(unicode as u32) {
-                                    if !ch.is_control() {
-                                        i.events.push(egui::Event::Text(ch.to_string()));
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-                jni_bridge::ImeInput::KeyUp { .. } => {}
-                jni_bridge::ImeInput::EditorAction(_)
-                | jni_bridge::ImeInput::FinishComposing => {
-                    ctx.input_mut(|i| i.events.push(egui::Event::Key {
-                        key: egui::Key::Enter, physical_key: None,
-                        pressed: true, repeat: false, modifiers: Default::default(),
-                    }));
-                }
-            }
         }
     }
 

@@ -37,10 +37,10 @@ luaur = { git = "https://github.com/TouseefX/luaur", branch = "main", default-fe
 
 # Bevy owns the whole window (so it gets a GPU context and can render the 3D
 # viewport natively on Android). egui runs INSIDE Bevy via bevy_egui.
-# android-native-activity (not the default game-activity) is what cargo-apk2 +
-# the existing NativeActivity MainActivity.java use.
+# android-game-activity provides a proper InputConnection / soft-keyboard
+# (GameActivity's GameTextInput), which makes Gboard/Samsung paste work.
 bevy = { version = "0.17", default-features = false, features = [
-    "android-native-activity",
+    "android-game-activity",
     "android_shared_stdcxx",
     "bevy_asset",
     "bevy_camera",
