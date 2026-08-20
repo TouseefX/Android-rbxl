@@ -418,6 +418,10 @@ impl EditorApp {
         let focused = ctx.memory(|m| m.focused());
         if focused != self.last_focused {
             self.last_focused = focused;
+            // Defer one frame so egui finishes its own click/focus
+            // handling before we ask the native view to focus; this
+            // prevents the keyboard opening then immediately closing
+            // when a TextEdit is tapped.
             if focused.is_some() {
                 #[cfg(target_os = "android")]
                 jni_bridge::request_show_ime();

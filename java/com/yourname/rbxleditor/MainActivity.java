@@ -71,8 +71,10 @@ public class MainActivity extends NativeActivity {
         // IMPORTANT: do NOT call setContentView — that would replace
         // the NativeActivity surface used by Bevy. Add a 1px focusable
         // view on top to host the InputConnection.
+        // Don't requestFocus() here — that would pop the keyboard
+        // open on launch. Rust focuses this view only when an egui
+        // text field gains focus.
         addContentView(inputTarget, new android.widget.FrameLayout.LayoutParams(1, 1));
-        inputTarget.requestFocus();
     }
 
     public static void showImeStatic() {
