@@ -1,5 +1,6 @@
 package com.yourname.rbxleditor;
 
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.inputmethod.BaseInputConnection;
@@ -31,12 +32,14 @@ public class RbxInputConnection extends BaseInputConnection {
         // Gboard's clipboard / long-press Paste also comes through
         // commitText; the editor decides whether to treat a long
         // string as a paste.
+        Log.i("RbxInput", "commitText: '" + s + "'");
         nativeCommitText(s);
         return true;
     }
 
     @Override
     public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+        Log.i("RbxInput", "deleteSurrounding " + beforeLength + "/" + afterLength);
         nativeDeleteSurrounding(beforeLength, afterLength);
         return true;
     }

@@ -74,7 +74,13 @@ public class MainActivity extends NativeActivity {
         // Don't requestFocus() here — that would pop the keyboard
         // open on launch. Rust focuses this view only when an egui
         // text field gains focus.
-        addContentView(inputTarget, new android.widget.FrameLayout.LayoutParams(1, 1));
+        // The view fills the screen so it's a valid IME target, but
+        // it's transparent and non-clickable so touches pass through
+        // to the Bevy surface underneath.
+        addContentView(inputTarget,
+                new android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
     }
 
     public static void showImeStatic() {

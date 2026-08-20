@@ -1,39 +1,40 @@
 package com.yourname.rbxleditor;
 
 import android.content.Context;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 
 /**
- * A tiny (1x1 px) focusable View whose only job is to own an
- * {@link InputConnection} so the soft keyboard / Gboard has somewhere to
- * send commitText (typing) and paste events. egui renders its own text
- * and NativeActivity provides no EditText, so without this the IME has
- * nowhere to deliver input.
+ * Hosts the {@link InputConnection} that lets the soft keyboard /
+ * Gboard deliver typing and paste to egui's self-rendered text fields.
  *
- * It is NOT focusable in touch mode so taps pass through to the Bevy
- * surface; focus is requested programmatically from Rust when an egui
- * text field gains focus.
+ * The view fills the window but is transparent and does NOT consume
+ * touches: pointer events still reach the Bevy/egui surface underneath.
+ * It MUST be focusable in touch mode so Android will create an
+ * InputConnection for it when we request focus + showSoftInput.
  */
 public class InputTargetView extends View {
     public InputTargetView(Context context) {
         super(context);
         setFocusable(true);
-        // Do NOT setFocusableInTouchMode(true): that would let this 1px
-        // view steal touches meant for the egui UI and cause the
-        // keyboard to flicker open/closed on every tap.
-        setFocusableInTouchMode(false);
+        setFocusableInTouchMode(true);
+        // Critical: without these, the 1px/transparent view is treated
+        // as not eligible for IME focus on many devices.
+        setVisibility(View.VISIBLE);
+        setEnabled(true);
+        // Don't intercept touches — let them reach Bevy/egui.
         setClickable(false);
         setLongClickable(false);
     }
 
     @Override
     public boolean onCheckIsTextEditor() {
-        // Only act as a text editor (and thus show a keyboard) when
-        // we've been explicitly focused by Rust.
-        return hasFocus();
+        // We are always a text editor while we have focus. Returning
+        // true unconditionally makes the IME bind an InputConnection.
+        return true;
     }
 
     @Override
@@ -42,26 +43,42 @@ public class InputTargetView extends View {
                 | EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE
                 | EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
         outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE;
+        // Some IMEs refuse to commit text unless the selection is set.
+        outAttrs.initialSelStart = 0;
+        outAttrs.initialSelEnd = 0;
         return new RbxInputConnection(this);
     }
 
-    /** Called from Rust when an egui text field gains focus. */
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        // Never consume touches; pass them through to the Bevy surface.
+        return false;
+    }
+
+    /** Rust calls this when an egui text field gains focus. */
     public void showIme() {
         post(() -> {
             requestFocus();
             InputMethodManager imm =
                     (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (imm != null) imm.showSoftInput(this, InputMethodManager.SHOW_FORCED);
+            if (imm == null) return;
+            // Force the IME to (re)create the InputConnection, then
+            // show. restartInput is important after focus changes.
+            imm.restartInput(this);
+            imm.showSoftInput(this, InputMethodManager.SHOW_FORCED);
         });
     }
 
-    /** Called from Rust when focus leaves all egui text fields. */
+    /** Rust calls this when focus leaves all egui text fields. */
     public void hideIme() {
         post(() -> {
             InputMethodManager imm =
                     (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (imm != null) imm.hideSoftInputFromWindow(getWindowToken(), 0);
+            if (imm != null) {
+                imm.hideSoftInputFromWindow(getWindowToken(), 0);
+            }
             clearFocus();
         });
     }
+
 }
