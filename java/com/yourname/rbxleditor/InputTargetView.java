@@ -1,6 +1,7 @@
 package com.yourname.rbxleditor;
 
 import android.content.Context;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
