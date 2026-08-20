@@ -418,3 +418,121 @@ pub fn files_dir() -> Option<String> {
     });
     out
 }
+
+// ---- Soft-keyboard (ImeBridge.java) ----
+// IME input (typing, Gboard paste) is delivered from the invisible
+// EditText's InputConnection into this queue, drained each frame.
+
+#[derive(Debug, Clone)]
+pub enum ImeInput {
+    Commit(String),
+    DeleteSurrounding { before: usize, after: usize },
+    KeyDown { keycode: i32, unicode: i32, shift: bool },
+    KeyUp { keycode: i32 },
+    EditorAction(i32),
+    FinishComposing,
+}
+
+static IME_QUEUE: OnceLock<Mutex<Vec<ImeInput>>> = OnceLock::new();
+fn ime_queue() -> &'static Mutex<Vec<ImeInput>> {
+    IME_QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Pop all queued IME events (called once per frame).
+pub fn drain_ime() -> Vec<ImeInput> {
+    if let Ok(mut q) = ime_queue().lock() {
+        std::mem::take(&mut *q)
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn request_show_ime() {
+    let _ = with_env(|env, class| {
+        env.call_static_method(class, "showImeStatic", "()V", &[])?;
+        Ok(())
+    });
+}
+
+pub fn request_hide_ime() {
+    let _ = with_env(|env, class| {
+        env.call_static_method(class, "hideImeStatic", "()V", &[])?;
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_ImeBridge_nativeCommitText(
+    mut env: JNIEnv,
+    _class: JClass,
+    text: JString,
+) {
+    let s: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+    if let Ok(mut q) = ime_queue().lock() {
+        q.push(ImeInput::Commit(s));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_ImeBridge_nativeDeleteSurrounding(
+    _env: JNIEnv,
+    _class: JClass,
+    before: i32,
+    after: i32,
+) {
+    if let Ok(mut q) = ime_queue().lock() {
+        q.push(ImeInput::DeleteSurrounding {
+            before: before.max(0) as usize,
+            after: after.max(0) as usize,
+        });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_ImeBridge_nativeKeyDown(
+    _env: JNIEnv,
+    _class: JClass,
+    keycode: i32,
+    unicode: i32,
+    shift: jni::sys::jboolean,
+) {
+    if let Ok(mut q) = ime_queue().lock() {
+        q.push(ImeInput::KeyDown {
+            keycode,
+            unicode,
+            shift: shift != 0,
+        });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_ImeBridge_nativeKeyUp(
+    _env: JNIEnv,
+    _class: JClass,
+    keycode: i32,
+) {
+    if let Ok(mut q) = ime_queue().lock() {
+        q.push(ImeInput::KeyUp { keycode });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_ImeBridge_nativeEditorAction(
+    _env: JNIEnv,
+    _class: JClass,
+    action: i32,
+) {
+    if let Ok(mut q) = ime_queue().lock() {
+        q.push(ImeInput::EditorAction(action));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_ImeBridge_nativeFinishComposing(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Ok(mut q) = ime_queue().lock() {
+        q.push(ImeInput::FinishComposing);
+    }
+}
