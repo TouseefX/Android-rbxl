@@ -1,6 +1,6 @@
 package com.yourname.rbxleditor;
 
-import androidx.games.activity.GameActivity;
+import com.google.androidgamesdk.GameActivity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
