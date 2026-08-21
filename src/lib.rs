@@ -16,6 +16,7 @@
 // is what gives us a proper InputConnection / soft keyboard (paste works).
 // ============================================================================
 
+mod android_ime;
 mod app;
 mod asset_downloader;
 mod audio;
@@ -58,7 +59,13 @@ fn draw_editor_ui(
     mut contexts: EguiContexts,
 ) {
     if let Ok(ctx) = contexts.ctx_mut() {
+        // Feed anything the Android IME produced since last frame into egui
+        // BEFORE the widgets are built, so the focused TextEdit sees it.
+        android_ime::begin_frame(ctx);
         app.draw_editor(ctx, &mut orbit);
+        // Show/hide the soft keyboard to match egui's focus and flush egui's
+        // clipboard writes to Android.
+        android_ime::end_frame(ctx);
     }
 }
 

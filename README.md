@@ -69,3 +69,44 @@ cargo run --bin rbxl-editor-desktop -- /path/to/place.rbxl
 `manifest.yaml` requests `androidx.games:games-activity:4.4.0` — the AAR
 version that release expects. **Bump both together**, otherwise you get an
 `UnsatisfiedLinkError` for `GameActivity.initializeNativeCode` at startup.
+
+## Text input (soft keyboard, IME, paste)
+
+GameActivity is necessary for text input but it is **not sufficient**: nothing
+in the Bevy stack consumes GameTextInput.
+
+* `winit` 0.30's Android backend only translates `InputEvent::KeyEvent` /
+  `MotionEvent`; it ignores `MainEvent::TextInputEvent` and always sets
+  `KeyEvent::text = None`.
+* `Window::set_ime_allowed()` is an empty stub on Android, so nothing ever asks
+  the system to raise the soft keyboard.
+
+So a focused egui `TextEdit` would blink a caret and receive nothing.
+`src/android_ime.rs` closes that gap by talking to `android-activity` directly,
+bypassing winit:
+
+* **End of each egui pass** — if `ctx.wants_keyboard_input()` just became true,
+  configure the IME (`set_ime_editor_info`: multi-line, no autocorrect,
+  `IME_FLAG_NO_FULLSCREEN`), seed the GameTextInput buffer and call
+  `show_soft_input()`. When focus is lost, `hide_soft_input()`.
+* **Start of each egui pass** — poll `AndroidApp::text_input_state()` and diff
+  it against our mirror of the buffer. Inserted text becomes
+  `egui::Event::Text` (newlines become `Key::Enter`), removed characters become
+  `Key::Backspace`. Gboard's clipboard chip commits through the same
+  `InputConnection`, so **paste works through this path**.
+* egui's copy/cut (`OutputCommand::CopyText`) is forwarded to Android's
+  `ClipboardManager` via the existing JNI bridge, and Ctrl+V on a hardware
+  keyboard pushes `egui::Event::Paste` from the system clipboard.
+
+The buffer keeps a small run of leading spaces as padding so a Backspace
+pressed before anything has been typed still registers, and it is re-seeded
+when that padding is consumed.
+
+Debugging: `adb logcat -s rbxl_editor` shows `android_ime: keyboard shown` /
+`hidden` on every focus change.
+
+**Known limitation:** the activity is fullscreen with the system bars hidden,
+so `windowSoftInputMode=adjustResize` cannot shrink the window — the keyboard
+overlays the bottom of the screen instead of pushing the UI up. If a field ends
+up underneath it, the fix is to read `AndroidApp::content_rect()` while the IME
+is up and reserve that much space at the bottom of the egui layout.
