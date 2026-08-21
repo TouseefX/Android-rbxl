@@ -8,10 +8,15 @@
 //   - The egui editor UI runs INSIDE Bevy via `bevy_egui`, drawn over the 3D.
 //   - Opening a place rebuilds the Bevy meshes; the 3D tab shows them live.
 //
-// Android entry uses `#[bevy_main]` (android-native-activity), compatible with
-// cargo-apk2 and the existing NativeActivity MainActivity.java.
+// Android entry uses `#[bevy_main]`, which expands to the `android_main` entry
+// point of `android-activity`'s GameActivity backend (Bevy feature
+// `android-game-activity`). The APK is built by xbuild (`manifest.yaml`), which
+// drives a real Gradle project so `kotlin/MainActivity.kt` can extend
+// `com.google.androidgamesdk.GameActivity` from the games-activity AAR — that
+// is what gives us a proper InputConnection / soft keyboard (paste works).
 // ============================================================================
 
+mod android_ime;
 mod app;
 mod asset_downloader;
 mod audio;
@@ -54,7 +59,13 @@ fn draw_editor_ui(
     mut contexts: EguiContexts,
 ) {
     if let Ok(ctx) = contexts.ctx_mut() {
+        // Feed anything the Android IME produced since last frame into egui
+        // BEFORE the widgets are built, so the focused TextEdit sees it.
+        android_ime::begin_frame(ctx);
         app.draw_editor(ctx, &mut orbit);
+        // Show/hide the soft keyboard to match egui's focus and flush egui's
+        // clipboard writes to Android.
+        android_ime::end_frame(ctx);
     }
 }
 

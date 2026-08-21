@@ -3,6 +3,37 @@ name: Build Android APK
 on:
   workflow_dispatch:
 
+# ---------------------------------------------------------------------------
+# Build pipeline: xbuild (https://github.com/rust-mobile/xbuild)
+#
+# xbuild is given `gradle: true` in manifest.yaml, so it:
+#   1. cross-compiles the Rust cdylib (librbxl_editor.so) against the NDK,
+#   2. generates a real Gradle/AGP project under target/x/release/android/gradle,
+#   3. copies kotlin/*.kt into it and resolves the Maven deps declared in
+#      manifest.yaml (games-activity, appcompat, core) from Google's Maven,
+#   4. runs `gradle assemble` to produce the APK.
+#
+# That last part is why we moved off cargo-apk2: cargo-apk2 calls `javac` with
+# nothing but android.jar on the classpath, so an Activity extending
+# GameActivity cannot compile (37 "cannot find symbol" errors).
+#
+# Two knobs are needed to make xbuild's generated project modern enough:
+#   * ~/.cache/x/Android.ndk is symlinked to a real NDK sysroot instead of the
+#     ancient one xbuild downloads (that one has no API-34 stubs).
+#   * ~/.gradle/init.d/ pins AGP/Kotlin plugin versions, because xbuild's
+#     template hardcodes AGP 7.3.0 / Kotlin 1.7.20 which cannot build against
+#     compileSdk 34 or consume modern AndroidX AARs.
+# ---------------------------------------------------------------------------
+
+env:
+  # Must expose usr/lib/aarch64-linux-android/<target_sdk_version> (34).
+  NDK_VERSION: r27c
+  GRADLE_VERSION: "8.11.1"
+  AGP_VERSION: "8.7.3"
+  KOTLIN_PLUGIN_VERSION: "2.0.21"
+  # Pinned xbuild revision (master @ 2025-08-15) so builds are reproducible.
+  XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
+
 jobs:
   build-android:
     name: Build Android APK
@@ -20,107 +51,166 @@ jobs:
           distribution: zulu
           java-version: "17"
 
-      - name: Install Android platform
-        run: echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-30"
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: Set up Android NDK
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
-          ndk-version: r26d
+          ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: false
 
-      - name: Configure Android NDK
+      # xbuild always compiles against $XDG_CACHE_HOME/x/Android.ndk. By default
+      # it downloads a 2022-era sysroot from its own GitHub release, which has
+      # no API-34 stubs (`x` then fails with "ndk doesn't support sdk version
+      # 34"). Point it at the real NDK sysroot instead and put the NDK's
+      # clang/llvm-ar/lld first on PATH, since that is what xbuild invokes.
+      - name: Wire xbuild up to the real NDK
         run: |
+          set -euo pipefail
           NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -d "$SYSROOT/usr/lib/aarch64-linux-android/34"
+          mkdir -p "$HOME/.cache/x"
+          rm -rf "$HOME/.cache/x/Android.ndk"
+          ln -s "$SYSROOT" "$HOME/.cache/x/Android.ndk"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
-          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
-          echo "TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          ls "$SYSROOT/usr/lib/aarch64-linux-android" | tr '\n' ' '
 
-      - name: Install Rust nightly and Android targets
+      # xbuild's generated Gradle project hardcodes AGP 7.3.0 / Kotlin 1.7.20.
+      # An init script rewrites those plugin requests to current versions so the
+      # build can use compileSdk 34 and modern AndroidX artifacts.
+      - name: Configure Gradle (AGP/Kotlin overrides)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/xbuild-overrides.gradle" <<EOF
+          settingsEvaluated { settings ->
+              settings.pluginManagement.resolutionStrategy.eachPlugin { details ->
+                  def id = details.requested.id.id
+                  if (id == 'com.android.application' || id == 'com.android.library') {
+                      details.useModule("com.android.tools.build:gradle:${{ env.AGP_VERSION }}")
+                  } else if (id == 'org.jetbrains.kotlin.android') {
+                      details.useModule("org.jetbrains.kotlin:kotlin-gradle-plugin:${{ env.KOTLIN_PLUGIN_VERSION }}")
+                  }
+              }
+          }
+          EOF
+          cat > "$HOME/.gradle/gradle.properties" <<'EOF'
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          org.gradle.daemon=false
+          android.useAndroidX=true
+          # xbuild's template targets AGP 7.3; keep the compileSdk sanity check
+          # from turning into a hard error after we upgrade the plugin.
+          android.suppressUnsupportedCompileSdk=34
+          # No Java sources in this project, so a Java/Kotlin target mismatch is
+          # not fatal - don't let the check fail the build.
+          kotlin.jvm.target.validation.mode=warning
+          EOF
+          cat "$HOME/.gradle/init.d/xbuild-overrides.gradle"
+
+      - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          targets: aarch64-linux-android
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # The Cargo project is at the repository root.
           workspaces: ". -> target"
-          key: android-apk-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          key: xbuild-apk-${{ hashFiles('Cargo.toml') }}
 
-      - name: Install APK build tools
-        uses: taiki-e/install-action@v2
+      - name: Cache xbuild binary
+        id: cache-x
+        uses: actions/cache@v4
         with:
-          tool: cargo-apk2,cargo-ndk
+          path: ~/.cargo/bin/x
+          key: xbuild-${{ env.XBUILD_REV }}-${{ runner.os }}
 
-      # cargo-apk2 signs release APKs with apksigner using the keystore given by
-      # CARGO_APK_RELEASE_KEYSTORE (falling back to the Cargo.toml signing table).
-      # Generate a fresh keystore with a single key so the build never fails for
-      # a missing release key on a fresh runner.
-      - name: Generate release keystore
+      - name: Install xbuild
+        if: steps.cache-x.outputs.cache-hit != 'true'
         run: |
-          mkdir -p "$RUNNER_TEMP"
-          if [ ! -f "$RUNNER_TEMP/rbxl-release.jks" ]; then
-            keytool -genkey -v \
-              -keystore "$RUNNER_TEMP/rbxl-release.jks" \
+          set -euo pipefail
+          # Build the tool itself with stable (its dependency tree predates the
+          # current nightly); the app is still cross-compiled with nightly.
+          rustup toolchain install stable --profile minimal
+          cargo +stable install --locked --git https://github.com/rust-mobile/xbuild \
+            --rev "$XBUILD_REV" xbuild
+
+      - name: x doctor
+        run: x doctor || true
+
+      - name: Build APK with xbuild
+        run: |
+          set -euo pipefail
+          # --release: the debug profile produced a ~1 GB APK. [profile.release]
+          # in Cargo.toml strips DWARF but keeps the symbol table, so logcat
+          # backtraces still resolve to function names.
+          x build --release --platform android --arch arm64 --format apk --verbose
+
+      - name: Zipalign + sign the APK
+        run: |
+          set -euo pipefail
+          UNSIGNED="target/x/release/android/rbxl-editor.apk"
+          test -f "$UNSIGNED" || { echo "xbuild produced no APK"; find target/x -maxdepth 3 -name '*.apk'; exit 1; }
+
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          echo "Using build-tools: $BUILD_TOOLS"
+
+          KEYSTORE="$RUNNER_TEMP/rbxl-release.jks"
+          if [ ! -f "$KEYSTORE" ]; then
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE" \
               -storepass android -keypass android \
               -alias rbxl -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=rbxl, O=rbxl, C=US" \
-              >/dev/null 2>&1
+              -dname "CN=rbxl, O=rbxl, C=US" >/dev/null 2>&1
           fi
-          echo "KEYSTORE=$RUNNER_TEMP/rbxl-release.jks" >> "$GITHUB_ENV"
-          echo "CARGO_APK_RELEASE_KEYSTORE=$RUNNER_TEMP/rbxl-release.jks" >> "$GITHUB_ENV"
-          echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=android" >> "$GITHUB_ENV"
-          ls -lh "$RUNNER_TEMP/rbxl-release.jks"
 
-      - name: Build APK (single Bevy app)
-        env:
-          CARGO_APK_RELEASE_KEYSTORE: ${{ env.CARGO_APK_RELEASE_KEYSTORE }}
-          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ env.CARGO_APK_RELEASE_KEYSTORE_PASSWORD }}
-        run: |
-          export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android30-clang"
-          export CC_armv7_linux_androideabi="$TOOLCHAIN/armv7a-linux-androideabi30-clang"
-          export CC_x86_64_linux_android="$TOOLCHAIN/x86_64-linux-android30-clang"
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/aarch64-linux-android30-clang"
-          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$TOOLCHAIN/armv7a-linux-androideabi30-clang"
-          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TOOLCHAIN/x86_64-linux-android30-clang"
-
-          # Single app: Bevy owns the window (GPU 3D viewport) and the egui
-          # editor UI runs inside it via bevy_egui.
-          # IMPORTANT: --release. The debug profile produced a ~1 GB APK.
-          # [profile.release] in Cargo.toml strips debug info but keeps the
-          # symbol table, so size drops to ~100 MB while backtraces still
-          # resolve to function names.
-          cargo apk2 build --release --lib
-
-      - name: Collect APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          APK="$(find target -type f -name 'rbxleditor.apk' | head -n 1)"
-          if [ -z "$APK" ]; then
-            echo "APK not found."
-            exit 1
-          fi
           mkdir -p dist
-          cp "$APK" dist/rbxleditor.apk
+          # -P 16: 16 KB page alignment, required for Android 15+ devices.
+          "$BUILD_TOOLS/zipalign" -f -P 16 4 "$UNSIGNED" dist/aligned.apk \
+            || "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" dist/aligned.apk
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
+            --ks-key-alias rbxl \
+            --out dist/rbxleditor.apk dist/aligned.apk
+          rm -f dist/aligned.apk dist/aligned.apk.idsig
+          "$BUILD_TOOLS/apksigner" verify --verbose dist/rbxleditor.apk
           ls -lh dist/rbxleditor.apk
 
-      # Keep the built native library as a symbols artifact so crashes can be
-      # symbolized offline with ndk-stack / addr2line.
+      # Keep the unstripped native library so crashes can be symbolized offline
+      # with ndk-stack / addr2line.
       - name: Collect symbols
-        shell: bash
+        if: always()
         run: |
           set -euo pipefail
-          SO="$(find target -type f -name 'librbxl_editor.so' | head -n 1)"
+          SO="$(find target/x -type f -name 'librbxl_editor.so' | head -n 1 || true)"
           if [ -n "$SO" ]; then
             mkdir -p dist-symbols
             cp "$SO" dist-symbols/librbxl_editor.so
             ls -lh dist-symbols/librbxl_editor.so
           else
             echo "no .so found; skipping symbols artifact"
+          fi
+
+      - name: Dump generated Gradle project on failure
+        if: failure()
+        run: |
+          GRADLE_DIR="target/x/release/android/gradle"
+          if [ -d "$GRADLE_DIR" ]; then
+            echo "--- AndroidManifest.xml"
+            cat "$GRADLE_DIR/app/src/main/AndroidManifest.xml" || true
+            echo "--- app/build.gradle"
+            cat "$GRADLE_DIR/app/build.gradle" || true
+            echo "--- sources"
+            ls -R "$GRADLE_DIR/app/src/main" || true
           fi
 
       - name: Upload APK
@@ -131,6 +221,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload symbols
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: symbols
