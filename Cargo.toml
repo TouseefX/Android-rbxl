@@ -4,7 +4,8 @@ version = "3.1.0"
 edition = "2024"
 
 [lib]
-# cdylib is what cargo-apk2 packages on Android; rlib lets a desktop bin link it.
+# cdylib is what xbuild packages into the APK (librbxl_editor.so, loaded by
+# MainActivity/GameActivity); rlib lets the desktop bin link the same code.
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
@@ -74,6 +75,19 @@ bevy = { version = "0.17", default-features = false, features = [
 bevy_egui = { version = "0.38", default-features = false, features = ["render", "bevy_ui", "default_fonts"] }
 
 # ----------------------------------------------------------------------------
+# Android-only dependencies.
+#
+# `android-activity` is what actually implements the GameActivity glue that
+# Bevy's `android-game-activity` feature selects. We depend on it directly so
+# that the version is pinned and stays in lock-step with the AAR declared in
+# `manifest.yaml`: android-activity 0.6.x targets
+# `androidx.games:games-activity:4.4.0` (backwards compatible with 4.0.0).
+# If you bump one, bump the other.
+# ----------------------------------------------------------------------------
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6.1", features = ["game-activity"] }
+
+# ----------------------------------------------------------------------------
 # Release profile — keeps the APK small WITHOUT losing the ability to debug.
 #
 # `strip = "debuginfo"` removes the bulky DWARF debug sections but KEEPS the
@@ -95,74 +109,6 @@ panic = "abort"
 # Keep dependency crate sizes down too.
 [profile.release.package."*"]
 opt-level = 3
-
-[package.metadata.android]
-package = "com.yourname.rbxleditor"
-apk_label = "rbxl Editor v3.1"
-apk_name = "rbxleditor"
-build_targets = ["aarch64-linux-android"]
-java_sources = "java"
-dependencies = [
-    "androidx.games:games-activity:1.2.2",
-    "androidx.core:core:1.9.0",
-]
-min_sdk_version = 24
-target_sdk_version = 34
-compile_sdk_version = 34
-
-[package.metadata.android.sdk]
-min_sdk_version = 26
-target_sdk_version = 34
-
-# Maven dependencies pulled in by cargo-apk2 (resolves against Google
-# Maven). GameActivity is required by the android-game-activity
-# backend; it provides the androidx.games.activity.GameActivity class
-# our MainActivity extends.
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.INTERNET"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.ACCESS_NETWORK_STATE"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.READ_EXTERNAL_STORAGE"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.WRITE_EXTERNAL_STORAGE"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.MANAGE_EXTERNAL_STORAGE"
-
-[package.metadata.android.application]
-extract_native_libs = true
-uses_cleartext_traffic = true
-
-[[package.metadata.android.application.activity]]
-name = ".MainActivity"
-launch_mode = "singleTop"
-config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode"
-orientation = "sensor"
-exported = true
-
-[[package.metadata.android.application.activity.meta_data]]
-name = "android.app.lib_name"
-value = "rbxl_editor"
-
-[[package.metadata.android.application.activity.intent_filter]]
-actions = ["android.intent.action.MAIN"]
-categories = ["android.intent.category.LAUNCHER"]
-
-[package.metadata.android.signing.release]
-# cargo-apk2 joins this against the crate root. In CI the workflow overrides it
-# via CARGO_APK_RELEASE_KEYSTORE (see .github/workflows/main.yml), so this is
-# only a local fallback. Generate it with:
-#   keytool -genkey -v -keystore keystore.jks -storepass android -keypass android \
-#     -alias rbxl -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=rbxl"
-path = "keystore.jks"
-keystore_password = "android"
-key_alias = "rbxl"
-key_password = "android"
 
 [features]
 default = []

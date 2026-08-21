@@ -8,8 +8,12 @@
 //   - The egui editor UI runs INSIDE Bevy via `bevy_egui`, drawn over the 3D.
 //   - Opening a place rebuilds the Bevy meshes; the 3D tab shows them live.
 //
-// Android entry uses `#[bevy_main]` (android-native-activity), compatible with
-// cargo-apk2 and the existing NativeActivity MainActivity.java.
+// Android entry uses `#[bevy_main]`, which expands to the `android_main` entry
+// point of `android-activity`'s GameActivity backend (Bevy feature
+// `android-game-activity`). The APK is built by xbuild (`manifest.yaml`), which
+// drives a real Gradle project so `kotlin/MainActivity.kt` can extend
+// `com.google.androidgamesdk.GameActivity` from the games-activity AAR — that
+// is what gives us a proper InputConnection / soft keyboard (paste works).
 // ============================================================================
 
 mod app;

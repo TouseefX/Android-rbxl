@@ -1,0 +1,78 @@
+# ============================================================================
+# xbuild (https://github.com/rust-mobile/xbuild) project manifest
+# ----------------------------------------------------------------------------
+# This replaces the old `[package.metadata.android]` table that cargo-apk2 used.
+#
+# Build locally with:
+#   x build --release --platform android --arch arm64 --format apk
+#
+# Why xbuild instead of cargo-apk2:
+#   * cargo-apk2 shells out to `javac` with only `android.jar` on the classpath,
+#     so it cannot compile an Activity that extends `GameActivity` (the class
+#     lives in the `androidx.games:games-activity` AAR). That is exactly what
+#     broke the old build: 37 "cannot find symbol" errors for every method
+#     inherited from GameActivity.
+#   * xbuild's `gradle: true` mode generates a real Gradle/AGP project, so
+#     Maven/AAR dependencies (games-activity, appcompat, core) resolve and our
+#     Kotlin Activity compiles against them like any native Android app.
+# ============================================================================
+
+android:
+  # Generate + run a real Gradle (AGP) project instead of the hand-rolled APK
+  # writer. Required for anything with Java/Kotlin sources or AAR deps.
+  gradle: true
+
+  # Resolved from Google's Maven repo by Gradle and packaged into the APK.
+  # games-activity 4.4.0 is the version required by android-activity 0.6.x
+  # (the GameActivity glue Bevy links through `android-game-activity`).
+  # appcompat is needed because GameActivity is an AppCompatActivity: without
+  # an AppCompat theme the app crashes on start with
+  # "You need to use a Theme.AppCompat theme (or descendant)".
+  dependencies:
+    - "androidx.games:games-activity:4.4.0"
+    - "androidx.appcompat:appcompat:1.7.0"
+    - "androidx.core:core:1.13.1"
+
+  manifest:
+    package: "com.yourname.rbxleditor"
+    version_name: "3.1.0"
+    version_code: 31
+
+    sdk:
+      # NOTE: target_sdk_version is also used by xbuild as
+      #   * the Gradle `compileSdk` / `targetSdk`, and
+      #   * the Android API level the native lib is compiled against
+      #     (`--target=aarch64-linux-android<version>`),
+      # so the NDK sysroot must contain `usr/lib/aarch64-linux-android/<version>`.
+      min_sdk_version: 26
+      target_sdk_version: 34
+
+    uses_permission:
+      - name: "android.permission.INTERNET"
+      - name: "android.permission.ACCESS_NETWORK_STATE"
+      - name: "android.permission.READ_EXTERNAL_STORAGE"
+        max_sdk_version: 32
+      - name: "android.permission.WRITE_EXTERNAL_STORAGE"
+        max_sdk_version: 29
+      - name: "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+    application:
+      label: "rbxl Editor v3.1"
+      # Our Kotlin MainActivity lives in the APK's dex, so this must be true
+      # (xbuild defaults it to false for pure-NativeActivity apps).
+      has_code: true
+      # GameActivity extends AppCompatActivity -> AppCompat theme required.
+      theme: "@style/Theme.AppCompat.NoActionBar"
+
+      activities:
+        - name: ".MainActivity"
+          launch_mode: "singleTop"
+          orientation: "sensor"
+          hardware_accelerated: true
+          exported: true
+          window_soft_input_mode: "adjustResize"
+          config_changes: "orientation|keyboardHidden|keyboard|screenSize|screenLayout|smallestScreenSize|locale|layoutDirection|fontScale|density|uiMode"
+          # xbuild automatically appends:
+          #   * <meta-data android:name="android.app.lib_name" value="rbxl_editor"/>
+          #   * the MAIN/LAUNCHER intent-filter
+          # so neither is declared here (declaring them would duplicate them).
