@@ -44,9 +44,14 @@ impl EditorSettings {
         let path = Self::get_settings_path();
         if let Ok(data) = std::fs::read_to_string(&path) {
             if let Ok(settings) = serde_json::from_str::<Self>(&data) {
+                log::info!("Loaded editor settings from {:?}", path);
                 return settings;
             }
         }
+        log::warn!(
+            "No editor settings found at {:?}; using defaults",
+            path
+        );
         Self::default()
     }
 
@@ -59,6 +64,7 @@ impl EditorSettings {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize settings: {e}"))?;
 
+        log::info!("Saving editor settings to {:?}", path);
         std::fs::write(&path, json)
             .map_err(|e| format!("Failed to write settings to {:?}: {e}", path))?;
 

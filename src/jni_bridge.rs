@@ -401,8 +401,24 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnExterna
 
 #[cfg(target_os = "android")]
 /// Get the app's internal files directory (always writable on Android, no
-/// permissions needed). This is where settings should be persisted.
+/// permissions needed). This is where settings and plugins are persisted.
+///
+/// Resolution order:
+///   1. The Application context that android-activity publishes through
+///      `ndk-context`. That context is a global reference initialized BEFORE
+///      `android_main` runs (see android-activity's `init_android_main_thread`),
+///      so it works even during the very first frames of the app — before
+///      `MainActivity.onCreate()` has had a chance to publish its `sInstance`
+///      that `getFilesDirStatic()` depends on. Without this, settings/plugins
+///      loaded at startup race the Activity and fall back to an unwritable
+///      path (so they never persisted across restarts).
+///   2. `MainActivity.getFilesDirStatic()` as a fallback (covers exotic
+///      embeddings where ndk-context was never set up).
 pub fn files_dir() -> Option<String> {
+    if let Some(dir) = files_dir_from_application_context() {
+        return Some(dir);
+    }
+    log::warn!("files_dir: ndk-context lookup failed; falling back to MainActivity instance");
     let mut out = None;
     with_env(|env, class| {
         let jval = env.call_static_method(class, "getFilesDirStatic", "()Ljava/lang/String;", &[])?;
@@ -417,4 +433,56 @@ pub fn files_dir() -> Option<String> {
         Ok(())
     });
     out
+}
+
+#[cfg(target_os = "android")]
+/// Resolve the internal files directory directly from the Application context
+/// that android-activity registers in `ndk-context`, without needing the
+/// MainActivity instance at all (see [`files_dir`] for why that matters).
+fn files_dir_from_application_context() -> Option<String> {
+    use jni::objects::{JObject, JString};
+
+    // `android_context()` panics if android-activity hasn't initialized it
+    // yet; treat that (and any JNI hiccup) as "unavailable" rather than
+    // crashing the app at startup.
+    let ctx = std::panic::catch_unwind(ndk_context::android_context).ok()?;
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+
+    // The context jobject is a GLOBAL reference created by android-activity
+    // before `android_main` runs, so it outlives this call; treating it as
+    // `'static` is sound.
+    let context: JObject<'static> = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    let files_dir = match env.call_method(context, "getFilesDir", "()Ljava/io/File;", &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("files_dir: Context.getFilesDir() failed: {e:?}");
+            let _ = env.exception_clear();
+            return None;
+        }
+    };
+    let files_dir = files_dir.l().ok()?;
+    if files_dir.is_null() {
+        return None;
+    }
+
+    let abs_path = match env.call_method(files_dir, "getAbsolutePath", "()Ljava/lang/String;", &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("files_dir: File.getAbsolutePath() failed: {e:?}");
+            let _ = env.exception_clear();
+            return None;
+        }
+    };
+    let abs_path = abs_path.l().ok()?;
+    if abs_path.is_null() {
+        return None;
+    }
+
+    let jstr = JString::from(abs_path);
+    env.get_string(&jstr).map(|s| s.into()).ok()
 }

@@ -54,12 +54,20 @@ class MainActivity : GameActivity() {
     private var lastExternalModifiedTime: Long = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Register the instance BEFORE super.onCreate(): GameActivity's
+        // onCreate() loads the native library and spawns the `android_main`
+        // thread, which immediately starts loading persisted settings/plugins
+        // through JNI (getFilesDirStatic). If sInstance were only set after
+        // super.onCreate() returns, that very first native load would race the
+        // UI thread, see a null instance, and fall back to an unwritable
+        // path — so saved settings never came back after a restart.
+        sInstance = this
+
         // Render behind the system bars; GameActivity reports the insets to the
         // native side so Bevy/egui can lay out around the cutout.
         WindowCompat.setDecorFitsSystemWindows(window, false)
         hideSystemUi()
         super.onCreate(savedInstanceState)
-        sInstance = this
 
         // Allow handing a plain file:// Uri to external editor apps without
         // tripping FileUriExposedException.
