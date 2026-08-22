@@ -74,7 +74,7 @@ pub fn fetch_and_cache_audio_async(audio_id_str: String, cookie_opt: Option<Stri
 }
 
 // ==========================================================================
-// Animation upload (cookie-authenticated)
+// Animation upload (Open Cloud Assets API — apis.roblox.com/assets/v1/assets)
 // ==========================================================================
 
 /// Result of a background `upload_animation_async` call. `result` is the new
@@ -100,112 +100,218 @@ pub fn try_recv_anim_result() -> Option<AnimUploadResult> {
     rx.lock().ok().and_then(|r| r.try_recv().ok())
 }
 
+/// Truncate a response body to a short snippet for error messages.
+fn snippet(s: &str) -> String {
+    s.chars().take(400).collect::<String>()
+}
+
+/// Build a `multipart/form-data` body with two fields — the Open Cloud asset
+/// `request` JSON and the binary `fileContent` — without pulling in reqwest's
+/// `multipart` feature (which isn't enabled in this build).
+fn build_assets_multipart(boundary: &str, request_json: &str, file_bytes: &[u8]) -> Vec<u8> {
+    fn append(body: &mut Vec<u8>, b: &[u8]) {
+        body.extend_from_slice(b);
+    }
+    let mut body = Vec::with_capacity(file_bytes.len() + request_json.len() + 512);
+    // request part
+    append(&mut body, b"--");
+    append(&mut body, boundary.as_bytes());
+    append(&mut body, b"\r\n");
+    append(&mut body, b"Content-Disposition: form-data; name=\"request\"\r\n\r\n");
+    append(&mut body, request_json.as_bytes());
+    append(&mut body, b"\r\n");
+    // fileContent part (binary rbxm)
+    append(&mut body, b"--");
+    append(&mut body, boundary.as_bytes());
+    append(&mut body, b"\r\n");
+    append(&mut body, b"Content-Disposition: form-data; name=\"fileContent\"; filename=\"animation.rbxm\"\r\n");
+    append(&mut body, b"Content-Type: model/x-rbxm\r\n\r\n");
+    append(&mut body, file_bytes);
+    append(&mut body, b"\r\n");
+    // closing boundary
+    append(&mut body, b"--");
+    append(&mut body, boundary.as_bytes());
+    append(&mut body, b"--\r\n");
+    body
+}
+
 impl RobloxApiClient {
-    /// Upload an animation (`KeyframeSequence`) to the authenticated user's
-    /// Roblox account and return the new animation asset id.
+    /// Upload an animation (`KeyframeSequence`) as a new asset via the Open
+    /// Cloud Assets API and return the new asset id.
     ///
-    /// Uses the cookie + CSRF-protected Studio publish endpoint
-    /// `www.roblox.com/ide/publish/uploadnewanimation` (the same one Studio's
-    /// Animation Editor and tools like noblox.js / roblox-animation-transfer
-    /// use). `rbxm_bytes` is a binary `.rbxm` model whose top-level instance is
-    /// the `KeyframeSequence` (built by `rbxl::export_subtree_rbxm`). It must
-    /// be POST with `Content-Type: application/xml` and a `RobloxStudio/WinInet`
-    /// user-agent; a missing CSRF token is answered with HTTP 403 + an
-    /// `x-csrf-token` header, which we capture and retry once with. On success
-    /// the response body is the new asset id as plain text.
+    /// This is Roblox's documented path for creating an animation asset on an
+    /// account or group: `POST https://apis.roblox.com/assets/v1/assets`,
+    /// authenticated with an Open Cloud `x-api-key` (asset Read+Write), body
+    /// is `multipart/form-data` with a `request` JSON field
+    /// (`assetType:"Animation"`, `creationContext.creator.userId`/`groupId`)
+    /// and a `fileContent` field holding the `.rbxm` with the KeyframeSequence
+    /// at its root (`model/x-rbxm`). The create call is asynchronous and
+    /// returns an operation id; we poll `GET /v1/operations/{id}` until it is
+    /// done, then read `response.assetId`.
     pub fn upload_animation(
-        cookie: &str,
+        api_key: &str,
+        creator_id: &str,
+        is_group: bool,
         name: &str,
         description: &str,
         rbxm_bytes: &[u8],
     ) -> Result<u64, String> {
-        if cookie.trim().is_empty() {
-            return Err("A .ROBLOSECURITY cookie is required to upload animations".into());
+        let key = api_key.trim();
+        let creator = creator_id.trim().trim_matches('"');
+        if key.is_empty() {
+            return Err(
+                "An Open Cloud API key (asset Read+Write) is required. Set it in the Open Cloud tab.".into(),
+            );
+        }
+        if creator.is_empty() || creator.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Creator User ID (or Group ID).".into());
         }
         if rbxm_bytes.is_empty() {
-            return Err("Nothing to upload (empty animation data)".into());
+            return Err("Nothing to upload (empty animation data).".into());
         }
 
-        // Dedicated client: the upload endpoint checks the User-Agent header,
-        // so impersonate Studio rather than using WebClient's browser UA.
         let http = reqwest::blocking::Client::builder()
-            .user_agent("RobloxStudio/WinInet RobloxApp/0.483.1.425021 (GlobalDist; RobloxDirectDownload)")
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .user_agent("rbxl-editor")
+            .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| format!("HTTP client build error: {e}"))?;
 
-        let cookie_hdr = format!(".ROBLOSECURITY={}", cookie.trim());
-        let url = format!(
-            "https://www.roblox.com/ide/publish/uploadnewanimation?AllID=1&assetTypeName=Animation&genreTypeId=1&name={}&description={}&ispublic=false&allowComments=true&groupId=",
-            urlencoding_simple(name),
-            urlencoding_simple(description),
+        // creationContext.creator: {"userId":"..."} or {"groupId":"..."}.
+        // The API sends/receives the id as a string.
+        let creator_key = if is_group { "groupId" } else { "userId" };
+        let name_json = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());
+        let desc_json = serde_json::to_string(description).unwrap_or_else(|_| "\"\"".into());
+        let request_json = format!(
+            "{{\"assetType\":\"Animation\",\"displayName\":{name_json},\"description\":{desc_json},\"creationContext\":{{\"creator\":{{\"{creator_key}\":\"{creator}\"}}}}}}"
         );
 
-        // CSRF challenge loop: attempt once with no token; if the server
-        // replies 403 + x-csrf-token, retry once with it.
-        let mut csrf: Option<String> = None;
-        let mut last_status = reqwest::StatusCode::OK;
-        let mut last_body = String::new();
-        for _attempt in 0..2 {
-            let mut req = http
-                .post(&url)
-                .header("Cookie", cookie_hdr.as_str())
-                .header("Content-Type", "application/xml");
-            if let Some(t) = &csrf {
-                req = req.header("X-CSRF-Token", t);
-            }
-            let resp = req
-                .body(rbxm_bytes.to_vec())
-                .send()
-                .map_err(|e| format!("Upload network error: {e}"))?;
-            last_status = resp.status();
-            let new_token = resp
-                .headers()
-                .get("x-csrf-token")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            last_body = resp.text().unwrap_or_default();
+        let boundary = "----rbxlEditorBoundary5b9f0c2e7d11";
+        let body = build_assets_multipart(boundary, &request_json, rbxm_bytes);
 
-            if last_status == reqwest::StatusCode::FORBIDDEN {
-                if let Some(t) = new_token {
-                    csrf = Some(t);
-                    continue; // retry with the fresh token
-                }
-                return Err(format!(
-                    "Roblox rejected the upload (403). Your .ROBLOSECURITY cookie may be invalid or lack upload permission. Response: {}",
-                    last_body.chars().take(300).collect::<String>()
-                ));
+        // 1) Create the asset -> returns {"path":"operations/{opId}"}.
+        let resp = http
+            .post("https://apis.roblox.com/assets/v1/assets")
+            .header("x-api-key", key)
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .map_err(|e| format!("Upload network error: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            let msg = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_else(|| snippet(&text));
+            return Err(format!("Create asset failed (HTTP {status}): {msg}"));
+        }
+        let op_path = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string))
+            .ok_or_else(|| {
+                format!("Upload accepted but no operation id returned: {}", snippet(&text))
+            })?;
+        let op_id = op_path
+            .strip_prefix("operations/")
+            .map(str::to_string)
+            .unwrap_or_else(|| op_path.rsplit('/').next().unwrap_or("").to_string());
+        if op_id.is_empty() {
+            return Err(format!("Could not parse operation id from: {op_path}"));
+        }
+
+        // 2) Poll the operation until done, then read response.assetId.
+        let op_url = format!("https://apis.roblox.com/assets/v1/operations/{op_id}");
+        let mut last = String::new();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            let resp = match http.get(&op_url).header("x-api-key", key).send() {
+                Ok(r) => r,
+                Err(e) => return Err(format!("Operation poll error: {e}")),
+            };
+            let st = resp.status();
+            last = resp.text().unwrap_or_default();
+            if !st.is_success() {
+                return Err(format!("Operation poll failed (HTTP {st}): {}", snippet(&last)));
             }
-            if last_status.is_success() {
-                let snippet = last_body.chars().take(300).collect::<String>();
-                let id = last_body.trim().parse::<u64>().map_err(|_| {
-                    format!("Upload returned a non-numeric id (expected the new asset id): {snippet}")
+            let v: serde_json::Value = match serde_json::from_str(&last) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(format!(
+                        "Operation response parse error: {e}: {}",
+                        snippet(&last)
+                    ))
+                }
+            };
+            let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+            if !done {
+                continue;
+            }
+            // done == true
+            if let Some(err) = v.get("error") {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                return Err(format!("Roblox rejected the animation: {msg}"));
+            }
+            let response = match v.get("response") {
+                Some(r) => r,
+                None => {
+                    return Err(format!(
+                        "Operation completed but no asset info was returned: {}",
+                        snippet(&last)
+                    ))
+                }
+            };
+            // Surface moderation outcome if it was rejected/banned.
+            if let Some(state) = response
+                .get("moderationResult")
+                .and_then(|m| m.get("moderationState"))
+                .and_then(|s| s.as_str())
+            {
+                if state.contains("REJECTED") || state.contains("BANNED") {
+                    return Err(format!("Animation was moderated ({state}) and not published."));
+                }
+            }
+            let id_str = response
+                .get("assetId")
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| {
+                    format!("Operation completed but no asset id was returned: {}", snippet(&last))
                 })?;
-                if id == 0 {
-                    return Err(format!("Roblox rejected the upload (id 0). Response: {snippet}"));
-                }
-                return Ok(id);
+            let id = id_str.parse::<u64>().map_err(|_| {
+                format!("Operation returned a non-numeric asset id: {id_str}")
+            })?;
+            if id == 0 {
+                return Err(format!("Roblox returned asset id 0. Response: {}", snippet(&last)));
             }
-            return Err(format!(
-                "Upload failed (HTTP {last_status}): {}",
-                last_body.chars().take(300).collect::<String>()
-            ));
+            return Ok(id);
         }
         Err(format!(
-            "Upload failed — CSRF challenge could not be completed (last HTTP {last_status}): {}",
-            last_body.chars().take(300).collect::<String>()
+            "Animation upload timed out waiting for Roblox to finish processing. Last status: {}",
+            snippet(&last)
         ))
     }
 
     /// Fire-and-forget background wrapper around `upload_animation`. The
     /// result is delivered through the animation channel and picked up by the
     /// UI thread in `drain_events`.
-    pub fn upload_animation_async(name: String, cookie: String, rbxm_bytes: Vec<u8>) {
+    pub fn upload_animation_async(
+        api_key: String,
+        creator_id: String,
+        is_group: bool,
+        name: String,
+        rbxm_bytes: Vec<u8>,
+    ) {
         let tx = anim_channel().0.clone();
         std::thread::spawn(move || {
             let result = RobloxApiClient::upload_animation(
-                &cookie,
+                &api_key,
+                &creator_id,
+                is_group,
                 &name,
                 "Animation created with rbxl Editor",
                 &rbxm_bytes,

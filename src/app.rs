@@ -231,6 +231,10 @@ pub struct EditorApp {
     anim_upload_name: String,
     anim_id_input: String,
     is_uploading_anim: bool,
+    // Creator for Open Cloud animation upload: a Roblox User ID (or a Group ID
+    // when anim_use_group is true).
+    anim_creator_id: String,
+    anim_use_group: bool,
 }
 
 impl Default for EditorApp {
@@ -307,6 +311,8 @@ impl Default for EditorApp {
             anim_upload_name: "NewAnimation".into(),
             anim_id_input: "522635533".into(),
             is_uploading_anim: false,
+            anim_creator_id: String::new(),
+            anim_use_group: false,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
         app.log_info(&format!(
@@ -3812,11 +3818,27 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 .heading()
                 .color(Color32::from_rgb(120, 255, 120)),
         );
+        ui.label(
+            RichText::new(
+                "Uses the Open Cloud Assets API (apis.roblox.com/assets/v1/assets) with your \
+                 API key. Needs an API key with asset Read+Write and your Creator ID.",
+            )
+            .weak(),
+        );
         ui.horizontal_wrapped(|ui| {
             ui.label("Name:");
             ui.add(
-                egui::TextEdit::singleline(&mut self.anim_upload_name).desired_width(160.0),
+                egui::TextEdit::singleline(&mut self.anim_upload_name).desired_width(150.0),
             );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(if self.anim_use_group { "Group ID:" } else { "User ID:" });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.anim_creator_id)
+                    .hint_text("your Roblox User ID")
+                    .desired_width(150.0),
+            );
+            ui.checkbox(&mut self.anim_use_group, "Group");
         });
         let is_kfs = sel.as_ref().map(|(_, c)| c == "KeyframeSequence").unwrap_or(false);
         ui.horizontal_wrapped(|ui| {
@@ -3834,13 +3856,17 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             }
             if self.is_uploading_anim {
                 ui.spinner();
-                ui.label("Uploading…");
+                ui.label("Uploading & processing…");
             }
         });
-        if self.roblosecurity_cookie.trim().is_empty() {
+        if self.open_cloud_api_key.trim().is_empty() {
             ui.label(
-                RichText::new("ℹ️ Upload needs your .ROBLOSECURITY cookie (set it in Settings).")
+                RichText::new("ℹ️ Set your Open Cloud API key (Open Cloud tab) with asset Read+Write.")
                     .color(Color32::from_rgb(200, 200, 100)),
+            );
+        } else {
+            ui.label(
+                RichText::new("✓ API key set").color(Color32::from_rgb(120, 200, 120)),
             );
         }
 
@@ -3891,8 +3917,13 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 "Add at least one Keyframe (with a Pose) before uploading".into();
             return;
         }
-        if self.roblosecurity_cookie.trim().is_empty() {
-            self.status = "Set your .ROBLOSECURITY cookie first (Settings)".into();
+        if self.open_cloud_api_key.trim().is_empty() {
+            self.status =
+                "Set your Open Cloud API key (Open Cloud tab) with asset Read+Write".into();
+            return;
+        }
+        if self.anim_creator_id.trim().is_empty() {
+            self.status = "Enter your Creator User ID (or Group ID) in the Animation tab".into();
             return;
         }
         let inst_name = dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
@@ -3909,14 +3940,16 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         } else {
             self.anim_upload_name.trim().to_string()
         };
-        let cookie = self.roblosecurity_cookie.trim().to_string();
+        let api_key = self.open_cloud_api_key.trim().to_string();
+        let creator_id = self.anim_creator_id.trim().to_string();
+        let is_group = self.anim_use_group;
         self.is_uploading_anim = true;
         self.status = format!("Uploading animation '{name}'…");
         self.log_info(format!(
-            "Uploading KeyframeSequence '{name}' ({} bytes) to Roblox",
+            "Uploading KeyframeSequence '{name}' ({} bytes) via Open Cloud Assets API",
             bytes.len()
         ));
-        RobloxApiClient::upload_animation_async(name, cookie, bytes);
+        RobloxApiClient::upload_animation_async(api_key, creator_id, is_group, name, bytes);
     }
 
     /// Insert an `Animation` instance referencing a given asset id under the
