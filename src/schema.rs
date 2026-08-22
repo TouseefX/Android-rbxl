@@ -158,3 +158,41 @@ pub fn create_instance_from_schema(
 
     Ok(dom.insert(parent, builder))
 }
+
+/// Build a sensible default `Variant` for a reflection-known property type,
+/// so the Properties editor can add a class property that isn't present in the
+/// file yet (Studio shows the full property list for a class — we mirror that).
+/// Returns `None` for types we don't know how to default (rare ones like Tags,
+/// Attributes, PhysicalProperties); callers fall back to a string.
+pub fn default_variant_for(dt: &DataType<'_>) -> Option<Variant> {
+    use rbx_dom_weak::types::{
+        CFrame, Color3, Color3uint8, Enum, NumberRange, UDim, UDim2, VariantType, Vector2, Vector3,
+    };
+    match dt {
+        DataType::Value(VariantType::Bool) => Some(Variant::Bool(false)),
+        DataType::Value(VariantType::String) => Some(Variant::String(String::new())),
+        DataType::Value(VariantType::Float32) => Some(Variant::Float32(0.0)),
+        DataType::Value(VariantType::Float64) => Some(Variant::Float64(0.0)),
+        DataType::Value(VariantType::Int32) => Some(Variant::Int32(0)),
+        DataType::Value(VariantType::Int64) => Some(Variant::Int64(0)),
+        DataType::Value(VariantType::Vector3) => {
+            Some(Variant::Vector3(Vector3::new(0.0, 0.0, 0.0)))
+        }
+        DataType::Value(VariantType::Vector2) => Some(Variant::Vector2(Vector2::new(0.0, 0.0))),
+        DataType::Value(VariantType::Color3) => Some(Variant::Color3(Color3::new(0.0, 0.0, 0.0))),
+        DataType::Value(VariantType::Color3uint8) => {
+            Some(Variant::Color3uint8(Color3uint8::new(0, 0, 0)))
+        }
+        DataType::Value(VariantType::UDim) => Some(Variant::UDim(UDim::new(0.0, 0))),
+        DataType::Value(VariantType::UDim2) => Some(Variant::UDim2(UDim2::new(
+            UDim::new(0.0, 0),
+            UDim::new(0.0, 0),
+        ))),
+        DataType::Value(VariantType::NumberRange) => {
+            Some(Variant::NumberRange(NumberRange::new(0.0, 0.0)))
+        }
+        DataType::Value(VariantType::CFrame) => Some(Variant::CFrame(CFrame::identity())),
+        DataType::Enum(_) => Some(Variant::Enum(Enum::from_u32(0))),
+        _ => None,
+    }
+}

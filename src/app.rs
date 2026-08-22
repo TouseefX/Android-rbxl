@@ -80,6 +80,7 @@ pub enum ActiveTab {
     Output,
     Command,
     Settings,
+    Animation,
 }
 
 pub struct OpenScriptTab {
@@ -225,6 +226,11 @@ pub struct EditorApp {
 
     // Live Session bridge state.
     live_session: live_session::LiveSessionState,
+
+    // Animation Studio state (create/upload Roblox animations).
+    anim_upload_name: String,
+    anim_id_input: String,
+    is_uploading_anim: bool,
 }
 
 impl Default for EditorApp {
@@ -298,6 +304,9 @@ impl Default for EditorApp {
             running_plugin_id: None,
             plugin_stop_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live_session: live_session::LiveSessionState::default(),
+            anim_upload_name: "NewAnimation".into(),
+            anim_id_input: "522635533".into(),
+            is_uploading_anim: false,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
         app.log_info(&format!(
@@ -526,6 +535,7 @@ impl EditorApp {
                             tab_btn(ui, "🌍 3D Viewport", ActiveTab::Viewport3D);
                             tab_btn(ui, &format!("📝 Scripts ({})", self.open_tabs.len()), ActiveTab::ScriptEditor);
                             tab_btn(ui, "⚙️ Properties", ActiveTab::Properties);
+                            tab_btn(ui, "🎬 Animation", ActiveTab::Animation);
                             tab_btn(ui, "➕ Insert", ActiveTab::Insert);
                             tab_btn(ui, "🧰 Toolbox", ActiveTab::Toolbox);
                             tab_btn(ui, "📜 Snippets", ActiveTab::Snippets);
@@ -575,6 +585,7 @@ impl EditorApp {
                     }
                     ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
                     ActiveTab::Properties => self.show_properties_ui(ui),
+                    ActiveTab::Animation => self.show_animation_ui(ui),
                     ActiveTab::Insert => self.show_insert_ui(ui),
                     ActiveTab::Toolbox => self.show_toolbox_ui(ui),
                     ActiveTab::Snippets => self.show_snippets_ui(ui),
@@ -1620,6 +1631,172 @@ ui.label("Place ID:");
                                 ui.label(RichText::new(format!("{} binary bytes", bytes.len())).weak());
                                 None
                             }
+                            Variant::CFrame(cf) => {
+                                let mut new_cf: Option<rbx_dom_weak::types::CFrame> = None;
+                                ui.vertical(|ui| {
+                                    if let Some(ncf) = edit_cframe_field(ui, cf) {
+                                        new_cf = Some(ncf);
+                                    }
+                                });
+                                new_cf.map(Variant::CFrame)
+                            }
+                            Variant::OptionalCFrame(opt) => {
+                                let mut out: Option<Variant> = None;
+                                ui.vertical(|ui| {
+                                    match opt {
+                                        None => {
+                                            ui.label(RichText::new("(none)").weak());
+                                            if ui.small_button("Set").clicked() {
+                                                out = Some(Variant::OptionalCFrame(Some(
+                                                    rbx_dom_weak::types::CFrame::identity(),
+                                                )));
+                                            }
+                                        }
+                                        Some(cf) => {
+                                            if let Some(ncf) = edit_cframe_field(ui, cf) {
+                                                out = Some(Variant::OptionalCFrame(Some(ncf)));
+                                            }
+                                            if ui.small_button("✕ Clear").clicked() {
+                                                out = Some(Variant::OptionalCFrame(None));
+                                            }
+                                        }
+                                    }
+                                });
+                                out
+                            }
+                            Variant::Content(c) => {
+                                let mut text = c.as_uri().unwrap_or("").to_string();
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut text)
+                                        .hint_text("rbxassetid://...")
+                                        .desired_width(200.0),
+                                );
+                                resp.changed()
+                                    .then(|| Variant::Content(rbx_dom_weak::types::Content::from_uri(text)))
+                            }
+                            Variant::Vector3int16(v) => {
+                                let (mut x, mut y, mut z) = (v.x as i32, v.y as i32, v.z as i32);
+                                ui.label("X"); let cx = ui.add(egui::DragValue::new(&mut x).range(-32768..=32767)).changed();
+                                ui.label("Y"); let cy = ui.add(egui::DragValue::new(&mut y).range(-32768..=32767)).changed();
+                                ui.label("Z"); let cz = ui.add(egui::DragValue::new(&mut z).range(-32768..=32767)).changed();
+                                (cx || cy || cz).then(|| {
+                                    Variant::Vector3int16(rbx_dom_weak::types::Vector3int16::new(
+                                        x as i16, y as i16, z as i16,
+                                    ))
+                                })
+                            }
+                            Variant::Vector2int16(v) => {
+                                let (mut x, mut y) = (v.x as i32, v.y as i32);
+                                ui.label("X"); let cx = ui.add(egui::DragValue::new(&mut x).range(-32768..=32767)).changed();
+                                ui.label("Y"); let cy = ui.add(egui::DragValue::new(&mut y).range(-32768..=32767)).changed();
+                                (cx || cy).then(|| {
+                                    Variant::Vector2int16(rbx_dom_weak::types::Vector2int16::new(x as i16, y as i16))
+                                })
+                            }
+                            Variant::Rect(rc) => {
+                                let (mut mnx, mut mny) = (rc.min.x, rc.min.y);
+                                let (mut mxx, mut mxy) = (rc.max.x, rc.max.y);
+                                ui.label("Min"); let cmnx = ui.add(egui::DragValue::new(&mut mnx).speed(1.0)).changed();
+                                let cmny = ui.add(egui::DragValue::new(&mut mny).speed(1.0)).changed();
+                                ui.label("Max"); let cmxx = ui.add(egui::DragValue::new(&mut mxx).speed(1.0)).changed();
+                                let cmxy = ui.add(egui::DragValue::new(&mut mxy).speed(1.0)).changed();
+                                (cmnx || cmny || cmxx || cmxy).then(|| {
+                                    Variant::Rect(rbx_dom_weak::types::Rect::new(
+                                        rbx_dom_weak::types::Vector2::new(mnx, mny),
+                                        rbx_dom_weak::types::Vector2::new(mxx, mxy),
+                                    ))
+                                })
+                            }
+                            Variant::Region3(r) => {
+                                let (mut mnx, mut mny, mut mnz) = (r.min.x, r.min.y, r.min.z);
+                                let (mut mxx, mut mxy, mut mxz) = (r.max.x, r.max.y, r.max.z);
+                                ui.label("Min"); let c0 = ui.add(egui::DragValue::new(&mut mnx).speed(0.5)).changed();
+                                let c1 = ui.add(egui::DragValue::new(&mut mny).speed(0.5)).changed();
+                                let c2 = ui.add(egui::DragValue::new(&mut mnz).speed(0.5)).changed();
+                                ui.label("Max"); let c3 = ui.add(egui::DragValue::new(&mut mxx).speed(0.5)).changed();
+                                let c4 = ui.add(egui::DragValue::new(&mut mxy).speed(0.5)).changed();
+                                let c5 = ui.add(egui::DragValue::new(&mut mxz).speed(0.5)).changed();
+                                (c0||c1||c2||c3||c4||c5).then(|| {
+                                    Variant::Region3(rbx_dom_weak::types::Region3::new(
+                                        Vector3::new(mnx, mny, mnz),
+                                        Vector3::new(mxx, mxy, mxz),
+                                    ))
+                                })
+                            }
+                            Variant::Region3int16(r) => {
+                                let (mut mnx, mut mny, mut mnz) = (r.min.x as i32, r.min.y as i32, r.min.z as i32);
+                                let (mut mxx, mut mxy, mut mxz) = (r.max.x as i32, r.max.y as i32, r.max.z as i32);
+                                ui.label("Min"); let c0 = ui.add(egui::DragValue::new(&mut mnx).range(-32768..=32767)).changed();
+                                let c1 = ui.add(egui::DragValue::new(&mut mny).range(-32768..=32767)).changed();
+                                let c2 = ui.add(egui::DragValue::new(&mut mnz).range(-32768..=32767)).changed();
+                                ui.label("Max"); let c3 = ui.add(egui::DragValue::new(&mut mxx).range(-32768..=32767)).changed();
+                                let c4 = ui.add(egui::DragValue::new(&mut mxy).range(-32768..=32767)).changed();
+                                let c5 = ui.add(egui::DragValue::new(&mut mxz).range(-32768..=32767)).changed();
+                                (c0||c1||c2||c3||c4||c5).then(|| {
+                                    Variant::Region3int16(rbx_dom_weak::types::Region3int16::new(
+                                        rbx_dom_weak::types::Vector3int16::new(mnx as i16, mny as i16, mnz as i16),
+                                        rbx_dom_weak::types::Vector3int16::new(mxx as i16, mxy as i16, mxz as i16),
+                                    ))
+                                })
+                            }
+                            Variant::Ray(ray) => {
+                                let (mut ox, mut oy, mut oz) = (ray.origin.x, ray.origin.y, ray.origin.z);
+                                let (mut dx, mut dy, mut dz) = (ray.direction.x, ray.direction.y, ray.direction.z);
+                                ui.label("Origin"); let c0 = ui.add(egui::DragValue::new(&mut ox).speed(0.5)).changed();
+                                let c1 = ui.add(egui::DragValue::new(&mut oy).speed(0.5)).changed();
+                                let c2 = ui.add(egui::DragValue::new(&mut oz).speed(0.5)).changed();
+                                ui.label("Dir"); let c3 = ui.add(egui::DragValue::new(&mut dx).speed(0.2)).changed();
+                                let c4 = ui.add(egui::DragValue::new(&mut dy).speed(0.2)).changed();
+                                let c5 = ui.add(egui::DragValue::new(&mut dz).speed(0.2)).changed();
+                                (c0||c1||c2||c3||c4||c5).then(|| {
+                                    Variant::Ray(rbx_dom_weak::types::Ray::new(
+                                        Vector3::new(ox, oy, oz),
+                                        Vector3::new(dx, dy, dz),
+                                    ))
+                                })
+                            }
+                            Variant::NumberSequence(ns) => {
+                                let mut new_ns: Option<rbx_dom_weak::types::NumberSequence> = None;
+                                ui.vertical(|ui| {
+                                    if let Some(n) = edit_number_sequence_field(ui, ns) {
+                                        new_ns = Some(n);
+                                    }
+                                });
+                                new_ns.map(Variant::NumberSequence)
+                            }
+                            Variant::ColorSequence(cs) => {
+                                let mut new_cs: Option<rbx_dom_weak::types::ColorSequence> = None;
+                                ui.vertical(|ui| {
+                                    if let Some(n) = edit_color_sequence_field(ui, cs) {
+                                        new_cs = Some(n);
+                                    }
+                                });
+                                new_cs.map(Variant::ColorSequence)
+                            }
+                            Variant::Font(font) => {
+                                let mut family = font.family.clone();
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Family:");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut family).desired_width(200.0),
+                                        );
+                                    });
+                                    ui.label(RichText::new(format!(
+                                        "weight: {:?} · style: {:?}",
+                                        font.weight, font.style
+                                    )).weak());
+                                });
+                                if family != font.family {
+                                    Some(Variant::Font(rbx_dom_weak::types::Font::new(
+                                        &family,
+                                        font.weight,
+                                        font.style,
+                                    )))
+                                } else {
+                                    None
+                                }
+                            }
                             _ => {
                                 ui.label(RichText::new(format!("{val:?}")).weak());
                                 None
@@ -1645,6 +1822,57 @@ ui.label("Place ID:");
                         let _ = rbxl::delete_property(dom, r, &k);
                     }
                 }
+
+                // Studio shows the full property list for a class — not just the
+                // ones present in the file. List every property the reflection
+                // DB knows for this class so users can add/edit anything Studio
+                // can, including properties that are currently at their default
+                // and therefore not stored on the instance.
+                ui.separator();
+                let all_schema = schema::get_class_schema_properties(&inst_class);
+                let present_names: std::collections::HashSet<String> =
+                    properties.keys().map(|k| k.as_str().to_string()).collect();
+                ui.collapsing(
+                    RichText::new(format!(
+                        "📚 All {inst_class} properties ({} known)",
+                        all_schema.len()
+                    ))
+                    .color(Color32::from_rgb(160, 180, 220)),
+                    |ui| {
+                        let mut add_default: Option<(String, Variant)> = None;
+                        for (name, type_name) in &all_schema {
+                            let is_present = present_names.contains(name.as_str());
+                            ui.horizontal(|ui| {
+                                let mark = if is_present { "✓" } else { "·" };
+                                ui.label(
+                                    RichText::new(format!("{mark} {name}: {type_name}"))
+                                        .weak(),
+                                );
+                                if !is_present
+                                    && ui
+                                        .small_button("➕")
+                                        .on_hover_text("Add this property with a default value")
+                                        .clicked()
+                                {
+                                    if let Some(dt) =
+                                        schema::resolve_property_type(&inst_class, name.as_str())
+                                    {
+                                        if let Some(v) = schema::default_variant_for(&dt) {
+                                            add_default = Some((name.clone(), v));
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        if let Some((name, v)) = add_default {
+                            if let Some(dom) = self.dom.as_mut() {
+                                let _ = rbxl::set_property(dom, r, &name, v);
+                                self.status = format!("Added property {name}");
+                                self.log_info(format!("Added schema property {name} to {inst_class}"));
+                            }
+                        }
+                    },
+                );
 
                 // Add Property Section with Reflection Schema Types
                 ui.separator();
@@ -2162,6 +2390,35 @@ ui.label("Place ID:");
         // Drain any background plugin-run log lines / completion.
         self.pump_plugin_logs();
         self.pump_plugin_thumbnails();
+
+        // Pick up finished animation uploads.
+        while let Some(res) = roblox_api::try_recv_anim_result() {
+            self.is_uploading_anim = false;
+            match res.result {
+                Ok(id) => {
+                    if let Some(dom) = self.dom.as_mut() {
+                        let parent = self.selected.unwrap_or_else(|| dom.root_ref());
+                        let anim = rbx_dom_weak::InstanceBuilder::new("Animation")
+                            .with_name(&res.name)
+                            .with_property(
+                                "AnimationId",
+                                Variant::String(format!("rbxassetid://{id}")),
+                            );
+                        self.selected = Some(dom.insert(parent, anim));
+                    }
+                    self.anim_id_input = id.to_string();
+                    self.status = format!("✅ Animation uploaded! AnimationId: {id}");
+                    self.log_info(format!(
+                        "Animation '{}' uploaded — AnimationId rbxassetid://{id}",
+                        res.name
+                    ));
+                }
+                Err(e) => {
+                    self.status = format!("Animation upload failed: {e}");
+                    self.log_error(format!("Animation upload failed: {e}"));
+                }
+            }
+        }
 
         // Any plugin downloads that finished on a background thread.
         for install in jni_bridge::try_recv_plugins() {
@@ -3488,6 +3745,241 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    // Animation Studio tab
+    // ------------------------------------------------------------------
+    fn show_animation_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🎬 Animation Studio");
+        ui.label(
+            RichText::new(
+                "Build and upload Roblox animations. Create a KeyframeSequence \
+                 (Keyframes → Poses), edit each Pose's CFrame and Keyframe time \
+                 in the Properties tab, then upload it to your account to get a \
+                 reusable AnimationId.",
+            )
+            .weak(),
+        );
+        ui.separator();
+
+        let sel = self.dom.as_ref().and_then(|d| {
+            self.selected
+                .and_then(|r| d.get_by_ref(r))
+                .map(|i| (i.name.clone(), i.class.to_string()))
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            if let Some((name, class)) = &sel {
+                ui.label(
+                    RichText::new(format!("Selected: {name} ({class})"))
+                        .strong()
+                        .color(Color32::from_rgb(100, 200, 255)),
+                );
+            } else {
+                ui.label("Select an instance in the Explorer first.");
+            }
+        });
+
+        ui.separator();
+        ui.label(
+            RichText::new("1. Build the animation data")
+                .heading()
+                .color(Color32::from_rgb(100, 200, 255)),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("➕ Insert KeyframeSequence").clicked() {
+                self.insert_class("KeyframeSequence", "Animation");
+            }
+            if ui.button("➕ Insert Keyframe").clicked() {
+                self.insert_class("Keyframe", "Keyframe");
+            }
+            if ui.button("➕ Insert Pose").clicked() {
+                self.insert_class("Pose", "Pose");
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Tip: select a KeyframeSequence, then add Keyframes under it; \
+                 select a Keyframe, then add Poses named like the joint \
+                 (e.g. \"HumanoidRootPart\"). Set each Pose's CFrame in Properties.",
+            )
+            .weak(),
+        );
+
+        ui.separator();
+        ui.label(
+            RichText::new("2. Upload to your Roblox account")
+                .heading()
+                .color(Color32::from_rgb(120, 255, 120)),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Name:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.anim_upload_name).desired_width(160.0),
+            );
+        });
+        let is_kfs = sel.as_ref().map(|(_, c)| c == "KeyframeSequence").unwrap_or(false);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    is_kfs && self.dom.is_some() && !self.is_uploading_anim,
+                    egui::Button::new("📤 Upload selected KeyframeSequence"),
+                )
+                .clicked()
+            {
+                self.trigger_animation_upload();
+            }
+            if !is_kfs {
+                ui.label(RichText::new("(select a KeyframeSequence first)").weak());
+            }
+            if self.is_uploading_anim {
+                ui.spinner();
+                ui.label("Uploading…");
+            }
+        });
+        if self.roblosecurity_cookie.trim().is_empty() {
+            ui.label(
+                RichText::new("ℹ️ Upload needs your .ROBLOSECURITY cookie (set it in Settings).")
+                    .color(Color32::from_rgb(200, 200, 100)),
+            );
+        }
+
+        ui.separator();
+        ui.label(
+            RichText::new("3. Use an uploaded animation")
+                .heading()
+                .color(Color32::from_rgb(180, 140, 255)),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("AnimationId:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.anim_id_input)
+                    .hint_text("e.g. 522635533")
+                    .desired_width(160.0),
+            );
+            if ui.button("➕ Insert Animation instance").clicked() {
+                self.insert_animation_instance();
+            }
+            if ui.button("▶ Insert PlayAnimation LocalScript").clicked() {
+                self.insert_anim_preview_script();
+            }
+        });
+    }
+
+    /// Serialize the selected KeyframeSequence to a `.rbxm` model and POST it
+    /// to Roblox (cookie-authenticated) to publish it as a new animation asset.
+    fn trigger_animation_upload(&mut self) {
+        let (dom, r) = match (&self.dom, self.selected) {
+            (Some(d), Some(r)) => (d, r),
+            _ => return,
+        };
+        let class = dom.get_by_ref(r).map(|i| i.class.to_string());
+        if class.as_deref() != Some("KeyframeSequence") {
+            self.status = "Select a KeyframeSequence to upload".into();
+            return;
+        }
+        if self.roblosecurity_cookie.trim().is_empty() {
+            self.status = "Set your .ROBLOSECURITY cookie first (Settings)".into();
+            return;
+        }
+        let inst_name = dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
+        let bytes = match rbxl::export_subtree_rbxm(dom, r) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Serialize failed: {e}");
+                self.log_error(format!("Animation serialize: {e}"));
+                return;
+            }
+        };
+        let name = if self.anim_upload_name.trim().is_empty() {
+            inst_name
+        } else {
+            self.anim_upload_name.trim().to_string()
+        };
+        let cookie = self.roblosecurity_cookie.trim().to_string();
+        self.is_uploading_anim = true;
+        self.status = format!("Uploading animation '{name}'…");
+        self.log_info(format!(
+            "Uploading KeyframeSequence '{name}' ({} bytes) to Roblox",
+            bytes.len()
+        ));
+        RobloxApiClient::upload_animation_async(name, cookie, bytes);
+    }
+
+    /// Insert an `Animation` instance referencing a given asset id under the
+    /// current selection (or place root).
+    fn insert_animation_instance(&mut self) {
+        let id = self.parse_anim_id_input();
+        if id == 0 {
+            self.status = "Enter a numeric AnimationId".into();
+            return;
+        }
+        if let Some(dom) = self.dom.as_mut() {
+            let parent = self.selected.unwrap_or_else(|| dom.root_ref());
+            let anim = rbx_dom_weak::InstanceBuilder::new("Animation")
+                .with_name("Animation")
+                .with_property("AnimationId", Variant::String(format!("rbxassetid://{id}")));
+            let new_ref = dom.insert(parent, anim);
+            self.selected = Some(new_ref);
+            self.status = format!("Inserted Animation (rbxassetid://{id})");
+            self.active_tab = ActiveTab::Properties;
+            self.log_info(format!("Inserted Animation rbxassetid://{id}"));
+        } else {
+            self.status = "Open a place first".into();
+        }
+    }
+
+    /// Insert a LocalScript that loads & plays the typed AnimationId on the
+    /// local player's character (handy for testing an uploaded animation).
+    fn insert_anim_preview_script(&mut self) {
+        let id = self.parse_anim_id_input();
+        if id == 0 {
+            self.status = "Enter a numeric AnimationId".into();
+            return;
+        }
+        let code = format!(
+            r#"-- Loads and plays this animation on the LocalPlayer's character
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+local function play()
+	local character = player.Character or player.CharacterAdded:Wait()
+	local humanoid = character:WaitForChild("Humanoid")
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+		or Instance.new("Animator")
+	animator.Parent = humanoid
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://{id}"
+	local track = animator:LoadAnimation(anim)
+	track:Play()
+end
+
+play()
+"#
+        );
+        if let Some(dom) = self.dom.as_mut() {
+            let parent = self.selected.unwrap_or_else(|| dom.root_ref());
+            let script = rbx_dom_weak::InstanceBuilder::new("LocalScript")
+                .with_name("PlayAnimation")
+                .with_property("Source", Variant::String(code));
+            let new_ref = dom.insert(parent, script);
+            self.selected = Some(new_ref);
+            self.status = format!("Inserted PlayAnimation LocalScript (rbxassetid://{id})");
+            self.log_info(format!("Inserted PlayAnimation LocalScript for rbxassetid://{id}"));
+        } else {
+            self.status = "Open a place first".into();
+        }
+    }
+
+    /// Parse the Animation-id text field into a numeric id (accepts a raw id or
+    /// an rbxassetid:// URL).
+    fn parse_anim_id_input(&self) -> u64 {
+        let raw = self.anim_id_input.trim();
+        crate::asset_downloader::extract_asset_id(raw)
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| raw.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
 }
 
 /// Map an Android KeyEvent keycode to an egui Key (for the small
@@ -3511,5 +4003,204 @@ fn android_keycode_to_egui(keycode: i32) -> Option<egui::Key> {
         111 => Key::Escape,
         _ => return None,
     })
+}
+
+// ============================================================================
+// Property editor field helpers (complex value types that need a multi-row or
+// multi-field widget instead of a single inline control).
+// ============================================================================
+
+/// Edit a CFrame as Position (X/Y/Z) + Orientation (X/Y/Z Euler degrees).
+/// Extracts Euler angles from the existing rotation matrix and recomposes the
+/// matrix on change, so the editor is stateless (re-reads the value each frame)
+/// and round-trips correctly. Single-axis rotations are exact; multi-axis
+/// rotations decompose with an XYZ order.
+fn edit_cframe_field(
+    ui: &mut egui::Ui,
+    cf: &rbx_dom_weak::types::CFrame,
+) -> Option<rbx_dom_weak::types::CFrame> {
+    use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+    let p = cf.position;
+    let m = cf.orientation;
+    let mut px = p.x;
+    let mut py = p.y;
+    let mut pz = p.z;
+
+    // Extract Euler angles (XYZ order) from the rotation matrix. m.x/y/z are
+    // the matrix rows (R00..R02 / R10..R12 / R20..R22).
+    let sy = m.x.z.clamp(-1.0, 1.0);
+    let ry = sy.asin();
+    let (rx, rz) = if ry.abs() < 1.5707 {
+        ((-m.y.z).atan2(m.z.z), (-m.x.y).atan2(m.x.x))
+    } else {
+        // Gimbal-lock fallback — keep the previous values stable.
+        (0.0, m.y.x.atan2(m.y.y))
+    };
+    let mut rxd = rx.to_degrees();
+    let mut ryd = ry.to_degrees();
+    let mut rzd = rz.to_degrees();
+
+    ui.horizontal(|ui| {
+        ui.label("Pos X");
+        ui.add(egui::DragValue::new(&mut px).speed(0.2));
+        ui.label("Y");
+        ui.add(egui::DragValue::new(&mut py).speed(0.2));
+        ui.label("Z");
+        ui.add(egui::DragValue::new(&mut pz).speed(0.2));
+    });
+    let mut rot_changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Rot X°");
+        rot_changed |= ui
+            .add(egui::DragValue::new(&mut rxd).speed(1.0).range(-360.0..=360.0))
+            .changed();
+        ui.label("Y°");
+        rot_changed |= ui
+            .add(egui::DragValue::new(&mut ryd).speed(1.0).range(-360.0..=360.0))
+            .changed();
+        ui.label("Z°");
+        rot_changed |= ui
+            .add(egui::DragValue::new(&mut rzd).speed(1.0).range(-360.0..=360.0))
+            .changed();
+    });
+    let pos_changed = (px != p.x) || (py != p.y) || (pz != p.z);
+    if !pos_changed && !rot_changed {
+        return None;
+    }
+
+    let (rx, ry, rz) = (rxd.to_radians(), ryd.to_radians(), rzd.to_radians());
+    let (cx, sx) = (rx.cos(), rx.sin());
+    let (cy, sy) = (ry.cos(), ry.sin());
+    let (cz, sz) = (rz.cos(), rz.sin());
+    // R = Rx(rx) * Ry(ry) * Rz(rz)  (row-major, matching rbx_types orientation).
+    let m00 = cy * cz;
+    let m01 = -cy * sz;
+    let m02 = sy;
+    let m10 = cx * sz + sx * sy * cz;
+    let m11 = cx * cz - sx * sy * sz;
+    let m12 = -sx * cy;
+    let m20 = sx * sz - cx * sy * cz;
+    let m21 = sx * cz + cx * sy * sz;
+    let m22 = cx * cy;
+    let mat = Matrix3::new(
+        Vector3::new(m00, m01, m02),
+        Vector3::new(m10, m11, m12),
+        Vector3::new(m20, m21, m22),
+    );
+    Some(CFrame::new(Vector3::new(px, py, pz), mat))
+}
+
+/// Edit a NumberSequence (particle/beam size/transparency curves) as a list of
+/// (time, value, envelope) keypoints with add/remove.
+fn edit_number_sequence_field(
+    ui: &mut egui::Ui,
+    ns: &rbx_dom_weak::types::NumberSequence,
+) -> Option<rbx_dom_weak::types::NumberSequence> {
+    use rbx_dom_weak::types::{NumberSequence, NumberSequenceKeypoint};
+    let mut kps: Vec<(f32, f32, f32)> = ns
+        .keypoints
+        .iter()
+        .map(|k| (k.time, k.value, k.envelope))
+        .collect();
+    let original = kps.clone();
+    let mut remove: Option<usize> = None;
+    let mut add = false;
+
+    ui.label(RichText::new(format!("{} keypoint(s)", kps.len())).weak());
+    for i in 0..kps.len() {
+        ui.horizontal(|ui| {
+            ui.label(format!("#{i}"));
+            ui.label("t");
+            ui.add(egui::DragValue::new(&mut kps[i].0).speed(0.01).range(0.0..=1.0));
+            ui.label("v");
+            ui.add(egui::DragValue::new(&mut kps[i].1).speed(0.05));
+            ui.label("env");
+            ui.add(egui::DragValue::new(&mut kps[i].2).speed(0.01));
+            if kps.len() > 2 && ui.small_button("🗑").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if ui.small_button("➕ Add keypoint").clicked() {
+        add = true;
+    }
+    if let Some(i) = remove {
+        kps.remove(i);
+    }
+    if add {
+        let last_t = kps.last().map(|k| k.0).unwrap_or(0.0).min(0.99);
+        kps.push((last_t + 0.01, 0.0, 0.0));
+    }
+    if kps == original {
+        return None;
+    }
+    kps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // A valid NumberSequence needs exactly 0 and 1 endpoints; clamp to be safe.
+    if let Some(first) = kps.first_mut() {
+        first.0 = 0.0;
+    }
+    if let Some(last) = kps.last_mut() {
+        last.0 = 1.0;
+    }
+    let keypoints = kps
+        .into_iter()
+        .map(|(t, v, e)| NumberSequenceKeypoint::new(t, v, e))
+        .collect();
+    Some(NumberSequence { keypoints })
+}
+
+/// Edit a ColorSequence (beam/trail colour gradients) as a list of
+/// (time, color) keypoints with add/remove.
+fn edit_color_sequence_field(
+    ui: &mut egui::Ui,
+    cs: &rbx_dom_weak::types::ColorSequence,
+) -> Option<rbx_dom_weak::types::ColorSequence> {
+    use rbx_dom_weak::types::{Color3, ColorSequence, ColorSequenceKeypoint};
+    let mut kps: Vec<(f32, [f32; 3])> = cs
+        .keypoints
+        .iter()
+        .map(|k| (k.time, [k.color.r, k.color.g, k.color.b]))
+        .collect();
+    let original = kps.clone();
+    let mut remove: Option<usize> = None;
+    let mut add = false;
+
+    ui.label(RichText::new(format!("{} keypoint(s)", kps.len())).weak());
+    for i in 0..kps.len() {
+        ui.horizontal(|ui| {
+            ui.label(format!("#{i}"));
+            ui.label("t");
+            ui.add(egui::DragValue::new(&mut kps[i].0).speed(0.01).range(0.0..=1.0));
+            ui.color_edit_button_rgb(&mut kps[i].1);
+            if kps.len() > 2 && ui.small_button("🗑").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if ui.small_button("➕ Add keypoint").clicked() {
+        add = true;
+    }
+    if let Some(i) = remove {
+        kps.remove(i);
+    }
+    if add {
+        let last_t = kps.last().map(|k| k.0).unwrap_or(0.0).min(0.99);
+        kps.push((last_t + 0.01, [1.0, 1.0, 1.0]));
+    }
+    if kps == original {
+        return None;
+    }
+    kps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(first) = kps.first_mut() {
+        first.0 = 0.0;
+    }
+    if let Some(last) = kps.last_mut() {
+        last.0 = 1.0;
+    }
+    let keypoints = kps
+        .into_iter()
+        .map(|(t, rgb)| ColorSequenceKeypoint::new(t, Color3::new(rgb[0], rgb[1], rgb[2])))
+        .collect();
+    Some(ColorSequence { keypoints })
 }
 

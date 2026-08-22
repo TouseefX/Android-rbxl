@@ -73,6 +73,74 @@ pub fn fetch_and_cache_audio_async(audio_id_str: String, cookie_opt: Option<Stri
     RobloxApiClient::fetch_and_cache_audio_async(audio_id_str, cookie_opt);
 }
 
+// ==========================================================================
+// Animation upload (cookie-authenticated)
+// ==========================================================================
+
+/// Result of a background `upload_animation_async` call. `result` is the new
+/// animation asset id on success, or the server error string on failure.
+pub struct AnimUploadResult {
+    pub name: String,
+    pub result: Result<u64, String>,
+}
+
+static ANIM_CHANNEL: OnceLock<(Sender<AnimUploadResult>, Mutex<Receiver<AnimUploadResult>>)> =
+    OnceLock::new();
+
+fn anim_channel() -> &'static (Sender<AnimUploadResult>, Mutex<Receiver<AnimUploadResult>>) {
+    ANIM_CHANNEL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+/// Poll for a finished animation upload (called from the UI thread).
+pub fn try_recv_anim_result() -> Option<AnimUploadResult> {
+    let (_, rx) = anim_channel();
+    rx.lock().ok().and_then(|r| r.try_recv().ok())
+}
+
+impl RobloxApiClient {
+    /// Upload an animation (`KeyframeSequence`) to the authenticated user's
+    /// Roblox account and return the new animation asset id.
+    ///
+    /// `rbxm_bytes` is a binary `.rbxm` model whose top-level instance is the
+    /// `KeyframeSequence` (built by `rbxl::export_subtree_rbxm`). The classic
+    /// `data.roblox.com/data/upload?assetTypeId=24` endpoint (assetTypeId 24 =
+    /// Animation) accepts exactly that body and returns the new asset id as
+    /// plain text. It is cookie + CSRF protected, which `WebClient::post_raw`
+    /// handles. On success the body is the numeric id; anything else is
+    /// surfaced as an error.
+    pub fn upload_animation(cookie: &str, name: &str, rbxm_bytes: &[u8]) -> Result<u64, String> {
+        let client = WebClient::new(cookie)?;
+        let url = format!(
+            "https://data.roblox.com/data/upload?assetTypeId=24&name={}&description={}",
+            urlencoding_simple(name),
+            urlencoding_simple("Created with rbxl Editor")
+        );
+        let body = client.post_raw(&url, "application/octet-stream", rbxm_bytes.to_vec())?;
+        let id = body
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("Upload returned a non-numeric response: {body}"))?;
+        if id == 0 {
+            return Err(format!("Roblox rejected the upload: {body}"));
+        }
+        Ok(id)
+    }
+
+    /// Fire-and-forget background wrapper around `upload_animation`. The
+    /// result is delivered through the animation channel and picked up by the
+    /// UI thread in `drain_events`.
+    pub fn upload_animation_async(name: String, cookie: String, rbxm_bytes: Vec<u8>) {
+        let tx = anim_channel().0.clone();
+        std::thread::spawn(move || {
+            let result = RobloxApiClient::upload_animation(&cookie, &name, &rbxm_bytes);
+            let _ = tx.send(AnimUploadResult { name, result });
+        });
+    }
+}
+
 pub struct RobloxApiClient {
     pub api_key: String,
     pub universe_id: String,
@@ -2321,6 +2389,65 @@ impl WebClient {
             return Err(format!("GET {url} → {status}: {text}"));
         }
         serde_json::from_str(&text).map_err(|e| format!("bad JSON from {url}: {e}"))
+    }
+
+    /// POST arbitrary raw bytes (e.g. an `application/octet-stream` model
+    /// upload) with the cookie attached and the same CSRF challenge handling
+    /// as `post_json`. Returns the raw response body text.
+    pub fn post_raw(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<String, String> {
+        match self.try_post_raw(url, content_type, body.clone(), self.csrf.borrow().clone()) {
+            Ok(text) => Ok(text),
+            Err(SendError::NeedsToken(token)) => {
+                *self.csrf.borrow_mut() = Some(token.clone());
+                self.try_post_raw(url, content_type, body, Some(token)).map_err(|e| match e {
+                    SendError::Http(s) => s,
+                    SendError::NeedsToken(_) => "CSRF token rejected on retry".to_string(),
+                })
+            }
+            Err(SendError::Http(s)) => Err(s),
+        }
+    }
+
+    fn try_post_raw(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        csrf: Option<String>,
+    ) -> Result<String, SendError> {
+        let mut req = self
+            .http
+            .post(url)
+            .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
+            .header("Content-Type", content_type);
+        if let Some(t) = csrf {
+            req = req.header("X-CSRF-Token", t);
+        }
+        let resp = req
+            .body(body)
+            .send()
+            .map_err(|e| SendError::Http(format!("POST {url}: {e}")))?;
+        let status = resp.status();
+        // CSRF challenge: 403 with an x-csrf-token header.
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(token) = resp.headers().get("x-csrf-token") {
+                if let Ok(t) = token.to_str() {
+                    return Err(SendError::NeedsToken(t.to_string()));
+                }
+            }
+        }
+        let text = resp
+            .text()
+            .map_err(|e| SendError::Http(format!("read body: {e}")))?;
+        if !status.is_success() {
+            return Err(SendError::Http(format!("POST {url} → {status}: {text}")));
+        }
+        Ok(text)
     }
 
     /// POST JSON to an endpoint, handling the CSRF challenge/refresh.
