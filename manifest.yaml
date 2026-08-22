@@ -57,7 +57,7 @@ android:
       - name: "android.permission.MANAGE_EXTERNAL_STORAGE"
 
     application:
-      label: "rbxl Editor v3.1"
+      label: "rbxl Editor"
       # Our Kotlin MainActivity lives in the APK's dex, so this must be true
       # (xbuild defaults it to false for pure-NativeActivity apps).
       has_code: true
