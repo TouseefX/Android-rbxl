@@ -301,14 +301,38 @@ impl RobloxApiClient {
         api_key: String,
         creator_id: String,
         is_group: bool,
+        cookie_opt: Option<String>,
         name: String,
         rbxm_bytes: Vec<u8>,
     ) {
         let tx = anim_channel().0.clone();
         std::thread::spawn(move || {
+            // Resolve the creator:
+            //   - Group upload -> `creator_id` is the Group ID (must be entered).
+            //   - User upload with a cookie -> auto-detect the User ID via the
+            //     authenticated `users.roblox.com/v1/users/authenticated` endpoint.
+            //   - User upload without a cookie -> use `creator_id` as the User ID.
+            let (creator, is_group) = if is_group {
+                (creator_id, true)
+            } else if let Some(cookie) = cookie_opt.as_deref() {
+                match WebClient::new(cookie).and_then(|c| c.whoami()) {
+                    Ok((uid, _username)) => (uid.to_string(), false),
+                    Err(e) => {
+                        let _ = tx.send(AnimUploadResult {
+                            name,
+                            result: Err(format!(
+                                "Could not determine your User ID from the .ROBLOSECURITY cookie: {e}"
+                            )),
+                        });
+                        return;
+                    }
+                }
+            } else {
+                (creator_id, false)
+            };
             let result = RobloxApiClient::upload_animation(
                 &api_key,
-                &creator_id,
+                &creator,
                 is_group,
                 &name,
                 &rbxm_bytes,

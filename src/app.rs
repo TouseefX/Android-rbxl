@@ -3832,13 +3832,29 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             );
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label(if self.anim_use_group { "Group ID:" } else { "User ID:" });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.anim_creator_id)
-                    .hint_text("your Roblox User ID")
-                    .desired_width(150.0),
-            );
-            ui.checkbox(&mut self.anim_use_group, "Group");
+            ui.checkbox(&mut self.anim_use_group, "Upload to a Group");
+        });
+        let has_cookie = !self.roblosecurity_cookie.trim().is_empty();
+        ui.horizontal_wrapped(|ui| {
+            if !self.anim_use_group && has_cookie {
+                ui.label(
+                    RichText::new(
+                        "Creator: your account — User ID auto-detected from your .ROBLOSECURITY cookie.",
+                    )
+                    .color(Color32::from_rgb(120, 200, 120)),
+                );
+            } else {
+                ui.label(if self.anim_use_group { "Group ID:" } else { "User ID:" });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.anim_creator_id)
+                        .hint_text(if self.anim_use_group {
+                            "group ID"
+                        } else {
+                            "your Roblox User ID"
+                        })
+                        .desired_width(150.0),
+                );
+            }
         });
         let is_kfs = sel.as_ref().map(|(_, c)| c == "KeyframeSequence").unwrap_or(false);
         ui.horizontal_wrapped(|ui| {
@@ -3922,8 +3938,14 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 "Set your Open Cloud API key (Open Cloud tab) with asset Read+Write".into();
             return;
         }
-        if self.anim_creator_id.trim().is_empty() {
-            self.status = "Enter your Creator User ID (or Group ID) in the Animation tab".into();
+        let has_cookie = !self.roblosecurity_cookie.trim().is_empty();
+        let auto_user = has_cookie && !self.anim_use_group;
+        if !auto_user && self.anim_creator_id.trim().is_empty() {
+            self.status = if self.anim_use_group {
+                "Enter the Group ID".into()
+            } else {
+                "Enter your Creator User ID (or set your .ROBLOSECURITY cookie to auto-detect)".into()
+            };
             return;
         }
         let inst_name = dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
@@ -3943,13 +3965,25 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         let api_key = self.open_cloud_api_key.trim().to_string();
         let creator_id = self.anim_creator_id.trim().to_string();
         let is_group = self.anim_use_group;
+        let cookie_opt = if has_cookie {
+            Some(self.roblosecurity_cookie.trim().to_string())
+        } else {
+            None
+        };
         self.is_uploading_anim = true;
         self.status = format!("Uploading animation '{name}'…");
-        self.log_info(format!(
-            "Uploading KeyframeSequence '{name}' ({} bytes) via Open Cloud Assets API",
-            bytes.len()
-        ));
-        RobloxApiClient::upload_animation_async(api_key, creator_id, is_group, name, bytes);
+        self.log_info(if auto_user {
+            format!(
+                "Uploading KeyframeSequence '{name}' ({} bytes) via Open Cloud Assets API (User ID from cookie)",
+                bytes.len()
+            )
+        } else {
+            format!(
+                "Uploading KeyframeSequence '{name}' ({} bytes) via Open Cloud Assets API",
+                bytes.len()
+            )
+        });
+        RobloxApiClient::upload_animation_async(api_key, creator_id, is_group, cookie_opt, name, bytes);
     }
 
     /// Insert an `Animation` instance referencing a given asset id under the
