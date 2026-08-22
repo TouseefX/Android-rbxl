@@ -153,7 +153,6 @@ impl RobloxApiClient {
         creator_id: &str,
         is_group: bool,
         name: &str,
-        description: &str,
         rbxm_bytes: &[u8],
     ) -> Result<u64, String> {
         let key = api_key.trim();
@@ -180,9 +179,8 @@ impl RobloxApiClient {
         // The API sends/receives the id as a string.
         let creator_key = if is_group { "groupId" } else { "userId" };
         let name_json = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());
-        let desc_json = serde_json::to_string(description).unwrap_or_else(|_| "\"\"".into());
         let request_json = format!(
-            "{{\"assetType\":\"Animation\",\"displayName\":{name_json},\"description\":{desc_json},\"creationContext\":{{\"creator\":{{\"{creator_key}\":\"{creator}\"}}}}}}"
+            "{{\"assetType\":\"Animation\",\"displayName\":{name_json},\"creationContext\":{{\"creator\":{{\"{creator_key}\":\"{creator}\"}}}}}}"
         );
 
         let boundary = "----rbxlEditorBoundary5b9f0c2e7d11";
@@ -313,7 +311,6 @@ impl RobloxApiClient {
                 &creator_id,
                 is_group,
                 &name,
-                "Animation created with rbxl Editor",
                 &rbxm_bytes,
             );
             let _ = tx.send(AnimUploadResult { name, result });
