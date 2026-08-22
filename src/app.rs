@@ -3878,6 +3878,19 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             self.status = "Select a KeyframeSequence to upload".into();
             return;
         }
+        // A valid animation needs at least one Keyframe; uploading an empty
+        // sequence fails on Roblox's side and is the most common cause of a
+        // confusing failure, so bail early with a clear message.
+        let has_keyframe = dom.get_by_ref(r).is_some_and(|i| {
+            i.children()
+                .iter()
+                .any(|c| dom.get_by_ref(*c).is_some_and(|x| x.class == "Keyframe"))
+        });
+        if !has_keyframe {
+            self.status =
+                "Add at least one Keyframe (with a Pose) before uploading".into();
+            return;
+        }
         if self.roblosecurity_cookie.trim().is_empty() {
             self.status = "Set your .ROBLOSECURITY cookie first (Settings)".into();
             return;

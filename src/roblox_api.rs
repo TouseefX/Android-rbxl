@@ -104,29 +104,98 @@ impl RobloxApiClient {
     /// Upload an animation (`KeyframeSequence`) to the authenticated user's
     /// Roblox account and return the new animation asset id.
     ///
-    /// `rbxm_bytes` is a binary `.rbxm` model whose top-level instance is the
-    /// `KeyframeSequence` (built by `rbxl::export_subtree_rbxm`). The classic
-    /// `data.roblox.com/data/upload?assetTypeId=24` endpoint (assetTypeId 24 =
-    /// Animation) accepts exactly that body and returns the new asset id as
-    /// plain text. It is cookie + CSRF protected, which `WebClient::post_raw`
-    /// handles. On success the body is the numeric id; anything else is
-    /// surfaced as an error.
-    pub fn upload_animation(cookie: &str, name: &str, rbxm_bytes: &[u8]) -> Result<u64, String> {
-        let client = WebClient::new(cookie)?;
-        let url = format!(
-            "https://data.roblox.com/data/upload?assetTypeId=24&name={}&description={}",
-            urlencoding_simple(name),
-            urlencoding_simple("Created with rbxl Editor")
-        );
-        let body = client.post_raw(&url, "application/octet-stream", rbxm_bytes.to_vec())?;
-        let id = body
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| format!("Upload returned a non-numeric response: {body}"))?;
-        if id == 0 {
-            return Err(format!("Roblox rejected the upload: {body}"));
+    /// Uses the cookie + CSRF-protected Studio publish endpoint
+    /// `www.roblox.com/ide/publish/uploadnewanimation` (the same one Studio's
+    /// Animation Editor and tools like noblox.js / roblox-animation-transfer
+    /// use). `rbxm_bytes` is a binary `.rbxm` model whose top-level instance is
+    /// the `KeyframeSequence` (built by `rbxl::export_subtree_rbxm`). It must
+    /// be POST with `Content-Type: application/xml` and a `RobloxStudio/WinInet`
+    /// user-agent; a missing CSRF token is answered with HTTP 403 + an
+    /// `x-csrf-token` header, which we capture and retry once with. On success
+    /// the response body is the new asset id as plain text.
+    pub fn upload_animation(
+        cookie: &str,
+        name: &str,
+        description: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        if cookie.trim().is_empty() {
+            return Err("A .ROBLOSECURITY cookie is required to upload animations".into());
         }
-        Ok(id)
+        if rbxm_bytes.is_empty() {
+            return Err("Nothing to upload (empty animation data)".into());
+        }
+
+        // Dedicated client: the upload endpoint checks the User-Agent header,
+        // so impersonate Studio rather than using WebClient's browser UA.
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("RobloxStudio/WinInet RobloxApp/0.483.1.425021 (GlobalDist; RobloxDirectDownload)")
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
+
+        let cookie_hdr = format!(".ROBLOSECURITY={}", cookie.trim());
+        let url = format!(
+            "https://www.roblox.com/ide/publish/uploadnewanimation?AllID=1&assetTypeName=Animation&genreTypeId=1&name={}&description={}&ispublic=false&allowComments=true&groupId=",
+            urlencoding_simple(name),
+            urlencoding_simple(description),
+        );
+
+        // CSRF challenge loop: attempt once with no token; if the server
+        // replies 403 + x-csrf-token, retry once with it.
+        let mut csrf: Option<String> = None;
+        let mut last_status = reqwest::StatusCode::OK;
+        let mut last_body = String::new();
+        for _attempt in 0..2 {
+            let mut req = http
+                .post(&url)
+                .header("Cookie", cookie_hdr.as_str())
+                .header("Content-Type", "application/xml");
+            if let Some(t) = &csrf {
+                req = req.header("X-CSRF-Token", t);
+            }
+            let resp = req
+                .body(rbxm_bytes.to_vec())
+                .send()
+                .map_err(|e| format!("Upload network error: {e}"))?;
+            last_status = resp.status();
+            let new_token = resp
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            last_body = resp.text().unwrap_or_default();
+
+            if last_status == reqwest::StatusCode::FORBIDDEN {
+                if let Some(t) = new_token {
+                    csrf = Some(t);
+                    continue; // retry with the fresh token
+                }
+                return Err(format!(
+                    "Roblox rejected the upload (403). Your .ROBLOSECURITY cookie may be invalid or lack upload permission. Response: {}",
+                    last_body.chars().take(300).collect::<String>()
+                ));
+            }
+            if last_status.is_success() {
+                let snippet = last_body.chars().take(300).collect::<String>();
+                let id = last_body.trim().parse::<u64>().map_err(|_| {
+                    format!("Upload returned a non-numeric id (expected the new asset id): {snippet}")
+                })?;
+                if id == 0 {
+                    return Err(format!("Roblox rejected the upload (id 0). Response: {snippet}"));
+                }
+                return Ok(id);
+            }
+            return Err(format!(
+                "Upload failed (HTTP {last_status}): {}",
+                last_body.chars().take(300).collect::<String>()
+            ));
+        }
+        Err(format!(
+            "Upload failed — CSRF challenge could not be completed (last HTTP {last_status}): {}",
+            last_body.chars().take(300).collect::<String>()
+        ))
     }
 
     /// Fire-and-forget background wrapper around `upload_animation`. The
@@ -135,7 +204,12 @@ impl RobloxApiClient {
     pub fn upload_animation_async(name: String, cookie: String, rbxm_bytes: Vec<u8>) {
         let tx = anim_channel().0.clone();
         std::thread::spawn(move || {
-            let result = RobloxApiClient::upload_animation(&cookie, &name, &rbxm_bytes);
+            let result = RobloxApiClient::upload_animation(
+                &cookie,
+                &name,
+                "Animation created with rbxl Editor",
+                &rbxm_bytes,
+            );
             let _ = tx.send(AnimUploadResult { name, result });
         });
     }
@@ -2389,65 +2463,6 @@ impl WebClient {
             return Err(format!("GET {url} → {status}: {text}"));
         }
         serde_json::from_str(&text).map_err(|e| format!("bad JSON from {url}: {e}"))
-    }
-
-    /// POST arbitrary raw bytes (e.g. an `application/octet-stream` model
-    /// upload) with the cookie attached and the same CSRF challenge handling
-    /// as `post_json`. Returns the raw response body text.
-    pub fn post_raw(
-        &self,
-        url: &str,
-        content_type: &str,
-        body: Vec<u8>,
-    ) -> Result<String, String> {
-        match self.try_post_raw(url, content_type, body.clone(), self.csrf.borrow().clone()) {
-            Ok(text) => Ok(text),
-            Err(SendError::NeedsToken(token)) => {
-                *self.csrf.borrow_mut() = Some(token.clone());
-                self.try_post_raw(url, content_type, body, Some(token)).map_err(|e| match e {
-                    SendError::Http(s) => s,
-                    SendError::NeedsToken(_) => "CSRF token rejected on retry".to_string(),
-                })
-            }
-            Err(SendError::Http(s)) => Err(s),
-        }
-    }
-
-    fn try_post_raw(
-        &self,
-        url: &str,
-        content_type: &str,
-        body: Vec<u8>,
-        csrf: Option<String>,
-    ) -> Result<String, SendError> {
-        let mut req = self
-            .http
-            .post(url)
-            .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
-            .header("Content-Type", content_type);
-        if let Some(t) = csrf {
-            req = req.header("X-CSRF-Token", t);
-        }
-        let resp = req
-            .body(body)
-            .send()
-            .map_err(|e| SendError::Http(format!("POST {url}: {e}")))?;
-        let status = resp.status();
-        // CSRF challenge: 403 with an x-csrf-token header.
-        if status == reqwest::StatusCode::FORBIDDEN {
-            if let Some(token) = resp.headers().get("x-csrf-token") {
-                if let Ok(t) = token.to_str() {
-                    return Err(SendError::NeedsToken(t.to_string()));
-                }
-            }
-        }
-        let text = resp
-            .text()
-            .map_err(|e| SendError::Http(format!("read body: {e}")))?;
-        if !status.is_success() {
-            return Err(SendError::Http(format!("POST {url} → {status}: {text}")));
-        }
-        Ok(text)
     }
 
     /// POST JSON to an endpoint, handling the CSRF challenge/refresh.
