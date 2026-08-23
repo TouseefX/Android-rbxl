@@ -1491,10 +1491,6 @@ ui.label("Place ID:");
                 let mut prop_updates: Vec<(String, Variant)> = Vec::new();
                 let mut prop_deletes = Vec::new();
 
-                // Shared per-property number-edit buffers (used by the numeric
-                // arms below so values can be typed, not just dragged).
-                let num_bufs = &mut self.prop_num_buf;
-
                 for (key, val) in &properties {
                     let key_str = key.as_str();
                     if key_str == "Source" {
@@ -1570,28 +1566,28 @@ ui.label("Place ID:");
                                 ui.checkbox(&mut val_bool, "").changed().then(|| Variant::Bool(val_bool))
                             }
                             Variant::Float32(f) => {
-                                scalar_edit(ui, num_bufs, key_str, *f as f64, false).map(|v| Variant::Float32(v as f32))
+                                scalar_edit(ui, &mut self.prop_num_buf, key_str, *f as f64, false).map(|v| Variant::Float32(v as f32))
                             }
                             Variant::Float64(f) => {
-                                scalar_edit(ui, num_bufs, key_str, *f, false).map(Variant::Float64)
+                                scalar_edit(ui, &mut self.prop_num_buf, key_str, *f, false).map(Variant::Float64)
                             }
                             Variant::Int32(i) => {
-                                scalar_edit(ui, num_bufs, key_str, *i as f64, true).map(|v| Variant::Int32(v as i32))
+                                scalar_edit(ui, &mut self.prop_num_buf, key_str, *i as f64, true).map(|v| Variant::Int32(v as i32))
                             }
                             Variant::Int64(i) => {
-                                scalar_edit(ui, num_bufs, key_str, *i as f64, true).map(|v| Variant::Int64(v as i64))
+                                scalar_edit(ui, &mut self.prop_num_buf, key_str, *i as f64, true).map(|v| Variant::Int64(v as i64))
                             }
                             Variant::Vector2(v) => {
-                                ui.label("X"); let nx = scalar_edit(ui, num_bufs, &format!("{key_str}.X"), v.x as f64, false);
-                                ui.label("Y"); let ny = scalar_edit(ui, num_bufs, &format!("{key_str}.Y"), v.y as f64, false);
+                                ui.label("X"); let nx = scalar_edit(ui, &mut self.prop_num_buf, &format!("{key_str}.X"), v.x as f64, false);
+                                ui.label("Y"); let ny = scalar_edit(ui, &mut self.prop_num_buf, &format!("{key_str}.Y"), v.y as f64, false);
                                 let x = nx.unwrap_or(v.x as f64) as f32;
                                 let y = ny.unwrap_or(v.y as f64) as f32;
                                 (nx.is_some() || ny.is_some()).then(|| Variant::Vector2(rbx_dom_weak::types::Vector2::new(x, y)))
                             }
                             Variant::Vector3(v) => {
-                                ui.label("X"); let nx = scalar_edit(ui, num_bufs, &format!("{key_str}.X"), v.x as f64, false);
-                                ui.label("Y"); let ny = scalar_edit(ui, num_bufs, &format!("{key_str}.Y"), v.y as f64, false);
-                                ui.label("Z"); let nz = scalar_edit(ui, num_bufs, &format!("{key_str}.Z"), v.z as f64, false);
+                                ui.label("X"); let nx = scalar_edit(ui, &mut self.prop_num_buf, &format!("{key_str}.X"), v.x as f64, false);
+                                ui.label("Y"); let ny = scalar_edit(ui, &mut self.prop_num_buf, &format!("{key_str}.Y"), v.y as f64, false);
+                                ui.label("Z"); let nz = scalar_edit(ui, &mut self.prop_num_buf, &format!("{key_str}.Z"), v.z as f64, false);
                                 let x = nx.unwrap_or(v.x as f64) as f32;
                                 let y = ny.unwrap_or(v.y as f64) as f32;
                                 let z = nz.unwrap_or(v.z as f64) as f32;
