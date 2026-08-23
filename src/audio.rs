@@ -53,17 +53,22 @@ pub fn stop() {
 
 #[cfg(target_os = "android")]
 fn play_android(bytes: &[u8]) -> Result<(), String> {
-    let mut path = std::env::temp_dir();
+    // Android's `std::env::temp_dir()` points at a non-app-writable /tmp, so
+    // writing there fails with EACCES ("permission os error"). Use the app's
+    // private files directory (Context.getFilesDir) instead, which is always
+    // writable and is readable by our own MediaPlayer via JNI.
+    let dir = crate::jni_bridge::files_dir()
+        .ok_or_else(|| "audio: could not resolve app files directory".to_string())?;
+    let mut path = std::path::PathBuf::from(dir);
     path.push(format!("rbxl_audio_{}.bin", std::process::id()));
     {
-        let mut f = std::fs::File::create(&path).map_err(|e| format!("tmp: {e}"))?;
-        f.write_all(bytes).map_err(|e| format!("write: {e}"))?;
+        let mut f = std::fs::File::create(&path).map_err(|e| format!("audio file create: {e}"))?;
+        f.write_all(bytes).map_err(|e| format!("audio write: {e}"))?;
         f.sync_all().ok();
     }
     let path_str = path.to_string_lossy().to_string();
     // Delegate to with_env; it logs any JNI errors. The Java side shows
     // a Toast if playback fails.
-    let _ = path_str.clone();
     crate::jni_bridge::with_env(move |env, class| {
         let jpath = env.new_string(&path_str)?;
         env.call_static_method(
