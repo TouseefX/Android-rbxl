@@ -235,6 +235,13 @@ pub struct EditorApp {
     // when anim_use_group is true).
     anim_creator_id: String,
     anim_use_group: bool,
+
+    // Per-property text buffers so number properties (float/int, and vector
+    // components) can be TYPED exactly like Studio instead of only dragged.
+    // Keyed by property name (vector components use "Name.X"/".Y"/".Z").
+    // Cleared when the selection changes so stale values aren't shown.
+    prop_num_buf: HashMap<String, String>,
+    prop_num_sel: Option<Ref>,
 }
 
 impl Default for EditorApp {
@@ -313,6 +320,8 @@ impl Default for EditorApp {
             is_uploading_anim: false,
             anim_creator_id: String::new(),
             anim_use_group: false,
+            prop_num_buf: HashMap::new(),
+            prop_num_sel: None,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
         app.log_info(&format!(
@@ -1435,6 +1444,14 @@ ui.label("Place ID:");
             return;
         };
 
+        // Reset the per-property number-edit buffers when a different instance
+        // is selected, so stale typed values from the previous selection aren't
+        // shown in the fields.
+        if self.prop_num_sel != Some(r) {
+            self.prop_num_buf.clear();
+            self.prop_num_sel = Some(r);
+        }
+
         let inst_name = inst.name.clone();
         let inst_class = inst.class.to_string();
         let properties = inst.properties.clone();
@@ -1473,6 +1490,10 @@ ui.label("Place ID:");
 
                 let mut prop_updates: Vec<(String, Variant)> = Vec::new();
                 let mut prop_deletes = Vec::new();
+
+                // Shared per-property number-edit buffers (used by the numeric
+                // arms below so values can be typed, not just dragged).
+                let num_bufs = &mut self.prop_num_buf;
 
                 for (key, val) in &properties {
                     let key_str = key.as_str();
@@ -1549,33 +1570,32 @@ ui.label("Place ID:");
                                 ui.checkbox(&mut val_bool, "").changed().then(|| Variant::Bool(val_bool))
                             }
                             Variant::Float32(f) => {
-                                let mut val_f = *f;
-                                ui.add(egui::DragValue::new(&mut val_f).speed(0.1)).changed().then(|| Variant::Float32(val_f))
+                                scalar_edit(ui, num_bufs, key_str, *f as f64, false).map(|v| Variant::Float32(v as f32))
                             }
                             Variant::Float64(f) => {
-                                let mut val_f = *f;
-                                ui.add(egui::DragValue::new(&mut val_f).speed(0.1)).changed().then(|| Variant::Float64(val_f))
+                                scalar_edit(ui, num_bufs, key_str, *f, false).map(Variant::Float64)
                             }
                             Variant::Int32(i) => {
-                                let mut val_i = *i;
-                                ui.add(egui::DragValue::new(&mut val_i).speed(1)).changed().then(|| Variant::Int32(val_i))
+                                scalar_edit(ui, num_bufs, key_str, *i as f64, true).map(|v| Variant::Int32(v as i32))
                             }
                             Variant::Int64(i) => {
-                                let mut val_i = *i;
-                                ui.add(egui::DragValue::new(&mut val_i).speed(1)).changed().then(|| Variant::Int64(val_i))
+                                scalar_edit(ui, num_bufs, key_str, *i as f64, true).map(|v| Variant::Int64(v as i64))
                             }
                             Variant::Vector2(v) => {
-                                let (mut x, mut y) = (v.x, v.y);
-                                ui.label("X"); ui.add(egui::DragValue::new(&mut x).speed(0.2));
-                                ui.label("Y"); let cy = ui.add(egui::DragValue::new(&mut y).speed(0.2)).changed();
-                                (x != v.x || cy).then(|| Variant::Vector2(rbx_dom_weak::types::Vector2::new(x, y)))
+                                ui.label("X"); let nx = scalar_edit(ui, num_bufs, &format!("{key_str}.X"), v.x as f64, false);
+                                ui.label("Y"); let ny = scalar_edit(ui, num_bufs, &format!("{key_str}.Y"), v.y as f64, false);
+                                let x = nx.unwrap_or(v.x as f64) as f32;
+                                let y = ny.unwrap_or(v.y as f64) as f32;
+                                (nx.is_some() || ny.is_some()).then(|| Variant::Vector2(rbx_dom_weak::types::Vector2::new(x, y)))
                             }
                             Variant::Vector3(v) => {
-                                let (mut x, mut y, mut z) = (v.x, v.y, v.z);
-                                ui.label("X"); let cx = ui.add(egui::DragValue::new(&mut x).speed(0.2)).changed();
-                                ui.label("Y"); let cy = ui.add(egui::DragValue::new(&mut y).speed(0.2)).changed();
-                                ui.label("Z"); let cz = ui.add(egui::DragValue::new(&mut z).speed(0.2)).changed();
-                                (cx || cy || cz).then(|| Variant::Vector3(Vector3::new(x, y, z)))
+                                ui.label("X"); let nx = scalar_edit(ui, num_bufs, &format!("{key_str}.X"), v.x as f64, false);
+                                ui.label("Y"); let ny = scalar_edit(ui, num_bufs, &format!("{key_str}.Y"), v.y as f64, false);
+                                ui.label("Z"); let nz = scalar_edit(ui, num_bufs, &format!("{key_str}.Z"), v.z as f64, false);
+                                let x = nx.unwrap_or(v.x as f64) as f32;
+                                let y = ny.unwrap_or(v.y as f64) as f32;
+                                let z = nz.unwrap_or(v.z as f64) as f32;
+                                (nx.is_some() || ny.is_some() || nz.is_some()).then(|| Variant::Vector3(Vector3::new(x, y, z)))
                             }
                             Variant::Color3(c) => {
                                 let mut rgb = [c.r, c.g, c.b];
@@ -2289,19 +2309,27 @@ ui.label("Place ID:");
             self.status = "Select a Sound instance to play it".into();
             return;
         }
-        // Find the SoundId property (ContentId/Content/String variants).
-        let id_str = inst.properties.iter().find_map(|(k, v)| {
-            if k.as_str().eq_ignore_ascii_case("SoundId") {
-                match v {
-                    Variant::String(s) => Some(s.clone()),
-                    Variant::ContentId(c) => Some(c.as_str().to_string()),
-                    Variant::Content(c) => c.as_uri().map(|s| s.to_string()),
-                    _ => None,
-                }
-            } else { None }
-        });
+        // Find the audio reference. Modern places store it under `AudioContent`
+        // (a `Content`/`ContentId`), older ones under `SoundId`; some use
+        // `SoundGroupId`. Prefer AudioContent, then SoundId.
+        let id_str = ["AudioContent", "SoundId", "SoundGroupId"]
+            .iter()
+            .find_map(|pname| {
+                inst.properties.iter().find_map(|(k, v)| {
+                    if k.as_str().eq_ignore_ascii_case(pname) {
+                        match v {
+                            Variant::String(s) => Some(s.clone()),
+                            Variant::ContentId(c) => Some(c.as_str().to_string()),
+                            Variant::Content(c) => c.as_uri().map(|s| s.to_string()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+            });
         let Some(raw) = id_str else {
-            self.status = "Sound has no SoundId".into();
+            self.status = "Sound has no SoundId / AudioContent".into();
             return;
         };
         let Some(asset_id) = crate::asset_downloader::extract_asset_id(&raw) else {
@@ -4089,6 +4117,61 @@ fn android_keycode_to_egui(keycode: i32) -> Option<egui::Key> {
 // Property editor field helpers (complex value types that need a multi-row or
 // multi-field widget instead of a single inline control).
 // ============================================================================
+
+/// Format a number for an editable text field. Integers render without a
+/// decimal point; floats use Rust's default formatting (no trailing zeros,
+/// no scientific notation for typical ranges).
+fn format_fnum(v: f64, is_int: bool) -> String {
+    if is_int {
+        format!("{}", v.round() as i64)
+    } else if v == 0.0 {
+        "0".to_string()
+    } else {
+        format!("{}", v)
+    }
+}
+
+/// A typeable number field (like Studio's property inputs): a single-line
+/// text edit bound to a per-property buffer in `store`. The value is committed
+/// live as the user types a *valid* number; an in-progress invalid fragment
+/// (e.g. "0." or "-") is left alone so it isn't clobbered, and on focus loss
+/// the field is normalized (or reset to the current value if it didn't parse).
+/// Returns `Some(new_value)` when the value should change.
+fn scalar_edit(
+    ui: &mut egui::Ui,
+    store: &mut HashMap<String, String>,
+    key: &str,
+    current: f64,
+    is_int: bool,
+) -> Option<f64> {
+    let entry = store
+        .entry(key.to_string())
+        .or_insert_with(|| format_fnum(current, is_int));
+    let resp = ui.add(
+        egui::TextEdit::singleline(entry)
+            .desired_width(64.0)
+            .clip_text(true),
+    );
+    if resp.changed() || resp.lost_focus() {
+        let parsed = if is_int {
+            entry.trim().parse::<i64>().ok().map(|v| v as f64)
+        } else {
+            entry.trim().parse::<f64>().ok()
+        };
+        if let Some(v) = parsed {
+            if (v - current).abs() > 1e-9 {
+                if resp.lost_focus() {
+                    *entry = format_fnum(v, is_int);
+                }
+                return Some(v);
+            }
+        }
+        if resp.lost_focus() {
+            *entry = format_fnum(current, is_int);
+        }
+    }
+    None
+}
 
 /// Edit a CFrame as Position (X/Y/Z) + Orientation (X/Y/Z Euler degrees).
 /// Extracts Euler angles from the existing rotation matrix and recomposes the
