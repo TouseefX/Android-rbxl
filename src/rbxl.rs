@@ -519,3 +519,15 @@ pub fn save_place_as(dom: &WeakDom, format: PlaceFormat) -> Result<Vec<u8>> {
         }
     }
 }
+
+/// Export a single instance (and its whole child subtree) as a self-contained
+/// binary `.rbxm` model. Used by the Animation tab to upload a
+/// `KeyframeSequence` to Roblox as a model asset: we copy the selected subtree
+/// into a fresh DataModel-rooted DOM (so the root's children serialize as the
+/// model's top-level instances) and write it as binary.
+pub fn export_subtree_rbxm(dom: &WeakDom, referent: Ref) -> Result<Vec<u8>> {
+    let mut export_dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = export_dom.root_ref();
+    insert_dom_subtree(&mut export_dom, root, dom, referent);
+    save_place_as(&export_dom, PlaceFormat::Binary)
+}
