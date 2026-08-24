@@ -52,6 +52,30 @@ pub fn try_recv_search_results() -> Option<LiveSearchResponse> {
     }
 }
 
+/// Signals that an audio fetch-for-playback finished (success or failure) so
+/// the UI can auto-play the sound (and notify the user) once it's cached,
+/// instead of making them press Play again.
+pub struct AudioReady {
+    pub id: String,
+    pub ok: bool,
+}
+
+static AUDIO_READY_CHANNEL: OnceLock<(Sender<AudioReady>, Mutex<Receiver<AudioReady>>)> =
+    OnceLock::new();
+
+fn audio_ready_channel() -> &'static (Sender<AudioReady>, Mutex<Receiver<AudioReady>>) {
+    AUDIO_READY_CHANNEL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+/// Poll for a finished audio-for-playback fetch (called from the UI thread).
+pub fn try_recv_audio_ready() -> Option<AudioReady> {
+    let (_, rx) = audio_ready_channel();
+    rx.lock().ok().and_then(|r| r.try_recv().ok())
+}
+
 pub fn fetch_and_cache_mesh_async(mesh_id_str: String, cookie_opt: Option<String>) {
     RobloxApiClient::fetch_and_cache_mesh_async(mesh_id_str, cookie_opt);
 }
@@ -622,6 +646,24 @@ impl RobloxApiClient {
                     }
                 }
             }
+        });
+    }
+
+    /// Like `fetch_and_cache_audio_async`, but reports completion through the
+    /// `AUDIO_READY` channel so the UI can auto-play the sound once it's cached
+    /// (and notify the user) instead of making them press Play again.
+    pub fn fetch_audio_for_playback_async(id: String, cookie_opt: Option<String>) {
+        let tx = audio_ready_channel().0.clone();
+        std::thread::spawn(move || {
+            let ok = asset_downloader::extract_asset_id(&id)
+                .and_then(|s| s.parse::<u64>().ok())
+                .and_then(|n| {
+                    RobloxApiClient::fetch_asset_payload_sync(n, cookie_opt.as_deref())
+                        .ok()
+                        .map(|bytes| asset_downloader::store_cached_raw(id.clone(), bytes))
+                })
+                .is_some();
+            let _ = tx.send(AudioReady { id, ok });
         });
     }
 

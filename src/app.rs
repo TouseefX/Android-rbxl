@@ -242,6 +242,11 @@ pub struct EditorApp {
     // Cleared when the selection changes so stale values aren't shown.
     prop_num_buf: HashMap<String, String>,
     prop_num_sel: Option<Ref>,
+
+    // A sound the user asked to play that wasn't cached yet; auto-played (and
+    // the user notified) once its fetch finishes, instead of making them press
+    // Play a second time.
+    pending_play_audio: Option<String>,
 }
 
 impl Default for EditorApp {
@@ -322,6 +327,7 @@ impl Default for EditorApp {
             anim_use_group: false,
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
+            pending_play_audio: None,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
         app.log_info(&format!(
@@ -2334,9 +2340,23 @@ ui.label("Place ID:");
         };
         let key = format!("rbxassetid://{asset_id}");
         let cookie = if self.roblosecurity_cookie.is_empty() { None } else { Some(self.roblosecurity_cookie.clone()) };
-        match crate::audio::play_cached_or_fetch(&key, cookie) {
-            Ok(()) => self.status = format!("Playing {key}"),
-            Err(msg) => self.status = format!("Audio: {msg}"),
+
+        if crate::asset_downloader::get_cached_raw(&key).is_some() {
+            // Already cached — play immediately.
+            match crate::audio::play_cached_or_fetch(&key, cookie) {
+                Ok(()) => {
+                    self.pending_play_audio = None;
+                    self.status = format!("Playing {key}");
+                }
+                Err(msg) => self.status = format!("Audio: {msg}"),
+            }
+        } else {
+            // Not cached: fetch in the background and auto-play + notify once
+            // it lands, so the user doesn't have to press Play a second time.
+            self.pending_play_audio = Some(key.clone());
+            self.status = "⏳ Downloading audio… will play when ready".into();
+            self.log_info(format!("Downloading {key} for playback"));
+            RobloxApiClient::fetch_audio_for_playback_async(key, cookie);
         }
     }
 
@@ -2420,6 +2440,28 @@ ui.label("Place ID:");
         // Drain any background plugin-run log lines / completion.
         self.pump_plugin_logs();
         self.pump_plugin_thumbnails();
+
+        // Auto-play (and notify) when a sound the user pressed Play on finishes
+        // downloading, instead of leaving them to press Play again.
+        while let Some(ready) = roblox_api::try_recv_audio_ready() {
+            if self.pending_play_audio.as_deref() == Some(ready.id.as_str()) {
+                if ready.ok {
+                    match crate::audio::play_cached_or_fetch(&ready.id, None) {
+                        Ok(()) => {
+                            self.status = "✅ Audio downloaded — playing".into();
+                            self.log_info(format!("Audio ready, playing {}", ready.id));
+                        }
+                        Err(e) => self.status = format!("Audio: {e}"),
+                    }
+                } else {
+                    self.status = "Audio download failed".into();
+                    self.log_error(format!("Audio download failed: {}", ready.id));
+                }
+                self.pending_play_audio = None;
+            } else if ready.ok {
+                self.log_info(format!("Audio cached: {}", ready.id));
+            }
+        }
 
         // Pick up finished animation uploads.
         while let Some(res) = roblox_api::try_recv_anim_result() {
