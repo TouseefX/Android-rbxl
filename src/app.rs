@@ -4138,7 +4138,7 @@ local function play()
 	track.KeyframeReached:Connect(function(markerName)
 		print("Animation marker:", markerName, "at", track.TimePosition)
 	end)
-	for _, markerName in ipairs({"Footstep", "Hit", "Sound"}) do
+	for _, markerName in ipairs({{"Footstep", "Hit", "Sound"}}) do
 		track:GetMarkerReachedSignal(markerName):Connect(function(value)
 			print("Marker", markerName, value or "")
 		end)
