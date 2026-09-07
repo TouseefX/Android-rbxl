@@ -717,6 +717,19 @@ pub fn run_command(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Re
     }
 }
 
+/// Recover the DataModel after a command run without assuming every VM-owned
+/// handle was released. `Rc::try_unwrap(...).expect(...)` made an otherwise
+/// recoverable Lua error crash the whole Android process if a handle survived.
+pub fn take_command_dom(dom: Rc<RefCell<WeakDom>>) -> WeakDom {
+    match Rc::try_unwrap(dom) {
+        Ok(cell) => cell.into_inner(),
+        Err(shared) => std::mem::replace(
+            &mut *shared.borrow_mut(),
+            WeakDom::new(InstanceBuilder::new("DataModel")),
+        ),
+    }
+}
+
 /// Drain output produced by the most recent `run_command`.
 pub fn take_command_log() -> Vec<OutputLine> { take_log() }
 
@@ -1143,12 +1156,20 @@ fn ensure_service(
     mt: Rc<Table>,
     name: &str,
 ) -> LuaResult<Table> {
-    let root = dom.borrow().root_ref();
-    let existing = dom.borrow().get_by_ref(root).and_then(|root_inst| {
-        root_inst.children().iter().copied().find(|c| {
-            dom.borrow().get_by_ref(*c).is_some_and(|i| i.class == name || i.name == name)
-        })
-    });
+    // Keep this lookup inside one immutable borrow. Borrowing `dom` again from
+    // the iterator closure used to panic (`RefCell already borrowed`) as soon
+    // as command mode tried to resolve Workspace, aborting the Android app.
+    let (root, existing) = {
+        let d = dom.borrow();
+        let root = d.root_ref();
+        let existing = d.get_by_ref(root).and_then(|root_inst| {
+            root_inst.children().iter().copied().find(|c| {
+                d.get_by_ref(*c)
+                    .is_some_and(|i| i.class == name || i.name == name)
+            })
+        });
+        (root, existing)
+    };
     let r = match existing {
         Some(r) => r,
         None => {

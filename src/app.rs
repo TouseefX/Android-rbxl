@@ -2715,11 +2715,10 @@ ui.label("Place ID:");
     fn show_command_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("▶ Command Bar");
         ui.label(RichText::new(
-            "Run Luau snippets in the embedded luaur VM. The command bar has \
-             print/warn/pcall, task.*, Vector3/Color3/CFrame/UDim2, Enum.*, and a \
-             stubbed plugin/script. It can't touch the live DataModel — for that, \
-             connect a Live Session (companion Studio plugin) and the command will \
-             execute inside real Studio instead.",
+            "Run Luau against this editor's local DataModel. Use game, workspace, \
+             Instance.new, properties, children, Clone/Destroy, Selection, and \
+             ChangeHistoryService. A connected Live Session can instead execute \
+             the command inside Roblox Studio.",
         ).weak());
 
         ui.separator();
@@ -2863,8 +2862,7 @@ ui.label("Place ID:");
                                 text: parts.join(", "),
                             });
                         }
-                        let back = Rc::try_unwrap(rc).ok().expect("rc leaked").into_inner();
-                        self.dom = Some(back);
+                        self.dom = Some(lua_runtime::take_command_dom(rc));
                     }
                     Err(e) => {
                         for line in lua_runtime::take_command_log() {
@@ -2873,8 +2871,7 @@ ui.label("Place ID:");
                         self.command_output.push(lua_runtime::OutputLine {
                             level: lua_runtime::Level::Error, text: e,
                         });
-                        let back = Rc::try_unwrap(rc).ok().expect("rc leaked").into_inner();
-                        self.dom = Some(back);
+                        self.dom = Some(lua_runtime::take_command_dom(rc));
                     }
                 }
             } else {
