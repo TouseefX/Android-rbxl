@@ -1750,7 +1750,21 @@ ui.label("Place ID:");
 
                     for (label, snippet) in symbols {
                         if ui.button(label).clicked() {
-                            let cursor = insert_at_selection(&mut tab.buffer, self.script_selection, snippet);
+                            let completion = (label == "Tab").then(|| {
+                                self.script_completion_cursor.and_then(|cursor| {
+                                    project_index.as_ref().and_then(|index| {
+                                        index.complete_at(tab_ref, &tab.buffer, cursor)
+                                            .get(self.script_completion_selected).cloned()
+                                    })
+                                })
+                            }).flatten();
+                            let cursor = if let (Some(completion), Some(at)) =
+                                (completion, self.script_completion_cursor)
+                            {
+                                luau_intelligence::apply_suggestion_at(&mut tab.buffer, at, &completion)
+                            } else {
+                                insert_at_selection(&mut tab.buffer, self.script_selection, snippet)
+                            };
                             self.pending_script_cursor = Some(cursor);
                             self.script_completion_cursor = Some(cursor);
                             self.script_selection = Some((cursor, cursor));
@@ -1867,6 +1881,7 @@ ui.label("Place ID:");
         }
 
         let mut cursor_char = self.script_completion_cursor;
+        let mut completion_popup_pos = None;
         let active_line = cursor_char.map_or(1, |cursor| {
             tab.buffer.chars().take(cursor).filter(|c| *c == '\n').count() + 1
         });
@@ -1941,6 +1956,12 @@ ui.label("Place ID:");
                         output.state.store(ui.ctx(), id);
                     }
                     tab.previous_buffer = tab.buffer.clone();
+                    if let Some(range) = reported_range {
+                        let caret = output.galley.pos_from_cursor(range.primary);
+                        completion_popup_pos = Some(
+                            output.galley_pos + caret.left_bottom().to_vec2() + egui::vec2(0.0, 6.0),
+                        );
+                    }
                     cursor_char = reported_range.map(|range| range.primary.index);
                     self.script_selection = reported_range.map(|range| {
                         (range.secondary.index, range.primary.index)
@@ -2042,30 +2063,33 @@ ui.label("Place ID:");
             if !completions.is_empty() {
                 self.script_completion_selected =
                     self.script_completion_selected.min(completions.len() - 1);
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(260.0);
-                    ui.label(
-                        RichText::new("Luau completions  ·  ↑↓ choose  Tab accepts  Enter makes a new line")
-                            .small()
-                            .color(Color32::from_rgb(140, 180, 220)),
-                    );
-                    for (position, completion) in completions.iter().enumerate() {
-                        let text = format!("{}    {}", completion.label, completion.detail);
-                        if ui.selectable_label(
-                            position == self.script_completion_selected,
-                            RichText::new(text).monospace(),
-                        ).clicked() {
-                            let new_cursor = luau_intelligence::apply_suggestion_at(
-                                &mut tab.buffer,
-                                index,
-                                completion,
-                            );
-                            self.script_completion_cursor = Some(new_cursor);
-                            self.pending_script_cursor = Some(new_cursor);
-                            self.script_completion_selected = 0;
-                        }
-                    }
-                });
+                let popup_pos = completion_popup_pos.unwrap_or_else(|| ui.next_widget_position());
+                egui::Area::new(egui::Id::new("luau_completion_popup"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(popup_pos)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(260.0);
+                            ui.set_max_height(240.0);
+                            ui.label(RichText::new("Luau suggestions · tap one or use Tab").small()
+                                .color(Color32::from_rgb(140, 180, 220)));
+                            egui::ScrollArea::vertical().max_height(205.0).show(ui, |ui| {
+                                for (position, completion) in completions.iter().enumerate() {
+                                    let text = format!("{}    {}", completion.label, completion.detail);
+                                    if ui.selectable_label(
+                                        position == self.script_completion_selected,
+                                        RichText::new(text).monospace(),
+                                    ).clicked() {
+                                        let new_cursor = luau_intelligence::apply_suggestion_at(
+                                            &mut tab.buffer, index, completion);
+                                        self.script_completion_cursor = Some(new_cursor);
+                                        self.pending_script_cursor = Some(new_cursor);
+                                        self.script_completion_selected = 0;
+                                    }
+                                }
+                            });
+                        });
+                    });
             }
         }
 
