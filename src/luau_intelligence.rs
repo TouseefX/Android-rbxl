@@ -260,7 +260,7 @@ impl ProjectIndex {
                     .and_then(|request| self.resolve_module_ref(current_script, request))
                     .or_else(|| self.module_refs.get(&normalize_path(module_alias)).copied());
                 if let Some(members) = target.and_then(|target| self.module_sources.get(&target))
-                    .map(|source| exported_members(source))
+                    .map(|source| constructed_object_members(source))
                 {
                     return members.into_iter()
                         .filter(|(member, _)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
@@ -1283,6 +1283,92 @@ fn source_symbols(source: &str) -> Vec<(String, String, usize)> {
     result
 }
 
+/// Infer the public shape of objects produced by the common Roblox/Luau OOP
+/// pattern (`Class.__index = Class`, `Class.new`, `setmetatable`, and `self.x`).
+fn constructed_object_members(source: &str) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    let mut classes = std::collections::BTreeSet::new();
+
+    // Colon methods are instance methods. Dot methods other than constructors
+    // are included too because many modules use `Class.Destroy(self)` style.
+    for raw in source.lines() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let Some(declaration) = code.strip_prefix("function ")
+            .or_else(|| code.strip_prefix("local function ")) else { continue };
+        if let Some((owner, rest)) = declaration.split_once(':') {
+            let member = identifier_start(rest);
+            if is_identifier(owner.trim()) && is_identifier(member) {
+                classes.insert(owner.trim().to_string());
+                result.insert(member.into(), function_signature(member, &rest[member.len()..])
+                    .unwrap_or_else(|| format!("method {member}")));
+            }
+        } else if let Some((owner, rest)) = declaration.split_once('.') {
+            let member = identifier_start(rest);
+            if is_identifier(owner.trim()) && is_identifier(member) {
+                classes.insert(owner.trim().to_string());
+                if !matches!(member, "new" | "create" | "Create") {
+                    result.insert(member.into(), function_signature(member, &rest[member.len()..])
+                        .unwrap_or_else(|| format!("method {member}")));
+                }
+            }
+        }
+    }
+
+    // Fields assigned to the constructed receiver are part of its shape.
+    // Accept conventional names (`self`) and variables initialized through
+    // setmetatable, including a preset/default table.
+    let mut receivers: std::collections::HashSet<String> = ["self".to_string()].into_iter().collect();
+    let mut preset_names = std::collections::BTreeSet::new();
+    for raw in source.lines() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        if code.contains("setmetatable(") {
+            if let Some((left, right)) = code.split_once('=') {
+                let name = left.trim().trim_start_matches("local ").split(':').next().unwrap_or("").trim();
+                if is_identifier(name) { receivers.insert(name.into()); }
+                for token in right.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    if is_identifier(token) && !classes.contains(token)
+                        && !matches!(token, "setmetatable" | "table" | "clone")
+                    { preset_names.insert(token.to_string()); }
+                }
+            }
+        }
+        if let Some((left, _)) = code.split_once('=') {
+            if let Some((receiver, field)) = left.trim().split_once('.') {
+                let field = field.trim();
+                if receivers.contains(receiver.trim()) && is_identifier(field) {
+                    result.entry(field.into()).or_insert_with(|| format!("instance field {field}"));
+                }
+            }
+        }
+    }
+
+    // Read direct keys from preset tables used by setmetatable/table.clone.
+    for preset in preset_names {
+        let mut in_table = false;
+        let mut depth = 0i32;
+        for raw in source.lines() {
+            let code = raw.split("--").next().unwrap_or("").trim();
+            if !in_table {
+                let declaration = code.strip_prefix("local ").or_else(|| code.strip_prefix("const "));
+                if declaration.is_some_and(|value| value.starts_with(&format!("{preset} = {{"))) {
+                    in_table = true;
+                    depth = structural_brace_delta(code);
+                }
+                continue;
+            }
+            if depth == 1 {
+                let field = identifier_start(code);
+                if is_identifier(field) && code[field.len()..].trim_start().starts_with('=') {
+                    result.entry(field.into()).or_insert_with(|| format!("preset field {field}"));
+                }
+            }
+            depth += structural_brace_delta(code);
+            if depth <= 0 { break; }
+        }
+    }
+    result
+}
+
 fn returned_member_paths(source: &str) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
     let mut depth: Option<i32> = None;
@@ -1655,6 +1741,20 @@ mod tests {
         let source = "local Module = require(\"WeldModule\")\nlocal weld = Module.new(part)\nweld.D";
         let suggestions = index.complete_at(consumer, source, source.chars().count());
         assert!(suggestions.iter().any(|item| item.label == "Destroy"));
+    }
+
+    #[test]
+    fn infers_oop_receiver_and_preset_fields() {
+        let source = "local Defaults = {\n Speed = 10,\n Enabled = true,\n}\n\
+            local Weld = {}\nWeld.__index = Weld\n\
+            function Weld.new()\n local object = setmetatable(table.clone(Defaults), Weld)\n object.Part0 = nil\n return object\nend\n\
+            function Weld:Destroy() end";
+        let members = constructed_object_members(source);
+        assert!(members.contains_key("Speed"));
+        assert!(members.contains_key("Enabled"));
+        assert!(members.contains_key("Part0"));
+        assert!(members.contains_key("Destroy"));
+        assert!(!members.contains_key("new"));
     }
 
     #[test]
