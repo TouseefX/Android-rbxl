@@ -156,6 +156,10 @@ pub struct EditorApp {
     show_stats: bool,
     rename_buffer: String,
     project_name: String,
+    show_quick_open: bool,
+    quick_open_query: String,
+    show_workspace_symbols: bool,
+    workspace_symbol_query: String,
 
     // Live Roblox Catalog & Creator Store State
     live_search_input: String,
@@ -308,6 +312,10 @@ impl Default for EditorApp {
             show_stats: false,
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
+            show_quick_open: false,
+            quick_open_query: String::new(),
+            show_workspace_symbols: false,
+            workspace_symbol_query: String::new(),
             live_search_input: "sword".into(),
             live_catalog_items: Vec::new(),
             catalog_thumbnails: HashMap::new(),
@@ -472,6 +480,12 @@ impl EditorApp {
     /// a Bevy system.
     pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
         self.drain_events();
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
+            self.show_quick_open = true;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::O)) {
+            self.show_workspace_symbols = true;
+        }
         // Keep egui's internal clipboard in sync with the Android system
         // clipboard. arboard (egui's default backend) doesn't work on
         // Android, and there's no native EditText long-press menu, so we
@@ -529,6 +543,12 @@ impl EditorApp {
                     }
                     if ui.button("💾 Save As...").clicked() {
                         self.save_as();
+                    }
+                    if ui.button("⌘ Quick Open").clicked() {
+                        self.show_quick_open = true;
+                    }
+                    if ui.button("⌕ Symbols").clicked() {
+                        self.show_workspace_symbols = true;
                     }
                     if ui.button(RichText::new("🚀 Publish to Roblox").color(Color32::from_rgb(255, 180, 80))).clicked() {
                         self.publish_place_to_roblox();
@@ -659,6 +679,8 @@ impl EditorApp {
             });
         }
 
+        self.show_project_navigation(ctx);
+
         // Drain egui output commands. In particular, when the user
         // copies text inside an egui widget (Ctrl+C / selection), egui
         // emits OutputCommand::CopyText; forward it to the Android
@@ -674,6 +696,82 @@ impl EditorApp {
 }
 
 impl EditorApp {
+    fn show_project_navigation(&mut self, ctx: &egui::Context) {
+        let mut jump: Option<(Ref, usize)> = None;
+        if self.show_quick_open {
+            let mut scripts = Vec::new();
+            if let Some(dom) = &self.dom {
+                collect_script_paths(dom, dom.root_ref(), &mut Vec::new(), &mut scripts);
+            }
+            let query = self.quick_open_query.to_ascii_lowercase();
+            scripts.retain(|(_, path)| query.is_empty() || fuzzy_ui_match(&path.to_ascii_lowercase(), &query));
+            scripts.sort_by_key(|(_, path)| path.to_ascii_lowercase());
+            let mut open = self.show_quick_open;
+            egui::Window::new("⌘ Quick Open")
+                .open(&mut open).collapsible(false).default_width(520.0)
+                .show(ctx, |ui| {
+                    let response = ui.add(egui::TextEdit::singleline(&mut self.quick_open_query)
+                        .hint_text("Type a script name or DataModel path…").desired_width(f32::INFINITY));
+                    response.request_focus();
+                    if response.ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        if let Some((referent, _)) = scripts.first() { jump = Some((*referent, 1)); }
+                    }
+                    ui.label(RichText::new(format!("{} matching scripts · Enter opens first · Ctrl+P", scripts.len())).weak());
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for (referent, path) in scripts.iter().take(100) {
+                            if ui.selectable_label(false, RichText::new(path).monospace()).clicked() {
+                                jump = Some((*referent, 1));
+                            }
+                        }
+                    });
+                });
+            self.show_quick_open = open && jump.is_none();
+        }
+
+        if self.show_workspace_symbols {
+            let symbols = self.dom.as_ref().map(|dom| {
+                luau_intelligence::ProjectIndex::build_with_overrides(
+                    dom, self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                ).workspace_symbols(&self.workspace_symbol_query)
+            }).unwrap_or_default();
+            let mut open = self.show_workspace_symbols;
+            egui::Window::new("⌕ Workspace Symbols")
+                .open(&mut open).collapsible(false).default_width(620.0)
+                .show(ctx, |ui| {
+                    let response = ui.add(egui::TextEdit::singleline(&mut self.workspace_symbol_query)
+                        .hint_text("Find exported functions, fields, and types…").desired_width(f32::INFINITY));
+                    response.request_focus();
+                    if response.ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        if let Some(symbol) = symbols.first() { jump = Some((symbol.referent, symbol.line)); }
+                    }
+                    ui.label(RichText::new(format!("{} symbols · Enter opens first · Ctrl+Shift+O", symbols.len())).weak());
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for symbol in &symbols {
+                            let label = format!("{}  —  {}", symbol.name, symbol.detail);
+                            if ui.selectable_label(false, RichText::new(label).monospace()).clicked() {
+                                jump = Some((symbol.referent, symbol.line));
+                            }
+                            ui.label(RichText::new(format!("    {}:{}", symbol.path, symbol.line)).small().weak());
+                        }
+                    });
+                });
+            self.show_workspace_symbols = open && jump.is_none();
+        }
+
+        if let Some((referent, line)) = jump {
+            self.open_script_tab(referent);
+            if let Some(tab) = self.open_tabs.get(self.active_script_idx) {
+                let cursor = tab.buffer.lines().take(line.saturating_sub(1))
+                    .map(|line| line.chars().count() + 1).sum();
+                self.pending_script_cursor = Some(cursor);
+                self.script_completion_cursor = Some(cursor);
+            }
+            self.selected = Some(referent);
+            self.active_tab = ActiveTab::ScriptEditor;
+            self.status = format!("Opened project symbol at line {line}");
+        }
+    }
+
     /// Camera control bar (always drawn on a solid panel so it's visible over
     /// the 3D). Steers the Bevy `OrbitCam`.
     fn show_viewport_controls(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
@@ -4675,6 +4773,33 @@ play()
             .or_else(|| raw.parse::<u64>().ok())
             .unwrap_or(0)
     }
+}
+
+fn collect_script_paths(
+    dom: &WeakDom,
+    referent: Ref,
+    path: &mut Vec<String>,
+    output: &mut Vec<(Ref, String)>,
+) {
+    let Some(instance) = dom.get_by_ref(referent) else { return };
+    if referent != dom.root_ref() { path.push(instance.name.clone()); }
+    if matches!(instance.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+        output.push((referent, path.join("/")));
+    }
+    for &child in instance.children() {
+        collect_script_paths(dom, child, path, output);
+    }
+    if referent != dom.root_ref() { path.pop(); }
+}
+
+fn fuzzy_ui_match(haystack: &str, needle: &str) -> bool {
+    if haystack.contains(needle) { return true; }
+    let mut wanted = needle.chars();
+    let mut next = wanted.next();
+    for character in haystack.chars() {
+        if next == Some(character) { next = wanted.next(); }
+    }
+    next.is_none()
 }
 
 /// Map an Android KeyEvent keycode to an egui Key (for the small

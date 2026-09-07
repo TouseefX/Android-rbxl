@@ -44,6 +44,15 @@ pub struct RenameEdit {
     pub replacements: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSymbol {
+    pub name: String,
+    pub detail: String,
+    pub path: String,
+    pub referent: Ref,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProjectIndex {
     /// Normalized DataModel path or unambiguous module name -> members.
@@ -153,6 +162,28 @@ impl ProjectIndex {
         if !is_root {
             path.pop();
         }
+    }
+
+    /// Search exported module functions, fields, and types across the workspace.
+    pub fn workspace_symbols(&self, query: &str) -> Vec<WorkspaceSymbol> {
+        let query = query.trim().to_ascii_lowercase();
+        let mut result = Vec::new();
+        for (&referent, source) in &self.script_sources {
+            let path = self.paths.get(&referent).cloned().unwrap_or_default();
+            for (name, detail, line) in source_symbols(source) {
+                let haystack = format!("{name} {detail} {path}").to_ascii_lowercase();
+                if query.is_empty() || fuzzy_match(&haystack, &query) {
+                    result.push(WorkspaceSymbol { name, detail, path: path.clone(), referent, line });
+                }
+            }
+        }
+        result.sort_by_key(|item| {
+            let name = item.name.to_ascii_lowercase();
+            let rank = if query.is_empty() { 2 } else if name == query { 0 } else if name.starts_with(&query) { 1 } else { 2 };
+            (rank, item.name.to_ascii_lowercase(), item.path.to_ascii_lowercase())
+        });
+        result.truncate(100);
+        result
     }
 
     /// Complete `Alias.partial` at a character cursor position, resolving Alias
@@ -871,6 +902,16 @@ fn replace_identifier_token(source: &str, needle: &str, replacement: &str) -> (S
     (output, count)
 }
 
+fn fuzzy_match(haystack: &str, needle: &str) -> bool {
+    if haystack.contains(needle) { return true; }
+    let mut wanted = needle.chars();
+    let mut next = wanted.next();
+    for character in haystack.chars() {
+        if next == Some(character) { next = wanted.next(); }
+    }
+    next.is_none()
+}
+
 fn contains_identifier(line: &str, needle: &str) -> bool {
     line.match_indices(needle).any(|(start, _)| {
         let before = line[..start].chars().next_back();
@@ -931,6 +972,41 @@ fn member_definition_line(source: &str, member: &str) -> Option<usize> {
         ) == member;
         (direct_member || exported || returned).then_some(line + 1)
     })
+}
+
+fn source_symbols(source: &str) -> Vec<(String, String, usize)> {
+    let mut result = Vec::new();
+    for (index, raw) in source.lines().enumerate() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let function = code.strip_prefix("local function ")
+            .or_else(|| code.strip_prefix("const function "))
+            .or_else(|| code.strip_prefix("export function "))
+            .or_else(|| code.strip_prefix("function "));
+        if let Some(value) = function {
+            let name: String = value.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
+                .collect();
+            if !name.is_empty() {
+                let detail = function_signature(&name, &value[name.len()..])
+                    .unwrap_or_else(|| format!("function {name}"));
+                result.push((name, detail, index + 1));
+            }
+        }
+        let type_decl = code.strip_prefix("export type ").or_else(|| code.strip_prefix("type "));
+        if let Some(value) = type_decl {
+            let name = identifier_start(value);
+            if is_identifier(name) {
+                result.push((name.to_string(), format!("type {name}"), index + 1));
+            }
+        }
+    }
+    // Returned fields and other module exports are not always declarations.
+    for (name, detail) in exported_members(source) {
+        if !result.iter().any(|(existing, _, _)| existing == &name) {
+            result.push((name.clone(), detail, member_definition_line(source, &name).unwrap_or(1)));
+        }
+    }
+    result
 }
 
 fn exported_members(source: &str) -> BTreeMap<String, String> {
