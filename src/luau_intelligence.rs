@@ -1285,15 +1285,32 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
     let mut return_depth: Option<i32> = None;
     for line in source.lines() {
         let code = line.split("--").next().unwrap_or("").trim();
-        let declaration = code.strip_prefix("function ")
-            .or_else(|| code.strip_prefix("const function ")).unwrap_or(code);
-        if let Some((_, member)) = declaration.split_once('.') {
-            let name = identifier_start(member);
-            if is_identifier(name) {
-                let suffix = &member[name.len()..];
-                let signature = function_signature(name, suffix)
-                    .unwrap_or_else(|| format!("field {name}"));
-                result.insert(name.to_string(), signature);
+        // Only a real owner-qualified function declaration exports a method.
+        // Previously every dotted expression was accepted, so a value such as
+        // `Color = Color3.fromRGB(...)` incorrectly exported `fromRGB` as a
+        // ModuleScript table function.
+        let method_declaration = code.strip_prefix("function ")
+            .or_else(|| code.strip_prefix("const function "));
+        if let Some(declaration) = method_declaration {
+            if let Some((owner, member)) = declaration.split_once('.') {
+                let name = identifier_start(member);
+                if is_identifier(owner.trim()) && is_identifier(name) {
+                    let suffix = &member[name.len()..];
+                    let signature = function_signature(name, suffix)
+                        .unwrap_or_else(|| format!("function {name}"));
+                    result.insert(name.to_string(), signature);
+                }
+            }
+        } else if let Some((lhs, rhs)) = code.split_once('=') {
+            // Also support `Module.Method = function(...)` exports without
+            // mistaking function calls on the right-hand side for exports.
+            if rhs.trim_start().starts_with("function") {
+                if let Some((owner, member)) = lhs.trim().split_once('.') {
+                    let name = member.trim();
+                    if is_identifier(owner.trim()) && is_identifier(name) {
+                        result.insert(name.to_string(), format!("function {name}"));
+                    }
+                }
             }
         }
         if let Some(rest) = code.strip_prefix("export type ") {
@@ -1543,6 +1560,17 @@ mod tests {
         assert!(warnings.iter().any(|warning| warning.message.contains("Unknown Roblox class")));
         assert!(warnings.iter().any(|warning| warning.message.contains("Unknown property 'Transparancy'")));
         assert!(warnings.iter().any(|warning| warning.message.contains("Unknown item")));
+    }
+
+    #[test]
+    fn dotted_value_calls_are_not_exported_as_module_functions() {
+        let members = exported_members(
+            "return {\n Color = Color3.fromRGB(170, 0, 0),\n Size = Vector3.new(1, 2, 3),\n}",
+        );
+        assert!(members.contains_key("Color"));
+        assert!(members.contains_key("Size"));
+        assert!(!members.contains_key("fromRGB"));
+        assert!(!members.contains_key("new"));
     }
 
     #[test]
