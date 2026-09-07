@@ -1950,10 +1950,16 @@ ui.label("Place ID:");
                             output.galley_pos + caret.left_bottom().to_vec2() + egui::vec2(0.0, 6.0),
                         );
                     }
-                    cursor_char = reported_range.map(|range| range.primary.index);
-                    self.script_selection = reported_range.map(|range| {
-                        (range.secondary.index, range.primary.index)
-                    });
+                    // Buttons and the floating completion popup temporarily
+                    // take egui focus, which makes TextEdit report no range.
+                    // Preserve the last live caret instead of resetting it;
+                    // completion replacement otherwise falls back to index 0.
+                    cursor_char = reported_range
+                        .map(|range| range.primary.index)
+                        .or(self.script_completion_cursor);
+                    if let Some(range) = reported_range {
+                        self.script_selection = Some((range.secondary.index, range.primary.index));
+                    }
                 });
             });
 
