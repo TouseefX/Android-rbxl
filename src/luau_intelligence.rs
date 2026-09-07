@@ -229,6 +229,9 @@ impl ProjectIndex {
                         .collect();
                 }
             }
+            // A dotted expression is a member lookup, never a new lexical
+            // keyword. Falling through used to turn `game.f` into `game.game`.
+            return roblox_member_completions(alias, prefix);
         }
         let before_cursor = &source[..cursor_byte];
         let mut completions = lexical_completions(before_cursor);
@@ -894,6 +897,43 @@ fn require_path(expression: &str) -> String {
         .replace("\")", "").replace('.', "/")
 }
 
+fn roblox_member_completions(owner: &str, prefix: &str) -> Vec<Completion> {
+    let items: &[(&str, &str)] = match owner {
+        "game" | "Game" => &[
+            ("GetService", "Roblox DataModel service lookup"),
+            ("FindService", "Find a loaded Roblox service"),
+            ("IsLoaded", "Whether the place finished loading"),
+            ("GetDescendants", "All descendants of the DataModel"),
+            ("GetChildren", "Children of the DataModel"),
+            ("Workspace", "Workspace service"),
+            ("Players", "Players service"),
+            ("ReplicatedStorage", "ReplicatedStorage service"),
+        ],
+        "workspace" | "Workspace" => &[
+            ("CurrentCamera", "Current workspace camera"),
+            ("FindFirstChild", "Find a child instance"),
+            ("WaitForChild", "Wait for a child instance"),
+            ("GetChildren", "Children of Workspace"),
+            ("GetDescendants", "All Workspace descendants"),
+            ("Raycast", "Cast a ray through Workspace"),
+        ],
+        "script" => &[
+            ("Parent", "Parent instance"),
+            ("Name", "Instance name"),
+            ("FindFirstChild", "Find a child instance"),
+            ("WaitForChild", "Wait for a child instance"),
+            ("GetChildren", "Child instances"),
+        ],
+        _ => return Vec::new(),
+    };
+    let lower = prefix.to_ascii_lowercase();
+    items.iter().filter(|(name, _)| name.to_ascii_lowercase().starts_with(&lower))
+        .take(12).map(|(name, detail)| Completion {
+            label: (*name).into(), detail: (*detail).into(), insert_text: (*name).into(),
+            replace_chars: prefix.chars().count(),
+        }).collect()
+}
+
 fn identifier_fragment(source_before_cursor: &str) -> &str {
     source_before_cursor.rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .next().unwrap_or("")
@@ -1234,6 +1274,14 @@ mod tests {
         let exact = lexical_completions("loc");
         assert_eq!(exact.first().map(|item| item.label.as_str()), Some("local"));
         assert!(lexical_completions("lope").iter().any(|item| item.label == "local"));
+    }
+
+    #[test]
+    fn dotted_roblox_completion_does_not_duplicate_game() {
+        let index = ProjectIndex::default();
+        let suggestions = index.complete_at(Ref::none(), "game.F", 6);
+        assert!(suggestions.iter().any(|item| item.label == "FindService"));
+        assert!(!suggestions.iter().any(|item| item.label == "game"));
     }
 
     #[test]

@@ -535,7 +535,7 @@ impl EditorApp {
         let compact = self.compact_toolbar || ctx.available_rect().width() < 720.0;
 
         let top_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
-            top: 48,
+            top: if compact { 6 } else { 48 },
             bottom: 6,
             left: 10,
             right: 10,
@@ -546,7 +546,8 @@ impl EditorApp {
         egui::TopBottomPanel::top("toolbar")
             .frame(top_frame)
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                egui::ScrollArea::horizontal().id_salt("main_toolbar_scroll").show(ui, |ui| {
+                ui.horizontal(|ui| {
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
 
@@ -595,7 +596,8 @@ impl EditorApp {
                         self.active_tab = ActiveTab::Output;
                     }
                     ui.separator();
-                    ui.label(&self.status);
+                    if !compact { ui.label(&self.status); }
+                });
                 });
 
                 if self.show_stats {
@@ -1569,8 +1571,10 @@ ui.label("Place ID:");
 
         ui.separator();
 
-        // Action Toolbar
-        ui.horizontal_wrapped(|ui| {
+        // Keep the editor controls to one horizontally scrollable row on
+        // phones so they cannot push the code area off-screen.
+        egui::ScrollArea::horizontal().id_salt("script_action_toolbar").show(ui, |ui| {
+        ui.horizontal(|ui| {
             ui.heading(&tab_name);
             ui.label(RichText::new(format!("({})", tab.class)).color(Color32::from_rgb(150, 150, 150)));
 
@@ -1627,6 +1631,7 @@ ui.label("Place ID:");
                     .and_then(|value| value.member.clone()).unwrap_or_default();
                 self.show_symbol_rename = true;
             }
+        });
         });
 
         let mut rename_requested = false;
@@ -1780,9 +1785,6 @@ ui.label("Place ID:");
             let accept_tab = ui.input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
             });
-            let accept_enter = ui.input_mut(|input| {
-                input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-            });
             let dismiss = ui.input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
             });
@@ -1799,7 +1801,7 @@ ui.label("Place ID:");
                 if let Some(cursor) = self.script_completion_cursor {
                     self.script_completion_dismissed_at = Some((tab_ref, cursor));
                 }
-            } else if accept_tab || accept_enter {
+            } else if accept_tab {
                 let completion = &completions[self.script_completion_selected];
                 let new_cursor = luau_intelligence::apply_suggestion_at(
                     &mut tab.buffer,
@@ -2015,7 +2017,7 @@ ui.label("Place ID:");
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(260.0);
                     ui.label(
-                        RichText::new("Luau completions  ·  ↑↓ choose  Tab/Enter accept  Esc close")
+                        RichText::new("Luau completions  ·  ↑↓ choose  Tab accepts  Enter makes a new line")
                             .small()
                             .color(Color32::from_rgb(140, 180, 220)),
                     );
