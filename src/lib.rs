@@ -31,6 +31,7 @@ mod roblox_api;
 mod roblox_domains;
 mod rbxl;
 mod schema;
+mod selection_edit;
 mod live_session;
 mod lua_runtime;
 mod plugins;

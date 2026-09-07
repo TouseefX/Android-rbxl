@@ -5,7 +5,7 @@ use crate::live_session;
 use crate::lua_runtime;
 use crate::plugins;
 use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
-use crate::{explorer, lua_syntax, luau_intelligence, rbxl, schema, templates};
+use crate::{explorer, lua_syntax, luau_intelligence, rbxl, schema, selection_edit, templates};
 use bevy_egui::egui;
 use bevy_egui::egui::{Color32, RichText};
 use rbx_dom_weak::{
@@ -126,6 +126,8 @@ pub struct EditorApp {
     script_completion_cursor: Option<usize>,
     script_completion_selected: usize,
     script_completion_dismissed_at: Option<(Ref, usize)>,
+    /// Anchor/primary character positions from the previous editor frame.
+    script_selection: Option<(usize, usize)>,
 
     // Find & Replace
     find_term: String,
@@ -273,6 +275,7 @@ impl Default for EditorApp {
             script_completion_cursor: None,
             script_completion_selected: 0,
             script_completion_dismissed_at: None,
+            script_selection: None,
             find_term: String::new(),
             replace_term: String::new(),
             show_replace: false,
@@ -1483,6 +1486,35 @@ ui.label("Place ID:");
             }
         }
 
+        // When there is no completion popup, Tab/Shift+Tab operate on all
+        // selected lines. A collapsed selection is left to TextEdit so Tab can
+        // still insert a normal indentation character at the caret.
+        let mut pending_selection = None;
+        if completions.is_empty() {
+            if let Some((anchor, primary)) = self.script_selection {
+                if anchor != primary {
+                    let unindent = ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)
+                    });
+                    let indent = if unindent {
+                        false
+                    } else {
+                        ui.input_mut(|input| {
+                            input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                        })
+                    };
+                    if indent || unindent {
+                        pending_selection = Some(selection_edit::indent_lines(
+                            &mut tab.buffer,
+                            anchor,
+                            primary,
+                            unindent,
+                        ));
+                    }
+                }
+            }
+        }
+
         let mut cursor_char = self.script_completion_cursor;
         egui::ScrollArea::both()
             .id_salt("code_scroll_area")
@@ -1493,7 +1525,7 @@ ui.label("Place ID:");
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
 
-                let output = egui::TextEdit::multiline(&mut tab.buffer)
+                let mut output = egui::TextEdit::multiline(&mut tab.buffer)
                     .id_source("script_multiline_view")
                     .font(egui::FontId::monospace(self.font_size))
                     .code_editor()
@@ -1502,7 +1534,21 @@ ui.label("Place ID:");
                     .lock_focus(true)
                     .layouter(&mut layouter)
                     .show(ui);
-                cursor_char = output.cursor_range.map(|range| range.primary.index);
+                let mut reported_range = output.cursor_range;
+                if let Some((anchor, primary)) = pending_selection {
+                    let range = egui::text::CCursorRange {
+                        primary: egui::text::CCursor::new(primary),
+                        secondary: egui::text::CCursor::new(anchor),
+                    };
+                    output.state.cursor.set_char_range(Some(range));
+                    let id = output.response.id;
+                    output.state.store(ui.ctx(), id);
+                    reported_range = Some(range);
+                }
+                cursor_char = reported_range.map(|range| range.primary.index);
+                self.script_selection = reported_range.map(|range| {
+                    (range.secondary.index, range.primary.index)
+                });
             });
 
         self.script_completion_cursor = cursor_char;
