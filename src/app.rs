@@ -1516,38 +1516,50 @@ ui.label("Place ID:");
         }
 
         let mut cursor_char = self.script_completion_cursor;
+        let active_line = cursor_char.map_or(1, |cursor| {
+            tab.buffer.chars().take(cursor).filter(|c| *c == '\n').count() + 1
+        });
         egui::ScrollArea::both()
             .id_salt("code_scroll_area")
             .show(ui, |ui| {
-                let search_ref = search_term.as_deref();
-                let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, _wrap: f32| {
-                    let job = lua_syntax::highlight_luau(text_buf.as_str(), font_size, search_ref);
-                    ui.fonts_mut(|f| f.layout_job(job))
-                };
+                ui.horizontal_top(|ui| {
+                    let line_count = tab.buffer.bytes().filter(|b| *b == b'\n').count() + 1;
+                    ui.label(lua_syntax::line_number_gutter(
+                        line_count,
+                        active_line,
+                        self.font_size,
+                    ));
 
-                let mut output = egui::TextEdit::multiline(&mut tab.buffer)
-                    .id_source("script_multiline_view")
-                    .font(egui::FontId::monospace(self.font_size))
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(28)
-                    .lock_focus(true)
-                    .layouter(&mut layouter)
-                    .show(ui);
-                let mut reported_range = output.cursor_range;
-                if let Some((anchor, primary)) = pending_selection {
-                    let range = egui::text::CCursorRange {
-                        primary: egui::text::CCursor::new(primary),
-                        secondary: egui::text::CCursor::new(anchor),
+                    let search_ref = search_term.as_deref();
+                    let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, _wrap: f32| {
+                        let job = lua_syntax::highlight_luau(text_buf.as_str(), font_size, search_ref);
+                        ui.fonts_mut(|f| f.layout_job(job))
                     };
-                    output.state.cursor.set_char_range(Some(range));
-                    let id = output.response.id;
-                    output.state.store(ui.ctx(), id);
-                    reported_range = Some(range);
-                }
-                cursor_char = reported_range.map(|range| range.primary.index);
-                self.script_selection = reported_range.map(|range| {
-                    (range.secondary.index, range.primary.index)
+
+                    let mut output = egui::TextEdit::multiline(&mut tab.buffer)
+                        .id_source("script_multiline_view")
+                        .font(egui::FontId::monospace(self.font_size))
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(28)
+                        .lock_focus(true)
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    let mut reported_range = output.cursor_range;
+                    if let Some((anchor, primary)) = pending_selection {
+                        let range = egui::text::CCursorRange {
+                            primary: egui::text::CCursor::new(primary),
+                            secondary: egui::text::CCursor::new(anchor),
+                        };
+                        output.state.cursor.set_char_range(Some(range));
+                        let id = output.response.id;
+                        output.state.store(ui.ctx(), id);
+                        reported_range = Some(range);
+                    }
+                    cursor_char = reported_range.map(|range| range.primary.index);
+                    self.script_selection = reported_range.map(|range| {
+                        (range.secondary.index, range.primary.index)
+                    });
                 });
             });
 
