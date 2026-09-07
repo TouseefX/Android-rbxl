@@ -237,14 +237,15 @@ mod imp {
         let mut state = STATE.lock().unwrap();
 
         if wants_keyboard && !state.active {
-            // Multi-line + no autocorrect: the editor is used for Luau source,
-            // where suggestions/autocapitalisation do more harm than good.
+            // Keep Samsung/Gboard's suggestion and correction strip available.
+            // Modified Samsung keyboards rely on this composing UI even for
+            // code, and composition is safely handled by the bridge above.
             // NO_FULLSCREEN keeps the IME from covering the app with its own
             // "extracted text" editor in landscape.
             app.set_ime_editor_info(
                 InputType::TYPE_CLASS_TEXT
                     | InputType::TYPE_TEXT_FLAG_MULTI_LINE
-                    | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS,
+                    | InputType::TYPE_TEXT_FLAG_AUTO_CORRECT,
                 TextInputAction::None,
                 ImeOptions::IME_FLAG_NO_FULLSCREEN,
             );

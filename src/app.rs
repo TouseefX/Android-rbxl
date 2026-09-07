@@ -95,6 +95,8 @@ pub struct OpenScriptTab {
     /// Source snapshot and parser results for incremental live diagnostics.
     pub analyzed_buffer: String,
     pub diagnostics: Vec<lua_runtime::SyntaxDiagnostic>,
+    /// Cached Roblox/Luau semantic warnings; recomputed only after edits.
+    pub semantic_diagnostics: Vec<luau_intelligence::ProjectDiagnostic>,
 }
 
 pub struct OutputLog {
@@ -144,6 +146,10 @@ pub struct EditorApp {
     project_index_cache: Option<std::sync::Arc<luau_intelligence::ProjectIndex>>,
     project_index_fingerprint: u64,
     project_index_rebuilds: u64,
+    /// Throttles whole-project fingerprints on mobile while typing.
+    project_index_checked_at: Option<std::time::Instant>,
+    project_diagnostics_key: u64,
+    project_diagnostics_cache: Vec<luau_intelligence::ProjectDiagnostic>,
 
     // Find & Replace
     find_term: String,
@@ -309,6 +315,9 @@ impl Default for EditorApp {
             project_index_cache: None,
             project_index_fingerprint: 0,
             project_index_rebuilds: 0,
+            project_index_checked_at: None,
+            project_diagnostics_key: 0,
+            project_diagnostics_cache: Vec::new(),
             find_term: String::new(),
             replace_term: String::new(),
             show_replace: false,
@@ -544,18 +553,16 @@ impl EditorApp {
                     // Open a place directly from Roblox by place ID using the
                     // cookie-authenticated web client. Downloads the .rbxl then
                     // loads it exactly like a local file open.
-                    if !compact {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.open_place_id_input)
-                                .hint_text("place ID")
-                                .desired_width(90.0),
-                        );
-                        if ui.button("🌐 Open from Roblox").clicked() {
-                            self.open_place_from_roblox();
-                        }
-                        if ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
-                            self.prompt_import_local_model();
-                        }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.open_place_id_input)
+                            .hint_text("place ID")
+                            .desired_width(if compact { 72.0 } else { 90.0 }),
+                    );
+                    if ui.button(if compact { "🌐 Roblox" } else { "🌐 Open from Roblox" }).clicked() {
+                        self.open_place_from_roblox();
+                    }
+                    if !compact && ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
+                        self.prompt_import_local_model();
                     }
                     if ui.button(RichText::new("💾 Save").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
                         self.save();
@@ -634,6 +641,13 @@ impl EditorApp {
                                     RichText::new(label)
                                 };
                                 if ui.selectable_label(is_active, text).clicked() {
+                                    if self.active_tab != tab {
+                                        ui.memory_mut(|memory| {
+                                            if let Some(focused) = memory.focused() {
+                                                memory.surrender_focus(focused);
+                                            }
+                                        });
+                                    }
                                     self.active_tab = tab;
                                 }
                             };
@@ -1389,6 +1403,7 @@ ui.label("Place ID:");
             buffer: source.clone(),
             original: source.clone(),
             previous_buffer: source.clone(),
+            semantic_diagnostics: luau_intelligence::semantic_diagnostics(&source),
             analyzed_buffer: source,
             diagnostics,
         });
@@ -1459,20 +1474,28 @@ ui.label("Place ID:");
         // notices DataModel edits and every unsaved tab, but parsing happens
         // only when those inputs actually change.
         if let Some(dom) = self.dom.as_ref() {
-            let fingerprint = luau_intelligence::ProjectIndex::fingerprint(
-                dom,
-                self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
-            );
-            if self.project_index_cache.is_none()
-                || fingerprint != self.project_index_fingerprint
-            {
-                let rebuilt = luau_intelligence::ProjectIndex::build_with_overrides(
+            let now = std::time::Instant::now();
+            let check_due = self.project_index_cache.is_none()
+                || self.project_index_checked_at.map_or(true, |last| {
+                    now.duration_since(last) >= std::time::Duration::from_millis(500)
+                });
+            if check_due {
+                self.project_index_checked_at = Some(now);
+                let fingerprint = luau_intelligence::ProjectIndex::fingerprint(
                     dom,
                     self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
                 );
-                self.project_index_cache = Some(std::sync::Arc::new(rebuilt));
-                self.project_index_fingerprint = fingerprint;
-                self.project_index_rebuilds += 1;
+                if self.project_index_cache.is_none()
+                    || fingerprint != self.project_index_fingerprint
+                {
+                    let rebuilt = luau_intelligence::ProjectIndex::build_with_overrides(
+                        dom,
+                        self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                    );
+                    self.project_index_cache = Some(std::sync::Arc::new(rebuilt));
+                    self.project_index_fingerprint = fingerprint;
+                    self.project_index_rebuilds += 1;
+                }
             }
         } else {
             self.project_index_cache = None;
@@ -1480,12 +1503,21 @@ ui.label("Place ID:");
         }
         let project_index = self.project_index_cache.clone();
         let project_diagnostics = project_index.as_ref().map_or_else(Vec::new, |index| {
+            use std::hash::{Hash, Hasher};
             let active = &self.open_tabs[self.active_script_idx];
-            index.diagnostics(active.referent, &active.buffer)
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            active.referent.hash(&mut hasher);
+            active.buffer.hash(&mut hasher);
+            self.project_index_fingerprint.hash(&mut hasher);
+            let key = hasher.finish();
+            if key != self.project_diagnostics_key {
+                self.project_diagnostics_cache = index.diagnostics(active.referent, &active.buffer);
+                self.project_diagnostics_key = key;
+            }
+            self.project_diagnostics_cache.clone()
         });
-        let semantic_diagnostics = luau_intelligence::semantic_diagnostics(
-            &self.open_tabs[self.active_script_idx].buffer,
-        );
+        let semantic_diagnostics = self.open_tabs[self.active_script_idx]
+            .semantic_diagnostics.clone();
         let definition = project_index.as_ref().and_then(|index| {
             let active = &self.open_tabs[self.active_script_idx];
             self.script_completion_cursor.and_then(|cursor| {
@@ -1505,6 +1537,7 @@ ui.label("Place ID:");
         // parser cost on every rendered frame.
         if tab.buffer != tab.analyzed_buffer {
             tab.diagnostics = lua_runtime::check_syntax(&tab.buffer, &tab_name);
+            tab.semantic_diagnostics = luau_intelligence::semantic_diagnostics(&tab.buffer);
             tab.analyzed_buffer = tab.buffer.clone();
         }
 

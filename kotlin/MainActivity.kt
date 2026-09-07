@@ -67,9 +67,10 @@ class MainActivity : GameActivity() {
         // path — so saved settings never came back after a restart.
         sInstance = this
 
-        // Render behind the system bars; GameActivity reports the insets to the
-        // native side so Bevy/egui can lay out around the cutout.
-        WindowCompat.setDecorFitsSystemWindows(window, false)
+        // Let Android resize the native surface above the Samsung/Gboard IME.
+        // Edge-to-edge (`false`) prevents adjustResize on several One UI builds
+        // and leaves the editor hidden behind the keyboard.
+        WindowCompat.setDecorFitsSystemWindows(window, true)
         hideSystemUi()
         super.onCreate(savedInstanceState)
 
