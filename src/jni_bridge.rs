@@ -27,6 +27,8 @@ pub enum FileEvent {
     /// Text came back from an external editor (QuickEdit, Acode etc.) for the
     /// script identified by `script_id` (see EditorApp::next_external_id).
     ExternalEditReturned { script_id: u64, text: String },
+    /// Snapshot of exported src/**/*.luau files after returning to the app.
+    ProjectSync { bundle_json: String },
 }
 
 static FILE_EVENTS: OnceLock<(mpsc::Sender<FileEvent>, Mutex<mpsc::Receiver<FileEvent>>)> =
@@ -261,6 +263,19 @@ pub fn trigger_save(data: &[u8]) {
     });
 }
 
+pub fn trigger_export_project(bundle_json: &str) {
+    with_env(|env, class| {
+        let bundle = env.new_string(bundle_json)?;
+        let _ = env.call_static_method(
+            class,
+            "exportProjectStatic",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&bundle)],
+        )?;
+        Ok(())
+    });
+}
+
 pub fn trigger_edit_externally(script_id: u64, name: &str, source: &str) {
     with_env(|env, class| {
         let jname = env.new_string(name)?;
@@ -397,6 +412,18 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnExterna
         script_id: script_id as u64,
         text: text_str,
     });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnProjectSync(
+    mut env: JNIEnv,
+    _class: JClass,
+    bundle_json: JString,
+) {
+    if bundle_json.is_null() { return; }
+    let value: String = env.get_string(&bundle_json).map(|s| s.into()).unwrap_or_default();
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::ProjectSync { bundle_json: value });
 }
 
 #[cfg(target_os = "android")]

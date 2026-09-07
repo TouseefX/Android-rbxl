@@ -35,6 +35,7 @@ mod selection_edit;
 mod live_session;
 mod lua_runtime;
 mod plugins;
+mod project;
 mod settings;
 mod templates;
 mod thumbnails;

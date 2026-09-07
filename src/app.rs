@@ -155,6 +155,7 @@ pub struct EditorApp {
     font_size: f32,
     show_stats: bool,
     rename_buffer: String,
+    project_name: String,
 
     // Live Roblox Catalog & Creator Store State
     live_search_input: String,
@@ -306,6 +307,7 @@ impl Default for EditorApp {
             font_size: 14.0,
             show_stats: false,
             rename_buffer: String::new(),
+            project_name: "RobloxProject".into(),
             live_search_input: "sword".into(),
             live_catalog_items: Vec::new(),
             catalog_thumbnails: HashMap::new(),
@@ -1356,6 +1358,7 @@ ui.label("Place ID:");
         });
         let mut goto_definition = None;
         let mut find_references_requested = false;
+        let mut export_project_requested = false;
 
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
@@ -1396,6 +1399,12 @@ ui.label("Place ID:");
                 self.next_external_id += 1;
                 self.pending_external_edits.insert(id, tab_ref);
                 jni_bridge::trigger_edit_externally(id, &tab_name, &tab.buffer);
+            }
+
+            ui.add(egui::TextEdit::singleline(&mut self.project_name)
+                .hint_text("project name").desired_width(120.0));
+            if ui.button("📁 Export Rojo Project").clicked() {
+                export_project_requested = true;
             }
 
             if ui.button("🔍 Find & Replace").clicked() {
@@ -1839,6 +1848,18 @@ ui.label("Place ID:");
                     }
                 }
             });
+        }
+
+        if export_project_requested {
+            if let Some(dom) = &self.dom {
+                let bundle = crate::project::build_bundle(
+                    dom,
+                    &self.project_name,
+                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                );
+                jni_bridge::trigger_export_project(&bundle);
+                self.status = format!("Exporting project '{}' to Android/media", self.project_name);
+            }
         }
 
         if rename_requested {
@@ -3154,6 +3175,26 @@ ui.label("Place ID:");
                         self.log_info("Saved place successfully");
                     } else {
                         self.log_error("Save failed");
+                    }
+                }
+                FileEvent::ProjectSync { bundle_json } => {
+                    if let Some(dom) = self.dom.as_mut() {
+                        match crate::project::decode_sync(dom, &bundle_json) {
+                            Ok(updates) => {
+                                let count = updates.len();
+                                for (referent, text) in updates {
+                                    let _ = rbxl::set_source(dom, referent, text.clone());
+                                    if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                                        tab.buffer = text.clone();
+                                        tab.original = text.clone();
+                                        tab.previous_buffer = text;
+                                    }
+                                }
+                                self.project_index_cache = None;
+                                self.status = format!("Synced {count} project script(s) from Android editor");
+                            }
+                            Err(error) => self.log_error(format!("Project sync failed: {error}")),
+                        }
                     }
                 }
                 FileEvent::ExternalEditReturned { script_id, text } => {

@@ -26,6 +26,8 @@ import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import org.json.JSONObject
+import org.json.JSONArray
 
 /**
  * Host Activity for the Rust/Bevy editor.
@@ -52,6 +54,8 @@ class MainActivity : GameActivity() {
     private var activeExternalScriptId: Long = -1
     private var activeExternalFilePath: String? = null
     private var lastExternalModifiedTime: Long = 0
+    private var activeProjectRoot: File? = null
+    private val projectModifiedTimes = HashMap<String, Long>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Register the instance BEFORE super.onCreate(): GameActivity's
@@ -86,6 +90,7 @@ class MainActivity : GameActivity() {
         // Whenever the user switches back to the app, auto-sync any script that
         // was modified in an external editor.
         checkExternalFileUpdate(false)
+        syncExportedProject()
     }
 
     private fun hideSystemUi() {
@@ -235,6 +240,60 @@ class MainActivity : GameActivity() {
             } else {
                 nativeOnSaveComplete(writeBytes(uri, data))
             }
+        }
+    }
+
+    /** Export a complete Rojo-style project where Android code editors can open it. */
+    fun exportProject(bundleJson: String) {
+        runOnUiThread {
+            try {
+                val bundle = JSONObject(bundleJson)
+                val name = bundle.optString("name", "RobloxProject")
+                    .replace(Regex("[^a-zA-Z0-9_.-]"), "_")
+                val media = externalMediaDirs.firstOrNull()
+                    ?: File(Environment.getExternalStorageDirectory(), "Android/media/$packageName")
+                val root = File(media, "projects/$name")
+                if (!root.exists()) root.mkdirs()
+                val files = bundle.getJSONArray("files")
+                for (i in 0 until files.length()) {
+                    val item = files.getJSONObject(i)
+                    val relative = item.getString("path")
+                    val target = File(root, relative)
+                    // Reject traversal even if malformed project data reaches JNI.
+                    if (!target.canonicalPath.startsWith(root.canonicalPath + File.separator)) continue
+                    target.parentFile?.mkdirs()
+                    target.writeText(item.getString("content"), StandardCharsets.UTF_8)
+                    projectModifiedTimes[target.canonicalPath] = target.lastModified()
+                }
+                activeProjectRoot = root
+                Toast.makeText(this, "Project exported: ${root.absolutePath}", Toast.LENGTH_LONG).show()
+                Log.i(TAG, "exportProject: ${files.length()} files to ${root.absolutePath}")
+            } catch (e: Exception) {
+                Log.e(TAG, "exportProject failed", e)
+                Toast.makeText(this, "Project export failed: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    /** Import changed script files when returning from an external project editor. */
+    private fun syncExportedProject() {
+        val root = activeProjectRoot ?: return
+        try {
+            val files = JSONArray()
+            File(root, "src").walkTopDown().filter { it.isFile && it.extension == "luau" }.forEach { file ->
+                val key = file.canonicalPath
+                val modified = file.lastModified()
+                if (modified > (projectModifiedTimes[key] ?: 0L)) {
+                    files.put(JSONObject().apply {
+                        put("path", file.relativeTo(root).invariantSeparatorsPath)
+                        put("content", file.readText(StandardCharsets.UTF_8))
+                    })
+                    projectModifiedTimes[key] = modified
+                }
+            }
+            if (files.length() > 0) nativeOnProjectSync(JSONObject().put("files", files).toString())
+        } catch (e: Exception) {
+            Log.e(TAG, "syncExportedProject failed", e)
         }
     }
 
@@ -460,6 +519,7 @@ class MainActivity : GameActivity() {
     private external fun nativeOnDocumentCreated(uri: String?)
     private external fun nativeOnSaveComplete(success: Boolean)
     private external fun nativeOnExternalEditReturned(scriptId: Long, text: String?)
+    private external fun nativeOnProjectSync(bundleJson: String)
 
     companion object {
         private const val TAG = "rbxl_editor"
@@ -513,6 +573,13 @@ class MainActivity : GameActivity() {
             val act = sInstance
             if (act != null) act.saveToCurrentDocument(data)
             else Log.e(TAG, "saveToCurrentDocumentStatic: MainActivity instance is null")
+        }
+
+        @JvmStatic
+        fun exportProjectStatic(bundleJson: String) {
+            val act = sInstance
+            if (act != null) act.exportProject(bundleJson)
+            else Log.e(TAG, "exportProjectStatic: MainActivity instance is null")
         }
 
         @JvmStatic

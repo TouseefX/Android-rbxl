@@ -476,6 +476,15 @@ impl ProjectIndex {
             let parent = current.rsplit_once('/').map_or("", |(p, _)| p);
             return collapse_path(&format!("{parent}/{request}"));
         }
+        // Aliases emitted in the exported .luaurc map the filesystem project
+        // back onto the DataModel hierarchy.
+        let request_lower = request.to_ascii_lowercase();
+        if request_lower.starts_with("@src/") {
+            return collapse_path(&request[5..]);
+        }
+        if request_lower.starts_with("@shared/") {
+            return collapse_path(&format!("ReplicatedStorage/{}", &request[8..]));
+        }
         // User aliases normally come from .luaurc. Until project folders land,
         // map @Service/foo naturally onto a top-level DataModel service.
         if let Some(rest) = request.strip_prefix('@') {
