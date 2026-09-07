@@ -33,6 +33,10 @@ env:
   KOTLIN_PLUGIN_VERSION: "2.0.21"
   # Pinned xbuild revision (master @ 2025-08-15) so builds are reproducible.
   XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
+  CARGO_BUILD_JOBS: 2                 # Matches the 2-core runner hardware
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16 # Splits compilation into parallel chunks
+  CARGO_PROFILE_RELEASE_DEBUG: 0      # Disables RAM-heavy debug symbols
+  CARGO_PROFILE_RELEASE_LTO: "thin"   # "thin" LTO is significantly faster and uses less RAM than "fat" LTO
 
 jobs:
   build-android:

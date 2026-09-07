@@ -54,6 +54,35 @@ pub fn load_place(bytes: Vec<u8>) -> Result<WeakDom> {
 
 /// Retrieve the script source text from an instance, supporting String,
 /// SharedString, and BinaryString formats used by Roblox place files.
+/// Returns animation marker events under a KeyframeSequence. Roblox stores
+/// markers as KeyframeMarker instances with a `Time` on the keyframe and a
+/// `Value` on the marker; keeping this DOM-level makes it usable by exporters
+/// and the preview UI without requiring an Animator.
+pub fn animation_markers(dom: &WeakDom, sequence: Ref) -> Vec<(f32, String, String)> {
+    let mut out = Vec::new();
+    let Some(seq) = dom.get_by_ref(sequence) else { return out };
+    for &kf_ref in seq.children() {
+        let Some(kf) = dom.get_by_ref(kf_ref) else { continue };
+        if kf.class.as_str() != "Keyframe" { continue; }
+        let time = match kf.properties.get(&Ustr::from("Time")) {
+            Some(Variant::Float32(v)) => *v,
+            Some(Variant::Float64(v)) => *v as f32,
+            _ => 0.0,
+        };
+        for &marker_ref in kf.children() {
+            let Some(marker) = dom.get_by_ref(marker_ref) else { continue };
+            if marker.class.as_str() == "KeyframeMarker" {
+                let value = match marker.properties.get(&Ustr::from("Value")) {
+                    Some(Variant::String(v)) => v.clone(), _ => String::new(),
+                };
+                out.push((time, marker.name.clone(), value));
+            }
+        }
+    }
+    out.sort_by(|a,b| a.0.total_cmp(&b.0));
+    out
+}
+
 pub fn get_source(dom: &WeakDom, referent: Ref) -> Option<String> {
     let inst = dom.get_by_ref(referent)?;
     let prop = inst.properties.get(&Ustr::from("Source"))?;

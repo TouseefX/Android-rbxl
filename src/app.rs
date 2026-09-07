@@ -247,6 +247,8 @@ pub struct EditorApp {
     // the user notified) once its fetch finishes, instead of making them press
     // Play a second time.
     pending_play_audio: Option<String>,
+    /// Bytes waiting for the Android SAF create-document result (model export).
+    pending_document_bytes: Option<(Vec<u8>, String)>,
 }
 
 impl Default for EditorApp {
@@ -328,6 +330,7 @@ impl Default for EditorApp {
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
+            pending_document_bytes: None,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
         app.log_info(&format!(
@@ -2674,7 +2677,12 @@ ui.label("Place ID:");
                 }
                 FileEvent::Created { uri } => {
                     self.current_uri = Some(uri);
-                    self.save();
+                    if let Some((bytes, label)) = self.pending_document_bytes.take() {
+                        jni_bridge::trigger_save(&bytes);
+                        self.status = format!("Saving {label} as .rbxm…");
+                    } else {
+                        self.save();
+                    }
                 }
                 FileEvent::SaveComplete(ok) => {
                     self.status = if ok { "Saved place successfully".into() } else { "Save failed".into() };
@@ -3650,6 +3658,22 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         }
     }
 
+    fn export_selected_rbxm(&mut self) {
+        let (Some(dom), Some(selected)) = (&self.dom, self.selected) else {
+            self.status = "Select a folder, item, script, or animation first".into();
+            return;
+        };
+        match rbxl::export_subtree_rbxm(dom, selected) {
+            Ok(bytes) => {
+                let name = dom.get_by_ref(selected).map(|i| i.name.clone()).unwrap_or_else(|| "model".into());
+                self.pending_document_bytes = Some((bytes, name.clone()));
+                jni_bridge::trigger_create_document(&format!("{name}.rbxm"));
+                self.status = format!("Choose where to save {name}.rbxm");
+            }
+            Err(e) => self.status = format!("RBXM export failed: {e}"),
+        }
+    }
+
     fn save_as(&mut self) {
         if self.dom.is_none() {
             self.status = "No place file open to save".into();
@@ -3868,6 +3892,9 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             if ui.button("➕ Insert Pose").clicked() {
                 self.insert_class("Pose", "Pose");
             }
+            if ui.button("💾 Export selected as .rbxm").clicked() {
+                self.export_selected_rbxm();
+            }
         });
         ui.label(
             RichText::new(
@@ -3877,6 +3904,15 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             )
             .weak(),
         );
+        if let (Some(dom), Some(sequence)) = (&self.dom, self.selected) {
+            if dom.get_by_ref(sequence).map(|i| i.class.as_str() == "KeyframeSequence").unwrap_or(false) {
+                let markers = rbxl::animation_markers(dom, sequence);
+                ui.collapsing(format!("🔖 Markers ({})", markers.len()), |ui| {
+                    if markers.is_empty() { ui.label("No KeyframeMarker objects found. Add them under a Keyframe and set Value."); }
+                    for (time, name, value) in markers { ui.label(format!("{time:.3}s  {name}: {value}")); }
+                });
+            }
+        }
 
         ui.separator();
         ui.label(
@@ -4097,6 +4133,16 @@ local function play()
 	local anim = Instance.new("Animation")
 	anim.AnimationId = "rbxassetid://{id}"
 	local track = animator:LoadAnimation(anim)
+	-- KeyframeMarker events are emitted by the AnimationTrack while it plays.
+	-- This lets exported KeyframeSequences drive gameplay/audio/UI cues.
+	track.KeyframeReached:Connect(function(markerName)
+		print("Animation marker:", markerName, "at", track.TimePosition)
+	end)
+	for _, markerName in ipairs({{"Footstep", "Hit", "Sound"}}) do
+		track:GetMarkerReachedSignal(markerName):Connect(function(value)
+			print("Marker", markerName, value or "")
+		end)
+	end
 	track:Play()
 end
 
