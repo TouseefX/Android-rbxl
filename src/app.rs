@@ -102,6 +102,9 @@ pub struct OpenScriptTab {
     pub highlighted_font_size: f32,
     pub highlighted_search: Option<String>,
     pub highlighted_job: egui::text::LayoutJob,
+    /// Expensive compiler/semantic passes run after typing pauses.
+    pub analysis_pending_buffer: String,
+    pub analysis_requested_at: Option<std::time::Instant>,
 }
 
 pub struct OutputLog {
@@ -1449,6 +1452,8 @@ ui.label("Place ID:");
             highlighted_font_size: self.font_size,
             highlighted_search: None,
             highlighted_job,
+            analysis_pending_buffer: source.clone(),
+            analysis_requested_at: None,
             analyzed_buffer: source,
             diagnostics,
         });
@@ -1515,15 +1520,25 @@ ui.label("Place ID:");
             }
         }
 
+        {
+            let active = &mut self.open_tabs[self.active_script_idx];
+            if active.buffer != active.analysis_pending_buffer {
+                active.analysis_pending_buffer = active.buffer.clone();
+                active.analysis_requested_at = Some(std::time::Instant::now());
+            }
+        }
+
         // Cache the expensive export/dependency index. Fingerprinting still
         // notices DataModel edits and every unsaved tab, but parsing happens
         // only when those inputs actually change.
         if let Some(dom) = self.dom.as_ref() {
             let now = std::time::Instant::now();
-            let check_due = self.project_index_cache.is_none()
-                || self.project_index_checked_at.map_or(true, |last| {
+            let editor_idle = self.open_tabs[self.active_script_idx].analysis_requested_at
+                .map_or(true, |at| at.elapsed() >= std::time::Duration::from_millis(450));
+            let check_due = self.project_index_cache.is_none() || (editor_idle
+                && self.project_index_checked_at.map_or(true, |last| {
                     now.duration_since(last) >= std::time::Duration::from_millis(500)
-                });
+                }));
             if check_due {
                 self.project_index_checked_at = Some(now);
                 let fingerprint = luau_intelligence::ProjectIndex::fingerprint(
@@ -1556,7 +1571,9 @@ ui.label("Place ID:");
             active.buffer.hash(&mut hasher);
             self.project_index_fingerprint.hash(&mut hasher);
             let key = hasher.finish();
-            if key != self.project_diagnostics_key {
+            let idle = active.analysis_requested_at
+                .map_or(true, |at| at.elapsed() >= std::time::Duration::from_millis(450));
+            if key != self.project_diagnostics_key && idle {
                 self.project_diagnostics_cache = index.diagnostics(active.referent, &active.buffer);
                 self.project_diagnostics_key = key;
             }
@@ -1579,12 +1596,16 @@ ui.label("Place ID:");
         let tab_ref = tab.referent;
         let tab_name = tab.name.clone();
 
-        // Re-parse only when this tab changes; large scripts do not pay the
-        // parser cost on every rendered frame.
-        if tab.buffer != tab.analyzed_buffer {
+        // Compiler and semantic checks are intentionally debounced. Running
+        // the full Luau compiler after every Samsung IME character caused a
+        // visible frame-time spike even on high-end phones.
+        let analysis_due = tab.buffer != tab.analyzed_buffer
+            && tab.analysis_requested_at.is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(450));
+        if analysis_due {
             tab.diagnostics = lua_runtime::check_syntax(&tab.buffer, &tab_name);
             tab.semantic_diagnostics = luau_intelligence::semantic_diagnostics(&tab.buffer);
             tab.analyzed_buffer = tab.buffer.clone();
+            tab.analysis_requested_at = None;
         }
 
         ui.separator();
@@ -1791,12 +1812,10 @@ ui.label("Place ID:");
         } else {
             Some(self.find_term.trim().to_string())
         };
-        if tab.highlighted_buffer != tab.buffer
-            || tab.highlighted_font_size != font_size
-            || tab.highlighted_search != search_term
-        {
-            tab.highlighted_job = lua_syntax::highlight_luau(
-                &tab.buffer, font_size, search_term.as_deref());
+        let highlight_due = tab.highlighted_buffer != tab.buffer
+            && tab.analysis_requested_at.is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(180));
+        if highlight_due || tab.highlighted_font_size != font_size || tab.highlighted_search != search_term {
+            tab.highlighted_job = lua_syntax::highlight_luau(&tab.buffer, font_size, search_term.as_deref());
             tab.highlighted_buffer = tab.buffer.clone();
             tab.highlighted_font_size = font_size;
             tab.highlighted_search = search_term.clone();
@@ -1897,13 +1916,17 @@ ui.label("Place ID:");
                         self.font_size,
                     ));
 
-                    let search_ref = search_term.as_deref();
                     let word_wrap = self.editor_word_wrap;
                     let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, wrap: f32| {
                         let mut job = if highlighted_job.text == text_buf.as_str() {
                             highlighted_job.clone()
                         } else {
-                            lua_syntax::highlight_luau(text_buf.as_str(), font_size, search_ref)
+                            // During the short debounce window use a cheap
+                            // monochrome job; syntax colours return after idle.
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(text_buf.as_str(), 0.0, egui::TextFormat::simple(
+                                egui::FontId::monospace(font_size), Color32::from_rgb(220, 220, 220)));
+                            job
                         };
                         // TextEdit passes its available width even for code
                         // editors. Applying it unconditionally made already
@@ -1954,6 +1977,13 @@ ui.label("Place ID:");
                                 ));
                                 store_cursor = true;
                             }
+                        }
+                        if let Some(new_cursor) = collapse_duplicated_member_chain(
+                            &mut tab.buffer, range.primary.index)
+                        {
+                            reported_range = Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(new_cursor)));
+                            store_cursor = true;
                         }
                     }
                     if store_cursor {
@@ -5011,6 +5041,29 @@ play()
             .or_else(|| raw.parse::<u64>().ok())
             .unwrap_or(0)
     }
+}
+
+fn collapse_duplicated_member_chain(source: &mut String, cursor: usize) -> Option<usize> {
+    let chars: Vec<char> = source.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut start = cursor;
+    while start > 0 && (chars[start - 1].is_ascii_alphanumeric() || matches!(chars[start - 1], '_' | '.')) {
+        start -= 1;
+    }
+    let expression: String = chars[start..cursor].iter().collect();
+    let parts: Vec<&str> = expression.split('.').collect();
+    if parts.len() < 3 || parts[0].is_empty() || parts[0] != parts[1] {
+        return None;
+    }
+    let owner = parts[0];
+    let safe = matches!(owner, "game" | "workspace" | "script")
+        || owner.chars().next().is_some_and(char::is_uppercase);
+    if !safe { return None; }
+    let remove_end = start + owner.chars().count() + 1;
+    let start_byte = source.char_indices().nth(start).map_or(source.len(), |(byte, _)| byte);
+    let end_byte = source.char_indices().nth(remove_end).map_or(source.len(), |(byte, _)| byte);
+    source.replace_range(start_byte..end_byte, "");
+    Some(cursor - owner.chars().count() - 1)
 }
 
 fn format_luau_indentation(source: &str) -> String {
