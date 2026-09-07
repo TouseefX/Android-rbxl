@@ -34,6 +34,13 @@ pub struct Reference {
     pub preview: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RenameEdit {
+    pub referent: Ref,
+    pub source: String,
+    pub replacements: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
     /// Normalized DataModel path or unambiguous module name -> members.
@@ -47,8 +54,29 @@ pub struct ProjectIndex {
 
 impl ProjectIndex {
     pub fn build(dom: &WeakDom) -> Self {
+        Self::build_with_overrides(dom, std::iter::empty())
+    }
+
+    /// Build from the DataModel while preferring unsaved editor buffers.
+    pub fn build_with_overrides<'a>(
+        dom: &WeakDom,
+        overrides: impl IntoIterator<Item = (Ref, &'a str)>,
+    ) -> Self {
         let mut index = Self::default();
         index.walk(dom, dom.root_ref(), &mut Vec::new());
+        for (referent, source) in overrides {
+            index.script_sources.insert(referent, source.to_string());
+            if index.module_sources.contains_key(&referent) {
+                index.module_sources.insert(referent, source.to_string());
+                let members = exported_members(source);
+                let keys: Vec<String> = index.module_refs.iter()
+                    .filter_map(|(key, value)| (*value == referent).then_some(key.clone()))
+                    .collect();
+                for key in keys {
+                    index.modules.insert(key, members.clone());
+                }
+            }
+        }
         index
     }
 
@@ -176,6 +204,68 @@ impl ProjectIndex {
         });
         result.dedup_by(|a, b| a.referent == b.referent && a.line == b.line);
         result
+    }
+
+    /// Produce non-overlapping source updates for a resolved exported member.
+    /// Module aliases themselves are intentionally not renamed project-wide,
+    /// because each consumer owns its local alias.
+    pub fn rename_member(&self, definition: &Definition, new_name: &str) -> Vec<RenameEdit> {
+        let Some(old_name) = definition.member.as_deref() else { return Vec::new() };
+        if !is_identifier(new_name) || old_name == new_name { return Vec::new() }
+        let mut edits = Vec::new();
+        for (&script_ref, original) in &self.script_sources {
+            let mut source = original.clone();
+            let mut replacements = 0;
+
+            // Consumers can use different aliases for the same target module.
+            for (alias, request) in require_aliases(original) {
+                if self.resolve_module_ref(script_ref, &request) == Some(definition.referent) {
+                    let (updated, count) = replace_identifier_token(
+                        &source,
+                        &format!("{alias}.{old_name}"),
+                        &format!("{alias}.{new_name}"),
+                    );
+                    source = updated;
+                    replacements += count;
+                }
+            }
+
+            if script_ref == definition.referent {
+                // Rename only owners that actually define this export; a broad
+                // `.Old` replacement could corrupt unrelated objects in the
+                // same module.
+                for owner in module_member_owners(original, old_name) {
+                    let old = format!("{owner}.{old_name}");
+                    let new = format!("{owner}.{new_name}");
+                    let (updated, count) = replace_identifier_token(&source, &old, &new);
+                    source = updated;
+                    replacements += count;
+                }
+                for (old, new) in [
+                    (format!("export type {old_name}"), format!("export type {new_name}")),
+                    (format!("export function {old_name}"), format!("export function {new_name}")),
+                ] {
+                    let (updated, count) = replace_identifier_token(&source, &old, &new);
+                    source = updated;
+                    replacements += count;
+                }
+                // Returned table fields don't have a leading dot.
+                for line in original.lines() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with(&format!("{old_name} =")) {
+                        let offset = line.len() - trimmed.len();
+                        let needle = &line[..offset + old_name.len()];
+                        let replacement = format!("{}{}", &line[..offset], new_name);
+                        source = source.replacen(needle, &replacement, 1);
+                        replacements += 1;
+                    }
+                }
+            }
+            if replacements > 0 {
+                edits.push(RenameEdit { referent: script_ref, source, replacements });
+            }
+        }
+        edits
     }
 
     /// Validate string/DataModel requires and member accesses against the local
@@ -482,6 +572,41 @@ fn member_expression_at_end(source: &str) -> Option<(&str, &str)> {
         .then_some((alias, prefix))
 }
 
+fn module_member_owners(source: &str, member: &str) -> std::collections::BTreeSet<String> {
+    source.lines().filter_map(|raw| {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let declaration = code.strip_prefix("function ")
+            .or_else(|| code.strip_prefix("const function ")).unwrap_or(code);
+        let (owner, rest) = declaration.split_once('.')?;
+        (identifier_start(rest) == member && is_identifier(owner.trim()))
+            .then(|| owner.trim().to_string())
+    }).collect()
+}
+
+fn replace_identifier_token(source: &str, needle: &str, replacement: &str) -> (String, usize) {
+    let mut output = String::with_capacity(source.len());
+    let mut rest = source;
+    let mut count = 0;
+    while let Some(position) = rest.find(needle) {
+        let before = rest[..position].chars().next_back();
+        let after = rest[position + needle.len()..].chars().next();
+        let needs_left_boundary = needle.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        let needs_right_boundary = needle.chars().next_back().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        let valid = (!needs_left_boundary || !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_'))
+            && (!needs_right_boundary || !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_'));
+        output.push_str(&rest[..position]);
+        if valid {
+            output.push_str(replacement);
+            count += 1;
+        } else {
+            output.push_str(needle);
+        }
+        rest = &rest[position + needle.len()..];
+    }
+    output.push_str(rest);
+    (output, count)
+}
+
 fn contains_identifier(line: &str, needle: &str) -> bool {
     line.match_indices(needle).any(|(start, _)| {
         let before = line[..start].chars().next_back();
@@ -682,6 +807,27 @@ mod tests {
         let source = "local Inventory = {}\n\nfunction Inventory.AddItem() end\nexport type Item = string";
         assert_eq!(member_definition_line(source, "AddItem"), Some(3));
         assert_eq!(member_definition_line(source, "Item"), Some(4));
+    }
+
+    #[test]
+    fn renames_resolved_members_without_touching_similar_names() {
+        let module = Ref::new();
+        let consumer = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.paths.insert(module, "Inventory".into());
+        index.paths.insert(consumer, "Controller".into());
+        index.module_refs.insert("inventory".into(), module);
+        index.module_sources.insert(module, "function Inventory.Add() end".into());
+        index.script_sources.insert(module, "function Inventory.Add() end".into());
+        index.script_sources.insert(
+            consumer,
+            "const Items = require(\"./Inventory\")\nItems.Add()\nItems.Additional()".into(),
+        );
+        let definition = Definition { referent: module, line: 1, member: Some("Add".into()) };
+        let edits = index.rename_member(&definition, "Insert");
+        let consumer_edit = edits.iter().find(|edit| edit.referent == consumer).unwrap();
+        assert!(consumer_edit.source.contains("Items.Insert()"));
+        assert!(consumer_edit.source.contains("Items.Additional()"));
     }
 
     #[test]

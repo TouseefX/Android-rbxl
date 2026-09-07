@@ -137,6 +137,8 @@ pub struct EditorApp {
     /// Character position to apply after opening a definition in another tab.
     pending_script_cursor: Option<usize>,
     script_references: Vec<luau_intelligence::Reference>,
+    show_symbol_rename: bool,
+    symbol_rename_input: String,
 
     // Find & Replace
     find_term: String,
@@ -287,6 +289,8 @@ impl Default for EditorApp {
             script_selection: None,
             pending_script_cursor: None,
             script_references: Vec::new(),
+            show_symbol_rename: false,
+            symbol_rename_input: String::new(),
             find_term: String::new(),
             replace_term: String::new(),
             show_replace: false,
@@ -1308,7 +1312,12 @@ ui.label("Place ID:");
         // Build completion information from every ModuleScript in the local
         // DataModel, not only from currently-open tabs. Completion itself is
         // requested after TextEdit reports the real caret position.
-        let project_index = self.dom.as_ref().map(luau_intelligence::ProjectIndex::build);
+        let project_index = self.dom.as_ref().map(|dom| {
+            luau_intelligence::ProjectIndex::build_with_overrides(
+                dom,
+                self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+            )
+        });
         let project_diagnostics = project_index.as_ref().map_or_else(Vec::new, |index| {
             let active = &self.open_tabs[self.active_script_idx];
             index.diagnostics(active.referent, &active.buffer)
@@ -1378,7 +1387,27 @@ ui.label("Place ID:");
             ).clicked() {
                 find_references_requested = true;
             }
+            let can_rename = definition.as_ref().is_some_and(|value| value.member.is_some());
+            if ui.add_enabled(can_rename, egui::Button::new("✎ Rename Symbol")).clicked() {
+                self.symbol_rename_input = definition.as_ref()
+                    .and_then(|value| value.member.clone()).unwrap_or_default();
+                self.show_symbol_rename = true;
+            }
         });
+
+        let mut rename_requested = false;
+        if self.show_symbol_rename {
+            ui.horizontal(|ui| {
+                ui.label("New exported member name:");
+                ui.add(egui::TextEdit::singleline(&mut self.symbol_rename_input).desired_width(180.0));
+                if ui.button("Rename Across Project").clicked() {
+                    rename_requested = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.show_symbol_rename = false;
+                }
+            });
+        }
 
         // External Edit Sync Banner
         if self.pending_external_edits.values().any(|&r| r == tab_ref) {
@@ -1760,6 +1789,31 @@ ui.label("Place ID:");
                     }
                 }
             });
+        }
+
+        if rename_requested {
+            if let (Some(index), Some(definition)) = (project_index.as_ref(), definition.as_ref()) {
+                let new_name = self.symbol_rename_input.trim().to_string();
+                let edits = index.rename_member(definition, &new_name);
+                let replacements: usize = edits.iter().map(|edit| edit.replacements).sum();
+                for edit in edits {
+                    if let Some(open) = self.open_tabs.iter_mut()
+                        .find(|tab| tab.referent == edit.referent)
+                    {
+                        open.buffer = edit.source;
+                        open.previous_buffer = open.buffer.clone();
+                    } else if let Some(dom) = self.dom.as_mut() {
+                        let _ = rbxl::set_source(dom, edit.referent, edit.source);
+                    }
+                }
+                self.show_symbol_rename = false;
+                self.script_references.clear();
+                self.status = if replacements == 0 {
+                    "Rename made no changes; enter a valid different identifier".into()
+                } else {
+                    format!("Renamed {replacements} project reference(s) to {new_name}")
+                };
+            }
         }
 
         if find_references_requested {
