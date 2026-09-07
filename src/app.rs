@@ -1728,6 +1728,7 @@ ui.label("Place ID:");
 
         // Quick Luau Symbol Bar
         let mut focus_editor_requested = false;
+        let mut tab_completion_requested = false;
         ui.separator();
         egui::ScrollArea::horizontal()
             .id_salt("quick_symbols_editor")
@@ -1750,25 +1751,19 @@ ui.label("Place ID:");
 
                     for (label, snippet) in symbols {
                         if ui.button(label).clicked() {
-                            let completion = (label == "Tab").then(|| {
-                                self.script_completion_cursor.and_then(|cursor| {
-                                    project_index.as_ref().and_then(|index| {
-                                        index.complete_at(tab_ref, &tab.buffer, cursor)
-                                            .get(self.script_completion_selected).cloned()
-                                    })
-                                })
-                            }).flatten();
-                            let cursor = if let (Some(completion), Some(at)) =
-                                (completion, self.script_completion_cursor)
-                            {
-                                luau_intelligence::apply_suggestion_at(&mut tab.buffer, at, &completion)
+                            if label == "Tab" {
+                                // Apply after TextEdit reports this frame's real
+                                // caret. Using the previous frame's cursor put
+                                // completions before the word on Samsung IME.
+                                tab_completion_requested = true;
                             } else {
-                                insert_at_selection(&mut tab.buffer, self.script_selection, snippet)
-                            };
-                            self.pending_script_cursor = Some(cursor);
-                            self.script_completion_cursor = Some(cursor);
-                            self.script_selection = Some((cursor, cursor));
-                            focus_editor_requested = true;
+                                let cursor = insert_at_selection(
+                                    &mut tab.buffer, self.script_selection, snippet);
+                                self.pending_script_cursor = Some(cursor);
+                                self.script_completion_cursor = Some(cursor);
+                                self.script_selection = Some((cursor, cursor));
+                                focus_editor_requested = true;
+                            }
                         }
                     }
                 });
@@ -1839,15 +1834,8 @@ ui.label("Place ID:");
                     self.script_completion_dismissed_at = Some((tab_ref, cursor));
                 }
             } else if accept_tab {
-                let completion = &completions[self.script_completion_selected];
-                let new_cursor = luau_intelligence::apply_suggestion_at(
-                    &mut tab.buffer,
-                    self.script_completion_cursor.unwrap_or_default(),
-                    completion,
-                );
-                self.script_completion_cursor = Some(new_cursor);
-                self.pending_script_cursor = Some(new_cursor);
-                completions.clear();
+                // Defer until after TextEdit reports the current IME caret.
+                tab_completion_requested = true;
             }
         }
 
@@ -2057,9 +2045,25 @@ ui.label("Place ID:");
                 .unwrap_or_default()
         };
 
-        // Compact popup-style list: touch selects immediately; hardware
-        // keyboards use Up/Down and Enter/Tab, with Escape to dismiss.
-        if let Some(index) = cursor_char {
+        if tab_completion_requested {
+            let cursor = if let (Some(at), Some(completion)) = (
+                cursor_char,
+                completions.get(self.script_completion_selected).cloned(),
+            ) {
+                luau_intelligence::apply_suggestion_at(&mut tab.buffer, at, &completion)
+            } else {
+                insert_at_selection(&mut tab.buffer, self.script_selection, "\t")
+            };
+            self.pending_script_cursor = Some(cursor);
+            self.script_completion_cursor = Some(cursor);
+            self.script_selection = Some((cursor, cursor));
+            focus_editor_requested = true;
+            completions.clear();
+        }
+
+        // Compact popup-style list at the live text caret.
+        let mut clicked_completion: Option<luau_intelligence::Completion> = None;
+        if let Some(_index) = cursor_char {
             if !completions.is_empty() {
                 self.script_completion_selected =
                     self.script_completion_selected.min(completions.len() - 1);
@@ -2080,17 +2084,21 @@ ui.label("Place ID:");
                                         position == self.script_completion_selected,
                                         RichText::new(text).monospace(),
                                     ).clicked() {
-                                        let new_cursor = luau_intelligence::apply_suggestion_at(
-                                            &mut tab.buffer, index, completion);
-                                        self.script_completion_cursor = Some(new_cursor);
-                                        self.pending_script_cursor = Some(new_cursor);
-                                        self.script_completion_selected = 0;
+                                        clicked_completion = Some(completion.clone());
                                     }
                                 }
                             });
                         });
                     });
             }
+        }
+        if let (Some(completion), Some(at)) = (clicked_completion, cursor_char) {
+            let new_cursor = luau_intelligence::apply_suggestion_at(
+                &mut tab.buffer, at, &completion);
+            self.script_completion_cursor = Some(new_cursor);
+            self.pending_script_cursor = Some(new_cursor);
+            self.script_selection = Some((new_cursor, new_cursor));
+            self.script_completion_selected = 0;
         }
 
         let references = self.script_references.clone();
