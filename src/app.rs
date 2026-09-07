@@ -89,6 +89,9 @@ pub struct OpenScriptTab {
     pub class: String,
     pub buffer: String,
     pub original: String,
+    /// Previous rendered contents, used to recognize IME/hardware-key edits
+    /// for auto-indent and delimiter pairing.
+    pub previous_buffer: String,
 }
 
 pub struct OutputLog {
@@ -1225,7 +1228,8 @@ ui.label("Place ID:");
             name: inst.name.clone(),
             class: inst.class.to_string(),
             buffer: source.clone(),
-            original: source,
+            original: source.clone(),
+            previous_buffer: source,
         });
         self.active_script_idx = self.open_tabs.len() - 1;
     }
@@ -1546,16 +1550,36 @@ ui.label("Place ID:");
                         .layouter(&mut layouter)
                         .show(ui);
                     let mut reported_range = output.cursor_range;
+                    let mut store_cursor = false;
                     if let Some((anchor, primary)) = pending_selection {
-                        let range = egui::text::CCursorRange {
+                        reported_range = Some(egui::text::CCursorRange {
                             primary: egui::text::CCursor::new(primary),
                             secondary: egui::text::CCursor::new(anchor),
-                        };
-                        output.state.cursor.set_char_range(Some(range));
+                        });
+                        store_cursor = true;
+                    } else if let Some(range) = reported_range {
+                        // Pair delimiters and continue indentation only for a
+                        // collapsed caret; selected-line editing is handled by
+                        // the explicit Tab transformation above.
+                        if range.primary.index == range.secondary.index {
+                            if let Some(new_cursor) = selection_edit::enhance_typed_edit(
+                                &tab.previous_buffer,
+                                &mut tab.buffer,
+                                range.primary.index,
+                            ) {
+                                reported_range = Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(new_cursor),
+                                ));
+                                store_cursor = true;
+                            }
+                        }
+                    }
+                    if store_cursor {
+                        output.state.cursor.set_char_range(reported_range);
                         let id = output.response.id;
                         output.state.store(ui.ctx(), id);
-                        reported_range = Some(range);
                     }
+                    tab.previous_buffer = tab.buffer.clone();
                     cursor_char = reported_range.map(|range| range.primary.index);
                     self.script_selection = reported_range.map(|range| {
                         (range.secondary.index, range.primary.index)
@@ -2879,7 +2903,8 @@ ui.label("Place ID:");
                             let _ = rbxl::set_source(dom, referent, text.clone());
                             if let Some(tab) = self.open_tabs.iter_mut().find(|t| t.referent == referent) {
                                 tab.buffer = text.clone();
-                                tab.original = text;
+                                tab.original = text.clone();
+                                tab.previous_buffer = text;
                             }
                             self.status = "⚡ Synced edits from external app".into();
                             self.log_info("Synced script from external editor");

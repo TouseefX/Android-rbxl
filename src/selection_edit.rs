@@ -67,6 +67,93 @@ pub fn indent_lines(
     (new_anchor, new_primary)
 }
 
+/// Apply code-editor conveniences after TextEdit/Android IME inserted text.
+/// Returns the desired caret position when it added or skipped a delimiter.
+pub fn enhance_typed_edit(before: &str, after: &mut String, cursor: usize) -> Option<usize> {
+    let before_chars: Vec<char> = before.chars().collect();
+    let after_chars: Vec<char> = after.chars().collect();
+    // For a one-character keypress, the caret disambiguates repeated closing
+    // characters that an ordinary longest-prefix diff cannot distinguish.
+    let single_insert = if after_chars.len() == before_chars.len() + 1 && cursor > 0 {
+        let mut without = after_chars.clone();
+        let inserted = without.remove(cursor - 1);
+        (without == before_chars).then_some((cursor - 1, inserted))
+    } else {
+        None
+    };
+    let (prefix, inserted, removed) = if let Some((at, ch)) = single_insert {
+        (at, vec![ch], 0)
+    } else {
+        let mut prefix = 0;
+        while prefix < before_chars.len()
+            && prefix < after_chars.len()
+            && before_chars[prefix] == after_chars[prefix]
+        {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < before_chars.len().saturating_sub(prefix)
+            && suffix < after_chars.len().saturating_sub(prefix)
+            && before_chars[before_chars.len() - 1 - suffix]
+                == after_chars[after_chars.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        (
+            prefix,
+            after_chars[prefix..after_chars.len().saturating_sub(suffix)].to_vec(),
+            before_chars.len().saturating_sub(prefix + suffix),
+        )
+    };
+
+    // Pair a single opening delimiter without interfering with paste or
+    // replacement edits. Quotes after a backslash are intentionally ignored.
+    if removed == 0 && inserted.len() == 1 && cursor == prefix + 1 {
+        let opener = inserted[0];
+        let closer = match opener {
+            '(' => ')', '[' => ']', '{' => '}', '"' => '"', '\'' => '\'', '`' => '`',
+            _ => '\0',
+        };
+        // Typing an existing closing delimiter moves over it instead of
+        // leaving two copies. This check comes first because quotes are both
+        // opening and closing delimiters.
+        if matches!(opener, ')' | ']' | '}' | '"' | '\'' | '`')
+            && before_chars.get(prefix) == Some(&opener)
+        {
+            let start = char_to_byte(after, prefix);
+            let end = char_to_byte(after, prefix + 1);
+            after.replace_range(start..end, "");
+            return Some(cursor);
+        }
+
+        if closer != '\0' && !(matches!(opener, '"' | '\'' | '`') && prefix > 0 && after_chars[prefix - 1] == '\\') {
+            let byte = char_to_byte(after, cursor);
+            after.insert(byte, closer);
+            return Some(cursor);
+        }
+    }
+
+    // Continue the previous line's indentation after Enter. Block-opening
+    // lines receive one extra tab, matching common Luau formatting.
+    if removed == 0 && inserted == ['\n'] && cursor == prefix + 1 {
+        let line_start = before_chars[..prefix].iter().rposition(|c| *c == '\n').map_or(0, |p| p + 1);
+        let line: String = before_chars[line_start..prefix].iter().collect();
+        let indent: String = line.chars().take_while(|c| matches!(c, ' ' | '\t')).collect();
+        let trimmed = line.trim_end();
+        let opens_block = trimmed.ends_with("then") || trimmed.ends_with("do")
+            || trimmed.ends_with('{') || trimmed.ends_with('[') || trimmed.ends_with('(')
+            || trimmed.starts_with("function ") || trimmed.starts_with("local function ")
+            || trimmed.starts_with("const function ");
+        let addition = if opens_block { format!("{indent}\t") } else { indent };
+        if !addition.is_empty() {
+            let byte = char_to_byte(after, cursor);
+            after.insert_str(byte, &addition);
+            return Some(cursor + addition.chars().count());
+        }
+    }
+    None
+}
+
 fn char_to_byte(source: &str, index: usize) -> usize {
     source.char_indices().nth(index).map_or(source.len(), |(byte, _)| byte)
 }
@@ -83,6 +170,31 @@ mod tests {
         let range = indent_lines(&mut text, range.0, range.1, true);
         assert_eq!(text, "one\ntwo\nthree");
         assert_eq!(range, (1, 7));
+    }
+
+    #[test]
+    fn pairs_delimiters_and_keeps_caret_inside() {
+        let mut after = "call(".to_string();
+        assert_eq!(enhance_typed_edit("call", &mut after, 5), Some(5));
+        assert_eq!(after, "call()");
+    }
+
+    #[test]
+    fn indents_after_luau_block_openers() {
+        let mut after = "\tif ready then\n".to_string();
+        let cursor = after.chars().count();
+        assert_eq!(
+            enhance_typed_edit("\tif ready then", &mut after, cursor),
+            Some(cursor + 2)
+        );
+        assert_eq!(after, "\tif ready then\n\t\t");
+    }
+
+    #[test]
+    fn skips_an_existing_closer() {
+        let mut after = "call())".to_string();
+        assert_eq!(enhance_typed_edit("call()", &mut after, 6), Some(6));
+        assert_eq!(after, "call()");
     }
 
     #[test]
