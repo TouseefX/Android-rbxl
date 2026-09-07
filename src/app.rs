@@ -1808,10 +1808,10 @@ ui.label("Place ID:");
                         ));
                         store_cursor = true;
                     } else if let Some((anchor, primary)) = pending_selection {
-                        reported_range = Some(egui::text::CCursorRange {
-                            primary: egui::text::CCursor::new(primary),
-                            secondary: egui::text::CCursor::new(anchor),
-                        });
+                        reported_range = Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(primary),
+                            egui::text::CCursor::new(anchor),
+                        ));
                         store_cursor = true;
                     } else if let Some(range) = reported_range {
                         // Pair delimiters and continue indentation only for a
