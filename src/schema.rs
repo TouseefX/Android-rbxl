@@ -30,6 +30,27 @@ pub struct SchemaClassInfo {
     pub is_creatable: bool,
 }
 
+pub fn class_exists(class_name: &str) -> bool {
+    database().classes.contains_key(class_name)
+}
+
+pub fn class_is_service(class_name: &str) -> bool {
+    database().classes.get(class_name)
+        .is_some_and(|desc| desc.tags.contains(&rbx_reflection::ClassTag::Service))
+}
+
+pub fn class_is_creatable(class_name: &str) -> bool {
+    database().classes.get(class_name).is_some_and(|desc| {
+        !desc.tags.contains(&rbx_reflection::ClassTag::NotCreatable)
+            && !desc.tags.contains(&rbx_reflection::ClassTag::Service)
+    })
+}
+
+pub fn enum_item_exists(enum_name: &str, item_name: &str) -> Option<bool> {
+    database().enums.get(enum_name)
+        .map(|desc| desc.items.contains_key(item_name))
+}
+
 /// Search all official Roblox Engine classes from rbx_reflection_database
 pub fn search_engine_classes(query: &str) -> Vec<SchemaClassInfo> {
     let db = database();

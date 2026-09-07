@@ -1345,6 +1345,9 @@ ui.label("Place ID:");
             let active = &self.open_tabs[self.active_script_idx];
             index.diagnostics(active.referent, &active.buffer)
         });
+        let semantic_diagnostics = luau_intelligence::semantic_diagnostics(
+            &self.open_tabs[self.active_script_idx].buffer,
+        );
         let definition = project_index.as_ref().and_then(|index| {
             let active = &self.open_tabs[self.active_script_idx];
             self.script_completion_cursor.and_then(|cursor| {
@@ -1735,6 +1738,25 @@ ui.label("Place ID:");
                             ))
                             .monospace()
                             .color(Color32::from_rgb(255, 220, 145)),
+                        );
+                    }
+                });
+        }
+
+        if !semantic_diagnostics.is_empty() {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(30, 42, 55))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("◆ {} Luau / Roblox warning(s)", semantic_diagnostics.len()))
+                            .strong()
+                            .color(Color32::from_rgb(110, 195, 255)),
+                    );
+                    for diagnostic in &semantic_diagnostics {
+                        ui.label(
+                            RichText::new(format!("Line {}: {}", diagnostic.line, diagnostic.message))
+                                .monospace()
+                                .color(Color32::from_rgb(165, 215, 255)),
                         );
                     }
                 });

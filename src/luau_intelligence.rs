@@ -4,7 +4,7 @@
 //! modern string requires (`./`, `../`, and `@self`), and exposes ModuleScript
 //! members without requiring a filesystem or an external language server.
 
-use crate::rbxl;
+use crate::{rbxl, schema};
 use rbx_dom_weak::{types::Ref, WeakDom};
 use std::collections::{BTreeMap, HashMap};
 
@@ -582,6 +582,167 @@ fn has_path(
     })
 }
 
+/// Roblox-engine-aware checks layered on top of the Luau parser. Reflection is
+/// used only where it is authoritative; methods/events are not guessed.
+pub fn semantic_diagnostics(source: &str) -> Vec<ProjectDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut instance_vars: HashMap<String, String> = HashMap::new();
+    let mut const_bindings: HashMap<String, usize> = HashMap::new();
+
+    for (line_index, raw) in source.lines().enumerate() {
+        let line_number = line_index + 1;
+        let code = raw.split("--").next().unwrap_or("").trim();
+
+        if let Some(rest) = code.strip_prefix("const ") {
+            let declaration = rest.strip_prefix("function ").unwrap_or(rest);
+            let name = identifier_start(declaration);
+            if is_identifier(name) {
+                const_bindings.insert(name.to_string(), line_number);
+            }
+        } else {
+            for (name, declared_line) in &const_bindings {
+                let rest = code.strip_prefix(name.as_str()).unwrap_or("").trim_start();
+                if rest.starts_with('=') || rest.starts_with("+=") || rest.starts_with("-=")
+                    || rest.starts_with("*=") || rest.starts_with("/=") || rest.starts_with("..=")
+                {
+                    diagnostics.push(ProjectDiagnostic {
+                        line: line_number,
+                        message: format!("Cannot reassign const '{name}' declared on line {declared_line}"),
+                    });
+                }
+            }
+        }
+
+        // Catch obvious annotated-literal mismatches without pretending to be
+        // a full flow-sensitive type checker.
+        if let Some((left, rhs)) = code.split_once('=') {
+            if let Some((_, annotation)) = left.split_once(':') {
+                let expected = annotation.trim();
+                let rhs = rhs.trim();
+                let mismatch = (expected == "number" && is_string_literal(rhs))
+                    || (expected == "string" && (rhs.parse::<f64>().is_ok() || matches!(rhs, "true" | "false")))
+                    || (expected == "boolean" && !matches!(rhs, "true" | "false") && is_literal(rhs));
+                if mismatch {
+                    diagnostics.push(ProjectDiagnostic {
+                        line: line_number,
+                        message: format!("Literal does not match annotated type '{expected}'"),
+                    });
+                }
+            }
+        }
+
+        for class_name in quoted_call_arguments(code, "Instance.new(") {
+            if !schema::class_exists(class_name) {
+                diagnostics.push(ProjectDiagnostic {
+                    line: line_number,
+                    message: format!("Unknown Roblox class '{class_name}' in Instance.new"),
+                });
+            } else if !schema::class_is_creatable(class_name) {
+                diagnostics.push(ProjectDiagnostic {
+                    line: line_number,
+                    message: format!("Roblox class '{class_name}' cannot be created with Instance.new"),
+                });
+            }
+        }
+
+        for service in quoted_call_arguments(code, "GetService(") {
+            if !schema::class_exists(service) || !schema::class_is_service(service) {
+                diagnostics.push(ProjectDiagnostic {
+                    line: line_number,
+                    message: format!("Unknown Roblox service '{service}'"),
+                });
+            }
+        }
+
+        // Infer straightforward local bindings from Instance.new so property
+        // assignments can be checked against inherited reflection properties.
+        if let Some(declaration) = code.strip_prefix("local ").or_else(|| code.strip_prefix("const ")) {
+            if let Some((name, rhs)) = declaration.split_once('=') {
+                let name = name.trim();
+                if is_identifier(name) {
+                    if let Some(class_name) = quoted_call_arguments(rhs, "Instance.new(").next() {
+                        if schema::class_exists(class_name) {
+                            instance_vars.insert(name.to_string(), class_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((lhs, rhs)) = code.split_once('=') {
+            let lhs = lhs.trim();
+            if let Some((variable, property)) = lhs.split_once('.') {
+                if is_identifier(variable) && is_identifier(property) {
+                    if let Some(class_name) = instance_vars.get(variable) {
+                        match schema::resolve_property_type(class_name, property) {
+                            None => diagnostics.push(ProjectDiagnostic {
+                                line: line_number,
+                                message: format!("Unknown property '{property}' on Roblox {class_name}"),
+                            }),
+                            Some(data_type) => {
+                                let expected = format!("{data_type:?}");
+                                let rhs = rhs.trim();
+                                let mismatch = (expected.contains("Bool") && matches!(rhs, "true" | "false") == false && is_literal(rhs))
+                                    || (expected.contains("String") && !is_string_literal(rhs) && is_literal(rhs));
+                                if mismatch {
+                                    diagnostics.push(ProjectDiagnostic {
+                                        line: line_number,
+                                        message: format!("Value for {class_name}.{property} does not match {expected}"),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for token in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')) {
+            let Some(rest) = token.strip_prefix("Enum.") else { continue };
+            let mut parts = rest.split('.');
+            let Some(enum_name) = parts.next() else { continue };
+            let Some(item_name) = parts.next() else { continue };
+            match schema::enum_item_exists(enum_name, item_name) {
+                None => diagnostics.push(ProjectDiagnostic {
+                    line: line_number,
+                    message: format!("Unknown Roblox enum 'Enum.{enum_name}'"),
+                }),
+                Some(false) => diagnostics.push(ProjectDiagnostic {
+                    line: line_number,
+                    message: format!("Unknown item '{item_name}' on Enum.{enum_name}"),
+                }),
+                Some(true) => {}
+            }
+        }
+    }
+    diagnostics.sort_by_key(|diagnostic| diagnostic.line);
+    diagnostics.dedup();
+    diagnostics
+}
+
+fn quoted_call_arguments<'a>(line: &'a str, call: &str) -> impl Iterator<Item = &'a str> {
+    line.match_indices(call).filter_map(move |(position, _)| {
+        let rest = line[position + call.len()..].trim_start();
+        let quote = rest.chars().next()?;
+        if !matches!(quote, '"' | '\'') { return None }
+        let value = &rest[quote.len_utf8()..];
+        let end = value.find(quote)?;
+        Some(&value[..end])
+    })
+}
+
+fn is_string_literal(value: &str) -> bool {
+    (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''))
+        || (value.starts_with('`') && value.ends_with('`'))
+}
+
+fn is_literal(value: &str) -> bool {
+    is_string_literal(value)
+        || matches!(value, "true" | "false" | "nil")
+        || value.parse::<f64>().is_ok()
+}
+
 pub fn apply_suggestion_at(source: &mut String, cursor_char: usize, completion: &Completion) -> usize {
     let cursor_byte = char_to_byte(source, cursor_char);
     let start_char = cursor_char.saturating_sub(completion.replace_chars);
@@ -957,6 +1118,28 @@ mod tests {
         let consumer_edit = edits.iter().find(|edit| edit.referent == consumer).unwrap();
         assert!(consumer_edit.source.contains("Items.Insert()"));
         assert!(consumer_edit.source.contains("Items.Additional()"));
+    }
+
+    #[test]
+    fn reports_const_reassignment_and_literal_type_mismatch() {
+        let warnings = semantic_diagnostics(
+            "const LIMIT: number = 10\nLIMIT += 1\nlocal name: string = 42",
+        );
+        assert!(warnings.iter().any(|warning| warning.message.contains("Cannot reassign const")));
+        assert!(warnings.iter().any(|warning| warning.message.contains("annotated type 'string'")));
+    }
+
+    #[test]
+    fn reports_invalid_roblox_classes_properties_and_enums() {
+        let warnings = semantic_diagnostics(
+            "local part = Instance.new(\"DefinitelyNotAClass\")\n\
+             local real = Instance.new(\"Part\")\n\
+             real.Transparancy = 0.5\n\
+             real.Material = Enum.Material.DefinitelyNotAnItem",
+        );
+        assert!(warnings.iter().any(|warning| warning.message.contains("Unknown Roblox class")));
+        assert!(warnings.iter().any(|warning| warning.message.contains("Unknown property 'Transparancy'")));
+        assert!(warnings.iter().any(|warning| warning.message.contains("Unknown item")));
     }
 
     #[test]
