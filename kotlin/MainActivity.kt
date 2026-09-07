@@ -18,6 +18,7 @@ import android.widget.Toast
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.ViewCompat
 import com.google.androidgamesdk.GameActivity
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -73,6 +74,7 @@ class MainActivity : GameActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, true)
         hideSystemUi()
         super.onCreate(savedInstanceState)
+        installImeResizeHandling()
 
         // Allow handing a plain file:// Uri to external editor apps without
         // tripping FileUriExposedException.
@@ -92,6 +94,28 @@ class MainActivity : GameActivity() {
         // was modified in an external editor.
         checkExternalFileUpdate(false)
         syncExportedProject()
+    }
+
+    /**
+     * GameActivity owns a native SurfaceView, and on some Samsung One UI
+     * versions the normal adjustResize flag does not resize that surface.
+     * Apply the IME inset to the content FrameLayout explicitly so Bevy's
+     * drawable area ends above the keyboard instead of being covered by it.
+     */
+    private fun installImeResizeHandling() {
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+        val content = findViewById<View>(android.R.id.content) ?: window.decorView
+        ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            val keyboardVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            val bottom = if (keyboardVisible) ime.bottom else 0
+            if (view.paddingBottom != bottom) {
+                view.setPadding(view.paddingLeft, view.paddingTop, view.paddingRight, bottom)
+                view.requestLayout()
+            }
+            insets
+        }
+        ViewCompat.requestApplyInsets(content)
     }
 
     private fun hideSystemUi() {

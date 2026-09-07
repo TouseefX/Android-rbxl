@@ -70,7 +70,9 @@ android:
           orientation: "sensor"
           hardware_accelerated: true
           exported: true
-          window_soft_input_mode: "adjustResize"
+          # GameActivity's SurfaceView ignores adjustResize on some Samsung
+          # devices; MainActivity applies IME insets to the content root.
+          window_soft_input_mode: "adjustNothing"
           config_changes: "orientation|keyboardHidden|keyboard|screenSize|screenLayout|smallestScreenSize|locale|layoutDirection|fontScale|density|uiMode"
           # xbuild automatically appends:
           #   * <meta-data android:name="android.app.lib_name" value="rbxl_editor"/>
