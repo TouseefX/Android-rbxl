@@ -97,6 +97,11 @@ pub struct OpenScriptTab {
     pub diagnostics: Vec<lua_runtime::SyntaxDiagnostic>,
     /// Cached Roblox/Luau semantic warnings; recomputed only after edits.
     pub semantic_diagnostics: Vec<luau_intelligence::ProjectDiagnostic>,
+    /// Cached syntax highlighting; font layout may run each frame, tokenizing does not.
+    pub highlighted_buffer: String,
+    pub highlighted_font_size: f32,
+    pub highlighted_search: Option<String>,
+    pub highlighted_job: egui::text::LayoutJob,
 }
 
 pub struct OutputLog {
@@ -171,6 +176,7 @@ pub struct EditorApp {
     quick_open_query: String,
     show_workspace_symbols: bool,
     workspace_symbol_query: String,
+    workspace_symbol_catalog: Vec<luau_intelligence::WorkspaceSymbol>,
 
     // Live Roblox Catalog & Creator Store State
     live_search_input: String,
@@ -335,6 +341,7 @@ impl Default for EditorApp {
             quick_open_query: String::new(),
             show_workspace_symbols: false,
             workspace_symbol_query: String::new(),
+            workspace_symbol_catalog: Vec::new(),
             live_search_input: "sword".into(),
             live_catalog_items: Vec::new(),
             catalog_thumbnails: HashMap::new(),
@@ -781,11 +788,24 @@ impl EditorApp {
         }
 
         if self.show_workspace_symbols {
-            let symbols = self.dom.as_ref().map(|dom| {
-                luau_intelligence::ProjectIndex::build_with_overrides(
-                    dom, self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
-                ).workspace_symbols(&self.workspace_symbol_query)
-            }).unwrap_or_default();
+            if self.workspace_symbol_catalog.is_empty() {
+                if self.project_index_cache.is_none() {
+                    if let Some(dom) = &self.dom {
+                        self.project_index_cache = Some(std::sync::Arc::new(
+                            luau_intelligence::ProjectIndex::build_with_overrides(
+                                dom, self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                            ),
+                        ));
+                    }
+                }
+                if let Some(index) = &self.project_index_cache {
+                    self.workspace_symbol_catalog = index.all_workspace_symbols();
+                }
+            }
+            let symbols = luau_intelligence::ProjectIndex::filter_workspace_symbols(
+                &self.workspace_symbol_catalog,
+                &self.workspace_symbol_query,
+            );
             let mut open = self.show_workspace_symbols;
             egui::Window::new("⌕ Workspace Symbols")
                 .open(&mut open).collapsible(false).default_width(620.0)
@@ -1396,6 +1416,7 @@ ui.label("Place ID:");
 
         let source = rbxl::get_source(dom, referent).unwrap_or_default();
         let diagnostics = lua_runtime::check_syntax(&source, &inst.name);
+        let highlighted_job = lua_syntax::highlight_luau(&source, self.font_size, None);
         self.open_tabs.push(OpenScriptTab {
             referent,
             name: inst.name.clone(),
@@ -1404,6 +1425,10 @@ ui.label("Place ID:");
             original: source.clone(),
             previous_buffer: source.clone(),
             semantic_diagnostics: luau_intelligence::semantic_diagnostics(&source),
+            highlighted_buffer: source.clone(),
+            highlighted_font_size: self.font_size,
+            highlighted_search: None,
+            highlighted_job,
             analyzed_buffer: source,
             diagnostics,
         });
@@ -1493,6 +1518,7 @@ ui.label("Place ID:");
                         self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
                     );
                     self.project_index_cache = Some(std::sync::Arc::new(rebuilt));
+                    self.workspace_symbol_catalog.clear();
                     self.project_index_fingerprint = fingerprint;
                     self.project_index_rebuilds += 1;
                 }
@@ -1715,6 +1741,17 @@ ui.label("Place ID:");
         } else {
             Some(self.find_term.trim().to_string())
         };
+        if tab.highlighted_buffer != tab.buffer
+            || tab.highlighted_font_size != font_size
+            || tab.highlighted_search != search_term
+        {
+            tab.highlighted_job = lua_syntax::highlight_luau(
+                &tab.buffer, font_size, search_term.as_deref());
+            tab.highlighted_buffer = tab.buffer.clone();
+            tab.highlighted_font_size = font_size;
+            tab.highlighted_search = search_term.clone();
+        }
+        let highlighted_job = tab.highlighted_job.clone();
 
         // Use the caret reported by the previous text pass to intercept
         // completion-navigation keys before TextEdit treats them as cursor
@@ -1819,9 +1856,14 @@ ui.label("Place ID:");
                     ));
 
                     let search_ref = search_term.as_deref();
-                    let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, _wrap: f32| {
-                        let job = lua_syntax::highlight_luau(text_buf.as_str(), font_size, search_ref);
-                        ui.fonts_mut(|f| f.layout_job(job))
+                    let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, wrap: f32| {
+                        let mut job = if highlighted_job.text == text_buf.as_str() {
+                            highlighted_job.clone()
+                        } else {
+                            lua_syntax::highlight_luau(text_buf.as_str(), font_size, search_ref)
+                        };
+                        job.wrap.max_width = wrap;
+                        ui.fonts_mut(|fonts| fonts.layout_job(job))
                     };
 
                     let mut output = egui::TextEdit::multiline(&mut tab.buffer)
@@ -3364,6 +3406,7 @@ ui.label("Place ID:");
                                     }
                                 }
                                 self.project_index_cache = None;
+                                self.workspace_symbol_catalog.clear();
                                 self.status = format!("Synced {count} project script(s) from Android editor");
                             }
                             Err(error) => self.log_error(format!("Project sync failed: {error}")),

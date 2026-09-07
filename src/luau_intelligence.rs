@@ -164,23 +164,32 @@ impl ProjectIndex {
         }
     }
 
-    /// Search exported module functions, fields, and types across the workspace.
-    pub fn workspace_symbols(&self, query: &str) -> Vec<WorkspaceSymbol> {
-        let query = query.trim().to_ascii_lowercase();
+    /// Parse the workspace symbol catalog once. UI filtering should reuse this
+    /// list rather than reparsing every large script on every rendered frame.
+    pub fn all_workspace_symbols(&self) -> Vec<WorkspaceSymbol> {
         let mut result = Vec::new();
         for (&referent, source) in &self.script_sources {
             let path = self.paths.get(&referent).cloned().unwrap_or_default();
             for (name, detail, line) in source_symbols(source) {
-                let haystack = format!("{name} {detail} {path}").to_ascii_lowercase();
-                if query.is_empty() || fuzzy_match(&haystack, &query) {
-                    result.push(WorkspaceSymbol { name, detail, path: path.clone(), referent, line });
-                }
+                result.push(WorkspaceSymbol { name, detail, path: path.clone(), referent, line });
             }
         }
+        result.sort_by_key(|item| (item.name.to_ascii_lowercase(), item.path.to_ascii_lowercase()));
+        result
+    }
+
+    pub fn filter_workspace_symbols(catalog: &[WorkspaceSymbol], query: &str) -> Vec<WorkspaceSymbol> {
+        let query = query.trim().to_ascii_lowercase();
+        let mut result: Vec<_> = catalog.iter().filter(|item| {
+            query.is_empty() || fuzzy_match(
+                &format!("{} {} {}", item.name, item.detail, item.path).to_ascii_lowercase(),
+                &query,
+            )
+        }).cloned().collect();
         result.sort_by_key(|item| {
             let name = item.name.to_ascii_lowercase();
             let rank = if query.is_empty() { 2 } else if name == query { 0 } else if name.starts_with(&query) { 1 } else { 2 };
-            (rank, item.name.to_ascii_lowercase(), item.path.to_ascii_lowercase())
+            (rank, name, item.path.to_ascii_lowercase())
         });
         result.truncate(100);
         result
@@ -221,7 +230,31 @@ impl ProjectIndex {
                 }
             }
         }
-        lexical_completions(&source[..cursor_byte])
+        let before_cursor = &source[..cursor_byte];
+        let mut completions = lexical_completions(before_cursor);
+        let prefix = identifier_fragment(before_cursor);
+        if prefix.len() >= 2 {
+            let lower = prefix.to_ascii_lowercase();
+            let mut seen: std::collections::HashSet<String> =
+                completions.iter().map(|item| item.label.to_ascii_lowercase()).collect();
+            for (&referent, path) in &self.paths {
+                if !self.module_sources.contains_key(&referent) { continue; }
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let candidate = name.to_ascii_lowercase();
+                if (candidate.starts_with(&lower) || (lower.len() >= 3 && common_prefix_len(&candidate, &lower) >= 2))
+                    && seen.insert(candidate)
+                {
+                    completions.push(Completion {
+                        label: name.to_string(),
+                        detail: format!("ModuleScript · {path}"),
+                        insert_text: name.to_string(),
+                        replace_chars: prefix.chars().count(),
+                    });
+                }
+            }
+        }
+        completions.truncate(12);
+        completions
     }
 
     fn complete_require_path(&self, current_script: Ref, typed: &str) -> Vec<Completion> {
@@ -861,10 +894,17 @@ fn require_path(expression: &str) -> String {
         .replace("\")", "").replace('.', "/")
 }
 
+fn identifier_fragment(source_before_cursor: &str) -> &str {
+    source_before_cursor.rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next().unwrap_or("")
+}
+
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    left.chars().zip(right.chars()).take_while(|(a, b)| a == b).count()
+}
+
 fn lexical_completions(source_before_cursor: &str) -> Vec<Completion> {
-    let prefix = source_before_cursor
-        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .next().unwrap_or("");
+    let prefix = identifier_fragment(source_before_cursor);
     if prefix.len() < 2 { return Vec::new(); }
     let lower = prefix.to_ascii_lowercase();
     const ITEMS: &[(&str, &str, &str)] = &[
@@ -892,6 +932,9 @@ fn lexical_completions(source_before_cursor: &str) -> Vec<Completion> {
         ("false", "boolean", "false"),
         ("nil", "nil value", "nil"),
         ("require", "Load a ModuleScript", "require()"),
+        ("ModuleScript", "Roblox module container class", "ModuleScript"),
+        ("Script", "Roblox server script class", "Script"),
+        ("LocalScript", "Roblox client script class", "LocalScript"),
         ("game", "Roblox DataModel", "game"),
         ("workspace", "Roblox Workspace", "workspace"),
         ("script", "Current Roblox script", "script"),
