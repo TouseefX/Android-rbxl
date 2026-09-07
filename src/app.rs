@@ -153,6 +153,11 @@ pub struct EditorApp {
     // UI state
     explorer_search: String,
     font_size: f32,
+    compact_toolbar: bool,
+    show_tablet_explorer: bool,
+    explorer_width: f32,
+    editor_word_wrap: bool,
+    editor_focus_mode: bool,
     show_stats: bool,
     rename_buffer: String,
     project_name: String,
@@ -308,7 +313,12 @@ impl Default for EditorApp {
             replace_term: String::new(),
             show_replace: false,
             explorer_search: String::new(),
-            font_size: 14.0,
+            font_size: saved_settings.editor_font_size.clamp(10.0, 32.0),
+            compact_toolbar: saved_settings.compact_toolbar,
+            show_tablet_explorer: saved_settings.show_tablet_explorer,
+            explorer_width: saved_settings.explorer_width.clamp(180.0, 520.0),
+            editor_word_wrap: saved_settings.editor_word_wrap,
+            editor_focus_mode: false,
             show_stats: false,
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
@@ -486,6 +496,9 @@ impl EditorApp {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::O)) {
             self.show_workspace_symbols = true;
         }
+        if self.editor_focus_mode && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.editor_focus_mode = false;
+        }
         // Keep egui's internal clipboard in sync with the Android system
         // clipboard. arboard (egui's default backend) doesn't work on
         // Android, and there's no native EditText long-press menu, so we
@@ -503,6 +516,7 @@ impl EditorApp {
         });
 
         let style = ctx.style();
+        let compact = self.compact_toolbar || ctx.available_rect().width() < 720.0;
 
         let top_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
             top: 48,
@@ -511,7 +525,8 @@ impl EditorApp {
             right: 10,
         });
 
-        // Top Studio Toolbar
+        // Top Studio Toolbar. Focus mode gives the editor every available row.
+        if !self.editor_focus_mode {
         egui::TopBottomPanel::top("toolbar")
             .frame(top_frame)
             .show(ctx, |ui| {
@@ -519,7 +534,9 @@ impl EditorApp {
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
 
-                    ui.label(RichText::new("v3.2-B8 • OpenRBLX • Bevy").strong().color(Color32::from_rgb(0, 230, 255)));
+                    if !compact {
+                        ui.label(RichText::new("v3.2-B8 • OpenRBLX • Bevy").strong().color(Color32::from_rgb(0, 230, 255)));
+                    }
 
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();
@@ -527,16 +544,18 @@ impl EditorApp {
                     // Open a place directly from Roblox by place ID using the
                     // cookie-authenticated web client. Downloads the .rbxl then
                     // loads it exactly like a local file open.
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.open_place_id_input)
-                            .hint_text("place ID")
-                            .desired_width(90.0),
-                    );
-                    if ui.button("🌐 Open from Roblox").clicked() {
-                        self.open_place_from_roblox();
-                    }
-                    if ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
-                        self.prompt_import_local_model();
+                    if !compact {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.open_place_id_input)
+                                .hint_text("place ID")
+                                .desired_width(90.0),
+                        );
+                        if ui.button("🌐 Open from Roblox").clicked() {
+                            self.open_place_from_roblox();
+                        }
+                        if ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
+                            self.prompt_import_local_model();
+                        }
                     }
                     if ui.button(RichText::new("💾 Save").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
                         self.save();
@@ -550,11 +569,13 @@ impl EditorApp {
                     if ui.button("⌕ Symbols").clicked() {
                         self.show_workspace_symbols = true;
                     }
-                    if ui.button(RichText::new("🚀 Publish to Roblox").color(Color32::from_rgb(255, 180, 80))).clicked() {
-                        self.publish_place_to_roblox();
-                    }
-                    if ui.button("📊 Stats").clicked() {
-                        self.show_stats = !self.show_stats;
+                    if !compact {
+                        if ui.button(RichText::new("🚀 Publish to Roblox").color(Color32::from_rgb(255, 180, 80))).clicked() {
+                            self.publish_place_to_roblox();
+                        }
+                        if ui.button("📊 Stats").clicked() {
+                            self.show_stats = !self.show_stats;
+                        }
                     }
                     if ui.button(format!("🖥️ Output ({})", self.output_logs.len())).clicked() {
                         self.active_tab = ActiveTab::Output;
@@ -577,9 +598,11 @@ impl EditorApp {
                     }
                 }
             });
+        }
 
-        // Studio Navigation Tabs Bar
-        let is_landscape = ctx.available_rect().width() > 650.0;
+        // Phones use thumb-reachable bottom navigation; tablets keep a top
+        // tab strip plus the resizable Explorer workspace sidebar.
+        let is_tablet = ctx.available_rect().width() > 720.0;
 
         let nav_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
             top: 4,
@@ -588,8 +611,13 @@ impl EditorApp {
             right: 10,
         });
 
-        egui::TopBottomPanel::top("nav_tabs")
-            .frame(nav_frame)
+        if !self.editor_focus_mode {
+        let nav_panel = if is_tablet {
+            egui::TopBottomPanel::top("nav_tabs")
+        } else {
+            egui::TopBottomPanel::bottom("nav_tabs")
+        };
+        nav_panel.frame(nav_frame)
             .show(ctx, |ui| {
                 egui::ScrollArea::horizontal()
                     .id_salt("nav_tabs_scroll")
@@ -628,13 +656,16 @@ impl EditorApp {
                         });
                     });
             });
+        }
 
-        // Landscape: Explorer on the left.
-        if is_landscape {
+        // Tablet workspace: persistent, resizable Explorer beside the editor.
+        if is_tablet && self.show_tablet_explorer && !self.editor_focus_mode {
             egui::SidePanel::left("landscape_left")
                 .resizable(true)
-                .default_width(280.0)
+                .default_width(self.explorer_width)
+                .width_range(180.0..=520.0)
                 .show(ctx, |ui| {
+                    self.explorer_width = ui.max_rect().width();
                     self.show_explorer_ui(ui);
                 });
         }
@@ -697,6 +728,13 @@ impl EditorApp {
 
 impl EditorApp {
     fn show_project_navigation(&mut self, ctx: &egui::Context) {
+        if self.editor_focus_mode {
+            egui::Area::new(egui::Id::new("focus_mode_exit"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 52.0))
+                .show(ctx, |ui| {
+                    if ui.button("↙ Exit Focus").clicked() { self.editor_focus_mode = false; }
+                });
+        }
         let mut jump: Option<(Ref, usize)> = None;
         if self.show_quick_open {
             let mut scripts = Vec::new();
@@ -1492,6 +1530,10 @@ ui.label("Place ID:");
                 ui.label(RichText::new("✓ Up to date").color(Color32::from_rgb(120, 200, 120)));
             }
 
+            if ui.button(if self.editor_focus_mode { "↙ Exit Focus" } else { "⛶ Focus" }).clicked() {
+                self.editor_focus_mode = !self.editor_focus_mode;
+            }
+
             if ui.button("📱 Edit in External App").clicked() {
                 let id = self.next_external_id;
                 self.next_external_id += 1;
@@ -1753,7 +1795,7 @@ ui.label("Place ID:");
                         .id_source("script_multiline_view")
                         .font(egui::FontId::monospace(self.font_size))
                         .code_editor()
-                        .desired_width(f32::INFINITY)
+                        .desired_width(if self.editor_word_wrap { ui.available_width().max(240.0) } else { f32::INFINITY })
                         .desired_rows(28)
                         .lock_focus(true)
                         .layouter(&mut layouter)
@@ -4208,6 +4250,26 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 ui.label(RichText::new("🌍 3D Viewing: opens in the separate \"rbxl Viewer\" GPU app (Bevy / OpenRBLX renderer) via the View tab.").weak());
 
                 ui.add_space(12.0);
+                ui.group(|ui| {
+                    ui.label(RichText::new("📱 Adaptive editor layout").heading().color(Color32::from_rgb(100, 200, 255)));
+                    ui.label("Phones use a bottom navigation bar. Tablets use top tabs and an optional resizable Explorer sidebar.");
+                    ui.add(egui::Slider::new(&mut self.font_size, 10.0..=32.0).text("Editor font size"));
+                    ui.checkbox(&mut self.editor_word_wrap, "Wrap long editor lines");
+                    ui.checkbox(&mut self.compact_toolbar, "Always use compact toolbar");
+                    ui.checkbox(&mut self.show_tablet_explorer, "Show Explorer sidebar on tablets");
+                    ui.add_enabled(self.show_tablet_explorer,
+                        egui::Slider::new(&mut self.explorer_width, 180.0..=520.0).text("Explorer width"));
+                    if ui.button("Reset layout defaults").clicked() {
+                        self.font_size = 14.0;
+                        self.editor_word_wrap = false;
+                        self.compact_toolbar = false;
+                        self.show_tablet_explorer = true;
+                        self.explorer_width = 280.0;
+                        self.editor_focus_mode = false;
+                    }
+                });
+
+                ui.add_space(12.0);
 
                 // Save & Action Buttons
                 ui.horizontal_wrapped(|ui| {
@@ -4219,6 +4281,11 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             open_cloud_place_id: self.open_cloud_place_id.clone(),
                             auto_download_meshes: true,
                             show_skybox: true,
+                            editor_font_size: self.font_size,
+                            compact_toolbar: self.compact_toolbar,
+                            show_tablet_explorer: self.show_tablet_explorer,
+                            explorer_width: self.explorer_width,
+                            editor_word_wrap: self.editor_word_wrap,
                         };
 
                         match settings_to_save.save() {
@@ -4238,7 +4305,15 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                         self.open_cloud_api_key.clear();
                         self.open_cloud_universe_id.clear();
                         self.open_cloud_place_id.clear();
-                        let _ = EditorSettings::default().save();
+                        let cleared = EditorSettings {
+                            editor_font_size: self.font_size,
+                            compact_toolbar: self.compact_toolbar,
+                            show_tablet_explorer: self.show_tablet_explorer,
+                            explorer_width: self.explorer_width,
+                            editor_word_wrap: self.editor_word_wrap,
+                            ..EditorSettings::default()
+                        };
+                        let _ = cleared.save();
                         self.status = "Cleared saved credentials".into();
                     }
                 });
