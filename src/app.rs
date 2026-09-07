@@ -1633,6 +1633,14 @@ ui.label("Place ID:");
                 tab.previous_buffer = tab.buffer.clone();
                 self.status = format!("Formatted {}", tab_name);
             }
+            if ui.selectable_label(self.editor_word_wrap, "↩ Wrap").clicked() {
+                self.editor_word_wrap = !self.editor_word_wrap;
+                self.status = if self.editor_word_wrap {
+                    "Editor line wrapping enabled".into()
+                } else {
+                    "Editor line wrapping disabled — source lines stay on one visual line".into()
+                };
+            }
             if ui.button("🔍 Find & Replace").clicked() {
                 self.show_replace = !self.show_replace;
             }
@@ -1890,13 +1898,18 @@ ui.label("Place ID:");
                     ));
 
                     let search_ref = search_term.as_deref();
+                    let word_wrap = self.editor_word_wrap;
                     let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, wrap: f32| {
                         let mut job = if highlighted_job.text == text_buf.as_str() {
                             highlighted_job.clone()
                         } else {
                             lua_syntax::highlight_luau(text_buf.as_str(), font_size, search_ref)
                         };
-                        job.wrap.max_width = wrap;
+                        // TextEdit passes its available width even for code
+                        // editors. Applying it unconditionally made already
+                        // formatted Luau visually reflow like a plain text file.
+                        job.wrap.max_width = if word_wrap { wrap } else { f32::INFINITY };
+                        job.wrap.break_anywhere = false;
                         ui.fonts_mut(|fonts| fonts.layout_job(job))
                     };
 
