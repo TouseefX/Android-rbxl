@@ -1551,10 +1551,10 @@ ui.label("Place ID:");
                 }
             } else if accept_tab || accept_enter {
                 let completion = &completions[self.script_completion_selected];
-                let new_cursor = luau_intelligence::apply_completion_at(
+                let new_cursor = luau_intelligence::apply_suggestion_at(
                     &mut tab.buffer,
                     self.script_completion_cursor.unwrap_or_default(),
-                    &completion.label,
+                    completion,
                 );
                 self.script_completion_cursor = Some(new_cursor);
                 completions.clear();
@@ -1751,10 +1751,10 @@ ui.label("Place ID:");
                             position == self.script_completion_selected,
                             RichText::new(text).monospace(),
                         ).clicked() {
-                            let new_cursor = luau_intelligence::apply_completion_at(
+                            let new_cursor = luau_intelligence::apply_suggestion_at(
                                 &mut tab.buffer,
                                 index,
-                                &completion.label,
+                                completion,
                             );
                             self.script_completion_cursor = Some(new_cursor);
                             self.script_completion_selected = 0;

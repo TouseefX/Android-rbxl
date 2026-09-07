@@ -12,6 +12,9 @@ use std::collections::{BTreeMap, HashMap};
 pub struct Completion {
     pub label: String,
     pub detail: String,
+    /// Text inserted when accepted and characters replaced before the caret.
+    pub insert_text: String,
+    pub replace_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +129,9 @@ impl ProjectIndex {
         cursor_char: usize,
     ) -> Vec<Completion> {
         let cursor_byte = char_to_byte(source, cursor_char);
+        if let Some(typed) = require_string_at_cursor(&source[..cursor_byte]) {
+            return self.complete_require_path(current_script, typed);
+        }
         let Some((alias, prefix)) = member_expression_at_end(&source[..cursor_byte]) else {
             return Vec::new();
         };
@@ -144,8 +150,53 @@ impl ProjectIndex {
             .map(|(member, signature)| Completion {
                 label: member.clone(),
                 detail: format!("{signature}  ·  {request} → {resolved}"),
+                insert_text: member.clone(),
+                replace_chars: prefix.chars().count(),
             })
             .collect()
+    }
+
+    fn complete_require_path(&self, current_script: Ref, typed: &str) -> Vec<Completion> {
+        let current = self.paths.get(&current_script).map(String::as_str).unwrap_or("");
+        let parent = current.rsplit_once('/').map_or("", |(path, _)| path);
+        let mut candidates = std::collections::BTreeSet::new();
+
+        if typed.is_empty() {
+            return ["./", "../", "@self/"]
+                .into_iter()
+                .map(|prefix| Completion {
+                    label: prefix.into(),
+                    detail: "Luau require path prefix".into(),
+                    insert_text: prefix.into(),
+                    replace_chars: 0,
+                })
+                .collect();
+        }
+        for (&referent, path) in &self.paths {
+            if !self.module_sources.contains_key(&referent) || referent == current_script {
+                continue;
+            }
+            let candidate = if typed.starts_with("@self/") {
+                path.strip_prefix(&format!("{current}/"))
+                    .map(|rest| format!("@self/{rest}"))
+            } else if typed.starts_with('@') {
+                Some(format!("@{path}"))
+            } else {
+                Some(relative_module_path(parent, path))
+            };
+            if let Some(candidate) = candidate {
+                if candidate.to_ascii_lowercase().starts_with(&typed.to_ascii_lowercase()) {
+                    candidates.insert(candidate);
+                }
+            }
+        }
+
+        candidates.into_iter().take(12).map(|path| Completion {
+            label: path.clone(),
+            detail: "ModuleScript path".into(),
+            insert_text: path,
+            replace_chars: typed.chars().count(),
+        }).collect()
     }
 
     /// Resolve the module member under the caret to its defining ModuleScript
@@ -496,6 +547,14 @@ fn has_path(
     })
 }
 
+pub fn apply_suggestion_at(source: &mut String, cursor_char: usize, completion: &Completion) -> usize {
+    let cursor_byte = char_to_byte(source, cursor_char);
+    let start_char = cursor_char.saturating_sub(completion.replace_chars);
+    let start_byte = char_to_byte(source, start_char);
+    source.replace_range(start_byte..cursor_byte, &completion.insert_text);
+    start_char + completion.insert_text.chars().count()
+}
+
 pub fn apply_completion_at(source: &mut String, cursor_char: usize, member: &str) -> usize {
     let cursor_byte = char_to_byte(source, cursor_char);
     let prefix_bytes = source[..cursor_byte]
@@ -615,6 +674,25 @@ fn contains_identifier(line: &str, needle: &str) -> bool {
         !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
             && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
     })
+}
+
+fn require_string_at_cursor(source_before_cursor: &str) -> Option<&str> {
+    let quote = source_before_cursor.rfind(|c| c == '"' || c == '\'')?;
+    let before_quote = source_before_cursor[..quote].trim_end();
+    if !before_quote.ends_with("require(") {
+        return None;
+    }
+    Some(&source_before_cursor[quote + 1..])
+}
+
+fn relative_module_path(from_dir: &str, target: &str) -> String {
+    let from: Vec<&str> = from_dir.split('/').filter(|part| !part.is_empty()).collect();
+    let to: Vec<&str> = target.split('/').filter(|part| !part.is_empty()).collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut parts = vec![".."; from.len().saturating_sub(common)];
+    parts.extend_from_slice(&to[common..]);
+    let path = parts.join("/");
+    if path.starts_with("../") || path == ".." { path } else { format!("./{path}") }
 }
 
 fn member_expression_at_cursor(source: &str, cursor_char: usize) -> Option<&str> {
@@ -745,6 +823,22 @@ mod tests {
     #[test]
     fn collapses_relative_paths() {
         assert_eq!(collapse_path("ReplicatedStorage/Package/Sub/../Inventory"), "ReplicatedStorage/Package/Inventory");
+    }
+
+    #[test]
+    fn completes_and_applies_require_paths() {
+        assert_eq!(require_string_at_cursor("const X = require(\"../Inv"), Some("../Inv"));
+        assert_eq!(relative_module_path("Game/Controllers", "Game/Inventory"), "../Inventory");
+        let mut source = "require(\"../Inv\")".to_string();
+        let cursor = "require(\"../Inv".chars().count();
+        let completion = Completion {
+            label: "../Inventory".into(),
+            detail: String::new(),
+            insert_text: "../Inventory".into(),
+            replace_chars: "../Inv".chars().count(),
+        };
+        apply_suggestion_at(&mut source, cursor, &completion);
+        assert_eq!(source, "require(\"../Inventory\")");
     }
 
     #[test]
