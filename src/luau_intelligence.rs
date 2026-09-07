@@ -6,7 +6,7 @@
 
 use crate::rbxl;
 use rbx_dom_weak::{types::Ref, WeakDom};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
@@ -17,7 +17,7 @@ pub struct Completion {
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
     /// Normalized DataModel path or unambiguous module name -> members.
-    modules: HashMap<String, BTreeSet<String>>,
+    modules: HashMap<String, BTreeMap<String, String>>,
     /// Every script's slash-separated virtual path in the DataModel.
     paths: HashMap<Ref, String>,
 }
@@ -73,11 +73,11 @@ impl ProjectIndex {
         let Some(members) = members else { return Vec::new() };
         members
             .iter()
-            .filter(|member| member.starts_with(prefix))
+            .filter(|(member, _)| member.starts_with(prefix))
             .take(12)
-            .map(|member| Completion {
+            .map(|(member, signature)| Completion {
                 label: member.clone(),
-                detail: format!("{alias} member · {request} → {resolved}"),
+                detail: format!("{signature}  ·  {request} → {resolved}"),
             })
             .collect()
     }
@@ -177,8 +177,8 @@ fn member_expression_at_end(source: &str) -> Option<(&str, &str)> {
         .then_some((alias, prefix))
 }
 
-fn exported_members(source: &str) -> BTreeSet<String> {
-    let mut result = BTreeSet::new();
+fn exported_members(source: &str) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
     let mut in_return_table = false;
     for line in source.lines() {
         let code = line.split("--").next().unwrap_or("").trim();
@@ -186,24 +186,73 @@ fn exported_members(source: &str) -> BTreeSet<String> {
             .or_else(|| code.strip_prefix("const function ")).unwrap_or(code);
         if let Some((_, member)) = declaration.split_once('.') {
             let name = identifier_start(member);
-            if is_identifier(name) { result.insert(name.to_string()); }
+            if is_identifier(name) {
+                let suffix = &member[name.len()..];
+                let signature = function_signature(name, suffix)
+                    .unwrap_or_else(|| format!("field {name}"));
+                result.insert(name.to_string(), signature);
+            }
         }
-        if let Some(rest) = code.strip_prefix("export ") {
-            let name = identifier_start(rest.trim_start_matches("function "));
-            if is_identifier(name) { result.insert(name.to_string()); }
+        if let Some(rest) = code.strip_prefix("export type ") {
+            let name = identifier_start(rest);
+            if is_identifier(name) {
+                let definition = rest.split_once('=').map_or("", |(_, value)| value.trim());
+                let detail = if definition.is_empty() {
+                    format!("type {name}")
+                } else {
+                    format!("type {name} = {definition}")
+                };
+                result.insert(name.to_string(), detail);
+            }
+        } else if let Some(rest) = code.strip_prefix("export ") {
+            let function = rest.strip_prefix("function ");
+            let value = function.unwrap_or(rest);
+            let name = identifier_start(value);
+            if is_identifier(name) {
+                let detail = function
+                    .and_then(|_| function_signature(name, &value[name.len()..]))
+                    .unwrap_or_else(|| format!("export {name}"));
+                result.insert(name.to_string(), detail);
+            }
         }
         // Also understand `return { foo = value, bar = function() ... }`.
         if code.starts_with("return {") { in_return_table = true; }
         if in_return_table {
             let body = code.strip_prefix("return {").unwrap_or(code);
             for field in body.split(',') {
-                let name = identifier_start(field.trim());
-                if field.contains('=') && is_identifier(name) { result.insert(name.to_string()); }
+                let field = field.trim();
+                let name = identifier_start(field);
+                if field.contains('=') && is_identifier(name) {
+                    let detail = field.split_once('=').map_or(
+                        format!("field {name}"),
+                        |(_, value)| {
+                            let value = value.trim();
+                            if let Some(rest) = value.strip_prefix("function") {
+                                function_signature(name, rest).unwrap_or_else(|| format!("function {name}"))
+                            } else {
+                                format!("field {name}")
+                            }
+                        },
+                    );
+                    result.entry(name.to_string()).or_insert(detail);
+                }
             }
             if code.contains('}') { in_return_table = false; }
         }
     }
     result
+}
+
+fn function_signature(name: &str, suffix: &str) -> Option<String> {
+    let open = suffix.find('(')?;
+    let close = suffix[open..].find(')')? + open;
+    let parameters = &suffix[open..=close];
+    let return_type = suffix[close + 1..].trim();
+    Some(if return_type.starts_with(':') {
+        format!("function {name}{parameters} {return_type}")
+    } else {
+        format!("function {name}{parameters}")
+    })
 }
 
 fn identifier_start(value: &str) -> &str {
@@ -236,9 +285,20 @@ mod tests {
 
     #[test]
     fn finds_module_and_return_table_members() {
-        let members = exported_members("function Inventory.AddItem() end\nreturn { MaxSlots = 20, Remove = function() end }");
-        assert!(members.contains("AddItem"));
-        assert!(members.contains("MaxSlots"));
-        assert!(members.contains("Remove"));
+        let members = exported_members(
+            "function Inventory.AddItem(player: Player, item: Item): boolean\n\
+             return { MaxSlots = 20, Remove = function(item: Item) end }\n\
+             export type Item = { Name: string }",
+        );
+        assert_eq!(
+            members.get("AddItem").map(String::as_str),
+            Some("function AddItem(player: Player, item: Item): boolean")
+        );
+        assert!(members.contains_key("MaxSlots"));
+        assert!(members.contains_key("Remove"));
+        assert_eq!(
+            members.get("Item").map(String::as_str),
+            Some("type Item = { Name: string }")
+        );
     }
 }
