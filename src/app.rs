@@ -92,6 +92,9 @@ pub struct OpenScriptTab {
     /// Previous rendered contents, used to recognize IME/hardware-key edits
     /// for auto-indent and delimiter pairing.
     pub previous_buffer: String,
+    /// Source snapshot and parser results for incremental live diagnostics.
+    pub analyzed_buffer: String,
+    pub diagnostics: Vec<lua_runtime::SyntaxDiagnostic>,
 }
 
 pub struct OutputLog {
@@ -1223,13 +1226,16 @@ ui.label("Place ID:");
         }
 
         let source = rbxl::get_source(dom, referent).unwrap_or_default();
+        let diagnostics = lua_runtime::check_syntax(&source, &inst.name);
         self.open_tabs.push(OpenScriptTab {
             referent,
             name: inst.name.clone(),
             class: inst.class.to_string(),
             buffer: source.clone(),
             original: source.clone(),
-            previous_buffer: source,
+            previous_buffer: source.clone(),
+            analyzed_buffer: source,
+            diagnostics,
         });
         self.active_script_idx = self.open_tabs.len() - 1;
     }
@@ -1303,6 +1309,13 @@ ui.label("Place ID:");
         let is_dirty = tab.buffer != tab.original;
         let tab_ref = tab.referent;
         let tab_name = tab.name.clone();
+
+        // Re-parse only when this tab changes; large scripts do not pay the
+        // parser cost on every rendered frame.
+        if tab.buffer != tab.analyzed_buffer {
+            tab.diagnostics = lua_runtime::check_syntax(&tab.buffer, &tab_name);
+            tab.analyzed_buffer = tab.buffer.clone();
+        }
 
         ui.separator();
 
@@ -1586,6 +1599,30 @@ ui.label("Place ID:");
                     });
                 });
             });
+
+        if !tab.diagnostics.is_empty() {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(55, 30, 34))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "✗ {} Luau syntax error(s)",
+                            tab.diagnostics.len()
+                        ))
+                        .strong()
+                        .color(Color32::from_rgb(255, 120, 120)),
+                    );
+                    for diagnostic in &tab.diagnostics {
+                        let location = diagnostic.line
+                            .map_or_else(|| "Luau".to_string(), |line| format!("Line {line}"));
+                        ui.label(
+                            RichText::new(format!("{location}: {}", diagnostic.message))
+                                .monospace()
+                                .color(Color32::from_rgb(255, 175, 175)),
+                        );
+                    }
+                });
+        }
 
         self.script_completion_cursor = cursor_char;
         if cursor_char.is_some_and(|cursor| {

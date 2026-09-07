@@ -193,6 +193,34 @@ fn build_vm() -> LuaResult<Lua> {
     Ok(lua)
 }
 
+/// A parser diagnostic produced without executing the script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxDiagnostic {
+    pub line: Option<usize>,
+    pub message: String,
+}
+
+/// Compile Luau source to bytecode without executing it. This powers live
+/// editor diagnostics while keeping game/plugin code completely sandboxed.
+pub fn check_syntax(source: &str, name: &str) -> Vec<SyntaxDiagnostic> {
+    let lua = Lua::new();
+    match lua.load(source).set_name(name).into_function() {
+        Ok(_) => Vec::new(),
+        Err(error) => {
+            let raw = error.to_string();
+            vec![SyntaxDiagnostic {
+                line: diagnostic_line(&raw),
+                message: raw,
+            }]
+        }
+    }
+}
+
+fn diagnostic_line(message: &str) -> Option<usize> {
+    // luaur errors commonly contain `chunk:12:` or `[string "chunk"]:12:`.
+    message.split(':').find_map(|part| part.trim().parse::<usize>().ok())
+}
+
 /// Run script source.
 pub fn run_source(source: &str, name: &str) -> RunResult {
     match run_inner(source, name, false) {
