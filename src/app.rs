@@ -5,7 +5,7 @@ use crate::live_session;
 use crate::lua_runtime;
 use crate::plugins;
 use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
-use crate::{explorer, lua_syntax, rbxl, schema, templates};
+use crate::{explorer, lua_syntax, luau_intelligence, rbxl, schema, templates};
 use bevy_egui::egui;
 use bevy_egui::egui::{Color32, RichText};
 use rbx_dom_weak::{
@@ -1280,6 +1280,13 @@ ui.label("Place ID:");
             }
         }
 
+        // Build completion information from every ModuleScript in the local
+        // DataModel, not only from currently-open tabs.
+        let completions = self.dom.as_ref().map_or_else(Vec::new, |dom| {
+            luau_intelligence::ProjectIndex::build(dom)
+                .complete(&self.open_tabs[self.active_script_idx].buffer)
+        });
+
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
         let tab_ref = tab.referent;
@@ -1318,6 +1325,20 @@ ui.label("Place ID:");
                 self.show_replace = !self.show_replace;
             }
         });
+
+        // Project-wide ModuleScript member completion. Suggestions appear for
+        // aliases declared with either local/const and both string or
+        // DataModel-path require calls, e.g. `Inventory.Ad`.
+        if !completions.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Suggestions:").color(Color32::from_rgb(120, 190, 255)));
+                for completion in completions {
+                    if ui.button(&completion.label).on_hover_text(&completion.detail).clicked() {
+                        luau_intelligence::apply_completion(&mut tab.buffer, &completion.label);
+                    }
+                }
+            });
+        }
 
         // External Edit Sync Banner
         if self.pending_external_edits.values().any(|&r| r == tab_ref) {

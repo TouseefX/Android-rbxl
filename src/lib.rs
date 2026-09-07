@@ -26,6 +26,7 @@ mod bevy_render;
 mod explorer;
 mod jni_bridge;
 mod lua_syntax;
+mod luau_intelligence;
 mod roblox_api;
 mod roblox_domains;
 mod rbxl;
