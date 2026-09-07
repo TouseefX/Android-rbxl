@@ -59,6 +59,8 @@ pub struct ProjectIndex {
     modules: HashMap<String, BTreeMap<String, String>>,
     module_refs: HashMap<String, Ref>,
     module_sources: HashMap<Ref, String>,
+    /// Dot-separated fields from nested returned tables (e.g. Moves.Base).
+    module_member_paths: HashMap<Ref, BTreeMap<String, String>>,
     script_sources: HashMap<Ref, String>,
     /// Every script's slash-separated virtual path in the DataModel.
     paths: HashMap<Ref, String>,
@@ -115,6 +117,7 @@ impl ProjectIndex {
             index.script_sources.insert(referent, source.to_string());
             if index.module_sources.contains_key(&referent) {
                 index.module_sources.insert(referent, source.to_string());
+                index.module_member_paths.insert(referent, returned_member_paths(source));
                 let members = exported_members(source);
                 let keys: Vec<String> = index.module_refs.iter()
                     .filter_map(|(key, value)| (*value == referent).then_some(key.clone()))
@@ -153,6 +156,7 @@ impl ProjectIndex {
             self.modules.insert(name_key.clone(), members);
             self.module_refs.insert(full_key, referent);
             self.module_refs.entry(name_key).or_insert(referent);
+            self.module_member_paths.insert(referent, returned_member_paths(&source));
             self.module_sources.insert(referent, source);
         }
 
@@ -206,6 +210,25 @@ impl ProjectIndex {
         let cursor_byte = char_to_byte(source, cursor_char);
         if let Some(typed) = require_string_at_cursor(&source[..cursor_byte]) {
             return self.complete_require_path(current_script, typed);
+        }
+        if let Some((root, parent, prefix)) = nested_member_expression_at_end(&source[..cursor_byte]) {
+            let aliases = require_aliases(source);
+            let target = aliases.get(root)
+                .and_then(|request| self.resolve_module_ref(current_script, request))
+                .or_else(|| self.module_refs.get(&normalize_path(root)).copied());
+            if let Some(paths) = target.and_then(|referent| self.module_member_paths.get(&referent)) {
+                let wanted = format!("{parent}.");
+                let lower = prefix.to_ascii_lowercase();
+                let mut seen = std::collections::BTreeSet::new();
+                return paths.iter().filter_map(|(path, detail)| {
+                    let rest = path.strip_prefix(&wanted)?;
+                    let child = rest.split('.').next()?;
+                    if child.to_ascii_lowercase().starts_with(&lower) && seen.insert(child.to_string()) {
+                        Some(Completion { label: child.into(), detail: detail.clone(), insert_text: child.into(), replace_chars: prefix.chars().count() })
+                    } else { None }
+                }).take(12).collect();
+            }
+            return Vec::new();
         }
         if let Some((alias, prefix)) = member_expression_at_end(&source[..cursor_byte]) {
             let aliases = require_aliases(source);
@@ -1061,6 +1084,17 @@ fn lexical_completions(source_before_cursor: &str) -> Vec<Completion> {
     matches
 }
 
+fn nested_member_expression_at_end(source: &str) -> Option<(&str, String, &str)> {
+    let tail = source.trim_end_matches(char::is_whitespace)
+        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).next()?;
+    let parts: Vec<&str> = tail.split('.').collect();
+    if parts.len() < 3 || !is_identifier(parts[0]) { return None; }
+    if !parts[1..parts.len() - 1].iter().all(|part| is_identifier(part)) { return None; }
+    let prefix = parts.last().copied().unwrap_or("");
+    if !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return None; }
+    Some((parts[0], parts[1..parts.len() - 1].join("."), prefix))
+}
+
 fn member_expression_at_end(source: &str) -> Option<(&str, &str)> {
     let tail = source.trim_end_matches(char::is_whitespace)
         .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).next()?;
@@ -1206,6 +1240,39 @@ fn source_symbols(source: &str) -> Vec<(String, String, usize)> {
     for (name, detail) in exported_members(source) {
         if !result.iter().any(|(existing, _, _)| existing == &name) {
             result.push((name.clone(), detail, member_definition_line(source, &name).unwrap_or(1)));
+        }
+    }
+    result
+}
+
+fn returned_member_paths(source: &str) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    let mut depth: Option<i32> = None;
+    let mut parents: HashMap<i32, String> = HashMap::new();
+    for raw in source.lines() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let starts = depth.is_none() && code.starts_with("return {");
+        if starts { depth = Some(1); parents.insert(1, String::new()); }
+        let Some(current) = depth else { continue };
+        let body = code.strip_prefix("return {").unwrap_or(code).trim();
+        let name = identifier_start(body);
+        if is_identifier(name) && body[name.len()..].trim_start().starts_with('=') {
+            let parent = parents.get(&current).cloned().unwrap_or_default();
+            let path = if parent.is_empty() { name.to_string() } else { format!("{parent}.{name}") };
+            let rhs = body.split_once('=').map_or("", |(_, rhs)| rhs.trim());
+            result.insert(path.clone(), if rhs.starts_with('{') { format!("table {name}") } else { format!("field {name}") });
+            if rhs.starts_with('{') { parents.insert(current + 1, path); }
+        } else if body.starts_with('[') {
+            let rhs = body.split_once('=').map_or("", |(_, rhs)| rhs.trim());
+            if rhs.starts_with('{') {
+                parents.insert(current + 1, parents.get(&current).cloned().unwrap_or_default());
+            }
+        }
+        let delta = structural_brace_delta(code);
+        let next = if starts { delta } else { current + delta };
+        if next <= 0 { depth = None; parents.clear(); } else {
+            depth = Some(next);
+            parents.retain(|level, _| *level <= next);
         }
     }
     result
@@ -1487,6 +1554,25 @@ mod tests {
         assert!(members.contains_key("Moves"));
         assert!(!members.contains_key("Base"));
         assert!(!members.contains_key("KeyBind"));
+        let paths = returned_member_paths(
+            "return {\n Moves = {\n  Base = {},\n  Ultimate = {},\n }\n}",
+        );
+        assert!(paths.contains_key("Moves.Base"));
+        assert!(paths.contains_key("Moves.Ultimate"));
+    }
+
+    #[test]
+    fn completes_nested_module_return_tables() {
+        let module = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.module_refs.insert("module".into(), module);
+        index.module_member_paths.insert(module, BTreeMap::from([
+            ("Moves.Base".into(), "table Base".into()),
+            ("Moves.Ultimate".into(), "table Ultimate".into()),
+        ]));
+        let suggestions = index.complete_at(Ref::none(), "Module.Moves.", 13);
+        assert!(suggestions.iter().any(|item| item.label == "Base"));
+        assert!(suggestions.iter().any(|item| item.label == "Ultimate"));
     }
 
     #[test]
