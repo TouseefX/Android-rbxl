@@ -252,6 +252,28 @@ impl ProjectIndex {
                         .collect();
                 }
             }
+            // Infer objects created by a module constructor:
+            // `local weld = Module.new(args)` makes `weld.` use that module's
+            // returned API instead of being treated as an unknown plain table.
+            if let Some(module_alias) = constructor_module_alias(source, alias) {
+                let target = aliases.get(module_alias)
+                    .and_then(|request| self.resolve_module_ref(current_script, request))
+                    .or_else(|| self.module_refs.get(&normalize_path(module_alias)).copied());
+                if let Some(members) = target.and_then(|target| self.module_sources.get(&target))
+                    .map(|source| exported_members(source))
+                {
+                    return members.into_iter()
+                        .filter(|(member, _)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+                        .take(12)
+                        .map(|(member, detail)| Completion {
+                            label: member.clone(),
+                            detail: format!("constructed {module_alias} object · {detail}"),
+                            insert_text: member,
+                            replace_chars: prefix.chars().count(),
+                        }).collect();
+                }
+            }
+
             // Roblox datatypes/globals take precedence over a coincidentally
             // named ModuleScript (for example Color3 must keep fromRGB casing).
             let builtin = roblox_member_completions(alias, prefix, &source[..cursor_byte]);
@@ -1084,6 +1106,22 @@ fn lexical_completions(source_before_cursor: &str) -> Vec<Completion> {
     matches
 }
 
+fn constructor_module_alias<'a>(source: &'a str, variable: &str) -> Option<&'a str> {
+    source.lines().rev().find_map(|raw| {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let declaration = code.strip_prefix("local ").or_else(|| code.strip_prefix("const "))?;
+        let (left, right) = declaration.split_once('=')?;
+        let name = left.split(':').next().unwrap_or(left).trim();
+        if name != variable { return None; }
+        let call = right.trim();
+        let dot = call.find('.')?;
+        let module_alias = call[..dot].trim();
+        let method = identifier_start(&call[dot + 1..]);
+        (is_identifier(module_alias) && matches!(method, "new" | "create" | "Create"))
+            .then_some(module_alias)
+    })
+}
+
 fn nested_member_expression_at_end(source: &str) -> Option<(&str, String, &str)> {
     let tail = source.trim_end_matches(char::is_whitespace)
         .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).next()?;
@@ -1292,7 +1330,9 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
         let method_declaration = code.strip_prefix("function ")
             .or_else(|| code.strip_prefix("const function "));
         if let Some(declaration) = method_declaration {
-            if let Some((owner, member)) = declaration.split_once('.') {
+            if let Some((owner, member)) = declaration.split_once('.')
+                .or_else(|| declaration.split_once(':'))
+            {
                 let name = identifier_start(member);
                 if is_identifier(owner.trim()) && is_identifier(name) {
                     let suffix = &member[name.len()..];
@@ -1601,6 +1641,20 @@ mod tests {
         let suggestions = index.complete_at(Ref::none(), "Module.Moves.", 13);
         assert!(suggestions.iter().any(|item| item.label == "Base"));
         assert!(suggestions.iter().any(|item| item.label == "Ultimate"));
+    }
+
+    #[test]
+    fn infers_objects_returned_by_module_constructors() {
+        let module = Ref::new();
+        let consumer = Ref::new();
+        let module_source = "function Weld.new(part) end\nfunction Weld:Destroy() end\nreturn Weld";
+        let mut index = ProjectIndex::default();
+        index.module_refs.insert("weldmodule".into(), module);
+        index.module_sources.insert(module, module_source.into());
+        index.paths.insert(consumer, "Controller".into());
+        let source = "local Module = require(\"WeldModule\")\nlocal weld = Module.new(part)\nweld.D";
+        let suggestions = index.complete_at(consumer, source, source.chars().count());
+        assert!(suggestions.iter().any(|item| item.label == "Destroy"));
     }
 
     #[test]
