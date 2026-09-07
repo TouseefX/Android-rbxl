@@ -156,7 +156,6 @@ pub struct EditorApp {
     project_index_rebuilds: u64,
     /// Throttles whole-project fingerprints on mobile while typing.
     project_index_checked_at: Option<std::time::Instant>,
-    project_diagnostics_key: u64,
     project_diagnostics_cache: Vec<luau_intelligence::ProjectDiagnostic>,
 
     // Find & Replace
@@ -325,7 +324,6 @@ impl Default for EditorApp {
             project_index_fingerprint: 0,
             project_index_rebuilds: 0,
             project_index_checked_at: None,
-            project_diagnostics_key: 0,
             project_diagnostics_cache: Vec::new(),
             find_term: String::new(),
             replace_term: String::new(),
@@ -702,8 +700,12 @@ impl EditorApp {
             });
         }
 
-        // Tablet workspace: persistent, resizable Explorer beside the editor.
-        if is_tablet && self.show_tablet_explorer && !self.editor_focus_mode {
+        // Do not render the same large tree twice when Explorer itself is the
+        // active page; that doubled traversal was especially costly on phones
+        // whose landscape width crosses the tablet breakpoint.
+        if is_tablet && self.show_tablet_explorer && !self.editor_focus_mode
+            && self.active_tab != ActiveTab::Explorer
+        {
             egui::SidePanel::left("landscape_left")
                 .resizable(true)
                 .default_width(self.explorer_width)
@@ -1438,7 +1440,9 @@ ui.label("Place ID:");
         }
 
         let source = rbxl::get_source(dom, referent).unwrap_or_default();
-        let diagnostics = lua_runtime::check_syntax(&source, &inst.name);
+        // Opening a script from Explorer must stay instant. Full compiler and
+        // semantic diagnostics run only from the explicit Check Luau button.
+        let diagnostics = Vec::new();
         let highlighted_job = lua_syntax::highlight_luau(&source, self.font_size, None);
         self.open_tabs.push(OpenScriptTab {
             referent,
@@ -1447,7 +1451,7 @@ ui.label("Place ID:");
             buffer: source.clone(),
             original: source.clone(),
             previous_buffer: source.clone(),
-            semantic_diagnostics: luau_intelligence::semantic_diagnostics(&source),
+            semantic_diagnostics: Vec::new(),
             highlighted_buffer: source.clone(),
             highlighted_font_size: self.font_size,
             highlighted_search: None,
@@ -1563,23 +1567,8 @@ ui.label("Place ID:");
             self.project_index_fingerprint = 0;
         }
         let project_index = self.project_index_cache.clone();
-        let project_diagnostics = project_index.as_ref().map_or_else(Vec::new, |index| {
-            use std::hash::{Hash, Hasher};
-            let active = &self.open_tabs[self.active_script_idx];
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            active.referent.hash(&mut hasher);
-            active.buffer.hash(&mut hasher);
-            self.project_index_fingerprint.hash(&mut hasher);
-            let key = hasher.finish();
-            let idle = active.analysis_requested_at
-                .map_or(true, |at| at.elapsed() >= std::time::Duration::from_millis(450));
-            if key != self.project_diagnostics_key && idle {
-                self.project_diagnostics_cache = index.diagnostics(active.referent, &active.buffer);
-                self.project_diagnostics_key = key;
-            }
-            self.project_diagnostics_cache.clone()
-        });
-        let semantic_diagnostics = self.open_tabs[self.active_script_idx]
+        let mut project_diagnostics = self.project_diagnostics_cache.clone();
+        let mut semantic_diagnostics = self.open_tabs[self.active_script_idx]
             .semantic_diagnostics.clone();
         let definition = project_index.as_ref().and_then(|index| {
             let active = &self.open_tabs[self.active_script_idx];
@@ -1590,23 +1579,12 @@ ui.label("Place ID:");
         let mut goto_definition = None;
         let mut find_references_requested = false;
         let mut export_project_requested = false;
+        let mut check_luau_requested = false;
 
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
         let tab_ref = tab.referent;
         let tab_name = tab.name.clone();
-
-        // Compiler and semantic checks are intentionally debounced. Running
-        // the full Luau compiler after every Samsung IME character caused a
-        // visible frame-time spike even on high-end phones.
-        let analysis_due = tab.buffer != tab.analyzed_buffer
-            && tab.analysis_requested_at.is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(450));
-        if analysis_due {
-            tab.diagnostics = lua_runtime::check_syntax(&tab.buffer, &tab_name);
-            tab.semantic_diagnostics = luau_intelligence::semantic_diagnostics(&tab.buffer);
-            tab.analyzed_buffer = tab.buffer.clone();
-            tab.analysis_requested_at = None;
-        }
 
         ui.separator();
 
@@ -1649,6 +1627,9 @@ ui.label("Place ID:");
                 export_project_requested = true;
             }
 
+            if ui.button("✓ Check Luau").clicked() {
+                check_luau_requested = true;
+            }
             if ui.button("✨ Format Luau").clicked() {
                 tab.buffer = format_luau_indentation(&tab.buffer);
                 tab.previous_buffer = tab.buffer.clone();
@@ -1685,6 +1666,22 @@ ui.label("Place ID:");
             }
         });
         });
+
+        if check_luau_requested {
+            tab.diagnostics = lua_runtime::check_syntax(&tab.buffer, &tab_name);
+            tab.semantic_diagnostics = luau_intelligence::semantic_diagnostics(&tab.buffer);
+            tab.analyzed_buffer = tab.buffer.clone();
+            tab.analysis_pending_buffer = tab.buffer.clone();
+            tab.analysis_requested_at = None;
+            semantic_diagnostics = tab.semantic_diagnostics.clone();
+            project_diagnostics = project_index.as_ref().map_or_else(Vec::new, |index| {
+                index.diagnostics(tab_ref, &tab.buffer)
+            });
+            self.project_diagnostics_cache = project_diagnostics.clone();
+            self.status = format!(
+                "Luau check finished: {} syntax error(s), {} project/semantic warning(s)",
+                tab.diagnostics.len(), project_diagnostics.len() + semantic_diagnostics.len());
+        }
 
         let mut rename_requested = false;
         if self.show_symbol_rename {
