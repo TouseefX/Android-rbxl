@@ -122,6 +122,10 @@ pub struct EditorApp {
     // Multi-tab Script Editor
     open_tabs: Vec<OpenScriptTab>,
     active_script_idx: usize,
+    /// Caret and highlighted item for the touch/keyboard completion popup.
+    script_completion_cursor: Option<usize>,
+    script_completion_selected: usize,
+    script_completion_dismissed_at: Option<(Ref, usize)>,
 
     // Find & Replace
     find_term: String,
@@ -266,6 +270,9 @@ impl Default for EditorApp {
             active_tab: ActiveTab::Viewport3D,
             open_tabs: Vec::new(),
             active_script_idx: 0,
+            script_completion_cursor: None,
+            script_completion_selected: 0,
+            script_completion_dismissed_at: None,
             find_term: String::new(),
             replace_term: String::new(),
             show_replace: false,
@@ -1418,7 +1425,65 @@ ui.label("Place ID:");
             Some(self.find_term.trim().to_string())
         };
 
-        let mut cursor_char = None;
+        // Use the caret reported by the previous text pass to intercept
+        // completion-navigation keys before TextEdit treats them as cursor
+        // movement, indentation, or a newline.
+        let mut completions = self.script_completion_cursor
+            .and_then(|cursor| project_index.as_ref().map(|index| {
+                index.complete_at(tab_ref, &tab.buffer, cursor)
+            }))
+            .unwrap_or_default();
+        if self.script_completion_cursor
+            .is_some_and(|cursor| self.script_completion_dismissed_at == Some((tab_ref, cursor)))
+        {
+            completions.clear();
+        }
+        let mut completion_dismissed = false;
+        if completions.is_empty() {
+            self.script_completion_selected = 0;
+        } else {
+            self.script_completion_selected = self.script_completion_selected.min(completions.len() - 1);
+            let down = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+            });
+            let up = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+            });
+            let accept_tab = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+            });
+            let accept_enter = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+            });
+            let dismiss = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            });
+            if down {
+                self.script_completion_selected =
+                    (self.script_completion_selected + 1) % completions.len();
+            } else if up {
+                self.script_completion_selected =
+                    (self.script_completion_selected + completions.len() - 1) % completions.len();
+            }
+            if dismiss {
+                completions.clear();
+                completion_dismissed = true;
+                if let Some(cursor) = self.script_completion_cursor {
+                    self.script_completion_dismissed_at = Some((tab_ref, cursor));
+                }
+            } else if accept_tab || accept_enter {
+                let completion = &completions[self.script_completion_selected];
+                let new_cursor = luau_intelligence::apply_completion_at(
+                    &mut tab.buffer,
+                    self.script_completion_cursor.unwrap_or_default(),
+                    &completion.label,
+                );
+                self.script_completion_cursor = Some(new_cursor);
+                completions.clear();
+            }
+        }
+
+        let mut cursor_char = self.script_completion_cursor;
         egui::ScrollArea::both()
             .id_salt("code_scroll_area")
             .show(ui, |ui| {
@@ -1440,20 +1505,52 @@ ui.label("Place ID:");
                 cursor_char = output.cursor_range.map(|range| range.primary.index);
             });
 
-        // Project-wide completion follows the actual caret, so it also works
-        // in the middle of a script without modifying text after the caret.
-        if let (Some(index), Some(project_index)) = (cursor_char, project_index.as_ref()) {
-            let completions = project_index.complete_at(tab_ref, &tab.buffer, index);
+        self.script_completion_cursor = cursor_char;
+        if cursor_char.is_some_and(|cursor| {
+            self.script_completion_dismissed_at.is_some_and(|dismissed| dismissed != (tab_ref, cursor))
+        }) {
+            self.script_completion_dismissed_at = None;
+        }
+        completions = if completion_dismissed
+            || cursor_char.is_some_and(|cursor| {
+                self.script_completion_dismissed_at == Some((tab_ref, cursor))
+            })
+        {
+            Vec::new()
+        } else {
+            cursor_char
+                .and_then(|cursor| project_index.as_ref().map(|index| {
+                    index.complete_at(tab_ref, &tab.buffer, cursor)
+                }))
+                .unwrap_or_default()
+        };
+
+        // Compact popup-style list: touch selects immediately; hardware
+        // keyboards use Up/Down and Enter/Tab, with Escape to dismiss.
+        if let Some(index) = cursor_char {
             if !completions.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Suggestions:").color(Color32::from_rgb(120, 190, 255)));
-                    for completion in completions {
-                        if ui.button(&completion.label).on_hover_text(&completion.detail).clicked() {
-                            luau_intelligence::apply_completion_at(
+                self.script_completion_selected =
+                    self.script_completion_selected.min(completions.len() - 1);
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(260.0);
+                    ui.label(
+                        RichText::new("Luau completions  ·  ↑↓ choose  Tab/Enter accept  Esc close")
+                            .small()
+                            .color(Color32::from_rgb(140, 180, 220)),
+                    );
+                    for (position, completion) in completions.iter().enumerate() {
+                        let text = format!("{}    {}", completion.label, completion.detail);
+                        if ui.selectable_label(
+                            position == self.script_completion_selected,
+                            RichText::new(text).monospace(),
+                        ).clicked() {
+                            let new_cursor = luau_intelligence::apply_completion_at(
                                 &mut tab.buffer,
                                 index,
                                 &completion.label,
                             );
+                            self.script_completion_cursor = Some(new_cursor);
+                            self.script_completion_selected = 0;
                         }
                     }
                 });
