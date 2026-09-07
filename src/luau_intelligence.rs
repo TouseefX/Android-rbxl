@@ -229,6 +229,11 @@ impl ProjectIndex {
                         .collect();
                 }
             }
+            // Roblox datatypes/globals take precedence over a coincidentally
+            // named ModuleScript (for example Color3 must keep fromRGB casing).
+            let builtin = roblox_member_completions(alias, prefix, &source[..cursor_byte]);
+            if !builtin.is_empty() { return builtin; }
+
             // Also allow `Inventory.Member` when Inventory is an unambiguous
             // ModuleScript name, even before a local require alias is written.
             let module_key = normalize_path(alias);
@@ -939,6 +944,15 @@ fn roblox_member_completions(owner: &str, prefix: &str, source: &str) -> Vec<Com
     }
 
     let items: &[(&str, &str)] = match owner {
+        "Color3" => &[
+            ("fromRGB", "Color3 from 0–255 red, green, and blue"),
+            ("fromHSV", "Color3 from hue, saturation, and value"),
+            ("new", "Color3 from 0–1 red, green, and blue"),
+        ],
+        "Vector3" => &[("new", "Create a Vector3"), ("zero", "Zero vector"), ("one", "Unit vector")],
+        "Vector2" => &[("new", "Create a Vector2"), ("zero", "Zero vector"), ("one", "Unit vector")],
+        "CFrame" => &[("new", "Create a CFrame"), ("lookAt", "Create an oriented CFrame"), ("Angles", "Create a rotation CFrame")],
+        "UDim2" => &[("new", "Create a UDim2"), ("fromScale", "Create from scale values"), ("fromOffset", "Create from pixel offsets")],
         "game" | "Game" => &[
             ("GetService", "Roblox DataModel service lookup"),
             ("FindService", "Find a loaded Roblox service"),
@@ -1199,7 +1213,9 @@ fn source_symbols(source: &str) -> Vec<(String, String, usize)> {
 
 fn exported_members(source: &str) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
-    let mut in_return_table = false;
+    // Brace depth inside the table returned by the module. Only fields at
+    // depth one are public module members; nested configuration keys are not.
+    let mut return_depth: Option<i32> = None;
     for line in source.lines() {
         let code = line.split("--").next().unwrap_or("").trim();
         let declaration = code.strip_prefix("function ")
@@ -1235,9 +1251,13 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
                 result.insert(name.to_string(), detail);
             }
         }
-        // Also understand `return { foo = value, bar = function() ... }`.
-        if code.starts_with("return {") { in_return_table = true; }
-        if in_return_table {
+        // Also understand `return { foo = value }`, but do not leak keys from
+        // nested tables (Moves.Base[1].KeyBind) into `Module.KeyBind`.
+        let starts_return = return_depth.is_none() && code.starts_with("return {");
+        if starts_return {
+            return_depth = Some(1);
+        }
+        if return_depth == Some(1) {
             let body = code.strip_prefix("return {").unwrap_or(code);
             for field in body.split(',') {
                 let field = field.trim();
@@ -1257,10 +1277,32 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
                     result.entry(name.to_string()).or_insert(detail);
                 }
             }
-            if code.contains('}') { in_return_table = false; }
+        }
+        if let Some(depth) = return_depth {
+            let delta = structural_brace_delta(code);
+            let next = if starts_return { delta } else { depth + delta };
+            return_depth = (next > 0).then_some(next);
         }
     }
     result
+}
+
+fn structural_brace_delta(code: &str) -> i32 {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut delta = 0;
+    for character in code.chars() {
+        if escaped { escaped = false; continue; }
+        if character == '\\' && quote.is_some() { escaped = true; continue; }
+        if let Some(active) = quote {
+            if character == active { quote = None; }
+            continue;
+        }
+        if matches!(character, '\'' | '"' | '`') { quote = Some(character); continue; }
+        if character == '{' { delta += 1; }
+        if character == '}' { delta -= 1; }
+    }
+    delta
 }
 
 fn function_signature(name: &str, suffix: &str) -> Option<String> {
@@ -1434,6 +1476,25 @@ mod tests {
         assert!(warnings.iter().any(|warning| warning.message.contains("Unknown Roblox class")));
         assert!(warnings.iter().any(|warning| warning.message.contains("Unknown property 'Transparancy'")));
         assert!(warnings.iter().any(|warning| warning.message.contains("Unknown item")));
+    }
+
+    #[test]
+    fn nested_return_table_keys_are_not_module_exports() {
+        let members = exported_members(
+            "return {\n Name = 'Jun',\n Moves = {\n  Base = {\n   [1] = { KeyBind = 1 }\n  }\n }\n}",
+        );
+        assert!(members.contains_key("Name"));
+        assert!(members.contains_key("Moves"));
+        assert!(!members.contains_key("Base"));
+        assert!(!members.contains_key("KeyBind"));
+    }
+
+    #[test]
+    fn color3_completion_preserves_roblox_casing() {
+        let index = ProjectIndex::default();
+        let suggestions = index.complete_at(Ref::none(), "Color3.fr", 9);
+        assert!(suggestions.iter().any(|item| item.label == "fromRGB"));
+        assert!(!suggestions.iter().any(|item| item.label == "fromrgb"));
     }
 
     #[test]
