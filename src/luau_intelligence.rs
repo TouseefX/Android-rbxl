@@ -230,7 +230,7 @@ impl ProjectIndex {
             }
             return Vec::new();
         }
-        if let Some((alias, prefix)) = member_expression_at_end(&source[..cursor_byte]) {
+        if let Some((alias, prefix, separator)) = member_expression_at_end(&source[..cursor_byte]) {
             let aliases = require_aliases(source);
             if let Some(request) = aliases.get(alias) {
                 let resolved = self.resolve_request(current_script, request);
@@ -241,7 +241,8 @@ impl ProjectIndex {
                 if let Some(members) = members {
                     return members
                         .iter()
-                        .filter(|(member, _)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+                        .filter(|(member, detail)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
+                            && member_matches_access(detail, separator))
                         .take(12)
                         .map(|(member, signature)| Completion {
                             label: member.clone(),
@@ -263,7 +264,8 @@ impl ProjectIndex {
                     .map(|source| constructed_object_members(source))
                 {
                     return members.into_iter()
-                        .filter(|(member, _)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+                        .filter(|(member, detail)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
+                            && member_matches_access(detail, separator))
                         .take(12)
                         .map(|(member, detail)| Completion {
                             label: member.clone(),
@@ -276,7 +278,8 @@ impl ProjectIndex {
 
             // Roblox datatypes/globals take precedence over a coincidentally
             // named ModuleScript (for example Color3 must keep fromRGB casing).
-            let builtin = roblox_member_completions(alias, prefix, &source[..cursor_byte]);
+            let builtin: Vec<_> = roblox_member_completions(alias, prefix, &source[..cursor_byte])
+                .into_iter().filter(|item| roblox_access_matches(alias, &item.label, separator)).collect();
             if !builtin.is_empty() { return builtin; }
 
             // Also allow `Inventory.Member` when Inventory is an unambiguous
@@ -284,7 +287,8 @@ impl ProjectIndex {
             let module_key = normalize_path(alias);
             if let Some(members) = self.modules.get(&module_key) {
                 return members.iter()
-                    .filter(|(member, _)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+                    .filter(|(member, detail)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
+                        && member_matches_access(detail, separator))
                     .take(12)
                     .map(|(member, detail)| Completion {
                         label: member.clone(), detail: detail.clone(), insert_text: member.clone(),
@@ -293,7 +297,8 @@ impl ProjectIndex {
             }
             // A dotted expression is a member lookup, never a new lexical
             // keyword. Falling through used to turn `game.f` into `game.game`.
-            return roblox_member_completions(alias, prefix, &source[..cursor_byte]);
+            return roblox_member_completions(alias, prefix, &source[..cursor_byte])
+                .into_iter().filter(|item| roblox_access_matches(alias, &item.label, separator)).collect();
         }
         let before_cursor = &source[..cursor_byte];
         // Nested member chains (e.g. Module.Factory().value) need type-flow
@@ -968,6 +973,17 @@ fn require_path(expression: &str) -> String {
         .replace("\")", "").replace('.', "/")
 }
 
+fn roblox_access_matches(owner: &str, member: &str, separator: char) -> bool {
+    let method = match owner {
+        "game" | "Game" => matches!(member, "GetService" | "FindService" | "IsLoaded" | "GetDescendants" | "GetChildren"),
+        "workspace" | "Workspace" => member != "CurrentCamera",
+        "script" => !matches!(member, "Parent" | "Name"),
+        // Constructors/static datatype functions use dot syntax.
+        _ => false,
+    };
+    if separator == ':' { method } else { !method }
+}
+
 fn roblox_member_completions(owner: &str, prefix: &str, source: &str) -> Vec<Completion> {
     // Reflection-backed properties for straightforward Instance.new bindings.
     for raw in source.lines().rev() {
@@ -1133,12 +1149,26 @@ fn nested_member_expression_at_end(source: &str) -> Option<(&str, String, &str)>
     Some((parts[0], parts[1..parts.len() - 1].join("."), prefix))
 }
 
-fn member_expression_at_end(source: &str) -> Option<(&str, &str)> {
+fn member_expression_at_end(source: &str) -> Option<(&str, &str, char)> {
     let tail = source.trim_end_matches(char::is_whitespace)
-        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).next()?;
-    let (alias, prefix) = tail.rsplit_once('.')?;
+        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || matches!(c, '.' | ':'))).next()?;
+    let dot = tail.rfind('.');
+    let colon = tail.rfind(':');
+    let (position, separator) = match (dot, colon) {
+        (Some(a), Some(b)) if b > a => (b, ':'),
+        (Some(a), _) => (a, '.'),
+        (_, Some(b)) => (b, ':'),
+        _ => return None,
+    };
+    let alias = &tail[..position];
+    let prefix = &tail[position + 1..];
     (is_identifier(alias) && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .then_some((alias, prefix))
+        .then_some((alias, prefix, separator))
+}
+
+fn member_matches_access(detail: &str, separator: char) -> bool {
+    let method = detail.starts_with("method ");
+    if separator == ':' { method } else { !method }
 }
 
 fn module_member_owners(source: &str, member: &str) -> std::collections::BTreeSet<String> {
@@ -1299,8 +1329,9 @@ fn constructed_object_members(source: &str) -> BTreeMap<String, String> {
             let member = identifier_start(rest);
             if is_identifier(owner.trim()) && is_identifier(member) {
                 classes.insert(owner.trim().to_string());
-                result.insert(member.into(), function_signature(member, &rest[member.len()..])
-                    .unwrap_or_else(|| format!("method {member}")));
+                let signature = function_signature(member, &rest[member.len()..])
+                    .unwrap_or_else(|| format!("function {member}"));
+                result.insert(member.into(), format!("method {signature}"));
             }
         } else if let Some((owner, rest)) = declaration.split_once('.') {
             let member = identifier_start(rest);
@@ -1416,6 +1447,7 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
         let method_declaration = code.strip_prefix("function ")
             .or_else(|| code.strip_prefix("const function "));
         if let Some(declaration) = method_declaration {
+            let colon_method = declaration.contains(':');
             if let Some((owner, member)) = declaration.split_once('.')
                 .or_else(|| declaration.split_once(':'))
             {
@@ -1424,7 +1456,9 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
                     let suffix = &member[name.len()..];
                     let signature = function_signature(name, suffix)
                         .unwrap_or_else(|| format!("function {name}"));
-                    result.insert(name.to_string(), signature);
+                    result.insert(name.to_string(), if colon_method {
+                        format!("method {signature}")
+                    } else { signature });
                 }
             }
         } else if let Some((lhs, rhs)) = code.split_once('=') {
@@ -1572,7 +1606,7 @@ mod tests {
     #[test]
     fn dotted_roblox_completion_does_not_duplicate_game() {
         let index = ProjectIndex::default();
-        let suggestions = index.complete_at(Ref::none(), "game.F", 6);
+        let suggestions = index.complete_at(Ref::none(), "game:F", 6);
         assert!(suggestions.iter().any(|item| item.label == "FindService"));
         assert!(!suggestions.iter().any(|item| item.label == "game"));
     }
@@ -1738,9 +1772,12 @@ mod tests {
         index.module_refs.insert("weldmodule".into(), module);
         index.module_sources.insert(module, module_source.into());
         index.paths.insert(consumer, "Controller".into());
-        let source = "local Module = require(\"WeldModule\")\nlocal weld = Module.new(part)\nweld.D";
+        let source = "local Module = require(\"WeldModule\")\nlocal weld = Module.new(part)\nweld:D";
         let suggestions = index.complete_at(consumer, source, source.chars().count());
         assert!(suggestions.iter().any(|item| item.label == "Destroy"));
+        let dot_source = "local Module = require(\"WeldModule\")\nlocal weld = Module.new(part)\nweld.D";
+        assert!(!index.complete_at(consumer, dot_source, dot_source.chars().count())
+            .iter().any(|item| item.label == "Destroy"));
     }
 
     #[test]
