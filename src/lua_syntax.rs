@@ -23,7 +23,7 @@ pub fn highlight_luau(text: &str, font_size: f32, search_term: Option<&str>) -> 
     };
 
     let keywords: HashSet<&str> = [
-        "and", "break", "continue", "do", "else", "elseif", "end", "export",
+        "and", "break", "const", "continue", "do", "else", "elseif", "end", "export",
         "for", "function", "goto", "if", "in", "local", "not", "or",
         "repeat", "return", "then", "type", "until", "while",
     ].into_iter().collect();
@@ -103,8 +103,11 @@ pub fn highlight_luau(text: &str, font_size: f32, search_term: Option<&str>) -> 
             continue;
         }
 
-        // Quoted strings: "..." or '...'
-        if chars[i] == '"' || chars[i] == '\'' {
+        // Quoted strings and modern Luau interpolated strings (`hello {name}`).
+        // Interpolation contents remain string-colored for now; recognizing the
+        // complete token prevents backticks from corrupting highlighting for
+        // the rest of the file.
+        if chars[i] == '"' || chars[i] == '\'' || chars[i] == '`' {
             let quote = chars[i];
             let start = i;
             i += 1;

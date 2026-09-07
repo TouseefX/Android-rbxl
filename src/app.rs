@@ -1387,7 +1387,7 @@ ui.label("Place ID:");
                         ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
                         ("=", " = "), ("==", " == "), ("~=", " ~= "), ("<=", " <= "), (">=", " >= "),
                         ("..", " .. "), (":", ":"), (".", "."), (",", ", "), ("->", " -> "), ("::", " :: "),
-                        ("local", "local "), ("function", "function "), ("end", "end"),
+                        ("local", "local "), ("const", "const "), ("function", "function "), ("end", "end"),
                         ("then", "then\n\t"), ("do", "do\n\t"), ("return", "return "),
                         ("if", "if "), ("else", "else\n\t"), ("elseif", "elseif "),
                         ("for", "for i, v in pairs() do\n\tend"), ("while", "while true do\n\ttask.wait()\nend"),
