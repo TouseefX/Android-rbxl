@@ -44,7 +44,7 @@ pub struct RenameEdit {
     pub replacements: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProjectIndex {
     /// Normalized DataModel path or unambiguous module name -> members.
     modules: HashMap<String, BTreeMap<String, String>>,
@@ -56,8 +56,43 @@ pub struct ProjectIndex {
 }
 
 impl ProjectIndex {
+    /// Cheap change token used by the UI cache. It hashes script identity,
+    /// hierarchy names, committed source, and unsaved tab overrides without
+    /// rebuilding module exports/dependency graphs every frame.
+    pub fn fingerprint<'a>(
+        dom: &WeakDom,
+        overrides: impl IntoIterator<Item = (Ref, &'a str)>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let overrides: HashMap<Ref, &str> = overrides.into_iter().collect();
+        fn walk(
+            dom: &WeakDom,
+            referent: Ref,
+            overrides: &HashMap<Ref, &str>,
+            hasher: &mut impl Hasher,
+        ) {
+            let Some(instance) = dom.get_by_ref(referent) else { return };
+            referent.hash(hasher);
+            instance.name.hash(hasher);
+            instance.class.as_str().hash(hasher);
+            if matches!(instance.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+                if let Some(source) = overrides.get(&referent) {
+                    source.hash(hasher);
+                } else {
+                    rbxl::get_source(dom, referent).unwrap_or_default().hash(hasher);
+                }
+            }
+            for &child in instance.children() {
+                walk(dom, child, overrides, hasher);
+            }
+        }
+        walk(dom, dom.root_ref(), &overrides, &mut hasher);
+        hasher.finish()
+    }
+
     pub fn build(dom: &WeakDom) -> Self {
-        Self::build_with_overrides(dom, std::iter::empty())
+        Self::build_with_overrides(dom, std::iter::empty::<(Ref, &str)>())
     }
 
     /// Build from the DataModel while preferring unsaved editor buffers.

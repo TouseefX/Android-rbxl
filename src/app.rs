@@ -139,6 +139,11 @@ pub struct EditorApp {
     script_references: Vec<luau_intelligence::Reference>,
     show_symbol_rename: bool,
     symbol_rename_input: String,
+    /// Incremental project-intelligence cache. The inexpensive fingerprint is
+    /// checked every frame; the full index is rebuilt only after a real change.
+    project_index_cache: Option<std::sync::Arc<luau_intelligence::ProjectIndex>>,
+    project_index_fingerprint: u64,
+    project_index_rebuilds: u64,
 
     // Find & Replace
     find_term: String,
@@ -291,6 +296,9 @@ impl Default for EditorApp {
             script_references: Vec::new(),
             show_symbol_rename: false,
             symbol_rename_input: String::new(),
+            project_index_cache: None,
+            project_index_fingerprint: 0,
+            project_index_rebuilds: 0,
             find_term: String::new(),
             replace_term: String::new(),
             show_replace: false,
@@ -1309,15 +1317,30 @@ ui.label("Place ID:");
             }
         }
 
-        // Build completion information from every ModuleScript in the local
-        // DataModel, not only from currently-open tabs. Completion itself is
-        // requested after TextEdit reports the real caret position.
-        let project_index = self.dom.as_ref().map(|dom| {
-            luau_intelligence::ProjectIndex::build_with_overrides(
+        // Cache the expensive export/dependency index. Fingerprinting still
+        // notices DataModel edits and every unsaved tab, but parsing happens
+        // only when those inputs actually change.
+        if let Some(dom) = self.dom.as_ref() {
+            let fingerprint = luau_intelligence::ProjectIndex::fingerprint(
                 dom,
                 self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
-            )
-        });
+            );
+            if self.project_index_cache.is_none()
+                || fingerprint != self.project_index_fingerprint
+            {
+                let rebuilt = luau_intelligence::ProjectIndex::build_with_overrides(
+                    dom,
+                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                );
+                self.project_index_cache = Some(std::sync::Arc::new(rebuilt));
+                self.project_index_fingerprint = fingerprint;
+                self.project_index_rebuilds += 1;
+            }
+        } else {
+            self.project_index_cache = None;
+            self.project_index_fingerprint = 0;
+        }
+        let project_index = self.project_index_cache.clone();
         let project_diagnostics = project_index.as_ref().map_or_else(Vec::new, |index| {
             let active = &self.open_tabs[self.active_script_idx];
             index.diagnostics(active.referent, &active.buffer)
@@ -1456,6 +1479,11 @@ ui.label("Place ID:");
             if ui.button("➕").clicked() && self.font_size < 32.0 {
                 self.font_size += 2.0;
             }
+            ui.label(
+                RichText::new(format!("Index cached · {} rebuild(s)", self.project_index_rebuilds))
+                    .small()
+                    .weak(),
+            );
 
             ui.separator();
             if ui.button("📋 Copy Script").clicked() {
