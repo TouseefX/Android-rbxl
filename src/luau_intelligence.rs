@@ -229,9 +229,21 @@ impl ProjectIndex {
                         .collect();
                 }
             }
+            // Also allow `Inventory.Member` when Inventory is an unambiguous
+            // ModuleScript name, even before a local require alias is written.
+            let module_key = normalize_path(alias);
+            if let Some(members) = self.modules.get(&module_key) {
+                return members.iter()
+                    .filter(|(member, _)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+                    .take(12)
+                    .map(|(member, detail)| Completion {
+                        label: member.clone(), detail: detail.clone(), insert_text: member.clone(),
+                        replace_chars: prefix.chars().count(),
+                    }).collect();
+            }
             // A dotted expression is a member lookup, never a new lexical
             // keyword. Falling through used to turn `game.f` into `game.game`.
-            return roblox_member_completions(alias, prefix);
+            return roblox_member_completions(alias, prefix, &source[..cursor_byte]);
         }
         let before_cursor = &source[..cursor_byte];
         let mut completions = lexical_completions(before_cursor);
@@ -897,7 +909,26 @@ fn require_path(expression: &str) -> String {
         .replace("\")", "").replace('.', "/")
 }
 
-fn roblox_member_completions(owner: &str, prefix: &str) -> Vec<Completion> {
+fn roblox_member_completions(owner: &str, prefix: &str, source: &str) -> Vec<Completion> {
+    // Reflection-backed properties for straightforward Instance.new bindings.
+    for raw in source.lines().rev() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        if let Some(declaration) = code.strip_prefix("local ").or_else(|| code.strip_prefix("const ")) {
+            if let Some((name, rhs)) = declaration.split_once('=') {
+                if name.trim() == owner {
+                    if let Some(class_name) = quoted_call_arguments(rhs, "Instance.new(").next() {
+                        return schema::get_class_schema_properties(class_name).into_iter()
+                            .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+                            .take(12).map(|(name, detail)| Completion {
+                                label: name.clone(), detail: format!("{class_name} property · {detail}"),
+                                insert_text: name, replace_chars: prefix.chars().count(),
+                            }).collect();
+                    }
+                }
+            }
+        }
+    }
+
     let items: &[(&str, &str)] = match owner {
         "game" | "Game" => &[
             ("GetService", "Roblox DataModel service lookup"),
@@ -992,7 +1023,8 @@ fn lexical_completions(source_before_cursor: &str) -> Vec<Completion> {
     let mut matches: Vec<_> = ITEMS.iter()
         .filter(|(label, _, _)| {
             let candidate = label.to_ascii_lowercase();
-            candidate.starts_with(&lower) || (lower.len() >= 3 && shared(label) >= 2)
+            (candidate != lower && candidate.starts_with(&lower))
+                || (lower.len() >= 3 && candidate != lower && shared(label) >= 2)
         })
         .map(|(label, detail, insert)| Completion {
             label: (*label).into(), detail: (*detail).into(), insert_text: (*insert).into(),

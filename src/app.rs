@@ -569,7 +569,25 @@ impl EditorApp {
                     if ui.button(if compact { "🌐 Roblox" } else { "🌐 Open from Roblox" }).clicked() {
                         self.open_place_from_roblox();
                     }
-                    if !compact && ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
+                    if compact {
+                        ui.menu_button("⋮ More", |ui| {
+                            if ui.button("📥 Import Local .rbxm").clicked() {
+                                self.prompt_import_local_model(); ui.close();
+                            }
+                            if ui.button("💾 Save As...").clicked() {
+                                self.save_as(); ui.close();
+                            }
+                            if ui.button("🚀 Publish to Roblox").clicked() {
+                                self.publish_place_to_roblox(); ui.close();
+                            }
+                            if ui.button("📊 Stats").clicked() {
+                                self.show_stats = !self.show_stats; ui.close();
+                            }
+                            if ui.button("⚙ Settings").clicked() {
+                                self.active_tab = ActiveTab::Settings; ui.close();
+                            }
+                        });
+                    } else if ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
                         self.prompt_import_local_model();
                     }
                     if ui.button(RichText::new("💾 Save").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
@@ -1709,6 +1727,7 @@ ui.label("Place ID:");
 });
 
         // Quick Luau Symbol Bar
+        let mut focus_editor_requested = false;
         ui.separator();
         egui::ScrollArea::horizontal()
             .id_salt("quick_symbols_editor")
@@ -1718,7 +1737,7 @@ ui.label("Place ID:");
                     ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
 
                     let symbols = [
-                        ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
+                        ("Tab", "\t"), ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
                         ("=", " = "), ("==", " == "), ("~=", " ~= "), ("<=", " <= "), (">=", " >= "),
                         ("..", " .. "), (":", ":"), (".", "."), (",", ", "), ("->", " -> "), ("::", " :: "),
                         ("local", "local "), ("const", "const "), ("function", "function "), ("end", "end"),
@@ -1731,7 +1750,11 @@ ui.label("Place ID:");
 
                     for (label, snippet) in symbols {
                         if ui.button(label).clicked() {
-                            tab.buffer.push_str(snippet);
+                            let cursor = insert_at_selection(&mut tab.buffer, self.script_selection, snippet);
+                            self.pending_script_cursor = Some(cursor);
+                            self.script_completion_cursor = Some(cursor);
+                            self.script_selection = Some((cursor, cursor));
+                            focus_editor_requested = true;
                         }
                     }
                 });
@@ -1809,6 +1832,7 @@ ui.label("Place ID:");
                     completion,
                 );
                 self.script_completion_cursor = Some(new_cursor);
+                self.pending_script_cursor = Some(new_cursor);
                 completions.clear();
             }
         }
@@ -1877,9 +1901,13 @@ ui.label("Place ID:");
                         .lock_focus(true)
                         .layouter(&mut layouter)
                         .show(ui);
+                    if focus_editor_requested {
+                        output.response.request_focus();
+                    }
                     let mut reported_range = output.cursor_range;
                     let mut store_cursor = false;
                     if let Some(cursor) = self.pending_script_cursor.take() {
+                        output.response.request_focus();
                         reported_range = Some(egui::text::CCursorRange::one(
                             egui::text::CCursor::new(cursor.min(tab.buffer.chars().count())),
                         ));
@@ -2033,6 +2061,7 @@ ui.label("Place ID:");
                                 completion,
                             );
                             self.script_completion_cursor = Some(new_cursor);
+                            self.pending_script_cursor = Some(new_cursor);
                             self.script_completion_selected = 0;
                         }
                     }
@@ -4926,6 +4955,17 @@ play()
             .or_else(|| raw.parse::<u64>().ok())
             .unwrap_or(0)
     }
+}
+
+fn insert_at_selection(source: &mut String, selection: Option<(usize, usize)>, text: &str) -> usize {
+    let fallback = source.chars().count();
+    let (anchor, primary) = selection.unwrap_or((fallback, fallback));
+    let start = anchor.min(primary).min(fallback);
+    let end = anchor.max(primary).min(fallback);
+    let start_byte = source.char_indices().nth(start).map_or(source.len(), |(byte, _)| byte);
+    let end_byte = source.char_indices().nth(end).map_or(source.len(), |(byte, _)| byte);
+    source.replace_range(start_byte..end_byte, text);
+    start + text.chars().count()
 }
 
 fn collect_script_paths(
