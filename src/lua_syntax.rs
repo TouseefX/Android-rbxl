@@ -2,7 +2,7 @@ use bevy_egui::egui::text::LayoutJob;
 use bevy_egui::egui::{Color32, FontId, TextFormat};
 use std::collections::HashSet;
 
-pub fn highlight_lua(text: &str, font_size: f32, search_term: Option<&str>) -> LayoutJob {
+pub fn highlight_luau(text: &str, font_size: f32, search_term: Option<&str>) -> LayoutJob {
     let font = FontId::monospace(font_size);
     let mut job = LayoutJob::default();
 

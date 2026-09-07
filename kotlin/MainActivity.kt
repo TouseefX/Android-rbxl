@@ -239,9 +239,10 @@ class MainActivity : GameActivity() {
     }
 
     /**
-     * Writes a real .lua file into Android/media/ (which stays reachable by
+     * Writes a real .luau file into Android/media/ (which stays reachable by
      * third-party editors on Android 13+, unlike Android/data) and hands it to
-     * whatever editor app the user picks.
+     * whatever editor app the user picks. Luau-aware editors use the extension
+     * for the correct grammar while text/plain keeps broad Android app support.
      */
     fun editExternally(scriptId: Long, fileName: String, source: String) {
         runOnUiThread {
@@ -266,8 +267,12 @@ class MainActivity : GameActivity() {
                 }
 
                 var sanitized = fileName.replace(Regex("[^a-zA-Z0-9_.-]"), "_")
-                if (!sanitized.endsWith(".lua")) {
-                    sanitized += ".lua"
+                // Roblox scripts use Luau. Replace a legacy extension rather
+                // than producing names like Foo.lua.luau.
+                sanitized = when {
+                    sanitized.endsWith(".luau", ignoreCase = true) -> sanitized
+                    sanitized.endsWith(".lua", ignoreCase = true) -> sanitized.dropLast(4) + ".luau"
+                    else -> "$sanitized.luau"
                 }
 
                 val scriptFile = File(targetDir, sanitized)
@@ -289,7 +294,7 @@ class MainActivity : GameActivity() {
                         Intent.FLAG_ACTIVITY_NEW_TASK
                 )
 
-                val chooser = Intent.createChooser(editIntent, "Edit Lua script with...")
+                val chooser = Intent.createChooser(editIntent, "Edit Luau script with...")
                 chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(chooser)
 

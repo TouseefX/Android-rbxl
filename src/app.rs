@@ -1374,7 +1374,7 @@ ui.label("Place ID:");
             }
 });
 
-        // Quick Lua Symbol Bar
+        // Quick Luau Symbol Bar
         ui.separator();
         egui::ScrollArea::horizontal()
             .id_salt("quick_symbols_editor")
@@ -1418,7 +1418,7 @@ ui.label("Place ID:");
             .show(ui, |ui| {
                 let search_ref = search_term.as_deref();
                 let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, _wrap: f32| {
-                    let job = lua_syntax::highlight_lua(text_buf.as_str(), font_size, search_ref);
+                    let job = lua_syntax::highlight_luau(text_buf.as_str(), font_size, search_ref);
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
 
