@@ -1283,8 +1283,9 @@ ui.label("Place ID:");
         // Build completion information from every ModuleScript in the local
         // DataModel, not only from currently-open tabs.
         let completions = self.dom.as_ref().map_or_else(Vec::new, |dom| {
+            let active = &self.open_tabs[self.active_script_idx];
             luau_intelligence::ProjectIndex::build(dom)
-                .complete(&self.open_tabs[self.active_script_idx].buffer)
+                .complete(active.referent, &active.buffer)
         });
 
         let tab = &mut self.open_tabs[self.active_script_idx];

@@ -1,9 +1,8 @@
 //! Lightweight project-wide Luau intelligence for the built-in mobile editor.
 //!
-//! This intentionally has no filesystem or LSP dependency: it indexes the
-//! Script instances already present in the loaded DataModel, resolves common
-//! instance-path and string `require` forms, and exposes ModuleScript members
-//! for completion. It can later be replaced or supplemented by luau-lsp.
+//! This indexes Script instances in the local DataModel, resolves instance and
+//! modern string requires (`./`, `../`, and `@self`), and exposes ModuleScript
+//! members without requiring a filesystem or an external language server.
 
 use crate::rbxl;
 use rbx_dom_weak::{types::Ref, WeakDom};
@@ -17,15 +16,16 @@ pub struct Completion {
 
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
-    /// Normalized DataModel path or module name -> exported member names.
+    /// Normalized DataModel path or unambiguous module name -> members.
     modules: HashMap<String, BTreeSet<String>>,
+    /// Every script's slash-separated virtual path in the DataModel.
+    paths: HashMap<Ref, String>,
 }
 
 impl ProjectIndex {
     pub fn build(dom: &WeakDom) -> Self {
         let mut index = Self::default();
-        let root = dom.root_ref();
-        index.walk(dom, root, &mut Vec::new());
+        index.walk(dom, dom.root_ref(), &mut Vec::new());
         index
     }
 
@@ -34,12 +34,12 @@ impl ProjectIndex {
         let is_root = referent == dom.root_ref();
         if !is_root {
             path.push(instance.name.clone());
+            self.paths.insert(referent, path.join("/"));
         }
 
         if instance.class.as_str() == "ModuleScript" {
             let members = exported_members(&rbxl::get_source(dom, referent).unwrap_or_default());
-            let full_path = path.join(".");
-            self.modules.insert(normalize_path(&full_path), members.clone());
+            self.modules.insert(normalize_path(&path.join("/")), members.clone());
             self.modules.insert(normalize_path(&instance.name), members);
         }
 
@@ -51,16 +51,15 @@ impl ProjectIndex {
         }
     }
 
-    /// Suggest members when the caret is at the end of `Alias.partial` and
-    /// Alias was assigned from require(...). This supports both DataModel paths
-    /// and string requires.
-    pub fn complete(&self, source: &str) -> Vec<Completion> {
+    /// Complete `Alias.partial`, resolving Alias from a require declaration.
+    pub fn complete(&self, current_script: Ref, source: &str) -> Vec<Completion> {
         let Some((alias, prefix)) = member_expression_at_end(source) else { return Vec::new() };
         let aliases = require_aliases(source);
-        let Some(module_path) = aliases.get(alias) else { return Vec::new() };
-        let key = normalize_path(module_path);
+        let Some(request) = aliases.get(alias) else { return Vec::new() };
+        let resolved = self.resolve_request(current_script, request);
+        let key = normalize_path(&resolved);
         let members = self.modules.get(&key).or_else(|| {
-            key.rsplit('.').next().and_then(|name| self.modules.get(name))
+            key.rsplit('/').next().and_then(|name| self.modules.get(name))
         });
         let Some(members) = members else { return Vec::new() };
         members
@@ -69,33 +68,55 @@ impl ProjectIndex {
             .take(12)
             .map(|member| Completion {
                 label: member.clone(),
-                detail: format!("{alias} member · {module_path}"),
+                detail: format!("{alias} member · {request} → {resolved}"),
             })
             .collect()
     }
+
+    fn resolve_request(&self, current_script: Ref, request: &str) -> String {
+        let current = self.paths.get(&current_script).cloned().unwrap_or_default();
+        if request == "@self" {
+            return current;
+        }
+        if let Some(rest) = request.strip_prefix("@self/") {
+            return collapse_path(&format!("{current}/{rest}"));
+        }
+        if request.starts_with("./") || request.starts_with("../") {
+            let parent = current.rsplit_once('/').map_or("", |(p, _)| p);
+            return collapse_path(&format!("{parent}/{request}"));
+        }
+        // User aliases normally come from .luaurc. Until project folders land,
+        // map @Service/foo naturally onto a top-level DataModel service.
+        if let Some(rest) = request.strip_prefix('@') {
+            return collapse_path(rest);
+        }
+        collapse_path(request)
+    }
 }
 
-/// Replace only the member fragment at the end of a source buffer.
 pub fn apply_completion(source: &mut String, member: &str) {
-    let prefix_len = source
-        .chars()
-        .rev()
+    let prefix_len = source.chars().rev()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .map(char::len_utf8)
-        .sum::<usize>();
+        .map(char::len_utf8).sum::<usize>();
     source.truncate(source.len().saturating_sub(prefix_len));
     source.push_str(member);
 }
 
-fn normalize_path(path: &str) -> String {
-    let mut value = path.trim().trim_matches(['"', '\'', ' ']).replace('/', ".");
-    for prefix in ["game.", "Game."] {
-        if value.starts_with(prefix) {
-            value = value[prefix.len()..].to_string();
-        }
+fn collapse_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in normalized.split('/').filter(|p| !p.is_empty() && *p != ".") {
+        if part == ".." { parts.pop(); } else { parts.push(part); }
     }
-    value.replace(":GetService(\"", ".")
-        .replace("\")", "")
+    parts.join("/")
+}
+
+fn normalize_path(path: &str) -> String {
+    let mut value = path.trim().trim_matches(['"', '\'', ' ']).replace('.', "/");
+    for prefix in ["game/", "Game/"] {
+        if value.starts_with(prefix) { value = value[prefix.len()..].to_string(); }
+    }
+    collapse_path(&value.replace(":GetService(\"", "/").replace("\")", ""))
         .to_ascii_lowercase()
 }
 
@@ -117,45 +138,51 @@ fn require_aliases(source: &str) -> HashMap<&str, String> {
 
 fn require_path(expression: &str) -> String {
     let quoted = expression.trim_matches(['"', '\'']);
-    if quoted != expression {
-        return quoted.to_string();
-    }
-    expression
-        .replace(":WaitForChild(\"", ".")
-        .replace(":FindFirstChild(\"", ".")
-        .replace("\")", "")
-        .replace("script.Parent.", "")
+    if quoted != expression { return quoted.to_string(); }
+    expression.replace(":WaitForChild(\"", "/")
+        .replace(":FindFirstChild(\"", "/")
+        .replace("\")", "").replace('.', "/")
 }
 
 fn member_expression_at_end(source: &str) -> Option<(&str, &str)> {
-    let tail = source
-        .trim_end_matches(|c: char| c.is_whitespace())
-        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
-        .next()?;
+    let tail = source.trim_end_matches(char::is_whitespace)
+        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).next()?;
     let (alias, prefix) = tail.rsplit_once('.')?;
-    if is_identifier(alias) && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        Some((alias, prefix))
-    } else {
-        None
-    }
+    (is_identifier(alias) && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some((alias, prefix))
 }
 
 fn exported_members(source: &str) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
+    let mut in_return_table = false;
     for line in source.lines() {
         let code = line.split("--").next().unwrap_or("").trim();
-        let code = code.strip_prefix("function ").or_else(|| code.strip_prefix("const function ")).unwrap_or(code);
-        if let Some((_, member)) = code.split_once('.') {
-            let name = member.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("");
+        let declaration = code.strip_prefix("function ")
+            .or_else(|| code.strip_prefix("const function ")).unwrap_or(code);
+        if let Some((_, member)) = declaration.split_once('.') {
+            let name = identifier_start(member);
             if is_identifier(name) { result.insert(name.to_string()); }
         }
         if let Some(rest) = code.strip_prefix("export ") {
-            let name = rest.trim_start_matches("function ")
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("");
+            let name = identifier_start(rest.trim_start_matches("function "));
             if is_identifier(name) { result.insert(name.to_string()); }
+        }
+        // Also understand `return { foo = value, bar = function() ... }`.
+        if code.starts_with("return {") { in_return_table = true; }
+        if in_return_table {
+            let body = code.strip_prefix("return {").unwrap_or(code);
+            for field in body.split(',') {
+                let name = identifier_start(field.trim());
+                if field.contains('=') && is_identifier(name) { result.insert(name.to_string()); }
+            }
+            if code.contains('}') { in_return_table = false; }
         }
     }
     result
+}
+
+fn identifier_start(value: &str) -> &str {
+    value.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("")
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -169,17 +196,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_string_require_members() {
-        let mut index = ProjectIndex::default();
-        index.modules.insert("inventory".into(), BTreeSet::from(["AddItem".into(), "MaxSlots".into()]));
-        let result = index.complete("const Inventory = require(\"Inventory\")\nInventory.Ad");
-        assert_eq!(result.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(), ["AddItem"]);
+    fn collapses_relative_paths() {
+        assert_eq!(collapse_path("ReplicatedStorage/Package/Sub/../Inventory"), "ReplicatedStorage/Package/Inventory");
     }
 
     #[test]
-    fn finds_module_table_members() {
-        let members = exported_members("function Inventory.AddItem() end\nInventory.MaxSlots = 20");
+    fn finds_module_and_return_table_members() {
+        let members = exported_members("function Inventory.AddItem() end\nreturn { MaxSlots = 20, Remove = function() end }");
         assert!(members.contains("AddItem"));
         assert!(members.contains("MaxSlots"));
+        assert!(members.contains("Remove"));
     }
 }
