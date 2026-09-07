@@ -246,6 +246,15 @@ impl ProjectIndex {
             return roblox_member_completions(alias, prefix, &source[..cursor_byte]);
         }
         let before_cursor = &source[..cursor_byte];
+        // Nested member chains (e.g. Module.Factory().value) need type-flow
+        // information. Never offer lexical keywords in the middle of one:
+        // accepting those was the source of duplicated `game.game.f` text.
+        let expression_tail = before_cursor
+            .rsplit(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '='))
+            .next().unwrap_or("");
+        if expression_tail.contains('.') {
+            return Vec::new();
+        }
         let mut completions = lexical_completions(before_cursor);
         let prefix = identifier_fragment(before_cursor);
         if prefix.len() >= 2 {
@@ -1314,6 +1323,12 @@ mod tests {
         let suggestions = index.complete_at(Ref::none(), "game.F", 6);
         assert!(suggestions.iter().any(|item| item.label == "FindService"));
         assert!(!suggestions.iter().any(|item| item.label == "game"));
+    }
+
+    #[test]
+    fn nested_member_chains_never_fall_back_to_keywords() {
+        let index = ProjectIndex::default();
+        assert!(index.complete_at(Ref::none(), "Module.Create().ga", 18).is_empty());
     }
 
     #[test]

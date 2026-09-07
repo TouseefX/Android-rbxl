@@ -1628,6 +1628,11 @@ ui.label("Place ID:");
                 export_project_requested = true;
             }
 
+            if ui.button("✨ Format Luau").clicked() {
+                tab.buffer = format_luau_indentation(&tab.buffer);
+                tab.previous_buffer = tab.buffer.clone();
+                self.status = format!("Formatted {}", tab_name);
+            }
             if ui.button("🔍 Find & Replace").clicked() {
                 self.show_replace = !self.show_replace;
             }
@@ -4993,6 +4998,32 @@ play()
             .or_else(|| raw.parse::<u64>().ok())
             .unwrap_or(0)
     }
+}
+
+fn format_luau_indentation(source: &str) -> String {
+    let mut depth = 0usize;
+    let mut output = Vec::new();
+    for raw in source.lines() {
+        let trimmed = raw.trim();
+        let code = trimmed.split("--").next().unwrap_or("").trim();
+        let closes = code == "end" || code.starts_with("end ") || code.starts_with("end;")
+            || code.starts_with("until ") || code == "else" || code.starts_with("elseif ");
+        if closes { depth = depth.saturating_sub(1); }
+        if trimmed.is_empty() {
+            output.push(String::new());
+        } else {
+            output.push(format!("{}{}", "\t".repeat(depth), trimmed));
+        }
+        let opens = (code.starts_with("if ") && code.ends_with("then"))
+            || ((code.starts_with("for ") || code.starts_with("while ")) && code.ends_with("do"))
+            || code.starts_with("function ") || code.starts_with("local function ")
+            || code.starts_with("const function ") || code == "do" || code == "repeat"
+            || code == "else" || code.starts_with("elseif ");
+        if opens && !code.ends_with(" end") { depth += 1; }
+    }
+    let mut formatted = output.join("\n");
+    if source.ends_with('\n') { formatted.push('\n'); }
+    formatted
 }
 
 fn insert_at_selection(source: &mut String, selection: Option<(usize, usize)>, text: &str) -> usize {
