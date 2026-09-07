@@ -14,6 +14,12 @@ pub struct Completion {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDiagnostic {
+    pub line: usize,
+    pub message: String,
+}
+
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
     /// Normalized DataModel path or unambiguous module name -> members.
@@ -82,6 +88,48 @@ impl ProjectIndex {
             .collect()
     }
 
+    /// Validate string/DataModel requires and member accesses against the local
+    /// project index. These are editor warnings, separate from Luau grammar
+    /// errors produced by the compiler.
+    pub fn diagnostics(&self, current_script: Ref, source: &str) -> Vec<ProjectDiagnostic> {
+        let aliases = require_aliases_with_lines(source);
+        let mut diagnostics = Vec::new();
+        for (alias, request, require_line) in aliases {
+            let resolved = self.resolve_request(current_script, &request);
+            let key = normalize_path(&resolved);
+            let members = self.modules.get(&key).or_else(|| {
+                key.rsplit('/').next().and_then(|name| self.modules.get(name))
+            });
+            let Some(members) = members else {
+                diagnostics.push(ProjectDiagnostic {
+                    line: require_line,
+                    message: format!("Unresolved module '{request}' (looked for '{resolved}')"),
+                });
+                continue;
+            };
+
+            let needle = format!("{alias}.");
+            for (line_index, line) in source.lines().enumerate() {
+                let code = line.split("--").next().unwrap_or("");
+                let mut remainder = code;
+                while let Some(position) = remainder.find(&needle) {
+                    let after = &remainder[position + needle.len()..];
+                    let member = identifier_start(after);
+                    if is_identifier(member) && !members.contains_key(member) {
+                        diagnostics.push(ProjectDiagnostic {
+                            line: line_index + 1,
+                            message: format!("Unknown member '{member}' on module '{alias}'"),
+                        });
+                    }
+                    remainder = &after[member.len()..];
+                }
+            }
+        }
+        diagnostics.sort_by_key(|diagnostic| diagnostic.line);
+        diagnostics.dedup();
+        diagnostics
+    }
+
     fn resolve_request(&self, current_script: Ref, request: &str) -> String {
         let current = self.paths.get(&current_script).cloned().unwrap_or_default();
         if request == "@self" {
@@ -145,20 +193,25 @@ fn normalize_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn parse_require_declaration(line: &str) -> Option<(&str, String)> {
+    let code = line.split("--").next().unwrap_or("").trim();
+    let code = code.strip_prefix("local ").or_else(|| code.strip_prefix("const "))?;
+    let (alias, rhs) = code.split_once('=')?;
+    let alias = alias.trim();
+    if !is_identifier(alias) { return None }
+    let inner = rhs.trim().strip_prefix("require(")?.strip_suffix(')')?;
+    Some((alias, require_path(inner.trim())))
+}
+
 fn require_aliases(source: &str) -> HashMap<&str, String> {
-    let mut aliases = HashMap::new();
-    for line in source.lines() {
-        let code = line.split("--").next().unwrap_or("").trim();
-        let code = code.strip_prefix("local ").or_else(|| code.strip_prefix("const "));
-        let Some(code) = code else { continue };
-        let Some((alias, rhs)) = code.split_once('=') else { continue };
-        let alias = alias.trim();
-        if !is_identifier(alias) { continue }
-        let rhs = rhs.trim();
-        let Some(inner) = rhs.strip_prefix("require(").and_then(|s| s.strip_suffix(')')) else { continue };
-        aliases.insert(alias, require_path(inner.trim()));
-    }
-    aliases
+    source.lines().filter_map(parse_require_declaration).collect()
+}
+
+fn require_aliases_with_lines(source: &str) -> Vec<(String, String, usize)> {
+    source.lines().enumerate().filter_map(|(line, text)| {
+        parse_require_declaration(text)
+            .map(|(alias, request)| (alias.to_string(), request, line + 1))
+    }).collect()
 }
 
 fn require_path(expression: &str) -> String {
@@ -281,6 +334,26 @@ mod tests {
         let new_cursor = apply_completion_at(&mut source, cursor, "AddItem");
         assert_eq!(source, "Inventory.AddItem + Inventory.Other");
         assert_eq!(new_cursor, "Inventory.AddItem".chars().count());
+    }
+
+    #[test]
+    fn reports_unresolved_modules_and_unknown_members() {
+        let mut index = ProjectIndex::default();
+        index.modules.insert(
+            "inventory".into(),
+            BTreeMap::from([("AddItem".into(), "function AddItem()".into())]),
+        );
+        let source = "const Inventory = require(\"./Inventory\")\nInventory.Missing()";
+        let warnings = index.diagnostics(Ref::none(), source);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("Unknown member 'Missing'"));
+
+        let unresolved = index.diagnostics(
+            Ref::none(),
+            "const Missing = require(\"./DoesNotExist\")",
+        );
+        assert_eq!(unresolved.len(), 1);
+        assert!(unresolved[0].message.contains("Unresolved module"));
     }
 
     #[test]

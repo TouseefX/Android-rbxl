@@ -1304,6 +1304,10 @@ ui.label("Place ID:");
         // DataModel, not only from currently-open tabs. Completion itself is
         // requested after TextEdit reports the real caret position.
         let project_index = self.dom.as_ref().map(luau_intelligence::ProjectIndex::build);
+        let project_diagnostics = project_index.as_ref().map_or_else(Vec::new, |index| {
+            let active = &self.open_tabs[self.active_script_idx];
+            index.diagnostics(active.referent, &active.buffer)
+        });
 
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
@@ -1619,6 +1623,31 @@ ui.label("Place ID:");
                             RichText::new(format!("{location}: {}", diagnostic.message))
                                 .monospace()
                                 .color(Color32::from_rgb(255, 175, 175)),
+                        );
+                    }
+                });
+        }
+
+        if !project_diagnostics.is_empty() {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(52, 43, 25))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "⚠ {} project warning(s)",
+                            project_diagnostics.len()
+                        ))
+                        .strong()
+                        .color(Color32::from_rgb(255, 205, 105)),
+                    );
+                    for diagnostic in &project_diagnostics {
+                        ui.label(
+                            RichText::new(format!(
+                                "Line {}: {}",
+                                diagnostic.line, diagnostic.message
+                            ))
+                            .monospace()
+                            .color(Color32::from_rgb(255, 220, 145)),
                         );
                     }
                 });
