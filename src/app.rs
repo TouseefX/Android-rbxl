@@ -136,6 +136,7 @@ pub struct EditorApp {
     script_selection: Option<(usize, usize)>,
     /// Character position to apply after opening a definition in another tab.
     pending_script_cursor: Option<usize>,
+    script_references: Vec<luau_intelligence::Reference>,
 
     // Find & Replace
     find_term: String,
@@ -285,6 +286,7 @@ impl Default for EditorApp {
             script_completion_dismissed_at: None,
             script_selection: None,
             pending_script_cursor: None,
+            script_references: Vec::new(),
             find_term: String::new(),
             replace_term: String::new(),
             show_replace: false,
@@ -1318,6 +1320,7 @@ ui.label("Place ID:");
             })
         });
         let mut goto_definition = None;
+        let mut find_references_requested = false;
 
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
@@ -1367,7 +1370,13 @@ ui.label("Place ID:");
                 definition.is_some(),
                 egui::Button::new("↗ Go to Definition"),
             ).clicked() {
-                goto_definition = definition;
+                goto_definition = definition.clone();
+            }
+            if ui.add_enabled(
+                definition.is_some(),
+                egui::Button::new("⌕ Find References"),
+            ).clicked() {
+                find_references_requested = true;
             }
         });
 
@@ -1726,7 +1735,52 @@ ui.label("Place ID:");
             }
         }
 
-        if let Some(definition) = goto_definition {
+        let references = self.script_references.clone();
+        let mut reference_jump = None;
+        if !references.is_empty() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("⌕ References ({})", references.len())).strong());
+                    if ui.small_button("Close").clicked() {
+                        self.script_references.clear();
+                    }
+                });
+                for reference in &references {
+                    let script_name = self.dom.as_ref()
+                        .and_then(|dom| dom.get_by_ref(reference.referent))
+                        .map_or("Script", |instance| instance.name.as_str());
+                    if ui.selectable_label(
+                        false,
+                        RichText::new(format!(
+                            "{script_name}:{}  {}",
+                            reference.line, reference.preview
+                        )).monospace(),
+                    ).clicked() {
+                        reference_jump = Some(reference.clone());
+                    }
+                }
+            });
+        }
+
+        if find_references_requested {
+            if let (Some(index), Some(definition)) = (project_index.as_ref(), definition.as_ref()) {
+                self.script_references = index.references(definition);
+                self.status = format!("Found {} reference(s)", self.script_references.len());
+            }
+        }
+
+        if let Some(reference) = reference_jump {
+            self.open_script_tab(reference.referent);
+            if let Some(target) = self.open_tabs.get(self.active_script_idx) {
+                let cursor = target.buffer.lines()
+                    .take(reference.line.saturating_sub(1))
+                    .map(|line| line.chars().count() + 1)
+                    .sum();
+                self.pending_script_cursor = Some(cursor);
+                self.script_completion_cursor = Some(cursor);
+                self.selected = Some(reference.referent);
+            }
+        } else if let Some(definition) = goto_definition {
             self.open_script_tab(definition.referent);
             if let Some(target) = self.open_tabs.get(self.active_script_idx) {
                 let cursor = target.buffer.lines()

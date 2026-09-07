@@ -20,10 +20,18 @@ pub struct ProjectDiagnostic {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Definition {
     pub referent: Ref,
     pub line: usize,
+    pub member: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    pub referent: Ref,
+    pub line: usize,
+    pub preview: String,
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +40,7 @@ pub struct ProjectIndex {
     modules: HashMap<String, BTreeMap<String, String>>,
     module_refs: HashMap<String, Ref>,
     module_sources: HashMap<Ref, String>,
+    script_sources: HashMap<Ref, String>,
     /// Every script's slash-separated virtual path in the DataModel.
     paths: HashMap<Ref, String>,
 }
@@ -51,8 +60,17 @@ impl ProjectIndex {
             self.paths.insert(referent, path.join("/"));
         }
 
+        let is_script = matches!(
+            instance.class.as_str(),
+            "Script" | "LocalScript" | "ModuleScript"
+        );
+        let source = is_script.then(|| rbxl::get_source(dom, referent).unwrap_or_default());
+        if let Some(source) = &source {
+            self.script_sources.insert(referent, source.clone());
+        }
+
         if instance.class.as_str() == "ModuleScript" {
-            let source = rbxl::get_source(dom, referent).unwrap_or_default();
+            let source = source.unwrap_or_default();
             let members = exported_members(&source);
             let full_key = normalize_path(&path.join("/"));
             let name_key = normalize_path(&instance.name);
@@ -124,7 +142,40 @@ impl ProjectIndex {
         Some(Definition {
             referent: target,
             line: member.and_then(|name| member_definition_line(module_source, name)).unwrap_or(1),
+            member: member.map(str::to_string),
         })
+    }
+
+    /// Find project-wide uses of a resolved module or one of its exported
+    /// members. Require aliases are resolved independently in every script.
+    pub fn references(&self, definition: &Definition) -> Vec<Reference> {
+        let mut result = Vec::new();
+        for (&script_ref, source) in &self.script_sources {
+            let aliases = require_aliases(source);
+            for (alias, request) in aliases {
+                if self.resolve_module_ref(script_ref, &request) != Some(definition.referent) {
+                    continue;
+                }
+                let needle = definition.member.as_ref()
+                    .map_or_else(|| alias.to_string(), |member| format!("{alias}.{member}"));
+                for (line_index, line) in source.lines().enumerate() {
+                    let code = line.split("--").next().unwrap_or("");
+                    if contains_identifier(code, &needle) {
+                        result.push(Reference {
+                            referent: script_ref,
+                            line: line_index + 1,
+                            preview: line.trim().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        result.sort_by(|a, b| {
+            self.paths.get(&a.referent).cmp(&self.paths.get(&b.referent))
+                .then(a.line.cmp(&b.line))
+        });
+        result.dedup_by(|a, b| a.referent == b.referent && a.line == b.line);
+        result
     }
 
     /// Validate string/DataModel requires and member accesses against the local
@@ -429,6 +480,16 @@ fn member_expression_at_end(source: &str) -> Option<(&str, &str)> {
     let (alias, prefix) = tail.rsplit_once('.')?;
     (is_identifier(alias) && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
         .then_some((alias, prefix))
+}
+
+fn contains_identifier(line: &str, needle: &str) -> bool {
+    line.match_indices(needle).any(|(start, _)| {
+        let before = line[..start].chars().next_back();
+        let end = start + needle.len();
+        let after = line[end..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 fn member_expression_at_cursor(source: &str, cursor_char: usize) -> Option<&str> {
