@@ -198,28 +198,30 @@ impl ProjectIndex {
         if let Some(typed) = require_string_at_cursor(&source[..cursor_byte]) {
             return self.complete_require_path(current_script, typed);
         }
-        let Some((alias, prefix)) = member_expression_at_end(&source[..cursor_byte]) else {
-            return Vec::new();
-        };
-        let aliases = require_aliases(source);
-        let Some(request) = aliases.get(alias) else { return Vec::new() };
-        let resolved = self.resolve_request(current_script, request);
-        let key = normalize_path(&resolved);
-        let members = self.modules.get(&key).or_else(|| {
-            key.rsplit('/').next().and_then(|name| self.modules.get(name))
-        });
-        let Some(members) = members else { return Vec::new() };
-        members
-            .iter()
-            .filter(|(member, _)| member.starts_with(prefix))
-            .take(12)
-            .map(|(member, signature)| Completion {
-                label: member.clone(),
-                detail: format!("{signature}  ·  {request} → {resolved}"),
-                insert_text: member.clone(),
-                replace_chars: prefix.chars().count(),
-            })
-            .collect()
+        if let Some((alias, prefix)) = member_expression_at_end(&source[..cursor_byte]) {
+            let aliases = require_aliases(source);
+            if let Some(request) = aliases.get(alias) {
+                let resolved = self.resolve_request(current_script, request);
+                let key = normalize_path(&resolved);
+                let members = self.modules.get(&key).or_else(|| {
+                    key.rsplit('/').next().and_then(|name| self.modules.get(name))
+                });
+                if let Some(members) = members {
+                    return members
+                        .iter()
+                        .filter(|(member, _)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+                        .take(12)
+                        .map(|(member, signature)| Completion {
+                            label: member.clone(),
+                            detail: format!("{signature}  ·  {request} → {resolved}"),
+                            insert_text: member.clone(),
+                            replace_chars: prefix.chars().count(),
+                        })
+                        .collect();
+                }
+            }
+        }
+        lexical_completions(&source[..cursor_byte])
     }
 
     fn complete_require_path(&self, current_script: Ref, typed: &str) -> Vec<Completion> {
@@ -859,6 +861,68 @@ fn require_path(expression: &str) -> String {
         .replace("\")", "").replace('.', "/")
 }
 
+fn lexical_completions(source_before_cursor: &str) -> Vec<Completion> {
+    let prefix = source_before_cursor
+        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next().unwrap_or("");
+    if prefix.len() < 2 { return Vec::new(); }
+    let lower = prefix.to_ascii_lowercase();
+    const ITEMS: &[(&str, &str, &str)] = &[
+        ("local", "Luau keyword", "local"),
+        ("const", "Luau constant declaration", "const"),
+        ("function", "Luau function declaration", "function"),
+        ("return", "Luau keyword", "return"),
+        ("export", "Luau exported declaration", "export"),
+        ("type", "Luau type declaration", "type"),
+        ("typeof", "Luau type operator", "typeof"),
+        ("if", "Luau keyword", "if"),
+        ("then", "Luau keyword", "then"),
+        ("elseif", "Luau keyword", "elseif"),
+        ("else", "Luau keyword", "else"),
+        ("for", "Luau keyword", "for"),
+        ("while", "Luau keyword", "while"),
+        ("repeat", "Luau keyword", "repeat"),
+        ("until", "Luau keyword", "until"),
+        ("do", "Luau keyword", "do"),
+        ("end", "Luau keyword", "end"),
+        ("and", "Luau operator", "and"),
+        ("or", "Luau operator", "or"),
+        ("not", "Luau operator", "not"),
+        ("true", "boolean", "true"),
+        ("false", "boolean", "false"),
+        ("nil", "nil value", "nil"),
+        ("require", "Load a ModuleScript", "require()"),
+        ("game", "Roblox DataModel", "game"),
+        ("workspace", "Roblox Workspace", "workspace"),
+        ("script", "Current Roblox script", "script"),
+        ("Instance.new", "Create a Roblox instance", "Instance.new(\"\")"),
+        ("game:GetService", "Get a Roblox service", "game:GetService(\"\")"),
+        ("task.wait", "Yield the current task", "task.wait()"),
+        ("task.spawn", "Spawn a task", "task.spawn(function()\n\t\nend)"),
+        ("print", "Write to Output", "print()"),
+        ("warn", "Write a warning", "warn()"),
+        ("pairs", "Iterate a table", "pairs()"),
+        ("ipairs", "Iterate an array", "ipairs()"),
+    ];
+    let shared = |candidate: &str| candidate.to_ascii_lowercase().chars()
+        .zip(lower.chars()).take_while(|(a, b)| a == b).count();
+    let mut matches: Vec<_> = ITEMS.iter()
+        .filter(|(label, _, _)| {
+            let candidate = label.to_ascii_lowercase();
+            candidate.starts_with(&lower) || (lower.len() >= 3 && shared(label) >= 2)
+        })
+        .map(|(label, detail, insert)| Completion {
+            label: (*label).into(), detail: (*detail).into(), insert_text: (*insert).into(),
+            replace_chars: prefix.chars().count(),
+        }).collect();
+    matches.sort_by_key(|item| {
+        let label = item.label.to_ascii_lowercase();
+        if label.starts_with(&lower) { 0 } else { 1 }
+    });
+    matches.truncate(12);
+    matches
+}
+
 fn member_expression_at_end(source: &str) -> Option<(&str, &str)> {
     let tail = source.trim_end_matches(char::is_whitespace)
         .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).next()?;
@@ -1120,6 +1184,13 @@ mod tests {
         };
         apply_suggestion_at(&mut source, cursor, &completion);
         assert_eq!(source, "require(\"../Inventory\")");
+    }
+
+    #[test]
+    fn suggests_luau_keywords_and_corrects_close_prefixes() {
+        let exact = lexical_completions("loc");
+        assert_eq!(exact.first().map(|item| item.label.as_str()), Some("local"));
+        assert!(lexical_completions("lope").iter().any(|item| item.label == "local"));
     }
 
     #[test]
