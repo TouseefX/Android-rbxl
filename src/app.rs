@@ -1281,12 +1281,9 @@ ui.label("Place ID:");
         }
 
         // Build completion information from every ModuleScript in the local
-        // DataModel, not only from currently-open tabs.
-        let completions = self.dom.as_ref().map_or_else(Vec::new, |dom| {
-            let active = &self.open_tabs[self.active_script_idx];
-            luau_intelligence::ProjectIndex::build(dom)
-                .complete(active.referent, &active.buffer)
-        });
+        // DataModel, not only from currently-open tabs. Completion itself is
+        // requested after TextEdit reports the real caret position.
+        let project_index = self.dom.as_ref().map(luau_intelligence::ProjectIndex::build);
 
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
@@ -1326,20 +1323,6 @@ ui.label("Place ID:");
                 self.show_replace = !self.show_replace;
             }
         });
-
-        // Project-wide ModuleScript member completion. Suggestions appear for
-        // aliases declared with either local/const and both string or
-        // DataModel-path require calls, e.g. `Inventory.Ad`.
-        if !completions.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Suggestions:").color(Color32::from_rgb(120, 190, 255)));
-                for completion in completions {
-                    if ui.button(&completion.label).on_hover_text(&completion.detail).clicked() {
-                        luau_intelligence::apply_completion(&mut tab.buffer, &completion.label);
-                    }
-                }
-            });
-        }
 
         // External Edit Sync Banner
         if self.pending_external_edits.values().any(|&r| r == tab_ref) {
@@ -1435,6 +1418,7 @@ ui.label("Place ID:");
             Some(self.find_term.trim().to_string())
         };
 
+        let mut cursor_char = None;
         egui::ScrollArea::both()
             .id_salt("code_scroll_area")
             .show(ui, |ui| {
@@ -1444,17 +1428,37 @@ ui.label("Place ID:");
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
 
-                ui.add(
-                    egui::TextEdit::multiline(&mut tab.buffer)
-                        .id_source("script_multiline_view")
-                        .font(egui::FontId::monospace(self.font_size))
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(28)
-                        .lock_focus(true)
-                        .layouter(&mut layouter),
-                );
+                let output = egui::TextEdit::multiline(&mut tab.buffer)
+                    .id_source("script_multiline_view")
+                    .font(egui::FontId::monospace(self.font_size))
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(28)
+                    .lock_focus(true)
+                    .layouter(&mut layouter)
+                    .show(ui);
+                cursor_char = output.cursor_range.map(|range| range.primary.index);
             });
+
+        // Project-wide completion follows the actual caret, so it also works
+        // in the middle of a script without modifying text after the caret.
+        if let (Some(index), Some(project_index)) = (cursor_char, project_index.as_ref()) {
+            let completions = project_index.complete_at(tab_ref, &tab.buffer, index);
+            if !completions.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Suggestions:").color(Color32::from_rgb(120, 190, 255)));
+                    for completion in completions {
+                        if ui.button(&completion.label).on_hover_text(&completion.detail).clicked() {
+                            luau_intelligence::apply_completion_at(
+                                &mut tab.buffer,
+                                index,
+                                &completion.label,
+                            );
+                        }
+                    }
+                });
+            }
+        }
     }
 
     fn show_properties_ui(&mut self, ui: &mut egui::Ui) {

@@ -51,9 +51,18 @@ impl ProjectIndex {
         }
     }
 
-    /// Complete `Alias.partial`, resolving Alias from a require declaration.
-    pub fn complete(&self, current_script: Ref, source: &str) -> Vec<Completion> {
-        let Some((alias, prefix)) = member_expression_at_end(source) else { return Vec::new() };
+    /// Complete `Alias.partial` at a character cursor position, resolving Alias
+    /// from a require declaration anywhere in the file.
+    pub fn complete_at(
+        &self,
+        current_script: Ref,
+        source: &str,
+        cursor_char: usize,
+    ) -> Vec<Completion> {
+        let cursor_byte = char_to_byte(source, cursor_char);
+        let Some((alias, prefix)) = member_expression_at_end(&source[..cursor_byte]) else {
+            return Vec::new();
+        };
         let aliases = require_aliases(source);
         let Some(request) = aliases.get(alias) else { return Vec::new() };
         let resolved = self.resolve_request(current_script, request);
@@ -94,12 +103,28 @@ impl ProjectIndex {
     }
 }
 
-pub fn apply_completion(source: &mut String, member: &str) {
-    let prefix_len = source.chars().rev()
+/// Replace the identifier fragment immediately before the caret while
+/// preserving everything after it. Cursor positions use egui's character
+/// indexing rather than UTF-8 byte offsets.
+pub fn apply_completion_at(source: &mut String, cursor_char: usize, member: &str) -> usize {
+    let cursor_byte = char_to_byte(source, cursor_char);
+    let prefix_bytes = source[..cursor_byte]
+        .chars()
+        .rev()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .map(char::len_utf8).sum::<usize>();
-    source.truncate(source.len().saturating_sub(prefix_len));
-    source.push_str(member);
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let start_byte = cursor_byte - prefix_bytes;
+    let start_char = source[..start_byte].chars().count();
+    source.replace_range(start_byte..cursor_byte, member);
+    start_char + member.chars().count()
+}
+
+fn char_to_byte(source: &str, char_index: usize) -> usize {
+    source
+        .char_indices()
+        .nth(char_index)
+        .map_or(source.len(), |(byte, _)| byte)
 }
 
 fn collapse_path(path: &str) -> String {
@@ -198,6 +223,15 @@ mod tests {
     #[test]
     fn collapses_relative_paths() {
         assert_eq!(collapse_path("ReplicatedStorage/Package/Sub/../Inventory"), "ReplicatedStorage/Package/Inventory");
+    }
+
+    #[test]
+    fn completion_replaces_only_text_before_cursor() {
+        let mut source = "Inventory.Ad + Inventory.Other".to_string();
+        let cursor = "Inventory.Ad".chars().count();
+        let new_cursor = apply_completion_at(&mut source, cursor, "AddItem");
+        assert_eq!(source, "Inventory.AddItem + Inventory.Other");
+        assert_eq!(new_cursor, "Inventory.AddItem".chars().count());
     }
 
     #[test]
