@@ -20,6 +20,12 @@ pub struct ProjectDiagnostic {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Definition {
+    pub referent: Ref,
+    pub line: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
     /// Normalized DataModel path or unambiguous module name -> members.
@@ -94,6 +100,31 @@ impl ProjectIndex {
                 detail: format!("{signature}  ·  {request} → {resolved}"),
             })
             .collect()
+    }
+
+    /// Resolve the module member under the caret to its defining ModuleScript
+    /// and source line.
+    pub fn definition_at(
+        &self,
+        current_script: Ref,
+        source: &str,
+        cursor_char: usize,
+    ) -> Option<Definition> {
+        let expression = member_expression_at_cursor(source, cursor_char)?;
+        let (alias, member) = match expression.rsplit_once('.') {
+            Some((alias, member)) if is_identifier(alias) && is_identifier(member) => {
+                (alias, Some(member))
+            }
+            None if is_identifier(expression) => (expression, None),
+            _ => return None,
+        };
+        let request = require_aliases(source).get(alias)?.clone();
+        let target = self.resolve_module_ref(current_script, &request)?;
+        let module_source = self.module_sources.get(&target)?;
+        Some(Definition {
+            referent: target,
+            line: member.and_then(|name| member_definition_line(module_source, name)).unwrap_or(1),
+        })
     }
 
     /// Validate string/DataModel requires and member accesses against the local
@@ -197,6 +228,13 @@ impl ProjectIndex {
             graph.insert(referent, edges);
         }
         graph
+    }
+
+    fn resolve_module_ref(&self, current_script: Ref, request: &str) -> Option<Ref> {
+        let key = normalize_path(&self.resolve_request(current_script, request));
+        self.module_refs.get(&key).copied().or_else(|| {
+            key.rsplit('/').next().and_then(|name| self.module_refs.get(name).copied())
+        })
     }
 
     fn resolve_request(&self, current_script: Ref, request: &str) -> String {
@@ -393,6 +431,39 @@ fn member_expression_at_end(source: &str) -> Option<(&str, &str)> {
         .then_some((alias, prefix))
 }
 
+fn member_expression_at_cursor(source: &str, cursor_char: usize) -> Option<&str> {
+    let chars: Vec<char> = source.chars().collect();
+    let cursor = cursor_char.min(chars.len());
+    let mut start = cursor;
+    while start > 0 && (chars[start - 1].is_ascii_alphanumeric() || matches!(chars[start - 1], '_' | '.')) {
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end < chars.len() && (chars[end].is_ascii_alphanumeric() || matches!(chars[end], '_' | '.')) {
+        end += 1;
+    }
+    if start == end { return None }
+    let start_byte = char_to_byte(source, start);
+    let end_byte = char_to_byte(source, end);
+    Some(&source[start_byte..end_byte])
+}
+
+fn member_definition_line(source: &str, member: &str) -> Option<usize> {
+    source.lines().enumerate().find_map(|(line, raw)| {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let direct_member = code.split_once('.').is_some_and(|(_, rest)| {
+            identifier_start(rest) == member
+        });
+        let exported = code.strip_prefix("export ").is_some_and(|rest| {
+            identifier_start(rest.trim_start_matches("type ").trim_start_matches("function ")) == member
+        });
+        let returned = code.contains('=') && identifier_start(
+            code.strip_prefix("return {").unwrap_or(code).trim()
+        ) == member;
+        (direct_member || exported || returned).then_some(line + 1)
+    })
+}
+
 fn exported_members(source: &str) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
     let mut in_return_table = false;
@@ -543,6 +614,13 @@ mod tests {
         );
         assert_eq!(unresolved.len(), 1);
         assert!(unresolved[0].message.contains("Unresolved module"));
+    }
+
+    #[test]
+    fn locates_member_definitions() {
+        let source = "local Inventory = {}\n\nfunction Inventory.AddItem() end\nexport type Item = string";
+        assert_eq!(member_definition_line(source, "AddItem"), Some(3));
+        assert_eq!(member_definition_line(source, "Item"), Some(4));
     }
 
     #[test]

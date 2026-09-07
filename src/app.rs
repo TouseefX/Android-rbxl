@@ -134,6 +134,8 @@ pub struct EditorApp {
     script_completion_dismissed_at: Option<(Ref, usize)>,
     /// Anchor/primary character positions from the previous editor frame.
     script_selection: Option<(usize, usize)>,
+    /// Character position to apply after opening a definition in another tab.
+    pending_script_cursor: Option<usize>,
 
     // Find & Replace
     find_term: String,
@@ -282,6 +284,7 @@ impl Default for EditorApp {
             script_completion_selected: 0,
             script_completion_dismissed_at: None,
             script_selection: None,
+            pending_script_cursor: None,
             find_term: String::new(),
             replace_term: String::new(),
             show_replace: false,
@@ -1308,6 +1311,13 @@ ui.label("Place ID:");
             let active = &self.open_tabs[self.active_script_idx];
             index.diagnostics(active.referent, &active.buffer)
         });
+        let definition = project_index.as_ref().and_then(|index| {
+            let active = &self.open_tabs[self.active_script_idx];
+            self.script_completion_cursor.and_then(|cursor| {
+                index.definition_at(active.referent, &active.buffer, cursor)
+            })
+        });
+        let mut goto_definition = None;
 
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
@@ -1352,6 +1362,12 @@ ui.label("Place ID:");
 
             if ui.button("🔍 Find & Replace").clicked() {
                 self.show_replace = !self.show_replace;
+            }
+            if ui.add_enabled(
+                definition.is_some(),
+                egui::Button::new("↗ Go to Definition"),
+            ).clicked() {
+                goto_definition = definition;
             }
         });
 
@@ -1568,7 +1584,12 @@ ui.label("Place ID:");
                         .show(ui);
                     let mut reported_range = output.cursor_range;
                     let mut store_cursor = false;
-                    if let Some((anchor, primary)) = pending_selection {
+                    if let Some(cursor) = self.pending_script_cursor.take() {
+                        reported_range = Some(egui::text::CCursorRange::one(
+                            egui::text::CCursor::new(cursor.min(tab.buffer.chars().count())),
+                        ));
+                        store_cursor = true;
+                    } else if let Some((anchor, primary)) = pending_selection {
                         reported_range = Some(egui::text::CCursorRange {
                             primary: egui::text::CCursor::new(primary),
                             secondary: egui::text::CCursor::new(anchor),
@@ -1702,6 +1723,20 @@ ui.label("Place ID:");
                         }
                     }
                 });
+            }
+        }
+
+        if let Some(definition) = goto_definition {
+            self.open_script_tab(definition.referent);
+            if let Some(target) = self.open_tabs.get(self.active_script_idx) {
+                let cursor = target.buffer.lines()
+                    .take(definition.line.saturating_sub(1))
+                    .map(|line| line.chars().count() + 1)
+                    .sum();
+                self.pending_script_cursor = Some(cursor);
+                self.script_completion_cursor = Some(cursor);
+                self.selected = Some(definition.referent);
+                self.status = format!("Opened definition at line {}", definition.line);
             }
         }
     }
