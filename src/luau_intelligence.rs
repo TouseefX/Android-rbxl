@@ -24,6 +24,8 @@ pub struct ProjectDiagnostic {
 pub struct ProjectIndex {
     /// Normalized DataModel path or unambiguous module name -> members.
     modules: HashMap<String, BTreeMap<String, String>>,
+    module_refs: HashMap<String, Ref>,
+    module_sources: HashMap<Ref, String>,
     /// Every script's slash-separated virtual path in the DataModel.
     paths: HashMap<Ref, String>,
 }
@@ -44,9 +46,15 @@ impl ProjectIndex {
         }
 
         if instance.class.as_str() == "ModuleScript" {
-            let members = exported_members(&rbxl::get_source(dom, referent).unwrap_or_default());
-            self.modules.insert(normalize_path(&path.join("/")), members.clone());
-            self.modules.insert(normalize_path(&instance.name), members);
+            let source = rbxl::get_source(dom, referent).unwrap_or_default();
+            let members = exported_members(&source);
+            let full_key = normalize_path(&path.join("/"));
+            let name_key = normalize_path(&instance.name);
+            self.modules.insert(full_key.clone(), members.clone());
+            self.modules.insert(name_key.clone(), members);
+            self.module_refs.insert(full_key, referent);
+            self.module_refs.entry(name_key).or_insert(referent);
+            self.module_sources.insert(referent, source);
         }
 
         for &child in instance.children() {
@@ -125,9 +133,70 @@ impl ProjectIndex {
                 }
             }
         }
+        diagnostics.extend(self.cycle_diagnostics(current_script, source));
         diagnostics.sort_by_key(|diagnostic| diagnostic.line);
         diagnostics.dedup();
         diagnostics
+    }
+
+    fn cycle_diagnostics(&self, current_script: Ref, current_source: &str) -> Vec<ProjectDiagnostic> {
+        if !self.module_sources.contains_key(&current_script) {
+            return Vec::new();
+        }
+        let graph = self.dependency_graph(Some((current_script, current_source)));
+        let mut path = Vec::new();
+        let mut visiting = std::collections::HashSet::new();
+        if let Some(cycle) = find_immediate_cycle(current_script, current_script, &graph, &mut visiting, &mut path) {
+            let names: Vec<String> = cycle.iter().map(|referent| {
+                self.paths.get(referent).and_then(|path| path.rsplit('/').next())
+                    .unwrap_or("Module").to_string()
+            }).collect();
+            let line = graph.get(&current_script)
+                .and_then(|edges| edges.iter().find(|edge| !edge.deferred).map(|edge| edge.line))
+                .unwrap_or(1);
+            return vec![ProjectDiagnostic {
+                line,
+                message: format!("Immediate cyclic module dependency: {}", names.join(" → ")),
+            }];
+        }
+
+        // Deferred edges are not initialization errors by themselves, but flag
+        // a reciprocal path so users know calling that function too early can
+        // recreate the cycle.
+        let mut result = Vec::new();
+        if let Some(edges) = graph.get(&current_script) {
+            for edge in edges.iter().filter(|edge| edge.deferred) {
+                if has_path(edge.target, current_script, &graph, &mut std::collections::HashSet::new()) {
+                    result.push(ProjectDiagnostic {
+                        line: edge.line,
+                        message: "Deferred cyclic require inside a function; safe only after both modules finish initialization".into(),
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    fn dependency_graph(&self, source_override: Option<(Ref, &str)>) -> HashMap<Ref, Vec<DependencyEdge>> {
+        let mut graph = HashMap::new();
+        for (&referent, stored_source) in &self.module_sources {
+            let source = source_override
+                .filter(|(override_ref, _)| *override_ref == referent)
+                .map_or(stored_source.as_str(), |(_, source)| source);
+            let mut edges = Vec::new();
+            for require in scan_requires(source) {
+                let resolved = self.resolve_request(referent, &require.request);
+                let key = normalize_path(&resolved);
+                let target = self.module_refs.get(&key).copied().or_else(|| {
+                    key.rsplit('/').next().and_then(|name| self.module_refs.get(name).copied())
+                });
+                if let Some(target) = target {
+                    edges.push(DependencyEdge { target, line: require.line, deferred: require.deferred });
+                }
+            }
+            graph.insert(referent, edges);
+        }
+        graph
     }
 
     fn resolve_request(&self, current_script: Ref, request: &str) -> String {
@@ -154,6 +223,100 @@ impl ProjectIndex {
 /// Replace the identifier fragment immediately before the caret while
 /// preserving everything after it. Cursor positions use egui's character
 /// indexing rather than UTF-8 byte offsets.
+#[derive(Debug, Clone)]
+struct DependencyEdge {
+    target: Ref,
+    line: usize,
+    deferred: bool,
+}
+
+#[derive(Debug)]
+struct RequireUse {
+    request: String,
+    line: usize,
+    deferred: bool,
+}
+
+fn scan_requires(source: &str) -> Vec<RequireUse> {
+    let mut result = Vec::new();
+    let mut blocks: Vec<bool> = Vec::new(); // true means function scope
+    for (line_index, raw) in source.lines().enumerate() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let closes = code == "end" || code.starts_with("end;") || code.starts_with("until ");
+        if closes { blocks.pop(); }
+
+        let in_function = blocks.iter().any(|is_function| *is_function);
+        let mut remainder = code;
+        while let Some(start) = remainder.find("require(") {
+            let after = &remainder[start + "require(".len()..];
+            if let Some(end) = after.rfind(')') {
+                let expression = after[..end].trim();
+                result.push(RequireUse {
+                    request: require_path(expression),
+                    line: line_index + 1,
+                    deferred: in_function,
+                });
+                remainder = &after[end + 1..];
+            } else {
+                break;
+            }
+        }
+
+        let function = code.starts_with("function ")
+            || code.starts_with("local function ")
+            || code.starts_with("const function ")
+            || (code.contains("= function") && !code.contains(" end"));
+        let other_block = (code.starts_with("if ") && code.ends_with("then"))
+            || ((code.starts_with("for ") || code.starts_with("while ")) && code.ends_with("do"))
+            || code == "do" || code == "repeat";
+        if function && !code.ends_with("end") {
+            blocks.push(true);
+        } else if other_block {
+            blocks.push(false);
+        }
+    }
+    result
+}
+
+fn find_immediate_cycle(
+    origin: Ref,
+    node: Ref,
+    graph: &HashMap<Ref, Vec<DependencyEdge>>,
+    visiting: &mut std::collections::HashSet<Ref>,
+    path: &mut Vec<Ref>,
+) -> Option<Vec<Ref>> {
+    visiting.insert(node);
+    path.push(node);
+    for edge in graph.get(&node).into_iter().flatten().filter(|edge| !edge.deferred) {
+        if edge.target == origin {
+            let mut cycle = path.clone();
+            cycle.push(origin);
+            return Some(cycle);
+        }
+        if !visiting.contains(&edge.target) {
+            if let Some(cycle) = find_immediate_cycle(origin, edge.target, graph, visiting, path) {
+                return Some(cycle);
+            }
+        }
+    }
+    path.pop();
+    visiting.remove(&node);
+    None
+}
+
+fn has_path(
+    node: Ref,
+    target: Ref,
+    graph: &HashMap<Ref, Vec<DependencyEdge>>,
+    visited: &mut std::collections::HashSet<Ref>,
+) -> bool {
+    if node == target { return true }
+    if !visited.insert(node) { return false }
+    graph.get(&node).into_iter().flatten().any(|edge| {
+        has_path(edge.target, target, graph, visited)
+    })
+}
+
 pub fn apply_completion_at(source: &mut String, cursor_char: usize, member: &str) -> usize {
     let cursor_byte = char_to_byte(source, cursor_char);
     let prefix_bytes = source[..cursor_byte]
@@ -334,6 +497,32 @@ mod tests {
         let new_cursor = apply_completion_at(&mut source, cursor, "AddItem");
         assert_eq!(source, "Inventory.AddItem + Inventory.Other");
         assert_eq!(new_cursor, "Inventory.AddItem".chars().count());
+    }
+
+    #[test]
+    fn distinguishes_immediate_and_deferred_requires() {
+        let uses = scan_requires(
+            "const A = require(\"./A\")\nlocal function later()\n require(\"./B\")\nend",
+        );
+        assert_eq!(uses.len(), 2);
+        assert!(!uses[0].deferred);
+        assert!(uses[1].deferred);
+    }
+
+    #[test]
+    fn finds_immediate_module_cycles() {
+        let a = Ref::new();
+        let b = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.paths.insert(a, "A".into());
+        index.paths.insert(b, "B".into());
+        index.module_refs.insert("a".into(), a);
+        index.module_refs.insert("b".into(), b);
+        index.module_sources.insert(a, "const B = require(\"./B\")".into());
+        index.module_sources.insert(b, "const A = require(\"./A\")".into());
+        let warnings = index.cycle_diagnostics(a, "const B = require(\"./B\")");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("A → B → A"));
     }
 
     #[test]
