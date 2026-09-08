@@ -28,6 +28,7 @@ pub enum FileEvent {
     /// script identified by `script_id` (see EditorApp::next_external_id).
     ExternalEditReturned { script_id: u64, text: String },
     NativeEditorChanged { script_id: u64, text: String, selection_start: usize, selection_end: usize },
+    NativeEditorCommand { script_id: u64, command: String, text: String, cursor: usize },
     /// Snapshot of exported src/**/*.luau files after returning to the app.
     ProjectSync { bundle_json: String },
 }
@@ -308,6 +309,23 @@ pub fn trigger_native_editor(script_id: u64, name: &str, source: &str) {
     });
 }
 
+pub fn update_native_editor_result(script_id: u64, command: &str, text: &str, message: &str) {
+    with_env(|env, class| {
+        let command = env.new_string(command)?;
+        let text = env.new_string(text)?;
+        let message = env.new_string(message)?;
+        let _ = env.call_static_method(
+            class, "updateNativeEditorResultStatic",
+            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Long(script_id as i64), JValue::Object(&command),
+                JValue::Object(&text), JValue::Object(&message),
+            ],
+        )?;
+        Ok(())
+    });
+}
+
 pub fn update_native_completions(script_id: u64, json: &str) {
     with_env(|env, class| {
         let value = env.new_string(json)?;
@@ -474,6 +492,27 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeE
         text: value,
         selection_start: selection_start.max(0) as usize,
         selection_end: selection_end.max(0) as usize,
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeEditorCommand(
+    mut env: JNIEnv,
+    _class: JClass,
+    script_id: jni::sys::jlong,
+    command: JString,
+    text: JString,
+    cursor: jni::sys::jint,
+) {
+    if command.is_null() || text.is_null() { return; }
+    let command: String = env.get_string(&command).map(|s| s.into()).unwrap_or_default();
+    let text: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::NativeEditorCommand {
+        script_id: script_id as u64,
+        command,
+        text,
+        cursor: cursor.max(0) as usize,
     });
 }
 

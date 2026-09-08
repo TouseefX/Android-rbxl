@@ -422,6 +422,21 @@ class MainActivity : GameActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
 
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(10, 2, 10, 2)
+                setBackgroundColor(Color.rgb(36, 36, 38))
+            }
+            val checkLuau = Button(this).apply { text = "✓ Check Luau" }
+            val formatLuau = Button(this).apply { text = "✨ Format" }
+            actions.addView(checkLuau)
+            actions.addView(formatLuau)
+            root.addView(actions, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+
             val editor = EditText(this).apply {
                 setText(source)
                 setTextColor(Color.rgb(225, 225, 225))
@@ -491,6 +506,12 @@ class MainActivity : GameActivity() {
                 }
             })
             editor.post(highlightTask)
+            checkLuau.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "check", editor.text.toString(), editor.selectionStart)
+            }
+            formatLuau.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), editor.selectionStart)
+            }
             root.addView(editor, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             ))
@@ -520,6 +541,23 @@ class MainActivity : GameActivity() {
                 val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
                 imm?.showSoftInput(editor, InputMethodManager.SHOW_IMPLICIT)
             }
+        }
+    }
+
+    fun updateNativeEditorResult(scriptId: Long, command: String, text: String, message: String) {
+        runOnUiThread {
+            val editor = nativeEditorView ?: return@runOnUiThread
+            if (nativeEditorScriptId != scriptId) return@runOnUiThread
+            if (command == "format" && editor.text.toString() != text) {
+                val cursor = editor.selectionStart.coerceAtLeast(0)
+                editor.setText(text)
+                editor.setSelection(cursor.coerceAtMost(text.length))
+                highlightNativeLuau(editor)
+            }
+            if (message.isNotBlank()) {
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            }
+            editor.requestFocus()
         }
     }
 
@@ -786,6 +824,7 @@ class MainActivity : GameActivity() {
     private external fun nativeOnSaveComplete(success: Boolean)
     private external fun nativeOnExternalEditReturned(scriptId: Long, text: String?)
     private external fun nativeOnNativeEditorChanged(scriptId: Long, text: String?, selectionStart: Int, selectionEnd: Int)
+    private external fun nativeOnNativeEditorCommand(scriptId: Long, command: String?, text: String?, cursor: Int)
     private external fun nativeOnProjectSync(bundleJson: String)
 
     companion object {
@@ -861,6 +900,11 @@ class MainActivity : GameActivity() {
             val act = sInstance
             if (act != null) act.showNativeEditor(scriptId, fileName, source)
             else Log.e(TAG, "showNativeEditorStatic: MainActivity instance is null")
+        }
+
+        @JvmStatic
+        fun updateNativeEditorResultStatic(scriptId: Long, command: String, text: String, message: String) {
+            sInstance?.updateNativeEditorResult(scriptId, command, text, message)
         }
 
         @JvmStatic

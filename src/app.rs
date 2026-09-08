@@ -3805,6 +3805,41 @@ ui.label("Place ID:");
                         }
                     }
                 }
+                FileEvent::NativeEditorCommand { script_id, command, text, cursor: _ } => {
+                    if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
+                        match command.as_str() {
+                            "format" => {
+                                let formatted = format_luau_indentation(&text);
+                                if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                                    tab.buffer = formatted.clone();
+                                    tab.previous_buffer = formatted.clone();
+                                }
+                                jni_bridge::update_native_editor_result(
+                                    script_id, "format", &formatted, "Luau formatting applied",
+                                );
+                            }
+                            "check" => {
+                                let diagnostics = lua_runtime::check_syntax(&text, "NativeEditor");
+                                let message = if diagnostics.is_empty() {
+                                    "✓ Luau check passed".to_string()
+                                } else {
+                                    let first = &diagnostics[0];
+                                    format!(
+                                        "✗ {} issue(s). First: line {} — {}",
+                                        diagnostics.len(), first.line.unwrap_or(1), first.message
+                                    )
+                                };
+                                if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                                    tab.diagnostics = diagnostics;
+                                }
+                                jni_bridge::update_native_editor_result(
+                                    script_id, "check", &text, &message,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 FileEvent::NativeEditorChanged { script_id, text, selection_start, selection_end } => {
                     if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
                         let cursor = utf16_to_char_index(&text, selection_end);
