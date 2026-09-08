@@ -27,6 +27,7 @@ pub enum FileEvent {
     /// Text came back from an external editor (QuickEdit, Acode etc.) for the
     /// script identified by `script_id` (see EditorApp::next_external_id).
     ExternalEditReturned { script_id: u64, text: String },
+    NativeEditorChanged { script_id: u64, text: String, selection_start: usize, selection_end: usize },
     /// Snapshot of exported src/**/*.luau files after returning to the app.
     ProjectSync { bundle_json: String },
 }
@@ -307,6 +308,17 @@ pub fn trigger_native_editor(script_id: u64, name: &str, source: &str) {
     });
 }
 
+pub fn update_native_completions(script_id: u64, json: &str) {
+    with_env(|env, class| {
+        let value = env.new_string(json)?;
+        let _ = env.call_static_method(
+            class, "updateNativeCompletionsStatic", "(JLjava/lang/String;)V",
+            &[JValue::Long(script_id as i64), JValue::Object(&value)],
+        )?;
+        Ok(())
+    });
+}
+
 pub fn trigger_edit_externally(script_id: u64, name: &str, source: &str) {
     with_env(|env, class| {
         let jname = env.new_string(name)?;
@@ -442,6 +454,26 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnExterna
     let _ = tx.send(FileEvent::ExternalEditReturned {
         script_id: script_id as u64,
         text: text_str,
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeEditorChanged(
+    mut env: JNIEnv,
+    _class: JClass,
+    script_id: jni::sys::jlong,
+    text: JString,
+    selection_start: jni::sys::jint,
+    selection_end: jni::sys::jint,
+) {
+    if text.is_null() { return; }
+    let value: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::NativeEditorChanged {
+        script_id: script_id as u64,
+        text: value,
+        selection_start: selection_start.max(0) as usize,
+        selection_end: selection_end.max(0) as usize,
     });
 }
 

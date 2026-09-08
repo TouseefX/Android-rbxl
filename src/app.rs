@@ -3805,6 +3805,36 @@ ui.label("Place ID:");
                         }
                     }
                 }
+                FileEvent::NativeEditorChanged { script_id, text, selection_start, selection_end } => {
+                    if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
+                        let cursor = utf16_to_char_index(&text, selection_end);
+                        let anchor = utf16_to_char_index(&text, selection_start);
+                        if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                            tab.buffer = text.clone();
+                        }
+                        self.script_completion_cursor = Some(cursor);
+                        self.script_selection = Some((anchor, cursor));
+                        let index = self.project_index_cache.clone().or_else(|| {
+                            self.dom.as_ref().map(|dom| std::sync::Arc::new(
+                                luau_intelligence::ProjectIndex::build_with_overrides(
+                                    dom,
+                                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                                )
+                            ))
+                        });
+                        let items = index.map(|index| index.complete_at(referent, &text, cursor))
+                            .unwrap_or_default();
+                        let payload: Vec<_> = items.into_iter().take(24).map(|item| serde_json::json!({
+                            "label": item.label,
+                            "detail": item.detail,
+                            "insertText": item.insert_text,
+                            "replaceChars": item.replace_chars,
+                        })).collect();
+                        if let Ok(json) = serde_json::to_string(&payload) {
+                            jni_bridge::update_native_completions(script_id, &json);
+                        }
+                    }
+                }
                 FileEvent::ExternalEditReturned { script_id, text } => {
                     if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
                         if let Some(dom) = self.dom.as_mut() {
@@ -5682,3 +5712,16 @@ fn edit_color_sequence_field(
     Some(ColorSequence { keypoints })
 }
 
+
+/// Android reports EditText selections in UTF-16 code units, while Luau
+/// intelligence indexes Unicode scalar values.
+fn utf16_to_char_index(text: &str, utf16_index: usize) -> usize {
+    let mut units = 0;
+    for (index, ch) in text.chars().enumerate() {
+        if units + ch.len_utf16() > utf16_index {
+            return index;
+        }
+        units += ch.len_utf16();
+    }
+    text.chars().count()
+}

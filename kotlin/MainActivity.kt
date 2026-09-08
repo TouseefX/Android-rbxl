@@ -28,6 +28,8 @@ import android.view.inputmethod.BaseInputConnection
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ArrayAdapter
+import android.widget.ListPopupWindow
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.view.WindowCompat
@@ -73,6 +75,9 @@ class MainActivity : GameActivity() {
     private var activeProjectRoot: File? = null
     private val projectModifiedTimes = HashMap<String, Long>()
     private var nativeEditorDialog: Dialog? = null
+    private var nativeEditorView: EditText? = null
+    private var nativeEditorScriptId: Long = -1
+    private var nativeCompletionPopup: ListPopupWindow? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Register the instance BEFORE super.onCreate(): GameActivity's
@@ -440,6 +445,15 @@ class MainActivity : GameActivity() {
             var changedBefore = 0
             var changedCount = 0
             val highlightTask = Runnable { highlightNativeLuau(editor) }
+            val intelligenceTask = Runnable {
+                if (nativeEditorScriptId == scriptId) {
+                    nativeOnNativeEditorChanged(
+                        scriptId, editor.text.toString(),
+                        editor.selectionStart.coerceAtLeast(0),
+                        editor.selectionEnd.coerceAtLeast(0)
+                    )
+                }
+            }
             editor.addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
@@ -450,6 +464,7 @@ class MainActivity : GameActivity() {
                 override fun afterTextChanged(text: Editable?) {
                     if (text == null || applyingPair) return
                     editor.removeCallbacks(highlightTask)
+                    editor.removeCallbacks(intelligenceTask)
                     val composing = BaseInputConnection.getComposingSpanStart(text) >= 0
                     if (!composing && changedBefore == 0 && changedCount == 1 && changedStart < text.length) {
                         val opener = text[changedStart]
@@ -472,6 +487,7 @@ class MainActivity : GameActivity() {
                         }
                     }
                     editor.postDelayed(highlightTask, if (composing) 220 else 110)
+                    if (!composing) editor.postDelayed(intelligenceTask, 75)
                 }
             })
             editor.post(highlightTask)
@@ -483,6 +499,10 @@ class MainActivity : GameActivity() {
                 if (apply) nativeOnExternalEditReturned(scriptId, editor.text.toString())
                 val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
                 imm?.hideSoftInputFromWindow(editor.windowToken, 0)
+                nativeCompletionPopup?.dismiss()
+                nativeCompletionPopup = null
+                nativeEditorView = null
+                nativeEditorScriptId = -1
                 dialog.dismiss()
                 nativeEditorDialog = null
             }
@@ -493,11 +513,59 @@ class MainActivity : GameActivity() {
             dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
             dialog.show()
             nativeEditorDialog = dialog
+            nativeEditorView = editor
+            nativeEditorScriptId = scriptId
             editor.requestFocus()
             editor.post {
                 val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
                 imm?.showSoftInput(editor, InputMethodManager.SHOW_IMPLICIT)
             }
+        }
+    }
+
+    fun updateNativeCompletions(scriptId: Long, json: String) {
+        runOnUiThread {
+            val editor = nativeEditorView ?: return@runOnUiThread
+            if (nativeEditorScriptId != scriptId || !editor.hasFocus()) return@runOnUiThread
+            val array = try { JSONArray(json) } catch (_: Exception) { return@runOnUiThread }
+            if (array.length() == 0) {
+                nativeCompletionPopup?.dismiss()
+                return@runOnUiThread
+            }
+            val labels = ArrayList<String>()
+            for (i in 0 until array.length()) {
+                val item = array.getJSONObject(i)
+                val detail = item.optString("detail")
+                labels.add(if (detail.isBlank()) item.getString("label") else "${item.getString("label")}  —  $detail")
+            }
+            val popup = nativeCompletionPopup ?: ListPopupWindow(this).also {
+                it.anchorView = editor
+                it.isModal = false
+                nativeCompletionPopup = it
+            }
+            popup.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, labels))
+            popup.width = (320 * resources.displayMetrics.density).toInt()
+            popup.height = (220 * resources.displayMetrics.density).toInt()
+            val cursor = editor.selectionStart.coerceAtLeast(0)
+            val layout = editor.layout
+            if (layout != null) {
+                val safeCursor = cursor.coerceAtMost(editor.text.length)
+                val line = layout.getLineForOffset(safeCursor)
+                popup.horizontalOffset = (layout.getPrimaryHorizontal(safeCursor) - editor.scrollX).toInt()
+                popup.verticalOffset = layout.getLineBottom(line) - editor.scrollY - editor.height
+            }
+            popup.setOnItemClickListener { _, _, position, _ ->
+                val item = array.getJSONObject(position)
+                val replace = item.optInt("replaceChars", 0)
+                val insert = item.getString("insertText")
+                val end = editor.selectionStart.coerceAtLeast(0)
+                val start = (end - replace).coerceAtLeast(0)
+                editor.text.replace(start, end, insert)
+                editor.setSelection(start + insert.length)
+                popup.dismiss()
+                editor.requestFocus()
+            }
+            if (!popup.isShowing) popup.show() else popup.show()
         }
     }
 
@@ -717,6 +785,7 @@ class MainActivity : GameActivity() {
     private external fun nativeOnDocumentCreated(uri: String?)
     private external fun nativeOnSaveComplete(success: Boolean)
     private external fun nativeOnExternalEditReturned(scriptId: Long, text: String?)
+    private external fun nativeOnNativeEditorChanged(scriptId: Long, text: String?, selectionStart: Int, selectionEnd: Int)
     private external fun nativeOnProjectSync(bundleJson: String)
 
     companion object {
@@ -792,6 +861,11 @@ class MainActivity : GameActivity() {
             val act = sInstance
             if (act != null) act.showNativeEditor(scriptId, fileName, source)
             else Log.e(TAG, "showNativeEditorStatic: MainActivity instance is null")
+        }
+
+        @JvmStatic
+        fun updateNativeCompletionsStatic(scriptId: Long, json: String) {
+            sInstance?.updateNativeCompletions(scriptId, json)
         }
 
         @JvmStatic
