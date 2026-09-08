@@ -1447,7 +1447,19 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
         let method_declaration = code.strip_prefix("function ")
             .or_else(|| code.strip_prefix("const function "));
         if let Some(declaration) = method_declaration {
-            let colon_method = declaration.contains(':');
+            // Determine the separator based on the last '.' or ':' that
+            // appears *before* the parameter list — not anywhere in the
+            // signature. Parameter type annotations (e.g.
+            // "Data: DataSettings") also contain ':' and were previously
+            // misread as a method-call separator, so
+            // `function Module.Ragdoll(Data: DataSettings)` was wrongly
+            // classified as a `:` method instead of a `.` function.
+            let head = declaration.split('(').next().unwrap_or(declaration);
+            let colon_method = match (head.rfind('.'), head.rfind(':')) {
+                (Some(dot), Some(colon)) => colon > dot,
+                (None, Some(_)) => true,
+                _ => false,
+            };
             if let Some((owner, member)) = declaration.split_once('.')
                 .or_else(|| declaration.split_once(':'))
             {
@@ -1731,6 +1743,31 @@ mod tests {
         assert!(members.contains_key("Size"));
         assert!(!members.contains_key("fromRGB"));
         assert!(!members.contains_key("new"));
+    }
+
+    #[test]
+    fn dotted_function_with_typed_params_is_not_a_method() {
+        // A ':' inside a parameter's type annotation must not be mistaken
+        // for the owner/member separator — this is a dot function, not a
+        // method, even though the signature contains a colon.
+        let members = exported_members(
+            "function Module.Ragdoll(Data: DataSettings)\nend\nreturn Module",
+        );
+        assert_eq!(
+            members.get("Ragdoll"),
+            Some(&"function Ragdoll(Data: DataSettings)".to_string())
+        );
+    }
+
+    #[test]
+    fn colon_method_with_typed_params_is_still_a_method() {
+        let members = exported_members(
+            "function Module:Ragdoll(Data: DataSettings)\nend\nreturn Module",
+        );
+        assert_eq!(
+            members.get("Ragdoll"),
+            Some(&"method function Ragdoll(Data: DataSettings)".to_string())
+        );
     }
 
     #[test]
