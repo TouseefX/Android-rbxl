@@ -19,14 +19,9 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
-import android.text.Editable
 import android.text.InputType
-import android.text.Spannable
-import android.text.TextWatcher
-import android.text.style.ForegroundColorSpan
 import android.widget.Button
 import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -73,9 +68,6 @@ class MainActivity : GameActivity() {
     private var activeProjectRoot: File? = null
     private val projectModifiedTimes = HashMap<String, Long>()
     private var nativeEditorDialog: Dialog? = null
-    private var nativeEditorOverlay: EditText? = null
-    private var nativeEditorOverlayId: Long = -1
-    private var nativeEditorApplyingStyle = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Register the instance BEFORE super.onCreate(): GameActivity's
@@ -348,113 +340,6 @@ class MainActivity : GameActivity() {
      * whatever editor app the user picks. Luau-aware editors use the extension
      * for the correct grammar while text/plain keeps broad Android app support.
      */
-    /** Native EditText placed only over egui's code rectangle. */
-    fun updateNativeEditorOverlay(
-        scriptId: Long, fileName: String, source: String,
-        left: Float, top: Float, right: Float, bottom: Float
-    ) {
-        runOnUiThread {
-            val content = findViewById<View>(android.R.id.content) as? FrameLayout
-                ?: return@runOnUiThread
-            var editor = nativeEditorOverlay
-            if (editor == null) {
-                val created = EditText(this).apply {
-                    setTextColor(Color.rgb(220, 220, 220))
-                    setBackgroundColor(Color.rgb(30, 30, 30))
-                    typeface = Typeface.MONOSPACE
-                    textSize = 15f
-                    gravity = Gravity.TOP or Gravity.START
-                    setPadding(14, 10, 14, 22)
-                    inputType = InputType.TYPE_CLASS_TEXT or
-                        InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-                        InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
-                    setHorizontallyScrolling(true)
-                    isVerticalScrollBarEnabled = true
-                    isHorizontalScrollBarEnabled = true
-                    isLongClickable = true
-                }
-                created.addTextChangedListener(object : TextWatcher {
-                    override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                        if (!nativeEditorApplyingStyle && nativeEditorOverlayId >= 0) {
-                            nativeOnNativeEditorChanged(
-                                nativeEditorOverlayId, s?.toString() ?: "",
-                                created.selectionStart, created.selectionEnd
-                            )
-                        }
-                    }
-                    override fun afterTextChanged(s: Editable?) {
-                        created.removeCallbacks(nativeSyntaxRunnable)
-                        created.postDelayed(nativeSyntaxRunnable, 120)
-                    }
-                })
-                content.addView(created)
-                nativeEditorOverlay = created
-                editor = created
-            }
-            val activeEditor = editor ?: return@runOnUiThread
-            if (nativeEditorOverlayId != scriptId) {
-                nativeEditorOverlayId = scriptId
-                nativeEditorApplyingStyle = true
-                activeEditor.setText(source)
-                activeEditor.setSelection(0)
-                nativeEditorApplyingStyle = false
-                activeEditor.post(nativeSyntaxRunnable)
-            } else if (activeEditor.text.toString() != source) {
-                val start = activeEditor.selectionStart.coerceAtLeast(0)
-                val end = activeEditor.selectionEnd.coerceAtLeast(0)
-                nativeEditorApplyingStyle = true
-                activeEditor.setText(source)
-                activeEditor.setSelection(start.coerceAtMost(source.length), end.coerceAtMost(source.length))
-                nativeEditorApplyingStyle = false
-                activeEditor.post(nativeSyntaxRunnable)
-            }
-            val width = content.width.coerceAtLeast(1)
-            val height = content.height.coerceAtLeast(1)
-            activeEditor.layoutParams = FrameLayout.LayoutParams(
-                ((right - left) * width).toInt().coerceAtLeast(1),
-                ((bottom - top) * height).toInt().coerceAtLeast(1)
-            ).apply {
-                leftMargin = (left * width).toInt()
-                topMargin = (top * height).toInt()
-            }
-            activeEditor.visibility = View.VISIBLE
-        }
-    }
-
-    private val nativeSyntaxRunnable = Runnable {
-        val editor = nativeEditorOverlay ?: return@Runnable
-        val text = editor.text
-        val start = editor.selectionStart
-        val end = editor.selectionEnd
-        nativeEditorApplyingStyle = true
-        text.getSpans(0, text.length, ForegroundColorSpan::class.java)
-            .forEach { text.removeSpan(it) }
-        val patterns = listOf(
-            Regex("\\b(local|const|function|end|if|then|else|elseif|for|while|do|return|break|continue|and|or|not|in|export|type)\\b") to Color.rgb(205, 120, 255),
-            Regex("\\b(true|false|nil)\\b") to Color.rgb(255, 150, 105),
-            Regex("(?m)--.*$") to Color.rgb(105, 170, 105),
-            Regex("\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'") to Color.rgb(220, 190, 125),
-            Regex("\\b\\d+(?:\\.\\d+)?\\b") to Color.rgb(120, 195, 255)
-        )
-        val value = text.toString()
-        patterns.forEach { (regex, color) ->
-            regex.findAll(value).forEach { match ->
-                text.setSpan(ForegroundColorSpan(color), match.range.first,
-                    match.range.last + 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-            }
-        }
-        if (start >= 0 && end >= 0) editor.setSelection(start.coerceAtMost(text.length), end.coerceAtMost(text.length))
-        nativeEditorApplyingStyle = false
-    }
-
-    fun hideNativeEditorOverlay() {
-        runOnUiThread {
-            nativeEditorOverlay?.visibility = View.GONE
-            nativeEditorOverlayId = -1
-        }
-    }
-
     /**
      * Full-screen native Android Luau editor. Unlike the Bevy SurfaceView this
      * is a real EditText, so Android owns caret placement, kinetic scrolling,
@@ -752,7 +637,6 @@ class MainActivity : GameActivity() {
     private external fun nativeOnDocumentCreated(uri: String?)
     private external fun nativeOnSaveComplete(success: Boolean)
     private external fun nativeOnExternalEditReturned(scriptId: Long, text: String?)
-    private external fun nativeOnNativeEditorChanged(scriptId: Long, text: String?, selectionStart: Int, selectionEnd: Int)
     private external fun nativeOnProjectSync(bundleJson: String)
 
     companion object {
@@ -821,23 +705,6 @@ class MainActivity : GameActivity() {
             val act = sInstance
             if (act != null) act.exportProject(bundleJson)
             else Log.e(TAG, "exportProjectStatic: MainActivity instance is null")
-        }
-
-        @JvmStatic
-        fun isNativeEditorOverlayVisibleStatic(): Boolean =
-            sInstance?.nativeEditorOverlay?.visibility == View.VISIBLE
-
-        @JvmStatic
-        fun updateNativeEditorOverlayStatic(
-            scriptId: Long, fileName: String, source: String,
-            left: Float, top: Float, right: Float, bottom: Float
-        ) {
-            sInstance?.updateNativeEditorOverlay(scriptId, fileName, source, left, top, right, bottom)
-        }
-
-        @JvmStatic
-        fun hideNativeEditorOverlayStatic() {
-            sInstance?.hideNativeEditorOverlay()
         }
 
         @JvmStatic

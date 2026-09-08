@@ -139,11 +139,6 @@ mod imp {
     /// the events are seen by the focused `TextEdit` in the same frame.
     pub fn begin_frame(ctx: &egui::Context) {
         let Some(app) = app() else { return };
-        // A native EditText has its own InputConnection and must receive IME
-        // events directly instead of through the GameTextInput bridge.
-        if crate::jni_bridge::is_native_editor_overlay_visible() {
-            return;
-        }
 
         // Ctrl+V from a hardware/bluetooth keyboard: egui only pastes when it
         // is handed an `Event::Paste`, and nothing on Android produces one.
@@ -241,11 +236,6 @@ mod imp {
     /// clipboard writes to Android. MUST run at the end of the egui pass.
     pub fn end_frame(ctx: &egui::Context) {
         let Some(app) = app() else { return };
-        // Do not hide or reconfigure the IME while the hybrid native EditText
-        // owns Android input focus.
-        if crate::jni_bridge::is_native_editor_overlay_visible() {
-            return;
-        }
 
         let wants_keyboard = ctx.wants_keyboard_input();
         let mut state = STATE.lock().unwrap();

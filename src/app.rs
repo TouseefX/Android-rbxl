@@ -230,8 +230,6 @@ pub struct EditorApp {
     // External edit mapping
     pending_external_edits: HashMap<u64, Ref>,
     next_external_id: u64,
-    native_overlay_script: Option<(Ref, u64)>,
-    native_overlay_signature: Option<(u64, [i32; 4])>,
 
     // Bevy 3D scene rebuild flag: set when the opened place changes, cleared
     // by the Bevy system that (re)builds the meshes.
@@ -385,8 +383,6 @@ impl Default for EditorApp {
             output_logs: Vec::new(),
             pending_external_edits: HashMap::new(),
             next_external_id: 1,
-            native_overlay_script: None,
-            native_overlay_signature: None,
             needs_3d_rebuild: false,
             cam_move_speed: 4.0,
             pending_asset_refresh_at: None,
@@ -732,12 +728,6 @@ impl EditorApp {
         }
 
         // Main work area.
-        #[cfg(target_os = "android")]
-        if self.active_tab != ActiveTab::ScriptEditor && self.native_overlay_script.take().is_some() {
-            self.native_overlay_signature = None;
-            jni_bridge::hide_native_editor_overlay();
-        }
-
         if self.active_tab == ActiveTab::Viewport3D {
             // SOLID top control bar (guaranteed to render over the 3D): camera
             // presets, distance/zoom, speed, up/down.
@@ -1464,6 +1454,7 @@ ui.label("Place ID:");
         // Check if tab already open
         if let Some(pos) = self.open_tabs.iter().position(|t| t.referent == referent) {
             self.active_script_idx = pos;
+            self.open_active_script_natively();
             return;
         }
 
@@ -1490,6 +1481,17 @@ ui.label("Place ID:");
             diagnostics,
         });
         self.active_script_idx = self.open_tabs.len() - 1;
+        self.open_active_script_natively();
+    }
+
+    fn open_active_script_natively(&mut self) {
+        #[cfg(target_os = "android")]
+        if let Some(tab) = self.open_tabs.get(self.active_script_idx) {
+            let id = self.next_external_id;
+            self.next_external_id += 1;
+            self.pending_external_edits.insert(id, tab.referent);
+            jni_bridge::trigger_native_editor(id, &tab.name, &tab.buffer);
+        }
     }
 
     fn show_script_editor_ui(&mut self, ui: &mut egui::Ui) {
@@ -1507,6 +1509,7 @@ ui.label("Place ID:");
 
         // Script Tabs Header
         let mut close_tab_idx = None;
+        let mut native_tab_idx = None;
         egui::ScrollArea::horizontal()
             .id_salt("script_tabs_scroll")
             .show(ui, |ui| {
@@ -1533,6 +1536,7 @@ ui.label("Place ID:");
                         if ui.selectable_label(is_active, text).clicked() {
                             self.active_script_idx = idx;
                             self.selected = Some(tab.referent);
+                            native_tab_idx = Some(idx);
                         }
 
                         if ui.small_button("✖").clicked() {
@@ -1542,18 +1546,17 @@ ui.label("Place ID:");
                 });
             });
 
+        if let Some(idx) = native_tab_idx {
+            self.active_script_idx = idx;
+            self.open_active_script_natively();
+        }
+
         if let Some(idx) = close_tab_idx {
             self.open_tabs.remove(idx);
             if self.active_script_idx >= self.open_tabs.len() && !self.open_tabs.is_empty() {
                 self.active_script_idx = self.open_tabs.len() - 1;
             }
             if self.open_tabs.is_empty() {
-                #[cfg(target_os = "android")]
-                {
-                    self.native_overlay_script = None;
-                    self.native_overlay_signature = None;
-                    jni_bridge::hide_native_editor_overlay();
-                }
                 return;
             }
         }
@@ -1614,18 +1617,6 @@ ui.label("Place ID:");
         let mut find_references_requested = false;
         let mut export_project_requested = false;
         let mut check_luau_requested = false;
-
-        #[cfg(target_os = "android")]
-        let native_overlay_id = {
-            let referent = self.open_tabs[self.active_script_idx].referent;
-            if self.native_overlay_script.map(|entry| entry.0) != Some(referent) {
-                let id = self.next_external_id;
-                self.next_external_id += 1;
-                self.pending_external_edits.insert(id, referent);
-                self.native_overlay_script = Some((referent, id));
-            }
-            self.native_overlay_script.map(|entry| entry.1).unwrap_or(0)
-        };
 
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
@@ -2070,28 +2061,6 @@ ui.label("Place ID:");
                         .lock_focus(true)
                         .layouter(&mut layouter)
                         .show(ui);
-                    #[cfg(target_os = "android")]
-                    {
-                        use std::hash::{Hash, Hasher};
-                        let screen = ui.ctx().screen_rect();
-                        let rect = output.response.rect;
-                        let normalized = [
-                            ((rect.left() - screen.left()) / screen.width()).clamp(0.0, 1.0),
-                            ((rect.top() - screen.top()) / screen.height()).clamp(0.0, 1.0),
-                            ((rect.right() - screen.left()) / screen.width()).clamp(0.0, 1.0),
-                            ((rect.bottom() - screen.top()) / screen.height()).clamp(0.0, 1.0),
-                        ];
-                        let bounds_key = normalized.map(|value| (value * 10_000.0) as i32);
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        tab.buffer.hash(&mut hasher);
-                        let signature = (hasher.finish(), bounds_key);
-                        if self.native_overlay_signature != Some(signature) {
-                            self.native_overlay_signature = Some(signature);
-                            jni_bridge::update_native_editor_overlay(
-                                native_overlay_id, &tab_name, &tab.buffer, normalized,
-                            );
-                        }
-                    }
                     if focus_editor_requested {
                         output.response.request_focus();
                     }
@@ -3834,23 +3803,6 @@ ui.label("Place ID:");
                             }
                             Err(error) => self.log_error(format!("Project sync failed: {error}")),
                         }
-                    }
-                }
-                FileEvent::NativeEditorChanged { script_id, text, selection_start, selection_end } => {
-                    if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
-                        let cursor = utf16_to_char_index(&text, selection_end);
-                        if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
-                            tab.buffer = text;
-                        }
-                        self.script_completion_cursor = Some(cursor);
-                        self.script_selection = Some((
-                            utf16_to_char_index(
-                                self.open_tabs.iter().find(|tab| tab.referent == referent)
-                                    .map_or("", |tab| tab.buffer.as_str()),
-                                selection_start,
-                            ),
-                            cursor,
-                        ));
                     }
                 }
                 FileEvent::ExternalEditReturned { script_id, text } => {
@@ -5730,17 +5682,3 @@ fn edit_color_sequence_field(
     Some(ColorSequence { keypoints })
 }
 
-
-/// Android selection offsets are UTF-16 code units; egui/Luau intelligence use
-/// Unicode scalar (char) indices.
-fn utf16_to_char_index(text: &str, utf16_index: usize) -> usize {
-    let mut units = 0;
-    for (index, ch) in text.chars().enumerate() {
-        let next = units + ch.len_utf16();
-        if next > utf16_index {
-            return index;
-        }
-        units = next;
-    }
-    text.chars().count()
-}
