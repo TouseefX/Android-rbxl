@@ -82,6 +82,12 @@ impl TextCursorState {
             let ccursor_range = select_line_at(text, cursor_at_pointer);
             self.set_char_range(Some(ccursor_range));
             true
+        } else if response.clicked() {
+            // Touch TextEdits use click-only Sense so their ScrollArea can own
+            // swipes. Click-only widgets still need to move the insertion caret;
+            // upstream only did this as the first step of a drag interaction.
+            self.set_char_range(Some(CCursorRange::one(cursor_at_pointer)));
+            true
         } else if response.sense.senses_drag() {
             if response.hovered() && ui.input(|i| i.pointer.any_pressed()) {
                 // The start of a drag (or a click).

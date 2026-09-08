@@ -2063,6 +2063,70 @@ ui.label("Place ID:");
                 });
             });
 
+        // GameActivity has no native EditText, so Android cannot display its
+        // stock floating selection ActionMode. Provide the equivalent controls
+        // directly beside the selected caret instead of making users search the
+        // editor toolbar while the keyboard is open.
+        let mut touch_selection_action = None;
+        if let Some((anchor, primary)) = self.script_selection {
+            if anchor != primary {
+                let screen = ui.ctx().screen_rect();
+                let desired = completion_popup_pos
+                    .unwrap_or_else(|| screen.center())
+                    + egui::vec2(0.0, -44.0);
+                let popup_pos = egui::pos2(
+                    desired.x.clamp(screen.left() + 6.0, screen.right() - 190.0),
+                    desired.y.clamp(screen.top() + 6.0, screen.bottom() - 48.0),
+                );
+                egui::Area::new(egui::Id::new("touch_selection_actions"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(popup_pos)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy").clicked() {
+                                    touch_selection_action = Some(0);
+                                }
+                                if ui.button("Cut").clicked() {
+                                    touch_selection_action = Some(1);
+                                }
+                                if ui.button("Paste").clicked() {
+                                    touch_selection_action = Some(2);
+                                }
+                            });
+                        });
+                    });
+            }
+        }
+        if let (Some(action), Some((anchor, primary))) =
+            (touch_selection_action, self.script_selection)
+        {
+            let start = anchor.min(primary);
+            let end = anchor.max(primary);
+            let start_byte = tab.buffer.char_indices().nth(start)
+                .map_or(tab.buffer.len(), |(byte, _)| byte);
+            let end_byte = tab.buffer.char_indices().nth(end)
+                .map_or(tab.buffer.len(), |(byte, _)| byte);
+            let selected = tab.buffer[start_byte..end_byte].to_owned();
+            match action {
+                0 => jni_bridge::trigger_copy_to_clipboard(&selected),
+                1 => {
+                    jni_bridge::trigger_copy_to_clipboard(&selected);
+                    tab.buffer.replace_range(start_byte..end_byte, "");
+                    self.pending_script_cursor = Some(start);
+                    self.script_selection = Some((start, start));
+                }
+                2 => {
+                    let pasted = jni_bridge::get_clipboard_text();
+                    tab.buffer.replace_range(start_byte..end_byte, &pasted);
+                    let caret = start + pasted.chars().count();
+                    self.pending_script_cursor = Some(caret);
+                    self.script_selection = Some((caret, caret));
+                }
+                _ => {}
+            }
+        }
+
         if !tab.diagnostics.is_empty() {
             egui::Frame::group(ui.style())
                 .fill(Color32::from_rgb(55, 30, 34))

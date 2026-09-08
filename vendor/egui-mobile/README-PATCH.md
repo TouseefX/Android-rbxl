@@ -11,8 +11,9 @@ Local changes:
 
 - `widgets/text_edit/builder.rs`: touch drags remain owned by the parent
   `ScrollArea`, regardless of editor focus.
-- `text_selection/text_cursor_state.rs`: a long touch selects the touched word,
-  preserving mobile selection and the app's Copy/Cut/Paste toolbar.
+- `text_selection/text_cursor_state.rs`: a normal click moves the caret even
+  with click-only touch interaction, and a long touch selects the touched word,
+  preserving mobile selection and the app's floating Copy/Cut/Paste toolbar.
 
 Desktop mouse drag-selection is unchanged.
 
