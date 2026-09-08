@@ -353,6 +353,71 @@ class MainActivity : GameActivity() {
      * whatever editor app the user picks. Luau-aware editors use the extension
      * for the correct grammar while text/plain keeps broad Android app support.
      */
+    /** Strip a trailing `--` comment without cutting inside a string literal. */
+    private fun stripLuauComment(line: String): String {
+        var quote: Char? = null
+        var index = 0
+        while (index < line.length) {
+            val character = line[index]
+            if (quote != null) {
+                if (character == '\\') { index += 2; continue }
+                if (character == quote) quote = null
+            } else when {
+                character == '"' || character == '\'' || character == '`' -> quote = character
+                character == '-' && index + 1 < line.length && line[index + 1] == '-' ->
+                    return line.substring(0, index)
+            }
+            index++
+        }
+        return line
+    }
+
+    /** Whether a line opens a Luau block, so the next line indents one level. */
+    private fun opensLuauBlock(code: String): Boolean {
+        val trimmed = code.trim()
+        return trimmed.endsWith("then") || trimmed.endsWith(" do") ||
+            trimmed == "do" || trimmed == "repeat" || trimmed == "else" ||
+            trimmed.endsWith("{") || trimmed.endsWith("(") || trimmed.endsWith("[") ||
+            trimmed.startsWith("else") && trimmed.endsWith("then") ||
+            Regex("^(local |const |export )?function\\b").containsMatchIn(trimmed) ||
+            Regex("=\\s*function\\s*\\(").containsMatchIn(trimmed)
+    }
+
+    /**
+     * The keyword that closes the block this line opens, or null when the line
+     * needs no auto-inserted closer (brackets are already paired on type).
+     */
+    private fun closingKeywordFor(code: String): String? {
+        val trimmed = code.trim()
+        if (trimmed.endsWith("{") || trimmed.endsWith("(") || trimmed.endsWith("[")) return null
+        if (trimmed == "else" || trimmed.startsWith("elseif ")) return null
+        if (trimmed == "repeat") return "until true"
+        val opens = trimmed.endsWith("then") || trimmed.endsWith(" do") || trimmed == "do" ||
+            Regex("^(local |const |export )?function\\b").containsMatchIn(trimmed) ||
+            Regex("=\\s*function\\s*\\(").containsMatchIn(trimmed)
+        return if (opens) "end" else null
+    }
+
+    /**
+     * Whether the block opened at [position] already has a closer, so Enter
+     * does not add a duplicate `end` to already-complete code.
+     */
+    private fun hasMatchingCloser(text: CharSequence, position: Int, closer: String): Boolean {
+        val keyword = closer.substringBefore(' ')
+        var depth = 1
+        for (line in text.subSequence(position, text.length).toString().lines().drop(1)) {
+            val code = stripLuauComment(line).trim()
+            if (code == keyword || code.startsWith("$keyword ") ||
+                code.startsWith("$keyword)") || code.startsWith("$keyword,")
+            ) {
+                depth--
+                if (depth <= 0) return true
+            }
+            if (opensLuauBlock(code) && closingKeywordFor(code) != null) depth++
+        }
+        return false
+    }
+
     /** Apply lightweight Luau colors without replacing text or composing spans. */
     private fun highlightNativeLuau(editor: EditText) {
         val editable = editor.text ?: return
@@ -452,15 +517,18 @@ class MainActivity : GameActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
 
+            // Normalize any tabs already stored in the script so on-screen
+            // columns match what the indent logic below produces.
+            val normalizedSource = source.replace("\t", INDENT_UNIT)
             val editor = EditText(this).apply {
-                setText(source)
+                setText(normalizedSource)
                 setTextColor(Color.rgb(225, 225, 225))
                 setHintTextColor(Color.GRAY)
-                setBackgroundColor(Color.rgb(30, 30, 30))
+                setBackgroundColor(Color.TRANSPARENT)
                 typeface = Typeface.MONOSPACE
                 textSize = 15f
                 gravity = Gravity.TOP or Gravity.START
-                setPadding(18, 14, 18, 28)
+                setPadding(12, 14, 18, 28)
                 inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                     InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -471,7 +539,7 @@ class MainActivity : GameActivity() {
                 isVerticalScrollBarEnabled = true
                 isHorizontalScrollBarEnabled = !nativeEditorWordWrap
                 isLongClickable = true
-                setSelection(initialCursor.coerceIn(0, source.length))
+                setSelection(initialCursor.coerceIn(0, normalizedSource.length))
             }
             var applyingPair = false
             var changedStart = 0
@@ -505,21 +573,22 @@ class MainActivity : GameActivity() {
                     if (!composing && changedBefore == 0 && changedCount == 1
                         && changedStart < text.length && text[changedStart] == '\n'
                     ) {
-                        val lineStart = text.lastIndexOf('\n', (changedStart - 1).coerceAtLeast(0))
-                            .let { if (it < 0 || changedStart == 0) 0 else it + 1 }
+                        val lineStart = if (changedStart == 0) 0 else
+                            text.lastIndexOf('\n', changedStart - 1) + 1
                         val previousLine = text.subSequence(lineStart, changedStart).toString()
                         val indent = previousLine.takeWhile { it == ' ' || it == '\t' }
-                        val code = previousLine.substringBefore("--").trimEnd()
-                        val opensBlock = code.endsWith("then") || code.endsWith(" do") ||
-                            code.trim() == "do" || code.trim() == "repeat" ||
-                            code.trim() == "else" || code.endsWith("{") ||
-                            code.endsWith("(") || code.endsWith("[") ||
-                            Regex("^\\s*(local |const |export )?function\\b").containsMatchIn(code) ||
-                            Regex("=\\s*function\\s*\\(.*\\)\\s*$").containsMatchIn(code)
-                        val addition = if (opensBlock) "$indent\t" else indent
-                        if (addition.isNotEmpty()) {
+                            .replace("\t", INDENT_UNIT)
+                        val code = stripLuauComment(previousLine).trimEnd()
+                        val addition = if (opensLuauBlock(code)) indent + INDENT_UNIT else indent
+                        // Auto-close the block: typing Enter after `then` also
+                        // lays down the matching `end` on its own line, with
+                        // the caret left on the blank line between them.
+                        val autoClose = closingKeywordFor(code)
+                        val trailing = if (autoClose != null && !hasMatchingCloser(text, changedStart, autoClose))
+                            "\n$indent$autoClose" else ""
+                        if (addition.isNotEmpty() || trailing.isNotEmpty()) {
                             applyingPair = true
-                            text.insert(changedStart + 1, addition)
+                            text.insert(changedStart + 1, addition + trailing)
                             editor.setSelection(
                                 (changedStart + 1 + addition.length).coerceAtMost(text.length)
                             )
@@ -530,17 +599,17 @@ class MainActivity : GameActivity() {
                     // indentation level, like a desktop code editor.
                     if (!composing && changedBefore == 0 && changedCount >= 1) {
                         val caret = editor.selectionStart.coerceIn(0, text.length)
-                        val lineStart = text.lastIndexOf('\n', (caret - 1).coerceAtLeast(0))
-                            .let { if (it < 0) 0 else it + 1 }
+                        val lineStart = if (caret == 0) 0 else text.lastIndexOf('\n', caret - 1) + 1
                         val current = text.subSequence(lineStart, caret).toString()
                         val trimmed = current.trim()
                         val dedents = trimmed == "end" || trimmed == "}" || trimmed == "else" ||
-                            trimmed == "elseif" || trimmed == "until"
+                            trimmed == "elseif" || trimmed == "until" || trimmed == ")" ||
+                            trimmed == "]"
                         if (dedents && current.length > trimmed.length) {
                             val indent = current.substring(0, current.length - trimmed.length)
                             val shorter = when {
+                                indent.endsWith(INDENT_UNIT) -> indent.dropLast(INDENT_WIDTH)
                                 indent.endsWith("\t") -> indent.dropLast(1)
-                                indent.endsWith("    ") -> indent.dropLast(4)
                                 else -> indent
                             }
                             if (shorter != indent) {
@@ -548,6 +617,23 @@ class MainActivity : GameActivity() {
                                 text.replace(lineStart, lineStart + indent.length, shorter)
                                 applyingPair = false
                             }
+                        }
+                    }
+                    // A literal tab typed or pasted anywhere becomes spaces so
+                    // the on-screen column never depends on the tab stop.
+                    if (!composing && changedCount > 0 && changedStart < text.length) {
+                        val end = (changedStart + changedCount).coerceAtMost(text.length)
+                        val slice = text.subSequence(changedStart, end).toString()
+                        if (slice.contains('\t')) {
+                            val caret = editor.selectionStart
+                            val expanded = slice.replace("\t", INDENT_UNIT)
+                            applyingPair = true
+                            text.replace(changedStart, end, expanded)
+                            editor.setSelection(
+                                (caret + expanded.length - slice.length)
+                                    .coerceIn(0, text.length)
+                            )
+                            applyingPair = false
                         }
                     }
                     if (!composing && changedBefore == 0 && changedCount == 1 && changedStart < text.length) {
@@ -585,6 +671,54 @@ class MainActivity : GameActivity() {
             formatLuau.setOnClickListener {
                 nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), editor.selectionStart)
             }
+            goDefinition.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), editor.selectionStart)
+            }
+            findReferences.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "references", editor.text.toString(), editor.selectionStart)
+            }
+            // Line-number gutter, kept in sync with the editor's own layout so
+            // wrapped lines stay aligned with their number.
+            val gutter = TextView(this).apply {
+                setTextColor(Color.rgb(110, 110, 118))
+                typeface = Typeface.MONOSPACE
+                textSize = 15f
+                gravity = Gravity.TOP or Gravity.END
+                setPadding(14, 14, 10, 28)
+                setBackgroundColor(Color.rgb(36, 36, 38))
+            }
+            fun refreshGutter() {
+                val layout = editor.layout
+                val builder = StringBuilder()
+                if (layout == null) {
+                    for (number in 1..(editor.text.count { it == '\n' } + 1)) {
+                        builder.append(number).append('\n')
+                    }
+                } else {
+                    // One entry per *visual* line; continuation rows stay blank
+                    // so numbers line up when word wrap is on. The logical line
+                    // is carried forward rather than recounted per row, which
+                    // would make this quadratic on large scripts.
+                    val content = editor.text
+                    var logical = 1
+                    for (visual in 0 until layout.lineCount) {
+                        val offset = layout.getLineStart(visual)
+                        if (offset == 0 || content[offset - 1] == '\n') {
+                            builder.append(logical)
+                            logical++
+                        }
+                        builder.append('\n')
+                    }
+                }
+                // Assign only on change: this runs from a layout listener, and
+                // setting identical text would schedule another layout pass.
+                val numbers = builder.toString()
+                if (gutter.text.toString() != numbers) gutter.text = numbers
+            }
+            editor.viewTreeObserver.addOnGlobalLayoutListener { refreshGutter() }
+            editor.post { refreshGutter() }
+
+            // Declared after refreshGutter so the local function is in scope.
             toggleWrap.setOnClickListener {
                 nativeEditorWordWrap = !nativeEditorWordWrap
                 toggleWrap.text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
@@ -594,16 +728,66 @@ class MainActivity : GameActivity() {
                 if (!nativeEditorWordWrap) editor.scrollTo(0, editor.scrollY)
                 // setHorizontallyScrolling only takes effect on re-layout.
                 editor.requestLayout()
-                editor.post { editor.setSelection(caret.coerceAtMost(editor.text.length)) }
+                editor.post {
+                    editor.setSelection(caret.coerceAtMost(editor.text.length))
+                    refreshGutter()
+                }
             }
-            goDefinition.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), editor.selectionStart)
+
+            // The EditText keeps its own kinetic scrolling (that is what makes
+            // caret dragging and the selection handles feel native). The
+            // gutter is a plain TextView that mirrors the editor's scrollY, so
+            // numbers stay glued to their lines without nesting scroll views.
+            gutter.setOnClickListener { editor.requestFocus() }
+            editor.viewTreeObserver.addOnScrollChangedListener {
+                if (gutter.scrollY != editor.scrollY) gutter.scrollTo(0, editor.scrollY)
             }
-            findReferences.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "references", editor.text.toString(), editor.selectionStart)
+            val codeRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setBackgroundColor(Color.rgb(30, 30, 30))
+                addView(gutter, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.MATCH_PARENT
+                ))
+                addView(editor, LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.MATCH_PARENT, 1f
+                ))
             }
-            root.addView(editor, LinearLayout.LayoutParams(
+            root.addView(codeRow, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            ))
+
+            // Symbol row: characters Android keyboards hide behind submenus,
+            // inserted at the caret. Tab emits one indent unit, never '\t'.
+            val symbolRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(6, 2, 6, 2)
+                setBackgroundColor(Color.rgb(42, 42, 44))
+            }
+            for (symbol in EXTRA_KEYS) {
+                val key = Button(this).apply {
+                    text = if (symbol == "\t") "⇥" else symbol
+                    textSize = 15f
+                    minWidth = 0
+                    minimumWidth = 0
+                    setPadding(20, 4, 20, 4)
+                    setOnClickListener {
+                        val insert = if (symbol == "\t") INDENT_UNIT else symbol
+                        val start = editor.selectionStart.coerceAtLeast(0)
+                        val end = editor.selectionEnd.coerceAtLeast(start)
+                        editor.text.replace(start, end, insert)
+                        editor.setSelection((start + insert.length).coerceAtMost(editor.text.length))
+                        editor.requestFocus()
+                    }
+                }
+                symbolRow.addView(key)
+            }
+            root.addView(HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(symbolRow)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             ))
 
             fun close(apply: Boolean) {
@@ -931,6 +1115,23 @@ class MainActivity : GameActivity() {
 
     companion object {
         private const val TAG = "rbxl_editor"
+
+        /**
+         * Indentation width in spaces.
+         *
+         * Spaces rather than '\t': Android's EditText renders a tab at a very
+         * wide default tab stop with no supported way to shrink it, which made
+         * one indent look like a huge blank gap and pushed the caret so far
+         * right that it appeared to wrap onto another line. Native Android
+         * code editors use a fixed space width for exactly this reason.
+         */
+        const val INDENT_WIDTH = 4
+        val INDENT_UNIT = " ".repeat(INDENT_WIDTH)
+
+        /** Quick-insert symbol row for keys Android keyboards bury in submenus. */
+        val EXTRA_KEYS = listOf(
+            "\t", "(", ")", "\"", "{", "}", "[", "]", ";", ":", ",", ".", "=", "-", "_", "#"
+        )
 
         private const val REQ_OPEN = 1001
         private const val REQ_CREATE = 1002

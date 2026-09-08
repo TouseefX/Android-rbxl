@@ -16,6 +16,14 @@ use crate::settings::EditorSettings;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
+/// One indentation level, as spaces.
+///
+/// Spaces rather than '\t' so a level occupies the same visual width in the
+/// egui editor, the native Android EditText (whose tab stop is very wide and
+/// not adjustable), and exported files.
+pub const INDENT_WIDTH: usize = 4;
+pub const INDENT_UNIT: &str = "    ";
+
 /// Log line emitted by a background plugin run.
 enum PluginLogLine {
     Output(lua_runtime::OutputLine),
@@ -1859,13 +1867,13 @@ ui.label("Place ID:");
                     ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
 
                     let symbols = [
-                        ("Tab", "\t"), ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
+                        ("Tab", INDENT_UNIT), ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
                         ("=", " = "), ("==", " == "), ("~=", " ~= "), ("<=", " <= "), (">=", " >= "),
                         ("..", " .. "), (":", ":"), (".", "."), (",", ", "), ("->", " -> "), ("::", " :: "),
                         ("local", "local "), ("const", "const "), ("function", "function "), ("end", "end"),
-                        ("then", "then\n\t"), ("do", "do\n\t"), ("return", "return "),
-                        ("if", "if "), ("else", "else\n\t"), ("elseif", "elseif "),
-                        ("for", "for i, v in pairs() do\n\tend"), ("while", "while true do\n\ttask.wait()\nend"),
+                        ("then", "then\n    "), ("do", "do\n    "), ("return", "return "),
+                        ("if", "if "), ("else", "else\n    "), ("elseif", "elseif "),
+                        ("for", "for i, v in pairs() do\n    end"), ("while", "while true do\n    task.wait()\nend"),
                         ("task.wait()", "task.wait()"), ("print()", "print()"),
                         ("game:GetService()", "game:GetService(\"\")"),
                     ];
@@ -2379,7 +2387,7 @@ ui.label("Place ID:");
             ) {
                 luau_intelligence::apply_suggestion_at(&mut tab.buffer, at, &completion)
             } else {
-                insert_at_selection(&mut tab.buffer, self.script_selection, "\t")
+                insert_at_selection(&mut tab.buffer, self.script_selection, INDENT_UNIT)
             };
             self.pending_script_cursor = Some(cursor);
             self.script_completion_cursor = Some(cursor);
@@ -5473,7 +5481,7 @@ fn format_luau_indentation(source: &str) -> String {
         if trimmed.is_empty() {
             output.push(String::new());
         } else {
-            output.push(format!("{}{}", "\t".repeat(depth), trimmed));
+            output.push(format!("{}{}", INDENT_UNIT.repeat(depth), trimmed));
         }
         // Block keywords add a level unless the same line already closed it.
         let block_opens = (code.starts_with("if ") && code.ends_with("then"))
