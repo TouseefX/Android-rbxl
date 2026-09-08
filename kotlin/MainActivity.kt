@@ -79,6 +79,8 @@ class MainActivity : GameActivity() {
     private var nativeEditorView: EditText? = null
     private var nativeEditorScriptId: Long = -1
     private var nativeCompletionPopup: ListPopupWindow? = null
+    /** Native editor line-wrap preference; off keeps code on one visual line. */
+    private var nativeEditorWordWrap: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Register the instance BEFORE super.onCreate(): GameActivity's
@@ -433,8 +435,12 @@ class MainActivity : GameActivity() {
             val formatLuau = Button(this).apply { text = "✨ Format" }
             val goDefinition = Button(this).apply { text = "↗ Definition" }
             val findReferences = Button(this).apply { text = "⌕ References" }
+            val toggleWrap = Button(this).apply {
+                text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
+            }
             actions.addView(checkLuau)
             actions.addView(formatLuau)
+            actions.addView(toggleWrap)
             actions.addView(goDefinition)
             actions.addView(findReferences)
             val actionScroller = HorizontalScrollView(this).apply {
@@ -458,9 +464,12 @@ class MainActivity : GameActivity() {
                 inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                     InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                setHorizontallyScrolling(true)
+                // Code should not reflow like prose by default, but very long
+                // lines are unreadable on a phone, so the wrap mode is a
+                // toggle instead of being hard-wired on.
+                setHorizontallyScrolling(!nativeEditorWordWrap)
                 isVerticalScrollBarEnabled = true
-                isHorizontalScrollBarEnabled = true
+                isHorizontalScrollBarEnabled = !nativeEditorWordWrap
                 isLongClickable = true
                 setSelection(initialCursor.coerceIn(0, source.length))
             }
@@ -490,6 +499,57 @@ class MainActivity : GameActivity() {
                     editor.removeCallbacks(highlightTask)
                     editor.removeCallbacks(intelligenceTask)
                     val composing = BaseInputConnection.getComposingSpanStart(text) >= 0
+                    // Continue the previous line's indentation after Enter and
+                    // add one level after a Luau block opener. Without this the
+                    // native EditText returned every new line to column zero.
+                    if (!composing && changedBefore == 0 && changedCount == 1
+                        && changedStart < text.length && text[changedStart] == '\n'
+                    ) {
+                        val lineStart = text.lastIndexOf('\n', (changedStart - 1).coerceAtLeast(0))
+                            .let { if (it < 0 || changedStart == 0) 0 else it + 1 }
+                        val previousLine = text.subSequence(lineStart, changedStart).toString()
+                        val indent = previousLine.takeWhile { it == ' ' || it == '\t' }
+                        val code = previousLine.substringBefore("--").trimEnd()
+                        val opensBlock = code.endsWith("then") || code.endsWith(" do") ||
+                            code.trim() == "do" || code.trim() == "repeat" ||
+                            code.trim() == "else" || code.endsWith("{") ||
+                            code.endsWith("(") || code.endsWith("[") ||
+                            Regex("^\\s*(local |const |export )?function\\b").containsMatchIn(code) ||
+                            Regex("=\\s*function\\s*\\(.*\\)\\s*$").containsMatchIn(code)
+                        val addition = if (opensBlock) "$indent\t" else indent
+                        if (addition.isNotEmpty()) {
+                            applyingPair = true
+                            text.insert(changedStart + 1, addition)
+                            editor.setSelection(
+                                (changedStart + 1 + addition.length).coerceAtMost(text.length)
+                            )
+                            applyingPair = false
+                        }
+                    }
+                    // Typing a block closer pulls the current line back one
+                    // indentation level, like a desktop code editor.
+                    if (!composing && changedBefore == 0 && changedCount >= 1) {
+                        val caret = editor.selectionStart.coerceIn(0, text.length)
+                        val lineStart = text.lastIndexOf('\n', (caret - 1).coerceAtLeast(0))
+                            .let { if (it < 0) 0 else it + 1 }
+                        val current = text.subSequence(lineStart, caret).toString()
+                        val trimmed = current.trim()
+                        val dedents = trimmed == "end" || trimmed == "}" || trimmed == "else" ||
+                            trimmed == "elseif" || trimmed == "until"
+                        if (dedents && current.length > trimmed.length) {
+                            val indent = current.substring(0, current.length - trimmed.length)
+                            val shorter = when {
+                                indent.endsWith("\t") -> indent.dropLast(1)
+                                indent.endsWith("    ") -> indent.dropLast(4)
+                                else -> indent
+                            }
+                            if (shorter != indent) {
+                                applyingPair = true
+                                text.replace(lineStart, lineStart + indent.length, shorter)
+                                applyingPair = false
+                            }
+                        }
+                    }
                     if (!composing && changedBefore == 0 && changedCount == 1 && changedStart < text.length) {
                         val opener = text[changedStart]
                         val closer = when (opener) {
@@ -524,6 +584,17 @@ class MainActivity : GameActivity() {
             }
             formatLuau.setOnClickListener {
                 nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), editor.selectionStart)
+            }
+            toggleWrap.setOnClickListener {
+                nativeEditorWordWrap = !nativeEditorWordWrap
+                toggleWrap.text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
+                val caret = editor.selectionStart.coerceAtLeast(0)
+                editor.setHorizontallyScrolling(!nativeEditorWordWrap)
+                editor.isHorizontalScrollBarEnabled = !nativeEditorWordWrap
+                if (!nativeEditorWordWrap) editor.scrollTo(0, editor.scrollY)
+                // setHorizontallyScrolling only takes effect on re-layout.
+                editor.requestLayout()
+                editor.post { editor.setSelection(caret.coerceAtMost(editor.text.length)) }
             }
             goDefinition.setOnClickListener {
                 nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), editor.selectionStart)
