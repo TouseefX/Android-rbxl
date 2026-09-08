@@ -62,13 +62,24 @@ mod imp {
     struct State {
         /// egui currently has keyboard focus.
         active: bool,
-        /// Our copy of what GameTextInput last reported.
+        /// Last fully committed GameTextInput contents. Composition candidates
+        /// are deliberately excluded so Samsung Keyboard can replace them.
         mirror: String,
+        /// Set after WindowInsets confirms the keyboard appeared. Once this is
+        /// true, a later invisible inset means the user explicitly dismissed it.
+        seen_visible: bool,
+        /// Whether the keyboard currently owns a composing region.
+        composing: bool,
+        /// Last candidate sent to egui, used to suppress duplicate preedits.
+        last_preedit: String,
     }
 
     static STATE: Mutex<State> = Mutex::new(State {
         active: false,
         mirror: String::new(),
+        seen_visible: false,
+        composing: false,
+        last_preedit: String::new(),
     });
 
     fn app() -> Option<&'static AndroidApp> {
@@ -78,6 +89,8 @@ mod imp {
     /// Replace the IME buffer with just the padding, caret at the end.
     fn reseed(app: &AndroidApp, state: &mut State) {
         state.mirror = PAD.to_owned();
+        state.composing = false;
+        state.last_preedit.clear();
         let end = state.mirror.len();
         app.set_text_input_state(TextInputState {
             text: state.mirror.clone(),
@@ -152,12 +165,40 @@ mod imp {
         }
 
         let current = app.text_input_state();
-        if current.text == state.mirror {
+
+        // Samsung Keyboard (especially Korean/handwriting/predictive modes)
+        // repeatedly replaces a composing range. Treating every replacement as
+        // Backspace + Text corrupts the egui buffer, so forward it through
+        // egui's native preedit/commit protocol instead.
+        if let Some(region) = current.compose_region.as_ref() {
+            let candidate = current.text.get(region.start..region.end)
+                .filter(|_| current.text.is_char_boundary(region.start)
+                    && current.text.is_char_boundary(region.end))
+                .map(str::to_owned)
+                .unwrap_or_else(|| diff(&state.mirror, &current.text).1);
+            if !state.composing || candidate != state.last_preedit {
+                ctx.input_mut(|input| {
+                    input.events.push(egui::Event::Ime(egui::ImeEvent::Preedit(
+                        candidate.clone(),
+                    )));
+                });
+                state.composing = true;
+                state.last_preedit = candidate;
+            }
+            return;
+        }
+
+        if current.text == state.mirror && !state.composing {
             return;
         }
 
         let (deleted, inserted) = diff(&state.mirror, &current.text);
+        // Samsung Keyboard can commit CRLF even though egui uses LF internally.
+        let inserted = inserted.replace("\r\n", "\n").replace('\r', "\n");
+        let finishing_composition = state.composing;
         state.mirror = current.text;
+        state.composing = false;
+        state.last_preedit.clear();
 
         ctx.input_mut(|input| {
             for _ in 0..deleted {
@@ -165,16 +206,23 @@ mod imp {
                 input.events.push(key_event(egui::Key::Backspace, false));
             }
 
-            // egui wants Enter as a key press, never as Text("\n").
-            let mut first = true;
-            for line in inserted.split('\n') {
-                if !first {
-                    input.events.push(key_event(egui::Key::Enter, true));
-                    input.events.push(key_event(egui::Key::Enter, false));
+            if finishing_composition {
+                input.events.push(egui::Event::Ime(egui::ImeEvent::Preedit(String::new())));
+                if !inserted.is_empty() {
+                    input.events.push(egui::Event::Ime(egui::ImeEvent::Commit(inserted)));
                 }
-                first = false;
-                if !line.is_empty() {
-                    input.events.push(egui::Event::Text(line.to_owned()));
+            } else {
+                // egui wants Enter as a key press, never as Text("\n").
+                let mut first = true;
+                for line in inserted.split('\n') {
+                    if !first {
+                        input.events.push(key_event(egui::Key::Enter, true));
+                        input.events.push(key_event(egui::Key::Enter, false));
+                    }
+                    first = false;
+                    if !line.is_empty() {
+                        input.events.push(egui::Event::Text(line.to_owned()));
+                    }
                 }
             }
         });
@@ -192,9 +240,25 @@ mod imp {
         let wants_keyboard = ctx.wants_keyboard_input();
         let mut state = STATE.lock().unwrap();
 
+        // Android Back/the keyboard's down-arrow hides the IME without changing
+        // egui's widget focus. Honor that action instead of immediately showing
+        // it again and leaving the editor in a phantom editing state.
+        let system_visible = crate::jni_bridge::is_ime_visible();
+        if state.active && system_visible {
+            state.seen_visible = true;
+        }
+        if state.active && state.seen_visible && !system_visible {
+            if let Some(focused) = ctx.memory(|memory| memory.focused()) {
+                ctx.memory_mut(|memory| memory.surrender_focus(focused));
+            }
+        }
+        let wants_keyboard = ctx.wants_keyboard_input();
+
         if wants_keyboard && !state.active {
-            // Multi-line + no autocorrect: the editor is used for Luau source,
-            // where suggestions/autocapitalisation do more harm than good.
+            // This is a source-code field, so disable Samsung/Gboard word
+            // correction. Luau suggestions are rendered by the editor itself;
+            // keyboard composition can otherwise show blue replacement text
+            // and duplicate identifiers around punctuation.
             // NO_FULLSCREEN keeps the IME from covering the app with its own
             // "extracted text" editor in landscape.
             app.set_ime_editor_info(
@@ -205,11 +269,26 @@ mod imp {
                 ImeOptions::IME_FLAG_NO_FULLSCREEN,
             );
             state.active = true;
+            state.seen_visible = false;
             reseed(app, &mut state);
+            ctx.input_mut(|input| {
+                input.events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
+            });
             app.show_soft_input(true);
-            log::info!("android_ime: keyboard shown");
+            log::info!("android_ime: keyboard shown (Samsung composition enabled)");
         } else if !wants_keyboard && state.active {
+            if state.composing {
+                ctx.input_mut(|input| {
+                    input.events.push(egui::Event::Ime(egui::ImeEvent::Preedit(String::new())));
+                });
+            }
+            ctx.input_mut(|input| {
+                input.events.push(egui::Event::Ime(egui::ImeEvent::Disabled));
+            });
             state.active = false;
+            state.seen_visible = false;
+            state.composing = false;
+            state.last_preedit.clear();
             app.hide_soft_input(false);
             log::info!("android_ime: keyboard hidden");
         }

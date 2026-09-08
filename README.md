@@ -92,7 +92,10 @@ bypassing winit:
 * **Start of each egui pass** — poll `AndroidApp::text_input_state()` and diff
   it against our mirror of the buffer. Inserted text becomes
   `egui::Event::Text` (newlines become `Key::Enter`), removed characters become
-  `Key::Backspace`. Gboard's clipboard chip commits through the same
+  `Key::Backspace`. Samsung Keyboard's replaceable composing regions are sent
+  as egui `ImeEvent::Preedit`/`Commit` events instead of destructive repeated
+  backspaces, supporting predictive, Korean, handwriting, and heavily modified
+  Samsung keyboard modes. Gboard's clipboard chip commits through the same
   `InputConnection`, so **paste works through this path**.
 * egui's copy/cut (`OutputCommand::CopyText`) is forwarded to Android's
   `ClipboardManager` via the existing JNI bridge, and Ctrl+V on a hardware

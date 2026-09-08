@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EditorSettings {
     pub roblosecurity_cookie: String,
     pub open_cloud_api_key: String,
@@ -11,6 +12,11 @@ pub struct EditorSettings {
     pub open_cloud_place_id: String,
     pub auto_download_meshes: bool,
     pub show_skybox: bool,
+    pub editor_font_size: f32,
+    pub compact_toolbar: bool,
+    pub show_tablet_explorer: bool,
+    pub explorer_width: f32,
+    pub editor_word_wrap: bool,
 }
 
 impl Default for EditorSettings {
@@ -22,6 +28,11 @@ impl Default for EditorSettings {
             open_cloud_place_id: String::new(),
             auto_download_meshes: true,
             show_skybox: true,
+            editor_font_size: 14.0,
+            compact_toolbar: false,
+            show_tablet_explorer: true,
+            explorer_width: 280.0,
+            editor_word_wrap: false,
         }
     }
 }

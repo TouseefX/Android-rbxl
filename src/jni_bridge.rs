@@ -27,6 +27,10 @@ pub enum FileEvent {
     /// Text came back from an external editor (QuickEdit, Acode etc.) for the
     /// script identified by `script_id` (see EditorApp::next_external_id).
     ExternalEditReturned { script_id: u64, text: String },
+    NativeEditorChanged { script_id: u64, text: String, selection_start: usize, selection_end: usize },
+    NativeEditorCommand { script_id: u64, command: String, text: String, cursor: usize },
+    /// Snapshot of exported src/**/*.luau files after returning to the app.
+    ProjectSync { bundle_json: String },
 }
 
 static FILE_EVENTS: OnceLock<(mpsc::Sender<FileEvent>, Mutex<mpsc::Receiver<FileEvent>>)> =
@@ -217,6 +221,19 @@ pub fn with_env(f: impl FnOnce(&mut JNIEnv, &JClass) -> Result<(), jni::errors::
     }
 }
 
+/// Whether Android currently reports the software keyboard as visible.
+/// Unlike egui focus this becomes false when the user dismisses the IME with
+/// Back or the keyboard's hide button.
+pub fn is_ime_visible() -> bool {
+    let visible = std::sync::atomic::AtomicBool::new(false);
+    with_env(|env, class| {
+        let value = env.call_static_method(class, "isImeVisibleStatic", "()Z", &[])?;
+        visible.store(value.z()?, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    });
+    visible.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn trigger_open_document() {
     with_env(|env, class| {
         let _ = env.call_static_method(class, "openDocumentStatic", "()V", &[])?;
@@ -256,6 +273,82 @@ pub fn trigger_save(data: &[u8]) {
             "saveToCurrentDocumentStatic",
             "([B)V",
             &[JValue::Object(&arr)],
+        )?;
+        Ok(())
+    });
+}
+
+pub fn trigger_export_project(bundle_json: &str) {
+    with_env(|env, class| {
+        let bundle = env.new_string(bundle_json)?;
+        let _ = env.call_static_method(
+            class,
+            "exportProjectStatic",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&bundle)],
+        )?;
+        Ok(())
+    });
+}
+
+pub fn trigger_native_editor_at(script_id: u64, name: &str, source: &str, cursor: usize) {
+    with_env(|env, class| {
+        let jname = env.new_string(name)?;
+        let jsource = env.new_string(source)?;
+        let _ = env.call_static_method(
+            class,
+            "showNativeEditorAtStatic",
+            "(JLjava/lang/String;Ljava/lang/String;I)V",
+            &[
+                JValue::Long(script_id as i64), JValue::Object(&jname),
+                JValue::Object(&jsource), JValue::Int(cursor.min(i32::MAX as usize) as i32),
+            ],
+        )?;
+        Ok(())
+    });
+}
+
+pub fn trigger_native_editor(script_id: u64, name: &str, source: &str) {
+    with_env(|env, class| {
+        let jname = env.new_string(name)?;
+        let jsource = env.new_string(source)?;
+        let _ = env.call_static_method(
+            class,
+            "showNativeEditorStatic",
+            "(JLjava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Long(script_id as i64),
+                JValue::Object(&jname),
+                JValue::Object(&jsource),
+            ],
+        )?;
+        Ok(())
+    });
+}
+
+pub fn update_native_editor_result(script_id: u64, command: &str, text: &str, message: &str) {
+    with_env(|env, class| {
+        let command = env.new_string(command)?;
+        let text = env.new_string(text)?;
+        let message = env.new_string(message)?;
+        let _ = env.call_static_method(
+            class, "updateNativeEditorResultStatic",
+            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Long(script_id as i64), JValue::Object(&command),
+                JValue::Object(&text), JValue::Object(&message),
+            ],
+        )?;
+        Ok(())
+    });
+}
+
+pub fn update_native_completions(script_id: u64, json: &str) {
+    with_env(|env, class| {
+        let value = env.new_string(json)?;
+        let _ = env.call_static_method(
+            class, "updateNativeCompletionsStatic", "(JLjava/lang/String;)V",
+            &[JValue::Long(script_id as i64), JValue::Object(&value)],
         )?;
         Ok(())
     });
@@ -397,6 +490,59 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnExterna
         script_id: script_id as u64,
         text: text_str,
     });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeEditorChanged(
+    mut env: JNIEnv,
+    _class: JClass,
+    script_id: jni::sys::jlong,
+    text: JString,
+    selection_start: jni::sys::jint,
+    selection_end: jni::sys::jint,
+) {
+    if text.is_null() { return; }
+    let value: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::NativeEditorChanged {
+        script_id: script_id as u64,
+        text: value,
+        selection_start: selection_start.max(0) as usize,
+        selection_end: selection_end.max(0) as usize,
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeEditorCommand(
+    mut env: JNIEnv,
+    _class: JClass,
+    script_id: jni::sys::jlong,
+    command: JString,
+    text: JString,
+    cursor: jni::sys::jint,
+) {
+    if command.is_null() || text.is_null() { return; }
+    let command: String = env.get_string(&command).map(|s| s.into()).unwrap_or_default();
+    let text: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::NativeEditorCommand {
+        script_id: script_id as u64,
+        command,
+        text,
+        cursor: cursor.max(0) as usize,
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnProjectSync(
+    mut env: JNIEnv,
+    _class: JClass,
+    bundle_json: JString,
+) {
+    if bundle_json.is_null() { return; }
+    let value: String = env.get_string(&bundle_json).map(|s| s.into()).unwrap_or_default();
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::ProjectSync { bundle_json: value });
 }
 
 #[cfg(target_os = "android")]

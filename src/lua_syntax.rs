@@ -1,8 +1,35 @@
 use bevy_egui::egui::text::LayoutJob;
 use bevy_egui::egui::{Color32, FontId, TextFormat};
+
+/// Build a monospace line-number gutter with the caret's current line marked.
+pub fn line_number_gutter(line_count: usize, active_line: usize, font_size: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let digits = line_count.max(1).to_string().len();
+    let font = FontId::monospace(font_size);
+    for line in 1..=line_count.max(1) {
+        let active = line == active_line;
+        let format = TextFormat {
+            font_id: font.clone(),
+            color: if active {
+                Color32::from_rgb(120, 210, 255)
+            } else {
+                Color32::from_rgb(105, 115, 125)
+            },
+            background: if active {
+                Color32::from_rgb(38, 48, 58)
+            } else {
+                Color32::TRANSPARENT
+            },
+            ..Default::default()
+        };
+        job.append(&format!("{line:>digits$}  \n"), 0.0, format);
+    }
+    job
+}
+
 use std::collections::HashSet;
 
-pub fn highlight_lua(text: &str, font_size: f32, search_term: Option<&str>) -> LayoutJob {
+pub fn highlight_luau(text: &str, font_size: f32, search_term: Option<&str>) -> LayoutJob {
     let font = FontId::monospace(font_size);
     let mut job = LayoutJob::default();
 
@@ -23,7 +50,7 @@ pub fn highlight_lua(text: &str, font_size: f32, search_term: Option<&str>) -> L
     };
 
     let keywords: HashSet<&str> = [
-        "and", "break", "continue", "do", "else", "elseif", "end", "export",
+        "and", "break", "const", "continue", "do", "else", "elseif", "end", "export",
         "for", "function", "goto", "if", "in", "local", "not", "or",
         "repeat", "return", "then", "type", "until", "while",
     ].into_iter().collect();
@@ -103,8 +130,11 @@ pub fn highlight_lua(text: &str, font_size: f32, search_term: Option<&str>) -> L
             continue;
         }
 
-        // Quoted strings: "..." or '...'
-        if chars[i] == '"' || chars[i] == '\'' {
+        // Quoted strings and modern Luau interpolated strings (`hello {name}`).
+        // Interpolation contents remain string-colored for now; recognizing the
+        // complete token prevents backticks from corrupting highlighting for
+        // the rest of the file.
+        if chars[i] == '"' || chars[i] == '\'' || chars[i] == '`' {
             let quote = chars[i];
             let start = i;
             i += 1;

@@ -5,7 +5,7 @@ use crate::live_session;
 use crate::lua_runtime;
 use crate::plugins;
 use crate::roblox_api::{self, LiveCatalogItem, RobloxApiClient};
-use crate::{explorer, lua_syntax, rbxl, schema, templates};
+use crate::{explorer, lua_syntax, luau_intelligence, rbxl, schema, selection_edit, templates};
 use bevy_egui::egui;
 use bevy_egui::egui::{Color32, RichText};
 use rbx_dom_weak::{
@@ -89,6 +89,22 @@ pub struct OpenScriptTab {
     pub class: String,
     pub buffer: String,
     pub original: String,
+    /// Previous rendered contents, used to recognize IME/hardware-key edits
+    /// for auto-indent and delimiter pairing.
+    pub previous_buffer: String,
+    /// Source snapshot and parser results for incremental live diagnostics.
+    pub analyzed_buffer: String,
+    pub diagnostics: Vec<lua_runtime::SyntaxDiagnostic>,
+    /// Cached Roblox/Luau semantic warnings; recomputed only after edits.
+    pub semantic_diagnostics: Vec<luau_intelligence::ProjectDiagnostic>,
+    /// Cached syntax highlighting; font layout may run each frame, tokenizing does not.
+    pub highlighted_buffer: String,
+    pub highlighted_font_size: f32,
+    pub highlighted_search: Option<String>,
+    pub highlighted_job: egui::text::LayoutJob,
+    /// Expensive compiler/semantic passes run after typing pauses.
+    pub analysis_pending_buffer: String,
+    pub analysis_requested_at: Option<std::time::Instant>,
 }
 
 pub struct OutputLog {
@@ -122,6 +138,33 @@ pub struct EditorApp {
     // Multi-tab Script Editor
     open_tabs: Vec<OpenScriptTab>,
     active_script_idx: usize,
+    /// Caret and highlighted item for the touch/keyboard completion popup.
+    script_completion_cursor: Option<usize>,
+    script_completion_selected: usize,
+    script_completion_dismissed_at: Option<(Ref, usize)>,
+    /// Anchor/primary character positions from the previous editor frame.
+    script_selection: Option<(usize, usize)>,
+    /// Character position to apply after opening a definition in another tab.
+    pending_script_cursor: Option<usize>,
+    /// Selection range requested by draggable Android selection handles.
+    pending_script_selection: Option<(usize, usize)>,
+    /// Raw-touch fallback for Android backends where overlapping egui Areas do
+    /// not reliably win drag ownership from the code ScrollArea.
+    script_active_selection_handle: Option<u8>,
+    /// Previous-frame hit targets let us suppress the underlying TextEdit click
+    /// before it can collapse the selected range.
+    script_selection_handle_rects: Option<[egui::Rect; 2]>,
+    script_references: Vec<luau_intelligence::Reference>,
+    show_symbol_rename: bool,
+    symbol_rename_input: String,
+    /// Incremental project-intelligence cache. The inexpensive fingerprint is
+    /// checked every frame; the full index is rebuilt only after a real change.
+    project_index_cache: Option<std::sync::Arc<luau_intelligence::ProjectIndex>>,
+    project_index_fingerprint: u64,
+    project_index_rebuilds: u64,
+    /// Throttles whole-project fingerprints on mobile while typing.
+    project_index_checked_at: Option<std::time::Instant>,
+    project_diagnostics_cache: Vec<luau_intelligence::ProjectDiagnostic>,
 
     // Find & Replace
     find_term: String,
@@ -131,8 +174,19 @@ pub struct EditorApp {
     // UI state
     explorer_search: String,
     font_size: f32,
+    compact_toolbar: bool,
+    show_tablet_explorer: bool,
+    explorer_width: f32,
+    editor_word_wrap: bool,
+    editor_focus_mode: bool,
     show_stats: bool,
     rename_buffer: String,
+    project_name: String,
+    show_quick_open: bool,
+    quick_open_query: String,
+    show_workspace_symbols: bool,
+    workspace_symbol_query: String,
+    workspace_symbol_catalog: Vec<luau_intelligence::WorkspaceSymbol>,
 
     // Live Roblox Catalog & Creator Store State
     live_search_input: String,
@@ -176,6 +230,7 @@ pub struct EditorApp {
     // External edit mapping
     pending_external_edits: HashMap<u64, Ref>,
     next_external_id: u64,
+    native_editor_initial_cursor: Option<usize>,
 
     // Bevy 3D scene rebuild flag: set when the opened place changes, cleared
     // by the Bevy system that (re)builds the meshes.
@@ -266,13 +321,40 @@ impl Default for EditorApp {
             active_tab: ActiveTab::Viewport3D,
             open_tabs: Vec::new(),
             active_script_idx: 0,
+            script_completion_cursor: None,
+            script_completion_selected: 0,
+            script_completion_dismissed_at: None,
+            script_selection: None,
+            pending_script_cursor: None,
+            pending_script_selection: None,
+            script_active_selection_handle: None,
+            script_selection_handle_rects: None,
+            script_references: Vec::new(),
+            show_symbol_rename: false,
+            symbol_rename_input: String::new(),
+            project_index_cache: None,
+            project_index_fingerprint: 0,
+            project_index_rebuilds: 0,
+            project_index_checked_at: None,
+            project_diagnostics_cache: Vec::new(),
             find_term: String::new(),
             replace_term: String::new(),
             show_replace: false,
             explorer_search: String::new(),
-            font_size: 14.0,
+            font_size: saved_settings.editor_font_size.clamp(10.0, 32.0),
+            compact_toolbar: saved_settings.compact_toolbar,
+            show_tablet_explorer: saved_settings.show_tablet_explorer,
+            explorer_width: saved_settings.explorer_width.clamp(180.0, 520.0),
+            editor_word_wrap: saved_settings.editor_word_wrap,
+            editor_focus_mode: false,
             show_stats: false,
             rename_buffer: String::new(),
+            project_name: "RobloxProject".into(),
+            show_quick_open: false,
+            quick_open_query: String::new(),
+            show_workspace_symbols: false,
+            workspace_symbol_query: String::new(),
+            workspace_symbol_catalog: Vec::new(),
             live_search_input: "sword".into(),
             live_catalog_items: Vec::new(),
             catalog_thumbnails: HashMap::new(),
@@ -302,6 +384,7 @@ impl Default for EditorApp {
             output_logs: Vec::new(),
             pending_external_edits: HashMap::new(),
             next_external_id: 1,
+            native_editor_initial_cursor: None,
             needs_3d_rebuild: false,
             cam_move_speed: 4.0,
             pending_asset_refresh_at: None,
@@ -437,6 +520,15 @@ impl EditorApp {
     /// a Bevy system.
     pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
         self.drain_events();
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
+            self.show_quick_open = true;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::O)) {
+            self.show_workspace_symbols = true;
+        }
+        if self.editor_focus_mode && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.editor_focus_mode = false;
+        }
         // Keep egui's internal clipboard in sync with the Android system
         // clipboard. arboard (egui's default backend) doesn't work on
         // Android, and there's no native EditText long-press menu, so we
@@ -454,23 +546,28 @@ impl EditorApp {
         });
 
         let style = ctx.style();
+        let compact = self.compact_toolbar || ctx.available_rect().width() < 720.0;
 
         let top_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
-            top: 48,
+            top: if compact { 6 } else { 48 },
             bottom: 6,
             left: 10,
             right: 10,
         });
 
-        // Top Studio Toolbar
+        // Top Studio Toolbar. Focus mode gives the editor every available row.
+        if !self.editor_focus_mode {
         egui::TopBottomPanel::top("toolbar")
             .frame(top_frame)
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                egui::ScrollArea::horizontal().id_salt("main_toolbar_scroll").show(ui, |ui| {
+                ui.horizontal(|ui| {
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
 
-                    ui.label(RichText::new("v3.2-B8 • OpenRBLX • Bevy").strong().color(Color32::from_rgb(0, 230, 255)));
+                    if !compact {
+                        ui.label(RichText::new("v3.2-B8 • OpenRBLX • Bevy").strong().color(Color32::from_rgb(0, 230, 255)));
+                    }
 
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();
@@ -481,12 +578,30 @@ impl EditorApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.open_place_id_input)
                             .hint_text("place ID")
-                            .desired_width(90.0),
+                            .desired_width(if compact { 72.0 } else { 90.0 }),
                     );
-                    if ui.button("🌐 Open from Roblox").clicked() {
+                    if ui.button(if compact { "🌐 Roblox" } else { "🌐 Open from Roblox" }).clicked() {
                         self.open_place_from_roblox();
                     }
-                    if ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
+                    if compact {
+                        ui.menu_button("⋮ More", |ui| {
+                            if ui.button("📥 Import Local .rbxm").clicked() {
+                                self.prompt_import_local_model(); ui.close();
+                            }
+                            if ui.button("💾 Save As...").clicked() {
+                                self.save_as(); ui.close();
+                            }
+                            if ui.button("🚀 Publish to Roblox").clicked() {
+                                self.publish_place_to_roblox(); ui.close();
+                            }
+                            if ui.button("📊 Stats").clicked() {
+                                self.show_stats = !self.show_stats; ui.close();
+                            }
+                            if ui.button("⚙ Settings").clicked() {
+                                self.active_tab = ActiveTab::Settings; ui.close();
+                            }
+                        });
+                    } else if ui.button(RichText::new("📥 Import Local .rbxm").strong().color(Color32::from_rgb(100, 200, 255))).clicked() {
                         self.prompt_import_local_model();
                     }
                     if ui.button(RichText::new("💾 Save").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
@@ -495,17 +610,26 @@ impl EditorApp {
                     if ui.button("💾 Save As...").clicked() {
                         self.save_as();
                     }
-                    if ui.button(RichText::new("🚀 Publish to Roblox").color(Color32::from_rgb(255, 180, 80))).clicked() {
-                        self.publish_place_to_roblox();
+                    if ui.button("⌘ Quick Open").clicked() {
+                        self.show_quick_open = true;
                     }
-                    if ui.button("📊 Stats").clicked() {
-                        self.show_stats = !self.show_stats;
+                    if ui.button("⌕ Symbols").clicked() {
+                        self.show_workspace_symbols = true;
+                    }
+                    if !compact {
+                        if ui.button(RichText::new("🚀 Publish to Roblox").color(Color32::from_rgb(255, 180, 80))).clicked() {
+                            self.publish_place_to_roblox();
+                        }
+                        if ui.button("📊 Stats").clicked() {
+                            self.show_stats = !self.show_stats;
+                        }
                     }
                     if ui.button(format!("🖥️ Output ({})", self.output_logs.len())).clicked() {
                         self.active_tab = ActiveTab::Output;
                     }
                     ui.separator();
-                    ui.label(&self.status);
+                    if !compact { ui.label(&self.status); }
+                });
                 });
 
                 if self.show_stats {
@@ -522,9 +646,11 @@ impl EditorApp {
                     }
                 }
             });
+        }
 
-        // Studio Navigation Tabs Bar
-        let is_landscape = ctx.available_rect().width() > 650.0;
+        // Phones use thumb-reachable bottom navigation; tablets keep a top
+        // tab strip plus the resizable Explorer workspace sidebar.
+        let is_tablet = ctx.available_rect().width() > 720.0;
 
         let nav_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
             top: 4,
@@ -533,8 +659,13 @@ impl EditorApp {
             right: 10,
         });
 
-        egui::TopBottomPanel::top("nav_tabs")
-            .frame(nav_frame)
+        if !self.editor_focus_mode {
+        let nav_panel = if is_tablet {
+            egui::TopBottomPanel::top("nav_tabs")
+        } else {
+            egui::TopBottomPanel::bottom("nav_tabs")
+        };
+        nav_panel.frame(nav_frame)
             .show(ctx, |ui| {
                 egui::ScrollArea::horizontal()
                     .id_salt("nav_tabs_scroll")
@@ -551,6 +682,13 @@ impl EditorApp {
                                     RichText::new(label)
                                 };
                                 if ui.selectable_label(is_active, text).clicked() {
+                                    if self.active_tab != tab {
+                                        ui.memory_mut(|memory| {
+                                            if let Some(focused) = memory.focused() {
+                                                memory.surrender_focus(focused);
+                                            }
+                                        });
+                                    }
                                     self.active_tab = tab;
                                 }
                             };
@@ -573,13 +711,20 @@ impl EditorApp {
                         });
                     });
             });
+        }
 
-        // Landscape: Explorer on the left.
-        if is_landscape {
+        // Do not render the same large tree twice when Explorer itself is the
+        // active page; that doubled traversal was especially costly on phones
+        // whose landscape width crosses the tablet breakpoint.
+        if is_tablet && self.show_tablet_explorer && !self.editor_focus_mode
+            && self.active_tab != ActiveTab::Explorer
+        {
             egui::SidePanel::left("landscape_left")
                 .resizable(true)
-                .default_width(280.0)
+                .default_width(self.explorer_width)
+                .width_range(180.0..=520.0)
                 .show(ctx, |ui| {
+                    self.explorer_width = ui.max_rect().width();
                     self.show_explorer_ui(ui);
                 });
         }
@@ -624,6 +769,8 @@ impl EditorApp {
             });
         }
 
+        self.show_project_navigation(ctx);
+
         // Drain egui output commands. In particular, when the user
         // copies text inside an egui widget (Ctrl+C / selection), egui
         // emits OutputCommand::CopyText; forward it to the Android
@@ -639,6 +786,109 @@ impl EditorApp {
 }
 
 impl EditorApp {
+    fn show_project_navigation(&mut self, ctx: &egui::Context) {
+        if self.editor_focus_mode {
+            egui::Area::new(egui::Id::new("focus_mode_exit"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 52.0))
+                .show(ctx, |ui| {
+                    if ui.button("↙ Exit Focus").clicked() {
+                        self.editor_focus_mode = false;
+                        ui.memory_mut(|memory| {
+                            if let Some(focused) = memory.focused() {
+                                memory.surrender_focus(focused);
+                            }
+                        });
+                    }
+                });
+        }
+        let mut jump: Option<(Ref, usize)> = None;
+        if self.show_quick_open {
+            let mut scripts = Vec::new();
+            if let Some(dom) = &self.dom {
+                collect_script_paths(dom, dom.root_ref(), &mut Vec::new(), &mut scripts);
+            }
+            let query = self.quick_open_query.to_ascii_lowercase();
+            scripts.retain(|(_, path)| query.is_empty() || fuzzy_ui_match(&path.to_ascii_lowercase(), &query));
+            scripts.sort_by_key(|(_, path)| path.to_ascii_lowercase());
+            let mut open = self.show_quick_open;
+            egui::Window::new("⌘ Quick Open")
+                .open(&mut open).collapsible(false).default_width(520.0)
+                .show(ctx, |ui| {
+                    let response = ui.add(egui::TextEdit::singleline(&mut self.quick_open_query)
+                        .hint_text("Type a script name or DataModel path…").desired_width(f32::INFINITY));
+                    response.request_focus();
+                    if response.ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        if let Some((referent, _)) = scripts.first() { jump = Some((*referent, 1)); }
+                    }
+                    ui.label(RichText::new(format!("{} matching scripts · Enter opens first · Ctrl+P", scripts.len())).weak());
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for (referent, path) in scripts.iter().take(100) {
+                            if ui.selectable_label(false, RichText::new(path).monospace()).clicked() {
+                                jump = Some((*referent, 1));
+                            }
+                        }
+                    });
+                });
+            self.show_quick_open = open && jump.is_none();
+        }
+
+        if self.show_workspace_symbols {
+            if self.workspace_symbol_catalog.is_empty() {
+                if self.project_index_cache.is_none() {
+                    if let Some(dom) = &self.dom {
+                        self.project_index_cache = Some(std::sync::Arc::new(
+                            luau_intelligence::ProjectIndex::build_with_overrides(
+                                dom, self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                            ),
+                        ));
+                    }
+                }
+                if let Some(index) = &self.project_index_cache {
+                    self.workspace_symbol_catalog = index.all_workspace_symbols();
+                }
+            }
+            let symbols = luau_intelligence::ProjectIndex::filter_workspace_symbols(
+                &self.workspace_symbol_catalog,
+                &self.workspace_symbol_query,
+            );
+            let mut open = self.show_workspace_symbols;
+            egui::Window::new("⌕ Workspace Symbols")
+                .open(&mut open).collapsible(false).default_width(620.0)
+                .show(ctx, |ui| {
+                    let response = ui.add(egui::TextEdit::singleline(&mut self.workspace_symbol_query)
+                        .hint_text("Find exported functions, fields, and types…").desired_width(f32::INFINITY));
+                    response.request_focus();
+                    if response.ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        if let Some(symbol) = symbols.first() { jump = Some((symbol.referent, symbol.line)); }
+                    }
+                    ui.label(RichText::new(format!("{} symbols · Enter opens first · Ctrl+Shift+O", symbols.len())).weak());
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for symbol in &symbols {
+                            let label = format!("{}  —  {}", symbol.name, symbol.detail);
+                            if ui.selectable_label(false, RichText::new(label).monospace()).clicked() {
+                                jump = Some((symbol.referent, symbol.line));
+                            }
+                            ui.label(RichText::new(format!("    {}:{}", symbol.path, symbol.line)).small().weak());
+                        }
+                    });
+                });
+            self.show_workspace_symbols = open && jump.is_none();
+        }
+
+        if let Some((referent, line)) = jump {
+            self.open_script_tab(referent);
+            if let Some(tab) = self.open_tabs.get(self.active_script_idx) {
+                let cursor = tab.buffer.lines().take(line.saturating_sub(1))
+                    .map(|line| line.chars().count() + 1).sum();
+                self.pending_script_cursor = Some(cursor);
+                self.script_completion_cursor = Some(cursor);
+            }
+            self.selected = Some(referent);
+            self.active_tab = ActiveTab::ScriptEditor;
+            self.status = format!("Opened project symbol at line {line}");
+        }
+    }
+
     /// Camera control bar (always drawn on a solid panel so it's visible over
     /// the 3D). Steers the Bevy `OrbitCam`.
     fn show_viewport_controls(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
@@ -1210,14 +1460,43 @@ ui.label("Place ID:");
         }
 
         let source = rbxl::get_source(dom, referent).unwrap_or_default();
+        // Opening a script from Explorer must stay instant. Full compiler and
+        // semantic diagnostics run only from the explicit Check Luau button.
+        let diagnostics = Vec::new();
+        let highlighted_job = lua_syntax::highlight_luau(&source, self.font_size, None);
         self.open_tabs.push(OpenScriptTab {
             referent,
             name: inst.name.clone(),
             class: inst.class.to_string(),
             buffer: source.clone(),
-            original: source,
+            original: source.clone(),
+            previous_buffer: source.clone(),
+            semantic_diagnostics: Vec::new(),
+            highlighted_buffer: source.clone(),
+            highlighted_font_size: self.font_size,
+            highlighted_search: None,
+            highlighted_job,
+            analysis_pending_buffer: source.clone(),
+            analysis_requested_at: None,
+            analyzed_buffer: source,
+            diagnostics,
         });
         self.active_script_idx = self.open_tabs.len() - 1;
+    }
+
+    /// Launch native editing only for an explicit user/navigation action.
+    /// Merely opening or switching an egui script tab must not force it.
+    fn launch_active_native_editor(&mut self) {
+        #[cfg(target_os = "android")]
+        {
+            let cursor = self.native_editor_initial_cursor.take().unwrap_or(0);
+            if let Some(tab) = self.open_tabs.get(self.active_script_idx) {
+                let id = self.next_external_id;
+                self.next_external_id += 1;
+                self.pending_external_edits.insert(id, tab.referent);
+                jni_bridge::trigger_native_editor_at(id, &tab.name, &tab.buffer, cursor);
+            }
+        }
     }
 
     fn show_script_editor_ui(&mut self, ui: &mut egui::Ui) {
@@ -1280,6 +1559,63 @@ ui.label("Place ID:");
             }
         }
 
+        {
+            let active = &mut self.open_tabs[self.active_script_idx];
+            if active.buffer != active.analysis_pending_buffer {
+                active.analysis_pending_buffer = active.buffer.clone();
+                active.analysis_requested_at = Some(std::time::Instant::now());
+            }
+        }
+
+        // Cache the expensive export/dependency index. Fingerprinting still
+        // notices DataModel edits and every unsaved tab, but parsing happens
+        // only when those inputs actually change.
+        if let Some(dom) = self.dom.as_ref() {
+            let now = std::time::Instant::now();
+            let editor_idle = self.open_tabs[self.active_script_idx].analysis_requested_at
+                .map_or(true, |at| at.elapsed() >= std::time::Duration::from_millis(450));
+            let check_due = self.project_index_cache.is_none() || (editor_idle
+                && self.project_index_checked_at.map_or(true, |last| {
+                    now.duration_since(last) >= std::time::Duration::from_millis(500)
+                }));
+            if check_due {
+                self.project_index_checked_at = Some(now);
+                let fingerprint = luau_intelligence::ProjectIndex::fingerprint(
+                    dom,
+                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                );
+                if self.project_index_cache.is_none()
+                    || fingerprint != self.project_index_fingerprint
+                {
+                    let rebuilt = luau_intelligence::ProjectIndex::build_with_overrides(
+                        dom,
+                        self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                    );
+                    self.project_index_cache = Some(std::sync::Arc::new(rebuilt));
+                    self.workspace_symbol_catalog.clear();
+                    self.project_index_fingerprint = fingerprint;
+                    self.project_index_rebuilds += 1;
+                }
+            }
+        } else {
+            self.project_index_cache = None;
+            self.project_index_fingerprint = 0;
+        }
+        let project_index = self.project_index_cache.clone();
+        let mut project_diagnostics = self.project_diagnostics_cache.clone();
+        let mut semantic_diagnostics = self.open_tabs[self.active_script_idx]
+            .semantic_diagnostics.clone();
+        let definition = project_index.as_ref().and_then(|index| {
+            let active = &self.open_tabs[self.active_script_idx];
+            self.script_completion_cursor.and_then(|cursor| {
+                index.definition_at(active.referent, &active.buffer, cursor)
+            })
+        });
+        let mut goto_definition = None;
+        let mut find_references_requested = false;
+        let mut export_project_requested = false;
+        let mut check_luau_requested = false;
+
         let tab = &mut self.open_tabs[self.active_script_idx];
         let is_dirty = tab.buffer != tab.original;
         let tab_ref = tab.referent;
@@ -1287,8 +1623,10 @@ ui.label("Place ID:");
 
         ui.separator();
 
-        // Action Toolbar
-        ui.horizontal_wrapped(|ui| {
+        // Keep the editor controls to one horizontally scrollable row on
+        // phones so they cannot push the code area off-screen.
+        egui::ScrollArea::horizontal().id_salt("script_action_toolbar").show(ui, |ui| {
+        ui.horizontal(|ui| {
             ui.heading(&tab_name);
             ui.label(RichText::new(format!("({})", tab.class)).color(Color32::from_rgb(150, 150, 150)));
 
@@ -1307,6 +1645,32 @@ ui.label("Place ID:");
                 ui.label(RichText::new("✓ Up to date").color(Color32::from_rgb(120, 200, 120)));
             }
 
+            if ui.button(if self.editor_focus_mode { "↙ Exit Focus" } else { "⛶ Focus" }).clicked() {
+                self.editor_focus_mode = !self.editor_focus_mode;
+                if !self.editor_focus_mode {
+                    ui.memory_mut(|memory| {
+                        if let Some(focused) = memory.focused() {
+                            memory.surrender_focus(focused);
+                        }
+                    });
+                }
+            }
+            if ui.button("⌄ Keyboard").clicked() {
+                ui.memory_mut(|memory| {
+                    if let Some(focused) = memory.focused() {
+                        memory.surrender_focus(focused);
+                    }
+                });
+            }
+
+            #[cfg(target_os = "android")]
+            if ui.button("📱 Native Android Editor").clicked() {
+                let id = self.next_external_id;
+                self.next_external_id += 1;
+                self.pending_external_edits.insert(id, tab_ref);
+                jni_bridge::trigger_native_editor(id, &tab_name, &tab.buffer);
+            }
+
             if ui.button("📱 Edit in External App").clicked() {
                 let id = self.next_external_id;
                 self.next_external_id += 1;
@@ -1314,10 +1678,81 @@ ui.label("Place ID:");
                 jni_bridge::trigger_edit_externally(id, &tab_name, &tab.buffer);
             }
 
+            ui.add(egui::TextEdit::singleline(&mut self.project_name)
+                .hint_text("project name").desired_width(120.0));
+            if ui.button("📁 Export Rojo Project").clicked() {
+                export_project_requested = true;
+            }
+
+            if ui.button("✓ Check Luau").clicked() {
+                check_luau_requested = true;
+            }
+            if ui.button("✨ Format Luau").clicked() {
+                tab.buffer = format_luau_indentation(&tab.buffer);
+                tab.previous_buffer = tab.buffer.clone();
+                self.status = format!("Formatted {}", tab_name);
+            }
+            if ui.selectable_label(self.editor_word_wrap, "↩ Wrap").clicked() {
+                self.editor_word_wrap = !self.editor_word_wrap;
+                self.status = if self.editor_word_wrap {
+                    "Editor line wrapping enabled".into()
+                } else {
+                    "Editor line wrapping disabled — source lines stay on one visual line".into()
+                };
+            }
             if ui.button("🔍 Find & Replace").clicked() {
                 self.show_replace = !self.show_replace;
             }
+            if ui.add_enabled(
+                definition.is_some(),
+                egui::Button::new("↗ Go to Definition"),
+            ).clicked() {
+                goto_definition = definition.clone();
+            }
+            if ui.add_enabled(
+                definition.is_some(),
+                egui::Button::new("⌕ Find References"),
+            ).clicked() {
+                find_references_requested = true;
+            }
+            let can_rename = definition.as_ref().is_some_and(|value| value.member.is_some());
+            if ui.add_enabled(can_rename, egui::Button::new("✎ Rename Symbol")).clicked() {
+                self.symbol_rename_input = definition.as_ref()
+                    .and_then(|value| value.member.clone()).unwrap_or_default();
+                self.show_symbol_rename = true;
+            }
         });
+        });
+
+        if check_luau_requested {
+            tab.diagnostics = lua_runtime::check_syntax(&tab.buffer, &tab_name);
+            tab.semantic_diagnostics = luau_intelligence::semantic_diagnostics(&tab.buffer);
+            tab.analyzed_buffer = tab.buffer.clone();
+            tab.analysis_pending_buffer = tab.buffer.clone();
+            tab.analysis_requested_at = None;
+            semantic_diagnostics = tab.semantic_diagnostics.clone();
+            project_diagnostics = project_index.as_ref().map_or_else(Vec::new, |index| {
+                index.diagnostics(tab_ref, &tab.buffer)
+            });
+            self.project_diagnostics_cache = project_diagnostics.clone();
+            self.status = format!(
+                "Luau check finished: {} syntax error(s), {} project/semantic warning(s)",
+                tab.diagnostics.len(), project_diagnostics.len() + semantic_diagnostics.len());
+        }
+
+        let mut rename_requested = false;
+        if self.show_symbol_rename {
+            ui.horizontal(|ui| {
+                ui.label("New exported member name:");
+                ui.add(egui::TextEdit::singleline(&mut self.symbol_rename_input).desired_width(180.0));
+                if ui.button("Rename Across Project").clicked() {
+                    rename_requested = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.show_symbol_rename = false;
+                }
+            });
+        }
 
         // External Edit Sync Banner
         if self.pending_external_edits.values().any(|&r| r == tab_ref) {
@@ -1366,15 +1801,55 @@ ui.label("Place ID:");
             if ui.button("➕").clicked() && self.font_size < 32.0 {
                 self.font_size += 2.0;
             }
+            ui.label(
+                RichText::new(format!("Index cached · {} rebuild(s)", self.project_index_rebuilds))
+                    .small()
+                    .weak(),
+            );
 
             ui.separator();
             if ui.button("📋 Copy Script").clicked() {
                 jni_bridge::trigger_copy_to_clipboard(&tab.buffer);
                 self.status = "Copied script to Android clipboard".into();
             }
+
+            // GameActivity renders a native surface rather than an Android
+            // EditText, so Android cannot create its stock selection action
+            // popup for us. Mirror the useful actions whenever TextEdit has a
+            // real selection (including hold-then-drag on touch).
+            if let Some((anchor, primary)) = self.script_selection {
+                if anchor != primary {
+                    let start = anchor.min(primary);
+                    let end = anchor.max(primary);
+                    let start_byte = tab.buffer.char_indices().nth(start)
+                        .map_or(tab.buffer.len(), |(byte, _)| byte);
+                    let end_byte = tab.buffer.char_indices().nth(end)
+                        .map_or(tab.buffer.len(), |(byte, _)| byte);
+                    let selected = tab.buffer[start_byte..end_byte].to_owned();
+                    ui.separator();
+                    ui.label("Selection:");
+                    if ui.button("Copy").clicked() {
+                        jni_bridge::trigger_copy_to_clipboard(&selected);
+                    }
+                    if ui.button("Cut").clicked() {
+                        jni_bridge::trigger_copy_to_clipboard(&selected);
+                        tab.buffer.replace_range(start_byte..end_byte, "");
+                        self.pending_script_cursor = Some(start);
+                        self.script_selection = Some((start, start));
+                    }
+                    if ui.button("Paste").clicked() {
+                        let pasted = jni_bridge::get_clipboard_text();
+                        tab.buffer.replace_range(start_byte..end_byte, &pasted);
+                        self.pending_script_cursor = Some(start + pasted.chars().count());
+                        self.script_selection = self.pending_script_cursor.map(|at| (at, at));
+                    }
+                }
+            }
 });
 
-        // Quick Lua Symbol Bar
+        // Quick Luau Symbol Bar
+        let mut focus_editor_requested = false;
+        let mut tab_completion_requested = false;
         ui.separator();
         egui::ScrollArea::horizontal()
             .id_salt("quick_symbols_editor")
@@ -1384,10 +1859,10 @@ ui.label("Place ID:");
                     ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
 
                     let symbols = [
-                        ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
+                        ("Tab", "\t"), ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
                         ("=", " = "), ("==", " == "), ("~=", " ~= "), ("<=", " <= "), (">=", " >= "),
                         ("..", " .. "), (":", ":"), (".", "."), (",", ", "), ("->", " -> "), ("::", " :: "),
-                        ("local", "local "), ("function", "function "), ("end", "end"),
+                        ("local", "local "), ("const", "const "), ("function", "function "), ("end", "end"),
                         ("then", "then\n\t"), ("do", "do\n\t"), ("return", "return "),
                         ("if", "if "), ("else", "else\n\t"), ("elseif", "elseif "),
                         ("for", "for i, v in pairs() do\n\tend"), ("while", "while true do\n\ttask.wait()\nend"),
@@ -1397,7 +1872,19 @@ ui.label("Place ID:");
 
                     for (label, snippet) in symbols {
                         if ui.button(label).clicked() {
-                            tab.buffer.push_str(snippet);
+                            if label == "Tab" {
+                                // Apply after TextEdit reports this frame's real
+                                // caret. Using the previous frame's cursor put
+                                // completions before the word on Samsung IME.
+                                tab_completion_requested = true;
+                            } else {
+                                let cursor = insert_at_selection(
+                                    &mut tab.buffer, self.script_selection, snippet);
+                                self.pending_script_cursor = Some(cursor);
+                                self.script_completion_cursor = Some(cursor);
+                                self.script_selection = Some((cursor, cursor));
+                                focus_editor_requested = true;
+                            }
                         }
                     }
                 });
@@ -1412,27 +1899,630 @@ ui.label("Place ID:");
         } else {
             Some(self.find_term.trim().to_string())
         };
+        let highlight_due = tab.highlighted_buffer != tab.buffer
+            && tab.analysis_requested_at.is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(180));
+        if highlight_due || tab.highlighted_font_size != font_size || tab.highlighted_search != search_term {
+            tab.highlighted_job = lua_syntax::highlight_luau(&tab.buffer, font_size, search_term.as_deref());
+            tab.highlighted_buffer = tab.buffer.clone();
+            tab.highlighted_font_size = font_size;
+            tab.highlighted_search = search_term.clone();
+        }
+        let highlighted_job = tab.highlighted_job.clone();
 
+        // Use the caret reported by the previous text pass to intercept
+        // completion-navigation keys before TextEdit treats them as cursor
+        // movement, indentation, or a newline.
+        let mut completions = self.script_completion_cursor
+            .and_then(|cursor| project_index.as_ref().map(|index| {
+                index.complete_at(tab_ref, &tab.buffer, cursor)
+            }))
+            .unwrap_or_default();
+        if self.script_completion_cursor
+            .is_some_and(|cursor| self.script_completion_dismissed_at == Some((tab_ref, cursor)))
+        {
+            completions.clear();
+        }
+        let mut completion_dismissed = false;
+        if completions.is_empty() {
+            self.script_completion_selected = 0;
+        } else {
+            self.script_completion_selected = self.script_completion_selected.min(completions.len() - 1);
+            let down = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+            });
+            let up = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+            });
+            let accept_tab = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+            });
+            let dismiss = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            });
+            if down {
+                self.script_completion_selected =
+                    (self.script_completion_selected + 1) % completions.len();
+            } else if up {
+                self.script_completion_selected =
+                    (self.script_completion_selected + completions.len() - 1) % completions.len();
+            }
+            if dismiss {
+                completions.clear();
+                completion_dismissed = true;
+                if let Some(cursor) = self.script_completion_cursor {
+                    self.script_completion_dismissed_at = Some((tab_ref, cursor));
+                }
+            } else if accept_tab {
+                // Defer until after TextEdit reports the current IME caret.
+                tab_completion_requested = true;
+            }
+        }
+
+        // When there is no completion popup, Tab/Shift+Tab operate on all
+        // selected lines. A collapsed selection is left to TextEdit so Tab can
+        // still insert a normal indentation character at the caret.
+        let mut pending_selection = None;
+        if completions.is_empty() {
+            if let Some((anchor, primary)) = self.script_selection {
+                if anchor != primary {
+                    let unindent = ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)
+                    });
+                    let indent = if unindent {
+                        false
+                    } else {
+                        ui.input_mut(|input| {
+                            input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                        })
+                    };
+                    if indent || unindent {
+                        pending_selection = Some(selection_edit::indent_lines(
+                            &mut tab.buffer,
+                            anchor,
+                            primary,
+                            unindent,
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut cursor_char = self.script_completion_cursor;
+        let mut completion_popup_pos = None;
+        let mut touch_selection_geometry = None;
+        let active_line = cursor_char.map_or(1, |cursor| {
+            tab.buffer.chars().take(cursor).filter(|c| *c == '\n').count() + 1
+        });
+        if !ui.input(|input| input.pointer.any_down()) {
+            self.script_active_selection_handle = None;
+        }
         egui::ScrollArea::both()
             .id_salt("code_scroll_area")
+            .drag_to_scroll(self.script_active_selection_handle.is_none())
             .show(ui, |ui| {
-                let search_ref = search_term.as_deref();
-                let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, _wrap: f32| {
-                    let job = lua_syntax::highlight_lua(text_buf.as_str(), font_size, search_ref);
-                    ui.fonts_mut(|f| f.layout_job(job))
-                };
+                ui.horizontal_top(|ui| {
+                    let line_count = tab.buffer.bytes().filter(|b| *b == b'\n').count() + 1;
+                    ui.label(lua_syntax::line_number_gutter(
+                        line_count,
+                        active_line,
+                        self.font_size,
+                    ));
 
-                ui.add(
-                    egui::TextEdit::multiline(&mut tab.buffer)
+                    let word_wrap = self.editor_word_wrap;
+                    let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, wrap: f32| {
+                        let mut job = if highlighted_job.text == text_buf.as_str() {
+                            highlighted_job.clone()
+                        } else {
+                            // During the short debounce window use a cheap
+                            // monochrome job; syntax colours return after idle.
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(text_buf.as_str(), 0.0, egui::TextFormat::simple(
+                                egui::FontId::monospace(font_size), Color32::from_rgb(220, 220, 220)));
+                            job
+                        };
+                        // TextEdit passes its available width even for code
+                        // editors. Applying it unconditionally made already
+                        // formatted Luau visually reflow like a plain text file.
+                        job.wrap.max_width = if word_wrap { wrap } else { f32::INFINITY };
+                        job.wrap.break_anywhere = false;
+                        ui.fonts_mut(|fonts| fonts.layout_job(job))
+                    };
+
+                    // Handle Areas are painted after TextEdit, but their
+                    // previous-frame rectangles are known now. Mark the touch
+                    // before TextEdit runs so its click cannot collapse the
+                    // selection underneath the blue handle.
+                    let handle_touch = ui.input(|input| {
+                        if !input.pointer.any_pressed() {
+                            return None;
+                        }
+                        let origin = input.pointer.press_origin()?;
+                        self.script_selection_handle_rects.and_then(|rects| {
+                            rects.iter().position(|rect| rect.contains(origin))
+                                .map(|index| index as u8)
+                        })
+                    });
+                    if let Some(handle) = handle_touch {
+                        self.script_active_selection_handle = Some(handle);
+                    }
+                    ui.ctx().data_mut(|data| data.insert_temp(
+                        egui::Id::new("openrbxl_suppress_textedit_pointer"),
+                        handle_touch.is_some() || self.script_active_selection_handle.is_some(),
+                    ));
+
+                    let mut output = egui::TextEdit::multiline(&mut tab.buffer)
                         .id_source("script_multiline_view")
                         .font(egui::FontId::monospace(self.font_size))
                         .code_editor()
-                        .desired_width(f32::INFINITY)
+                        .desired_width(if self.editor_word_wrap { ui.available_width().max(240.0) } else { f32::INFINITY })
                         .desired_rows(28)
                         .lock_focus(true)
-                        .layouter(&mut layouter),
-                );
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    if focus_editor_requested {
+                        output.response.request_focus();
+                    }
+                    let mut reported_range = output.cursor_range;
+                    let mut store_cursor = false;
+                    if let Some(cursor) = self.pending_script_cursor.take() {
+                        output.response.request_focus();
+                        reported_range = Some(egui::text::CCursorRange::one(
+                            egui::text::CCursor::new(cursor.min(tab.buffer.chars().count())),
+                        ));
+                        store_cursor = true;
+                    } else if let Some((anchor, primary)) = self.pending_script_selection.take() {
+                        output.response.request_focus();
+                        let count = tab.buffer.chars().count();
+                        reported_range = Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(primary.min(count)),
+                            egui::text::CCursor::new(anchor.min(count)),
+                        ));
+                        store_cursor = true;
+                    } else if let Some((anchor, primary)) = pending_selection {
+                        reported_range = Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(primary),
+                            egui::text::CCursor::new(anchor),
+                        ));
+                        store_cursor = true;
+                    } else if let Some(range) = reported_range {
+                        // Pair delimiters and continue indentation only for a
+                        // collapsed caret; selected-line editing is handled by
+                        // the explicit Tab transformation above.
+                        if range.primary.index == range.secondary.index {
+                            if let Some(new_cursor) = selection_edit::enhance_typed_edit(
+                                &tab.previous_buffer,
+                                &mut tab.buffer,
+                                range.primary.index,
+                            ) {
+                                reported_range = Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(new_cursor),
+                                ));
+                                store_cursor = true;
+                            }
+                        }
+                        if let Some(new_cursor) = collapse_duplicated_member_chain(
+                            &mut tab.buffer, range.primary.index)
+                        {
+                            reported_range = Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(new_cursor)));
+                            store_cursor = true;
+                        }
+                    }
+
+                    if store_cursor {
+                        output.state.cursor.set_char_range(reported_range);
+                        let id = output.response.id;
+                        output.state.store(ui.ctx(), id);
+                    }
+                    tab.previous_buffer = tab.buffer.clone();
+                    if let Some(range) = reported_range {
+                        let caret = output.galley.pos_from_cursor(range.primary);
+                        completion_popup_pos = Some(
+                            output.galley_pos + caret.left_bottom().to_vec2() + egui::vec2(0.0, 6.0),
+                        );
+                        if range.primary.index != range.secondary.index {
+                            let anchor_rect = output.galley.pos_from_cursor(range.secondary);
+                            let primary_rect = output.galley.pos_from_cursor(range.primary);
+                            touch_selection_geometry = Some((
+                                output.galley.clone(),
+                                output.galley_pos,
+                                output.galley_pos + anchor_rect.left_bottom().to_vec2(),
+                                output.galley_pos + primary_rect.left_bottom().to_vec2(),
+                            ));
+                        }
+                    }
+                    // Buttons and the floating completion popup temporarily
+                    // take egui focus, which makes TextEdit report no range.
+                    // Preserve the last live caret instead of resetting it;
+                    // completion replacement otherwise falls back to index 0.
+                    cursor_char = reported_range
+                        .map(|range| range.primary.index)
+                        .or(self.script_completion_cursor);
+                    if let Some(range) = reported_range {
+                        self.script_selection = Some((range.secondary.index, range.primary.index));
+                    }
+                });
             });
+
+        // Android-style draggable selection handles. They are rendered in the
+        // foreground because GameActivity has no native EditText from which the
+        // platform could create its standard blue handles.
+        if self.script_selection.is_none_or(|(anchor, primary)| anchor == primary) {
+            self.script_selection_handle_rects = None;
+        }
+        if let (Some((galley, galley_pos, anchor_pos, primary_pos)), Some((anchor, primary))) =
+            (touch_selection_geometry, self.script_selection)
+        {
+            let handle_size = egui::vec2(60.0, 64.0);
+            self.script_selection_handle_rects = Some([
+                egui::Rect::from_min_size(anchor_pos - egui::vec2(30.0, 12.0), handle_size),
+                egui::Rect::from_min_size(primary_pos - egui::vec2(30.0, 12.0), handle_size),
+            ]);
+            for (handle_index, handle_pos, current_anchor, current_primary) in [
+                (0_u8, anchor_pos, anchor, primary),
+                (1_u8, primary_pos, anchor, primary),
+            ] {
+                let mut dragged_to = None;
+                let target_min = handle_pos - egui::vec2(30.0, 12.0);
+                let target_size = egui::vec2(60.0, 64.0);
+                let target_rect = egui::Rect::from_min_size(target_min, target_size);
+                let (pressed, down, origin, pointer_pos) = ui.input(|input| (
+                    input.pointer.any_pressed(),
+                    input.pointer.any_down(),
+                    input.pointer.press_origin(),
+                    input.pointer.interact_pos(),
+                ));
+                if pressed && origin.is_some_and(|pos| target_rect.contains(pos)) {
+                    self.script_active_selection_handle = Some(handle_index);
+                }
+                if down && self.script_active_selection_handle == Some(handle_index) {
+                    if let Some(pos) = pointer_pos {
+                        dragged_to = Some(galley.cursor_from_pos(pos - galley_pos).index);
+                    }
+                }
+
+                egui::Area::new(egui::Id::new(("touch_selection_handle", handle_index)))
+                    .order(egui::Order::Foreground)
+                    // A 60×64 point invisible target follows Android's large
+                    // selection-handle hit slop while the visible knob stays compact.
+                    .fixed_pos(target_min)
+                    .show(ui.ctx(), |ui| {
+                        let (rect, response) = ui.allocate_exact_size(
+                            target_size,
+                            egui::Sense::click_and_drag(),
+                        );
+                        let center = egui::pos2(rect.center().x, rect.top() + 15.0);
+                        ui.painter().line_segment(
+                            [egui::pos2(center.x, rect.top()), center],
+                            egui::Stroke::new(3.0, Color32::from_rgb(40, 135, 255)),
+                        );
+                        ui.painter().circle_filled(
+                            center,
+                            10.0,
+                            Color32::from_rgb(40, 135, 255),
+                        );
+                        if response.dragged() {
+                            if let Some(pos) = response.interact_pointer_pos() {
+                                dragged_to = Some(
+                                    galley.cursor_from_pos(pos - galley_pos).index,
+                                );
+                            }
+                        }
+                    });
+                if let Some(index) = dragged_to {
+                    self.pending_script_selection = Some(if handle_index == 0 {
+                        (index, current_primary)
+                    } else {
+                        (current_anchor, index)
+                    });
+                    self.script_selection = self.pending_script_selection;
+                }
+            }
+        }
+
+        // GameActivity has no native EditText, so Android cannot display its
+        // stock floating selection ActionMode. Provide the equivalent controls
+        // directly beside the selected caret instead of making users search the
+        // editor toolbar while the keyboard is open.
+        let mut touch_selection_action = None;
+        if let Some((anchor, primary)) = self.script_selection {
+            if anchor != primary {
+                let screen = ui.ctx().screen_rect();
+                let desired = completion_popup_pos
+                    .unwrap_or_else(|| screen.center())
+                    + egui::vec2(0.0, -44.0);
+                let popup_pos = egui::pos2(
+                    desired.x.clamp(screen.left() + 6.0, screen.right() - 190.0),
+                    desired.y.clamp(screen.top() + 6.0, screen.bottom() - 48.0),
+                );
+                egui::Area::new(egui::Id::new("touch_selection_actions"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(popup_pos)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy").clicked() {
+                                    touch_selection_action = Some(0);
+                                }
+                                if ui.button("Cut").clicked() {
+                                    touch_selection_action = Some(1);
+                                }
+                                if ui.button("Paste").clicked() {
+                                    touch_selection_action = Some(2);
+                                }
+                            });
+                        });
+                    });
+            }
+        }
+        if let (Some(action), Some((anchor, primary))) =
+            (touch_selection_action, self.script_selection)
+        {
+            let start = anchor.min(primary);
+            let end = anchor.max(primary);
+            let start_byte = tab.buffer.char_indices().nth(start)
+                .map_or(tab.buffer.len(), |(byte, _)| byte);
+            let end_byte = tab.buffer.char_indices().nth(end)
+                .map_or(tab.buffer.len(), |(byte, _)| byte);
+            let selected = tab.buffer[start_byte..end_byte].to_owned();
+            match action {
+                0 => jni_bridge::trigger_copy_to_clipboard(&selected),
+                1 => {
+                    jni_bridge::trigger_copy_to_clipboard(&selected);
+                    tab.buffer.replace_range(start_byte..end_byte, "");
+                    self.pending_script_cursor = Some(start);
+                    self.script_selection = Some((start, start));
+                }
+                2 => {
+                    let pasted = jni_bridge::get_clipboard_text();
+                    tab.buffer.replace_range(start_byte..end_byte, &pasted);
+                    let caret = start + pasted.chars().count();
+                    self.pending_script_cursor = Some(caret);
+                    self.script_selection = Some((caret, caret));
+                }
+                _ => {}
+            }
+        }
+
+        if !tab.diagnostics.is_empty() {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(55, 30, 34))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "✗ {} Luau syntax error(s)",
+                            tab.diagnostics.len()
+                        ))
+                        .strong()
+                        .color(Color32::from_rgb(255, 120, 120)),
+                    );
+                    for diagnostic in &tab.diagnostics {
+                        let location = diagnostic.line
+                            .map_or_else(|| "Luau".to_string(), |line| format!("Line {line}"));
+                        ui.label(
+                            RichText::new(format!("{location}: {}", diagnostic.message))
+                                .monospace()
+                                .color(Color32::from_rgb(255, 175, 175)),
+                        );
+                    }
+                });
+        }
+
+        if !project_diagnostics.is_empty() {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(52, 43, 25))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "⚠ {} project warning(s)",
+                            project_diagnostics.len()
+                        ))
+                        .strong()
+                        .color(Color32::from_rgb(255, 205, 105)),
+                    );
+                    for diagnostic in &project_diagnostics {
+                        ui.label(
+                            RichText::new(format!(
+                                "Line {}: {}",
+                                diagnostic.line, diagnostic.message
+                            ))
+                            .monospace()
+                            .color(Color32::from_rgb(255, 220, 145)),
+                        );
+                    }
+                });
+        }
+
+        if !semantic_diagnostics.is_empty() {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(30, 42, 55))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("◆ {} Luau / Roblox warning(s)", semantic_diagnostics.len()))
+                            .strong()
+                            .color(Color32::from_rgb(110, 195, 255)),
+                    );
+                    for diagnostic in &semantic_diagnostics {
+                        ui.label(
+                            RichText::new(format!("Line {}: {}", diagnostic.line, diagnostic.message))
+                                .monospace()
+                                .color(Color32::from_rgb(165, 215, 255)),
+                        );
+                    }
+                });
+        }
+
+        self.script_completion_cursor = cursor_char;
+        if cursor_char.is_some_and(|cursor| {
+            self.script_completion_dismissed_at.is_some_and(|dismissed| dismissed != (tab_ref, cursor))
+        }) {
+            self.script_completion_dismissed_at = None;
+        }
+        completions = if completion_dismissed
+            || cursor_char.is_some_and(|cursor| {
+                self.script_completion_dismissed_at == Some((tab_ref, cursor))
+            })
+        {
+            Vec::new()
+        } else {
+            cursor_char
+                .and_then(|cursor| project_index.as_ref().map(|index| {
+                    index.complete_at(tab_ref, &tab.buffer, cursor)
+                }))
+                .unwrap_or_default()
+        };
+
+        if tab_completion_requested {
+            let cursor = if let (Some(at), Some(completion)) = (
+                cursor_char,
+                completions.get(self.script_completion_selected).cloned(),
+            ) {
+                luau_intelligence::apply_suggestion_at(&mut tab.buffer, at, &completion)
+            } else {
+                insert_at_selection(&mut tab.buffer, self.script_selection, "\t")
+            };
+            self.pending_script_cursor = Some(cursor);
+            self.script_completion_cursor = Some(cursor);
+            self.script_selection = Some((cursor, cursor));
+            focus_editor_requested = true;
+            completions.clear();
+        }
+
+        // Compact popup-style list at the live text caret.
+        let mut clicked_completion: Option<luau_intelligence::Completion> = None;
+        if let Some(_index) = cursor_char {
+            if !completions.is_empty() {
+                self.script_completion_selected =
+                    self.script_completion_selected.min(completions.len() - 1);
+                let popup_pos = completion_popup_pos.unwrap_or_else(|| ui.next_widget_position());
+                egui::Area::new(egui::Id::new("luau_completion_popup"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(popup_pos)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(260.0);
+                            ui.set_max_height(240.0);
+                            ui.label(RichText::new("Luau suggestions · tap one or use Tab").small()
+                                .color(Color32::from_rgb(140, 180, 220)));
+                            egui::ScrollArea::vertical().max_height(205.0).show(ui, |ui| {
+                                for (position, completion) in completions.iter().enumerate() {
+                                    let text = format!("{}    {}", completion.label, completion.detail);
+                                    if ui.selectable_label(
+                                        position == self.script_completion_selected,
+                                        RichText::new(text).monospace(),
+                                    ).clicked() {
+                                        clicked_completion = Some(completion.clone());
+                                    }
+                                }
+                            });
+                        });
+                    });
+            }
+        }
+        if let (Some(completion), Some(at)) = (clicked_completion, cursor_char) {
+            let new_cursor = luau_intelligence::apply_suggestion_at(
+                &mut tab.buffer, at, &completion);
+            self.script_completion_cursor = Some(new_cursor);
+            self.pending_script_cursor = Some(new_cursor);
+            self.script_selection = Some((new_cursor, new_cursor));
+            self.script_completion_selected = 0;
+        }
+
+        let references = self.script_references.clone();
+        let mut reference_jump = None;
+        if !references.is_empty() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("⌕ References ({})", references.len())).strong());
+                    if ui.small_button("Close").clicked() {
+                        self.script_references.clear();
+                    }
+                });
+                for reference in &references {
+                    let script_name = self.dom.as_ref()
+                        .and_then(|dom| dom.get_by_ref(reference.referent))
+                        .map_or("Script", |instance| instance.name.as_str());
+                    if ui.selectable_label(
+                        false,
+                        RichText::new(format!(
+                            "{script_name}:{}  {}",
+                            reference.line, reference.preview
+                        )).monospace(),
+                    ).clicked() {
+                        reference_jump = Some(reference.clone());
+                    }
+                }
+            });
+        }
+
+        if export_project_requested {
+            if let Some(dom) = &self.dom {
+                let bundle = crate::project::build_bundle(
+                    dom,
+                    &self.project_name,
+                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                );
+                jni_bridge::trigger_export_project(&bundle);
+                self.status = format!("Exporting project '{}' to Android/media", self.project_name);
+            }
+        }
+
+        if rename_requested {
+            if let (Some(index), Some(definition)) = (project_index.as_ref(), definition.as_ref()) {
+                let new_name = self.symbol_rename_input.trim().to_string();
+                let edits = index.rename_member(definition, &new_name);
+                let replacements: usize = edits.iter().map(|edit| edit.replacements).sum();
+                for edit in edits {
+                    if let Some(open) = self.open_tabs.iter_mut()
+                        .find(|tab| tab.referent == edit.referent)
+                    {
+                        open.buffer = edit.source;
+                        open.previous_buffer = open.buffer.clone();
+                    } else if let Some(dom) = self.dom.as_mut() {
+                        let _ = rbxl::set_source(dom, edit.referent, edit.source);
+                    }
+                }
+                self.show_symbol_rename = false;
+                self.script_references.clear();
+                self.status = if replacements == 0 {
+                    "Rename made no changes; enter a valid different identifier".into()
+                } else {
+                    format!("Renamed {replacements} project reference(s) to {new_name}")
+                };
+            }
+        }
+
+        if find_references_requested {
+            if let (Some(index), Some(definition)) = (project_index.as_ref(), definition.as_ref()) {
+                self.script_references = index.references(definition);
+                self.status = format!("Found {} reference(s)", self.script_references.len());
+            }
+        }
+
+        if let Some(reference) = reference_jump {
+            self.open_script_tab(reference.referent);
+            if let Some(target) = self.open_tabs.get(self.active_script_idx) {
+                let cursor = target.buffer.lines()
+                    .take(reference.line.saturating_sub(1))
+                    .map(|line| line.chars().count() + 1)
+                    .sum();
+                self.pending_script_cursor = Some(cursor);
+                self.script_completion_cursor = Some(cursor);
+                self.selected = Some(reference.referent);
+            }
+        } else if let Some(definition) = goto_definition {
+            self.open_script_tab(definition.referent);
+            if let Some(target) = self.open_tabs.get(self.active_script_idx) {
+                let cursor = target.buffer.lines()
+                    .take(definition.line.saturating_sub(1))
+                    .map(|line| line.chars().count() + 1)
+                    .sum();
+                self.pending_script_cursor = Some(cursor);
+                self.script_completion_cursor = Some(cursor);
+                self.selected = Some(definition.referent);
+                self.status = format!("Opened definition at line {}", definition.line);
+            }
+        }
     }
 
     fn show_properties_ui(&mut self, ui: &mut egui::Ui) {
@@ -2692,13 +3782,152 @@ ui.label("Place ID:");
                         self.log_error("Save failed");
                     }
                 }
+                FileEvent::ProjectSync { bundle_json } => {
+                    if let Some(dom) = self.dom.as_mut() {
+                        match crate::project::decode_sync(dom, &bundle_json) {
+                            Ok(updates) => {
+                                let count = updates.len();
+                                for (referent, text) in updates {
+                                    let _ = rbxl::set_source(dom, referent, text.clone());
+                                    if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                                        tab.buffer = text.clone();
+                                        tab.original = text.clone();
+                                        tab.previous_buffer = text;
+                                    }
+                                }
+                                self.project_index_cache = None;
+                                self.workspace_symbol_catalog.clear();
+                                self.status = format!("Synced {count} project script(s) from Android editor");
+                            }
+                            Err(error) => self.log_error(format!("Project sync failed: {error}")),
+                        }
+                    }
+                }
+                FileEvent::NativeEditorCommand { script_id, command, text, cursor } => {
+                    if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
+                        match command.as_str() {
+                            "format" => {
+                                let formatted = format_luau_indentation(&text);
+                                if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                                    tab.buffer = formatted.clone();
+                                    tab.previous_buffer = formatted.clone();
+                                }
+                                jni_bridge::update_native_editor_result(
+                                    script_id, "format", &formatted, "Luau formatting applied",
+                                );
+                            }
+                            "check" => {
+                                let diagnostics = lua_runtime::check_syntax(&text, "NativeEditor");
+                                let message = if diagnostics.is_empty() {
+                                    "✓ Luau check passed".to_string()
+                                } else {
+                                    let first = &diagnostics[0];
+                                    format!(
+                                        "✗ {} issue(s). First: line {} — {}",
+                                        diagnostics.len(), first.line.unwrap_or(1), first.message
+                                    )
+                                };
+                                if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                                    tab.diagnostics = diagnostics;
+                                }
+                                jni_bridge::update_native_editor_result(
+                                    script_id, "check", &text, &message,
+                                );
+                            }
+                            "definition" | "references" => {
+                                if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                                    tab.buffer = text.clone();
+                                }
+                                let cursor_char = utf16_to_char_index(&text, cursor);
+                                let index = self.dom.as_ref().map(|dom| {
+                                    luau_intelligence::ProjectIndex::build_with_overrides(
+                                        dom,
+                                        self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                                    )
+                                });
+                                let definition = index.as_ref().and_then(|index| {
+                                    index.definition_at(referent, &text, cursor_char)
+                                });
+                                if command == "definition" {
+                                    if let Some(definition) = definition {
+                                        self.native_editor_initial_cursor = self.dom.as_ref()
+                                            .and_then(|dom| rbxl::get_source(dom, definition.referent))
+                                            .map(|source| source.lines()
+                                                .take(definition.line.saturating_sub(1))
+                                                .map(|line| line.encode_utf16().count() + 1)
+                                                .sum());
+                                        self.open_script_tab(definition.referent);
+                                        self.launch_active_native_editor();
+                                        self.status = format!("Opened native definition at line {}", definition.line);
+                                    } else {
+                                        jni_bridge::update_native_editor_result(
+                                            script_id, "definition", &text,
+                                            "No ModuleScript definition found at the caret",
+                                        );
+                                    }
+                                } else if let (Some(index), Some(definition)) = (index.as_ref(), definition.as_ref()) {
+                                    let references = index.references(definition);
+                                    let message = if references.is_empty() {
+                                        "No project references found".to_string()
+                                    } else {
+                                        let preview = references.iter().take(5)
+                                            .map(|reference| format!("Line {}: {}", reference.line, reference.preview))
+                                            .collect::<Vec<_>>().join("\n");
+                                        format!("{} reference(s)\n{}", references.len(), preview)
+                                    };
+                                    self.script_references = references;
+                                    jni_bridge::update_native_editor_result(
+                                        script_id, "references", &text, &message,
+                                    );
+                                } else {
+                                    jni_bridge::update_native_editor_result(
+                                        script_id, "references", &text,
+                                        "No resolvable symbol found at the caret",
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                FileEvent::NativeEditorChanged { script_id, text, selection_start, selection_end } => {
+                    if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
+                        let cursor = utf16_to_char_index(&text, selection_end);
+                        let anchor = utf16_to_char_index(&text, selection_start);
+                        if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                            tab.buffer = text.clone();
+                        }
+                        self.script_completion_cursor = Some(cursor);
+                        self.script_selection = Some((anchor, cursor));
+                        let index = self.project_index_cache.clone().or_else(|| {
+                            self.dom.as_ref().map(|dom| std::sync::Arc::new(
+                                luau_intelligence::ProjectIndex::build_with_overrides(
+                                    dom,
+                                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                                )
+                            ))
+                        });
+                        let items = index.map(|index| index.complete_at(referent, &text, cursor))
+                            .unwrap_or_default();
+                        let payload: Vec<_> = items.into_iter().take(24).map(|item| serde_json::json!({
+                            "label": item.label,
+                            "detail": item.detail,
+                            "insertText": item.insert_text,
+                            "replaceChars": item.replace_chars,
+                        })).collect();
+                        if let Ok(json) = serde_json::to_string(&payload) {
+                            jni_bridge::update_native_completions(script_id, &json);
+                        }
+                    }
+                }
                 FileEvent::ExternalEditReturned { script_id, text } => {
                     if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
                         if let Some(dom) = self.dom.as_mut() {
                             let _ = rbxl::set_source(dom, referent, text.clone());
                             if let Some(tab) = self.open_tabs.iter_mut().find(|t| t.referent == referent) {
                                 tab.buffer = text.clone();
-                                tab.original = text;
+                                tab.original = text.clone();
+                                tab.previous_buffer = text;
                             }
                             self.status = "⚡ Synced edits from external app".into();
                             self.log_info("Synced script from external editor");
@@ -2715,11 +3944,10 @@ ui.label("Place ID:");
     fn show_command_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("▶ Command Bar");
         ui.label(RichText::new(
-            "Run Luau snippets in the embedded luaur VM. The command bar has \
-             print/warn/pcall, task.*, Vector3/Color3/CFrame/UDim2, Enum.*, and a \
-             stubbed plugin/script. It can't touch the live DataModel — for that, \
-             connect a Live Session (companion Studio plugin) and the command will \
-             execute inside real Studio instead.",
+            "Run Luau against this editor's local DataModel. Use game, workspace, \
+             Instance.new, properties, children, Clone/Destroy, Selection, and \
+             ChangeHistoryService. A connected Live Session can instead execute \
+             the command inside Roblox Studio.",
         ).weak());
 
         ui.separator();
@@ -2863,8 +4091,7 @@ ui.label("Place ID:");
                                 text: parts.join(", "),
                             });
                         }
-                        let back = Rc::try_unwrap(rc).ok().expect("rc leaked").into_inner();
-                        self.dom = Some(back);
+                        self.dom = Some(lua_runtime::take_command_dom(rc));
                     }
                     Err(e) => {
                         for line in lua_runtime::take_command_log() {
@@ -2873,8 +4100,7 @@ ui.label("Place ID:");
                         self.command_output.push(lua_runtime::OutputLine {
                             level: lua_runtime::Level::Error, text: e,
                         });
-                        let back = Rc::try_unwrap(rc).ok().expect("rc leaked").into_inner();
-                        self.dom = Some(back);
+                        self.dom = Some(lua_runtime::take_command_dom(rc));
                     }
                 }
             } else {
@@ -3607,6 +4833,26 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 ui.label(RichText::new("🌍 3D Viewing: opens in the separate \"rbxl Viewer\" GPU app (Bevy / OpenRBLX renderer) via the View tab.").weak());
 
                 ui.add_space(12.0);
+                ui.group(|ui| {
+                    ui.label(RichText::new("📱 Adaptive editor layout").heading().color(Color32::from_rgb(100, 200, 255)));
+                    ui.label("Phones use a bottom navigation bar. Tablets use top tabs and an optional resizable Explorer sidebar.");
+                    ui.add(egui::Slider::new(&mut self.font_size, 10.0..=32.0).text("Editor font size"));
+                    ui.checkbox(&mut self.editor_word_wrap, "Wrap long editor lines");
+                    ui.checkbox(&mut self.compact_toolbar, "Always use compact toolbar");
+                    ui.checkbox(&mut self.show_tablet_explorer, "Show Explorer sidebar on tablets");
+                    ui.add_enabled(self.show_tablet_explorer,
+                        egui::Slider::new(&mut self.explorer_width, 180.0..=520.0).text("Explorer width"));
+                    if ui.button("Reset layout defaults").clicked() {
+                        self.font_size = 14.0;
+                        self.editor_word_wrap = false;
+                        self.compact_toolbar = false;
+                        self.show_tablet_explorer = true;
+                        self.explorer_width = 280.0;
+                        self.editor_focus_mode = false;
+                    }
+                });
+
+                ui.add_space(12.0);
 
                 // Save & Action Buttons
                 ui.horizontal_wrapped(|ui| {
@@ -3618,6 +4864,11 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             open_cloud_place_id: self.open_cloud_place_id.clone(),
                             auto_download_meshes: true,
                             show_skybox: true,
+                            editor_font_size: self.font_size,
+                            compact_toolbar: self.compact_toolbar,
+                            show_tablet_explorer: self.show_tablet_explorer,
+                            explorer_width: self.explorer_width,
+                            editor_word_wrap: self.editor_word_wrap,
                         };
 
                         match settings_to_save.save() {
@@ -3637,7 +4888,15 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                         self.open_cloud_api_key.clear();
                         self.open_cloud_universe_id.clear();
                         self.open_cloud_place_id.clear();
-                        let _ = EditorSettings::default().save();
+                        let cleared = EditorSettings {
+                            editor_font_size: self.font_size,
+                            compact_toolbar: self.compact_toolbar,
+                            show_tablet_explorer: self.show_tablet_explorer,
+                            explorer_width: self.explorer_width,
+                            editor_word_wrap: self.editor_word_wrap,
+                            ..EditorSettings::default()
+                        };
+                        let _ = cleared.save();
                         self.status = "Cleared saved credentials".into();
                     }
                 });
@@ -4174,6 +5433,93 @@ play()
     }
 }
 
+fn collapse_duplicated_member_chain(source: &mut String, cursor: usize) -> Option<usize> {
+    let chars: Vec<char> = source.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut start = cursor;
+    while start > 0 && (chars[start - 1].is_ascii_alphanumeric() || matches!(chars[start - 1], '_' | '.')) {
+        start -= 1;
+    }
+    let expression: String = chars[start..cursor].iter().collect();
+    let parts: Vec<&str> = expression.split('.').collect();
+    if parts.len() < 3 || parts[0].is_empty() || parts[0] != parts[1] {
+        return None;
+    }
+    let owner = parts[0];
+    let safe = matches!(owner, "game" | "workspace" | "script")
+        || owner.chars().next().is_some_and(char::is_uppercase);
+    if !safe { return None; }
+    let remove_end = start + owner.chars().count() + 1;
+    let start_byte = source.char_indices().nth(start).map_or(source.len(), |(byte, _)| byte);
+    let end_byte = source.char_indices().nth(remove_end).map_or(source.len(), |(byte, _)| byte);
+    source.replace_range(start_byte..end_byte, "");
+    Some(cursor - owner.chars().count() - 1)
+}
+
+fn format_luau_indentation(source: &str) -> String {
+    let mut depth = 0usize;
+    let mut output = Vec::new();
+    for raw in source.lines() {
+        let trimmed = raw.trim();
+        let code = trimmed.split("--").next().unwrap_or("").trim();
+        let closes = code == "end" || code.starts_with("end ") || code.starts_with("end;")
+            || code.starts_with("until ") || code == "else" || code.starts_with("elseif ");
+        if closes { depth = depth.saturating_sub(1); }
+        if trimmed.is_empty() {
+            output.push(String::new());
+        } else {
+            output.push(format!("{}{}", "\t".repeat(depth), trimmed));
+        }
+        let opens = (code.starts_with("if ") && code.ends_with("then"))
+            || ((code.starts_with("for ") || code.starts_with("while ")) && code.ends_with("do"))
+            || code.starts_with("function ") || code.starts_with("local function ")
+            || code.starts_with("const function ") || code == "do" || code == "repeat"
+            || code == "else" || code.starts_with("elseif ");
+        if opens && !code.ends_with(" end") { depth += 1; }
+    }
+    let mut formatted = output.join("\n");
+    if source.ends_with('\n') { formatted.push('\n'); }
+    formatted
+}
+
+fn insert_at_selection(source: &mut String, selection: Option<(usize, usize)>, text: &str) -> usize {
+    let fallback = source.chars().count();
+    let (anchor, primary) = selection.unwrap_or((fallback, fallback));
+    let start = anchor.min(primary).min(fallback);
+    let end = anchor.max(primary).min(fallback);
+    let start_byte = source.char_indices().nth(start).map_or(source.len(), |(byte, _)| byte);
+    let end_byte = source.char_indices().nth(end).map_or(source.len(), |(byte, _)| byte);
+    source.replace_range(start_byte..end_byte, text);
+    start + text.chars().count()
+}
+
+fn collect_script_paths(
+    dom: &WeakDom,
+    referent: Ref,
+    path: &mut Vec<String>,
+    output: &mut Vec<(Ref, String)>,
+) {
+    let Some(instance) = dom.get_by_ref(referent) else { return };
+    if referent != dom.root_ref() { path.push(instance.name.clone()); }
+    if matches!(instance.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+        output.push((referent, path.join("/")));
+    }
+    for &child in instance.children() {
+        collect_script_paths(dom, child, path, output);
+    }
+    if referent != dom.root_ref() { path.pop(); }
+}
+
+fn fuzzy_ui_match(haystack: &str, needle: &str) -> bool {
+    if haystack.contains(needle) { return true; }
+    let mut wanted = needle.chars();
+    let mut next = wanted.next();
+    for character in haystack.chars() {
+        if next == Some(character) { next = wanted.next(); }
+    }
+    next.is_none()
+}
+
 /// Map an Android KeyEvent keycode to an egui Key (for the small
 /// subset of keys the soft keyboard actually sends; most text comes
 /// through commitText instead).
@@ -4451,3 +5797,16 @@ fn edit_color_sequence_field(
     Some(ColorSequence { keypoints })
 }
 
+
+/// Android reports EditText selections in UTF-16 code units, while Luau
+/// intelligence indexes Unicode scalar values.
+fn utf16_to_char_index(text: &str, utf16_index: usize) -> usize {
+    let mut units = 0;
+    for (index, ch) in text.chars().enumerate() {
+        if units + ch.len_utf16() > utf16_index {
+            return index;
+        }
+        units += ch.len_utf16();
+    }
+    text.chars().count()
+}
