@@ -38,6 +38,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.ViewCompat
 import com.google.androidgamesdk.GameActivity
+import io.github.rosemoe.sora.widget.CodeEditor
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -81,6 +82,15 @@ class MainActivity : GameActivity() {
     private var nativeCompletionPopup: ListPopupWindow? = null
     /** Native editor line-wrap preference; off keeps code on one visual line. */
     private var nativeEditorWordWrap: Boolean = false
+
+    /**
+     * sora-editor widget and its language, non-null only while the new editor
+     * path is active. The legacy [nativeEditorView] stays in place as the
+     * fallback so a problem with the swap can be worked around at runtime
+     * rather than needing a new build.
+     */
+    private var soraEditorView: CodeEditor? = null
+    private var soraLanguage: LuauLanguage? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Register the instance BEFORE super.onCreate(): GameActivity's
@@ -459,6 +469,188 @@ class MainActivity : GameActivity() {
      * blue selection handles, and the system Copy/Cut/Paste ActionMode.
      */
     fun showNativeEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int = 0) {
+        if (USE_SORA_EDITOR) {
+            showSoraEditor(scriptId, fileName, source, initialCursor)
+            return
+        }
+        showLegacyEditor(scriptId, fileName, source, initialCursor)
+    }
+
+    /**
+     * Script editor built on sora-editor. Unlike the EditText path this gets
+     * the gutter, syntax highlighting, bracket pairing, smart Enter and the
+     * completion window from the library, so the only wiring left here is the
+     * toolbar, the symbol row and the Rust intelligence bridge.
+     */
+    private fun showSoraEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int) {
+        runOnUiThread {
+            nativeEditorDialog?.dismiss()
+
+            val dialog = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
+            val root = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.rgb(30, 30, 30))
+            }
+            val toolbar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(12, 8, 12, 8)
+                setBackgroundColor(Color.rgb(42, 42, 44))
+            }
+            val title = TextView(this).apply {
+                text = fileName
+                setTextColor(Color.WHITE)
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            toolbar.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            val cancel = Button(this).apply { text = "Cancel" }
+            val done = Button(this).apply { text = "Done" }
+            toolbar.addView(cancel)
+            toolbar.addView(done)
+            root.addView(toolbar, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+
+            val language = LuauLanguage(scriptId) { id, text, cursor ->
+                // Called on sora's completion worker; the JNI bridge is
+                // thread-safe and the reply comes back through
+                // updateNativeCompletions -> deliverCompletions.
+                nativeOnNativeEditorChanged(id, text, cursor, cursor)
+            }
+
+            // Tabs already stored in the script become spaces so on-screen
+            // columns match what the indent logic produces.
+            val normalizedSource = source.replace("\t", INDENT_UNIT)
+            val editor = CodeEditor(this).apply {
+                setEditorLanguage(language)
+                colorScheme = LuauLanguage.darkScheme()
+                typefaceText = Typeface.MONOSPACE
+                setTextSize(15f)
+                setLineNumberEnabled(true)
+                setPinLineNumber(true)
+                setWordwrap(nativeEditorWordWrap)
+                tabWidth = INDENT_WIDTH
+                isHighlightCurrentLine = true
+                setText(normalizedSource)
+            }
+            // Position the caret by translating the Rust character index into
+            // the (line, column) pair sora addresses text with.
+            val caret = editor.text.getIndexer().getCharPosition(
+                initialCursor.coerceIn(0, normalizedSource.length)
+            )
+            editor.setSelection(caret.line, caret.column)
+
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(10, 2, 10, 2)
+                setBackgroundColor(Color.rgb(36, 36, 38))
+            }
+            val checkLuau = Button(this).apply { text = "✓ Check" }
+            val formatLuau = Button(this).apply { text = "✨ Format" }
+            val goDefinition = Button(this).apply { text = "↗ Definition" }
+            val findReferences = Button(this).apply { text = "⌕ References" }
+            val toggleWrap = Button(this).apply {
+                text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
+            }
+            actions.addView(checkLuau)
+            actions.addView(formatLuau)
+            actions.addView(toggleWrap)
+            actions.addView(goDefinition)
+            actions.addView(findReferences)
+            root.addView(HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(actions)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+
+            fun caretIndex(): Int = editor.cursor.left
+
+            checkLuau.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "check", editor.text.toString(), caretIndex())
+            }
+            formatLuau.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), caretIndex())
+            }
+            goDefinition.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), caretIndex())
+            }
+            findReferences.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "references", editor.text.toString(), caretIndex())
+            }
+            toggleWrap.setOnClickListener {
+                nativeEditorWordWrap = !nativeEditorWordWrap
+                toggleWrap.text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
+                editor.setWordwrap(nativeEditorWordWrap)
+            }
+
+            root.addView(editor, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            ))
+
+            // Symbol row for characters Android keyboards bury in submenus.
+            val symbolRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(6, 2, 6, 2)
+                setBackgroundColor(Color.rgb(42, 42, 44))
+            }
+            for (symbol in EXTRA_KEYS) {
+                val key = Button(this).apply {
+                    text = if (symbol == "\t") "⇥" else symbol
+                    textSize = 15f
+                    minWidth = 0
+                    minimumWidth = 0
+                    setPadding(20, 4, 20, 4)
+                    setOnClickListener {
+                        // insertText replaces the selection and moves the caret.
+                        // The offset must be the full length so the caret lands
+                        // after the inserted text, not one character into it.
+                        val insert = if (symbol == "\t") INDENT_UNIT else symbol
+                        editor.insertText(insert, insert.length)
+                        editor.requestFocus()
+                    }
+                }
+                symbolRow.addView(key)
+            }
+            root.addView(HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(symbolRow)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+
+            fun close(apply: Boolean) {
+                if (apply) nativeOnExternalEditReturned(scriptId, editor.text.toString())
+                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                imm?.hideSoftInputFromWindow(editor.windowToken, 0)
+                soraEditorView = null
+                soraLanguage = null
+                nativeEditorScriptId = -1
+                // Frees the editor's threads and the language's analyzer.
+                editor.release()
+                dialog.dismiss()
+                nativeEditorDialog = null
+            }
+            cancel.setOnClickListener { close(false) }
+            done.setOnClickListener { close(true) }
+            dialog.setOnCancelListener { nativeEditorDialog = null }
+            dialog.setContentView(root)
+            dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            dialog.show()
+            nativeEditorDialog = dialog
+            soraEditorView = editor
+            soraLanguage = language
+            nativeEditorScriptId = scriptId
+            editor.requestFocus()
+        }
+    }
+
+    private fun showLegacyEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int = 0) {
         runOnUiThread {
             nativeEditorDialog?.dismiss()
 
@@ -820,6 +1012,22 @@ class MainActivity : GameActivity() {
 
     fun updateNativeEditorResult(scriptId: Long, command: String, text: String, message: String) {
         runOnUiThread {
+            val sora = soraEditorView
+            if (sora != null) {
+                if (nativeEditorScriptId != scriptId) return@runOnUiThread
+                if (command == "format" && sora.text.toString() != text) {
+                    val cursor = sora.cursor.left
+                    sora.setText(text)
+                    val position = sora.text.getIndexer()
+                        .getCharPosition(cursor.coerceIn(0, text.length))
+                    sora.setSelection(position.line, position.column)
+                }
+                if (message.isNotBlank()) {
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                }
+                sora.requestFocus()
+                return@runOnUiThread
+            }
             val editor = nativeEditorView ?: return@runOnUiThread
             if (nativeEditorScriptId != scriptId) return@runOnUiThread
             if (command == "format" && editor.text.toString() != text) {
@@ -837,6 +1045,14 @@ class MainActivity : GameActivity() {
 
     fun updateNativeCompletions(scriptId: Long, json: String) {
         runOnUiThread {
+            val language = soraLanguage
+            if (language != null) {
+                // Hand straight to the language, which unparks the worker
+                // blocked in requireAutoComplete. Sora owns the popup, so
+                // there is no ListPopupWindow to build or position here.
+                if (nativeEditorScriptId == scriptId) language.deliverCompletions(json)
+                return@runOnUiThread
+            }
             val editor = nativeEditorView ?: return@runOnUiThread
             if (nativeEditorScriptId != scriptId || !editor.hasFocus()) return@runOnUiThread
             val array = try { JSONArray(json) } catch (_: Exception) { return@runOnUiThread }
@@ -1127,6 +1343,16 @@ class MainActivity : GameActivity() {
          */
         const val INDENT_WIDTH = 4
         val INDENT_UNIT = " ".repeat(INDENT_WIDTH)
+
+        /**
+         * Selects the sora-editor script editor over the legacy EditText one.
+         *
+         * The old path is deliberately kept compiling rather than deleted: it
+         * is the fallback if the swap misbehaves on a real device, and it is
+         * removed in the next step once sora has been exercised. Flip this to
+         * false to get the previous editor back.
+         */
+        const val USE_SORA_EDITOR = true
 
         /** Quick-insert symbol row for keys Android keyboards bury in submenus. */
         val EXTRA_KEYS = listOf(
