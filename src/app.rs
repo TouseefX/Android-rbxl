@@ -148,6 +148,9 @@ pub struct EditorApp {
     pending_script_cursor: Option<usize>,
     /// Selection range requested by draggable Android selection handles.
     pending_script_selection: Option<(usize, usize)>,
+    /// Raw-touch fallback for Android backends where overlapping egui Areas do
+    /// not reliably win drag ownership from the code ScrollArea.
+    script_active_selection_handle: Option<u8>,
     script_references: Vec<luau_intelligence::Reference>,
     show_symbol_rename: bool,
     symbol_rename_input: String,
@@ -320,6 +323,7 @@ impl Default for EditorApp {
             script_selection: None,
             pending_script_cursor: None,
             pending_script_selection: None,
+            script_active_selection_handle: None,
             script_references: Vec::new(),
             show_symbol_rename: false,
             symbol_rename_input: String::new(),
@@ -1960,8 +1964,12 @@ ui.label("Place ID:");
         let active_line = cursor_char.map_or(1, |cursor| {
             tab.buffer.chars().take(cursor).filter(|c| *c == '\n').count() + 1
         });
+        if !ui.input(|input| input.pointer.any_down()) {
+            self.script_active_selection_handle = None;
+        }
         egui::ScrollArea::both()
             .id_salt("code_scroll_area")
+            .drag_to_scroll(self.script_active_selection_handle.is_none())
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     let line_count = tab.buffer.bytes().filter(|b| *b == b'\n').count() + 1;
@@ -2096,15 +2104,32 @@ ui.label("Place ID:");
                 (1_u8, primary_pos, anchor, primary),
             ] {
                 let mut dragged_to = None;
+                let target_min = handle_pos - egui::vec2(30.0, 12.0);
+                let target_size = egui::vec2(60.0, 64.0);
+                let target_rect = egui::Rect::from_min_size(target_min, target_size);
+                let (pressed, down, origin, pointer_pos) = ui.input(|input| (
+                    input.pointer.any_pressed(),
+                    input.pointer.any_down(),
+                    input.pointer.press_origin(),
+                    input.pointer.interact_pos(),
+                ));
+                if pressed && origin.is_some_and(|pos| target_rect.contains(pos)) {
+                    self.script_active_selection_handle = Some(handle_index);
+                }
+                if down && self.script_active_selection_handle == Some(handle_index) {
+                    if let Some(pos) = pointer_pos {
+                        dragged_to = Some(galley.cursor_from_pos(pos - galley_pos).index);
+                    }
+                }
+
                 egui::Area::new(egui::Id::new(("touch_selection_handle", handle_index)))
                     .order(egui::Order::Foreground)
-                    // Keep a large invisible touch target around the visible
-                    // handle. Samsung's high-density screens made the previous
-                    // 26×32 point target difficult to grab accurately.
-                    .fixed_pos(handle_pos - egui::vec2(24.0, 9.0))
+                    // A 60×64 point invisible target follows Android's large
+                    // selection-handle hit slop while the visible knob stays compact.
+                    .fixed_pos(target_min)
                     .show(ui.ctx(), |ui| {
                         let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(48.0, 56.0),
+                            target_size,
                             egui::Sense::click_and_drag(),
                         );
                         let center = egui::pos2(rect.center().x, rect.top() + 15.0);
