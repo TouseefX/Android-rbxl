@@ -4,6 +4,7 @@ import android.os.Bundle
 import io.github.rosemoe.sora.lang.EmptyLanguage
 import io.github.rosemoe.sora.lang.analysis.AnalyzeManager
 import io.github.rosemoe.sora.lang.analysis.SimpleAnalyzeManager
+import io.github.rosemoe.sora.lang.completion.CompletionCancelledException
 import io.github.rosemoe.sora.lang.completion.CompletionItem
 import io.github.rosemoe.sora.lang.completion.CompletionPublisher
 import io.github.rosemoe.sora.lang.completion.SimpleCompletionItem
@@ -91,6 +92,23 @@ class LuauLanguage(
     /** Spaces, never '\t' -- matches `app::INDENT_WIDTH` on the Rust side. */
     override fun useTab(): Boolean = false
 
+    /**
+     * Bracket and quote pairing, replacing the old afterTextChanged handler.
+     *
+     * Per instance, never shared: setEditorLanguage() calls setParent() on
+     * whatever this returns, so a single static SymbolPairMatch handed to two
+     * editors gets its parent reassigned underneath the first one.
+     */
+    private val symbolPairs = SymbolPairMatch().apply {
+        putPair('(', SymbolPairMatch.SymbolPair("(", ")"))
+        putPair('[', SymbolPairMatch.SymbolPair("[", "]"))
+        putPair('{', SymbolPairMatch.SymbolPair("{", "}"))
+        putPair('"', SymbolPairMatch.SymbolPair("\"", "\""))
+        putPair('\'', SymbolPairMatch.SymbolPair("'", "'"))
+    }
+
+    private val newlineHandlers: Array<NewlineHandler> = arrayOf(blockNewlineHandler)
+
     override fun getSymbolPairs(): SymbolPairMatch = symbolPairs
 
     override fun getNewlineHandlers(): Array<NewlineHandler> = newlineHandlers
@@ -100,6 +118,22 @@ class LuauLanguage(
         position: CharPosition,
         publisher: CompletionPublisher,
         extraArguments: Bundle
+    ) {
+        try {
+            publishCompletions(content, position, publisher)
+        } catch (_: CompletionCancelledException) {
+            // Sora's own signal that this request was superseded; not an error.
+        } catch (error: Throwable) {
+            // Also a worker thread: never let a completion failure take the
+            // process down, just offer nothing this keystroke.
+            android.util.Log.e("rbxl_editor", "Luau completion failed", error)
+        }
+    }
+
+    private fun publishCompletions(
+        content: ContentReference,
+        position: CharPosition,
+        publisher: CompletionPublisher
     ) {
         val prefix = prefixAt(content, position)
         // An empty prefix on a non-member position would match the whole index
@@ -148,7 +182,21 @@ class LuauLanguage(
     // -- highlighting ---------------------------------------------------------
 
     private val analyzer = object : SimpleAnalyzeManager<Void>() {
-        override fun analyze(text: StringBuilder, delegate: Delegate<Void>): Styles {
+        /**
+         * Runs on sora's analyzer thread. Any throw here happens off the UI
+         * thread, where the caller's fallback cannot catch it, and would kill
+         * the process. Returning unstyled text is always better than that, so
+         * failures degrade to plain black-and-white rather than crashing.
+         */
+        override fun analyze(text: StringBuilder, delegate: Delegate<Void>): Styles =
+            try {
+                highlight(text, delegate)
+            } catch (error: Throwable) {
+                android.util.Log.e("rbxl_editor", "Luau highlighting failed", error)
+                Styles(MappedSpans.Builder(1).also { it.determine(0) }.build())
+            }
+
+        private fun highlight(text: StringBuilder, delegate: Delegate<Void>): Styles {
             val builder = MappedSpans.Builder(1024)
             val value = text.toString()
             var line = 0
@@ -350,18 +398,6 @@ class LuauLanguage(
         }
 
         /**
-         * Bracket and quote pairing. Sora inserts the closer and places the
-         * caret between the two, replacing the old afterTextChanged handler.
-         */
-        private val symbolPairs = SymbolPairMatch().apply {
-            putPair('(', SymbolPairMatch.SymbolPair("(", ")"))
-            putPair('[', SymbolPairMatch.SymbolPair("[", "]"))
-            putPair('{', SymbolPairMatch.SymbolPair("{", "}"))
-            putPair('"', SymbolPairMatch.SymbolPair("\"", "\""))
-            putPair('\'', SymbolPairMatch.SymbolPair("'", "'"))
-        }
-
-        /**
          * Smart Enter. Copies the previous line's indent, adds a level after a
          * block opener, and lays down the matching `end` when the block is not
          * already closed -- the behaviour verified for the EditText version.
@@ -398,7 +434,6 @@ class LuauLanguage(
             }
         }
 
-        private val newlineHandlers: Array<NewlineHandler> = arrayOf(blockNewlineHandler)
 
         /** Dark scheme approximating the previous editor's colors. */
         fun darkScheme(): EditorColorScheme = EditorColorScheme().apply {

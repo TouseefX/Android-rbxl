@@ -92,6 +92,9 @@ class MainActivity : GameActivity() {
     private var soraEditorView: CodeEditor? = null
     private var soraLanguage: LuauLanguage? = null
 
+    /** Last sora construction failure, shown on screen when adb is unavailable. */
+    private var lastSoraError: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // Register the instance BEFORE super.onCreate(): GameActivity's
         // onCreate() loads the native library and spawns the `android_main`
@@ -470,10 +473,99 @@ class MainActivity : GameActivity() {
      */
     fun showNativeEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int = 0) {
         if (USE_SORA_EDITOR) {
-            showSoraEditor(scriptId, fileName, source, initialCursor)
+            // Build the sora editor defensively. Anything thrown while
+            // constructing it (a missing class if the AAR was not packaged, a
+            // missing resource, a theme the widget cannot inflate against)
+            // would otherwise take the whole process down with no way to see
+            // why on a device without adb. Instead: surface the exception and
+            // fall back to the editor that is known to work.
+            // The guard must run *inside* runOnUiThread: this method is called
+            // from the Rust thread through JNI, so a try/catch out here would
+            // return before the posted work ever executes and would catch
+            // nothing.
+            runOnUiThread {
+                try {
+                    showSoraEditor(scriptId, fileName, source, initialCursor)
+                } catch (error: Throwable) {
+                    Log.e(TAG, "sora editor failed to open; falling back", error)
+                    lastSoraError = describeThrowable(error)
+                    nativeEditorDialog?.dismiss()
+                    nativeEditorDialog = null
+                    soraEditorView = null
+                    soraLanguage = null
+                    showSoraErrorDialog(scriptId, fileName, source, initialCursor)
+                }
+            }
             return
         }
         showLegacyEditor(scriptId, fileName, source, initialCursor)
+    }
+
+    /** Exception text and top frames, formatted for on-screen reporting. */
+    private fun describeThrowable(error: Throwable): String {
+        val text = StringBuilder()
+        var current: Throwable? = error
+        var depth = 0
+        while (current != null && depth < 4) {
+            if (depth > 0) text.append("\nCaused by: ")
+            text.append(current.javaClass.name)
+            current.message?.let { text.append(": ").append(it) }
+            current.stackTrace.take(6).forEach { text.append("\n    at ").append(it) }
+            current = current.cause
+            depth++
+        }
+        return text.toString()
+    }
+
+    /**
+     * Shows why the sora editor could not open, with the trace selectable so it
+     * can be copied off a device that has no adb, and a button to continue into
+     * the legacy editor so the script is still editable.
+     */
+    private fun showSoraErrorDialog(scriptId: Long, fileName: String, source: String, initialCursor: Int) {
+        val dialog = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.rgb(30, 30, 30))
+            setPadding(20, 20, 20, 20)
+        }
+        root.addView(TextView(this).apply {
+            text = "The new editor failed to open"
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        val trace = TextView(this).apply {
+            text = lastSoraError ?: "(no detail captured)"
+            setTextColor(Color.rgb(255, 170, 170))
+            typeface = Typeface.MONOSPACE
+            textSize = 11f
+            setTextIsSelectable(true)
+        }
+        root.addView(android.widget.ScrollView(this).apply { addView(trace) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        buttons.addView(Button(this).apply {
+            text = "Copy"
+            setOnClickListener {
+                val clip = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                clip?.setPrimaryClip(ClipData.newPlainText("sora error", lastSoraError ?: ""))
+                Toast.makeText(this@MainActivity, "Copied", Toast.LENGTH_SHORT).show()
+            }
+        })
+        buttons.addView(Button(this).apply {
+            text = "Use old editor"
+            setOnClickListener {
+                dialog.dismiss()
+                nativeEditorDialog = null
+                showLegacyEditor(scriptId, fileName, source, initialCursor)
+            }
+        })
+        root.addView(buttons)
+        dialog.setContentView(root)
+        dialog.show()
+        nativeEditorDialog = dialog
     }
 
     /**
@@ -483,171 +575,171 @@ class MainActivity : GameActivity() {
      * toolbar, the symbol row and the Rust intelligence bridge.
      */
     private fun showSoraEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int) {
-        runOnUiThread {
-            nativeEditorDialog?.dismiss()
+        // Runs on the UI thread already: the caller wraps this in
+        // runOnUiThread so construction failures are catchable.
+        nativeEditorDialog?.dismiss()
 
-            val dialog = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
-            val root = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.rgb(30, 30, 30))
-            }
-            val toolbar = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(12, 8, 12, 8)
-                setBackgroundColor(Color.rgb(42, 42, 44))
-            }
-            val title = TextView(this).apply {
-                text = fileName
-                setTextColor(Color.WHITE)
-                textSize = 16f
-                typeface = Typeface.DEFAULT_BOLD
-            }
-            toolbar.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            val cancel = Button(this).apply { text = "Cancel" }
-            val done = Button(this).apply { text = "Done" }
-            toolbar.addView(cancel)
-            toolbar.addView(done)
-            root.addView(toolbar, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-
-            val language = LuauLanguage(scriptId) { id, text, cursor ->
-                // Called on sora's completion worker; the JNI bridge is
-                // thread-safe and the reply comes back through
-                // updateNativeCompletions -> deliverCompletions.
-                nativeOnNativeEditorChanged(id, text, cursor, cursor)
-            }
-
-            // Tabs already stored in the script become spaces so on-screen
-            // columns match what the indent logic produces.
-            val normalizedSource = source.replace("\t", INDENT_UNIT)
-            val editor = CodeEditor(this).apply {
-                setEditorLanguage(language)
-                colorScheme = LuauLanguage.darkScheme()
-                typefaceText = Typeface.MONOSPACE
-                setTextSize(15f)
-                setLineNumberEnabled(true)
-                setPinLineNumber(true)
-                setWordwrap(nativeEditorWordWrap)
-                tabWidth = INDENT_WIDTH
-                isHighlightCurrentLine = true
-                setText(normalizedSource)
-            }
-            // Position the caret by translating the Rust character index into
-            // the (line, column) pair sora addresses text with.
-            val caret = editor.text.getIndexer().getCharPosition(
-                initialCursor.coerceIn(0, normalizedSource.length)
-            )
-            editor.setSelection(caret.line, caret.column)
-
-            val actions = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(10, 2, 10, 2)
-                setBackgroundColor(Color.rgb(36, 36, 38))
-            }
-            val checkLuau = Button(this).apply { text = "✓ Check" }
-            val formatLuau = Button(this).apply { text = "✨ Format" }
-            val goDefinition = Button(this).apply { text = "↗ Definition" }
-            val findReferences = Button(this).apply { text = "⌕ References" }
-            val toggleWrap = Button(this).apply {
-                text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
-            }
-            actions.addView(checkLuau)
-            actions.addView(formatLuau)
-            actions.addView(toggleWrap)
-            actions.addView(goDefinition)
-            actions.addView(findReferences)
-            root.addView(HorizontalScrollView(this).apply {
-                isHorizontalScrollBarEnabled = false
-                addView(actions)
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-
-            fun caretIndex(): Int = editor.cursor.left
-
-            checkLuau.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "check", editor.text.toString(), caretIndex())
-            }
-            formatLuau.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), caretIndex())
-            }
-            goDefinition.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), caretIndex())
-            }
-            findReferences.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "references", editor.text.toString(), caretIndex())
-            }
-            toggleWrap.setOnClickListener {
-                nativeEditorWordWrap = !nativeEditorWordWrap
-                toggleWrap.text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
-                editor.setWordwrap(nativeEditorWordWrap)
-            }
-
-            root.addView(editor, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            ))
-
-            // Symbol row for characters Android keyboards bury in submenus.
-            val symbolRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(6, 2, 6, 2)
-                setBackgroundColor(Color.rgb(42, 42, 44))
-            }
-            for (symbol in EXTRA_KEYS) {
-                val key = Button(this).apply {
-                    text = if (symbol == "\t") "⇥" else symbol
-                    textSize = 15f
-                    minWidth = 0
-                    minimumWidth = 0
-                    setPadding(20, 4, 20, 4)
-                    setOnClickListener {
-                        // insertText replaces the selection and moves the caret.
-                        // The offset must be the full length so the caret lands
-                        // after the inserted text, not one character into it.
-                        val insert = if (symbol == "\t") INDENT_UNIT else symbol
-                        editor.insertText(insert, insert.length)
-                        editor.requestFocus()
-                    }
-                }
-                symbolRow.addView(key)
-            }
-            root.addView(HorizontalScrollView(this).apply {
-                isHorizontalScrollBarEnabled = false
-                addView(symbolRow)
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-
-            fun close(apply: Boolean) {
-                if (apply) nativeOnExternalEditReturned(scriptId, editor.text.toString())
-                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                imm?.hideSoftInputFromWindow(editor.windowToken, 0)
-                soraEditorView = null
-                soraLanguage = null
-                nativeEditorScriptId = -1
-                // Frees the editor's threads and the language's analyzer.
-                editor.release()
-                dialog.dismiss()
-                nativeEditorDialog = null
-            }
-            cancel.setOnClickListener { close(false) }
-            done.setOnClickListener { close(true) }
-            dialog.setOnCancelListener { nativeEditorDialog = null }
-            dialog.setContentView(root)
-            dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-            dialog.show()
-            nativeEditorDialog = dialog
-            soraEditorView = editor
-            soraLanguage = language
-            nativeEditorScriptId = scriptId
-            editor.requestFocus()
+        val dialog = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.rgb(30, 30, 30))
         }
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(12, 8, 12, 8)
+            setBackgroundColor(Color.rgb(42, 42, 44))
+        }
+        val title = TextView(this).apply {
+            text = fileName
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        toolbar.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val cancel = Button(this).apply { text = "Cancel" }
+        val done = Button(this).apply { text = "Done" }
+        toolbar.addView(cancel)
+        toolbar.addView(done)
+        root.addView(toolbar, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        val language = LuauLanguage(scriptId) { id, text, cursor ->
+            // Called on sora's completion worker; the JNI bridge is
+            // thread-safe and the reply comes back through
+            // updateNativeCompletions -> deliverCompletions.
+            nativeOnNativeEditorChanged(id, text, cursor, cursor)
+        }
+
+        // Tabs already stored in the script become spaces so on-screen
+        // columns match what the indent logic produces.
+        val normalizedSource = source.replace("\t", INDENT_UNIT)
+        val editor = CodeEditor(this).apply {
+            setEditorLanguage(language)
+            colorScheme = LuauLanguage.darkScheme()
+            typefaceText = Typeface.MONOSPACE
+            setTextSize(15f)
+            setLineNumberEnabled(true)
+            setPinLineNumber(true)
+            setWordwrap(nativeEditorWordWrap)
+            tabWidth = INDENT_WIDTH
+            isHighlightCurrentLine = true
+            setText(normalizedSource)
+        }
+        // Position the caret by translating the Rust character index into
+        // the (line, column) pair sora addresses text with.
+        val caret = editor.text.getIndexer().getCharPosition(
+            initialCursor.coerceIn(0, normalizedSource.length)
+        )
+        editor.setSelection(caret.line, caret.column)
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10, 2, 10, 2)
+            setBackgroundColor(Color.rgb(36, 36, 38))
+        }
+        val checkLuau = Button(this).apply { text = "✓ Check" }
+        val formatLuau = Button(this).apply { text = "✨ Format" }
+        val goDefinition = Button(this).apply { text = "↗ Definition" }
+        val findReferences = Button(this).apply { text = "⌕ References" }
+        val toggleWrap = Button(this).apply {
+            text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
+        }
+        actions.addView(checkLuau)
+        actions.addView(formatLuau)
+        actions.addView(toggleWrap)
+        actions.addView(goDefinition)
+        actions.addView(findReferences)
+        root.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(actions)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        fun caretIndex(): Int = editor.cursor.left
+
+        checkLuau.setOnClickListener {
+            nativeOnNativeEditorCommand(scriptId, "check", editor.text.toString(), caretIndex())
+        }
+        formatLuau.setOnClickListener {
+            nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), caretIndex())
+        }
+        goDefinition.setOnClickListener {
+            nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), caretIndex())
+        }
+        findReferences.setOnClickListener {
+            nativeOnNativeEditorCommand(scriptId, "references", editor.text.toString(), caretIndex())
+        }
+        toggleWrap.setOnClickListener {
+            nativeEditorWordWrap = !nativeEditorWordWrap
+            toggleWrap.text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
+            editor.setWordwrap(nativeEditorWordWrap)
+        }
+
+        root.addView(editor, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+        ))
+
+        // Symbol row for characters Android keyboards bury in submenus.
+        val symbolRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(6, 2, 6, 2)
+            setBackgroundColor(Color.rgb(42, 42, 44))
+        }
+        for (symbol in EXTRA_KEYS) {
+            val key = Button(this).apply {
+                text = if (symbol == "\t") "⇥" else symbol
+                textSize = 15f
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(20, 4, 20, 4)
+                setOnClickListener {
+                    // insertText replaces the selection and moves the caret.
+                    // The offset must be the full length so the caret lands
+                    // after the inserted text, not one character into it.
+                    val insert = if (symbol == "\t") INDENT_UNIT else symbol
+                    editor.insertText(insert, insert.length)
+                    editor.requestFocus()
+                }
+            }
+            symbolRow.addView(key)
+        }
+        root.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(symbolRow)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        fun close(apply: Boolean) {
+            if (apply) nativeOnExternalEditReturned(scriptId, editor.text.toString())
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(editor.windowToken, 0)
+            soraEditorView = null
+            soraLanguage = null
+            nativeEditorScriptId = -1
+            // Frees the editor's threads and the language's analyzer.
+            editor.release()
+            dialog.dismiss()
+            nativeEditorDialog = null
+        }
+        cancel.setOnClickListener { close(false) }
+        done.setOnClickListener { close(true) }
+        dialog.setOnCancelListener { nativeEditorDialog = null }
+        dialog.setContentView(root)
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        dialog.show()
+        nativeEditorDialog = dialog
+        soraEditorView = editor
+        soraLanguage = language
+        nativeEditorScriptId = scriptId
+        editor.requestFocus()
     }
 
     private fun showLegacyEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int = 0) {
