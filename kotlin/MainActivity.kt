@@ -19,7 +19,12 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
+import android.text.Editable
 import android.text.InputType
+import android.text.Spannable
+import android.text.TextWatcher
+import android.text.style.ForegroundColorSpan
+import android.view.inputmethod.BaseInputConnection
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -340,6 +345,41 @@ class MainActivity : GameActivity() {
      * whatever editor app the user picks. Luau-aware editors use the extension
      * for the correct grammar while text/plain keeps broad Android app support.
      */
+    /** Apply lightweight Luau colors without replacing text or composing spans. */
+    private fun highlightNativeLuau(editor: EditText) {
+        val editable = editor.text ?: return
+        if (BaseInputConnection.getComposingSpanStart(editable) >= 0) {
+            editor.postDelayed({ highlightNativeLuau(editor) }, 180)
+            return
+        }
+        val selectionStart = editor.selectionStart
+        val selectionEnd = editor.selectionEnd
+        editable.getSpans(0, editable.length, ForegroundColorSpan::class.java)
+            .forEach { editable.removeSpan(it) }
+        val value = editable.toString()
+        val rules = listOf(
+            Regex("\\b(local|const|function|end|if|then|else|elseif|for|while|repeat|until|do|return|break|continue|and|or|not|in|export|type)\\b") to Color.rgb(205, 125, 255),
+            Regex("\\b(true|false|nil)\\b") to Color.rgb(255, 155, 105),
+            Regex("(?m)--.*$") to Color.rgb(105, 170, 105),
+            Regex("\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'") to Color.rgb(225, 190, 125),
+            Regex("\\b\\d+(?:\\.\\d+)?\\b") to Color.rgb(115, 195, 255)
+        )
+        rules.forEach { (regex, color) ->
+            regex.findAll(value).forEach { match ->
+                editable.setSpan(
+                    ForegroundColorSpan(color), match.range.first, match.range.last + 1,
+                    Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+                )
+            }
+        }
+        if (selectionStart >= 0 && selectionEnd >= 0) {
+            editor.setSelection(
+                selectionStart.coerceAtMost(editable.length),
+                selectionEnd.coerceAtMost(editable.length)
+            )
+        }
+    }
+
     /**
      * Full-screen native Android Luau editor. Unlike the Bevy SurfaceView this
      * is a real EditText, so Android owns caret placement, kinetic scrolling,
@@ -388,13 +428,53 @@ class MainActivity : GameActivity() {
                 setPadding(18, 14, 18, 28)
                 inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                    InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
                 setHorizontallyScrolling(true)
                 isVerticalScrollBarEnabled = true
                 isHorizontalScrollBarEnabled = true
                 isLongClickable = true
                 setSelection(0)
             }
+            var applyingPair = false
+            var changedStart = 0
+            var changedBefore = 0
+            var changedCount = 0
+            val highlightTask = Runnable { highlightNativeLuau(editor) }
+            editor.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    changedStart = start
+                    changedBefore = before
+                    changedCount = count
+                }
+                override fun afterTextChanged(text: Editable?) {
+                    if (text == null || applyingPair) return
+                    editor.removeCallbacks(highlightTask)
+                    val composing = BaseInputConnection.getComposingSpanStart(text) >= 0
+                    if (!composing && changedBefore == 0 && changedCount == 1 && changedStart < text.length) {
+                        val opener = text[changedStart]
+                        val closer = when (opener) {
+                            '(' -> ')'
+                            '[' -> ']'
+                            '{' -> '}'
+                            '"' -> '"'
+                            '\'' -> '\''
+                            else -> null
+                        }
+                        if (closer != null) {
+                            val next = text.getOrNull(changedStart + 1)
+                            if (next != closer) {
+                                applyingPair = true
+                                text.insert(changedStart + 1, closer.toString())
+                                editor.setSelection(changedStart + 1)
+                                applyingPair = false
+                            }
+                        }
+                    }
+                    editor.postDelayed(highlightTask, if (composing) 220 else 110)
+                }
+            })
+            editor.post(highlightTask)
             root.addView(editor, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             ))
