@@ -144,12 +144,9 @@ pub struct EditorApp {
     script_completion_dismissed_at: Option<(Ref, usize)>,
     /// Anchor/primary character positions from the previous editor frame.
     script_selection: Option<(usize, usize)>,
-    /// Android one-finger drags pan the code viewport rather than extending a
-    /// selection. Long-press/tap remains available for caret placement.
-    script_touch_drag_selection: Option<(usize, usize)>,
-    script_touch_drag_started_at: Option<std::time::Instant>,
-    script_touch_drag_distance: egui::Vec2,
-    script_touch_scrolling: bool,
+    /// Last code-widget bounds, used to release TextEdit's drag ownership at
+    /// touch-down so the enclosing ScrollArea can provide native kinetic pan.
+    script_editor_touch_rect: Option<egui::Rect>,
     /// Character position to apply after opening a definition in another tab.
     pending_script_cursor: Option<usize>,
     script_references: Vec<luau_intelligence::Reference>,
@@ -322,10 +319,7 @@ impl Default for EditorApp {
             script_completion_selected: 0,
             script_completion_dismissed_at: None,
             script_selection: None,
-            script_touch_drag_selection: None,
-            script_touch_drag_started_at: None,
-            script_touch_drag_distance: egui::Vec2::ZERO,
-            script_touch_scrolling: false,
+            script_editor_touch_rect: None,
             pending_script_cursor: None,
             script_references: Vec::new(),
             show_symbol_rename: false,
@@ -1997,8 +1991,32 @@ ui.label("Place ID:");
                         ui.fonts_mut(|fonts| fonts.layout_job(job))
                     };
 
+                    // egui intentionally gives a focused TextEdit drag
+                    // ownership, which means a finger swipe selects text and
+                    // prevents its parent ScrollArea from panning. On Android,
+                    // drop only the widget focus for the touch-down pass. This
+                    // makes TextEdit register click-only touch interaction and
+                    // lets ScrollArea own the drag with its built-in kinetic
+                    // scrolling. Focus is restored immediately after show, so
+                    // the IME remains active and typed input is not lost.
+                    let editor_id = ui.make_persistent_id("script_multiline_view");
+                    #[cfg(target_os = "android")]
+                    let release_drag_ownership = crate::jni_bridge::is_ime_visible()
+                        && ui.input(|input| {
+                            input.pointer.any_pressed()
+                                && input.pointer.press_origin().is_some_and(|pos| {
+                                    self.script_editor_touch_rect
+                                        .is_some_and(|rect| rect.contains(pos))
+                                })
+                        });
+                    #[cfg(not(target_os = "android"))]
+                    let release_drag_ownership = false;
+                    if release_drag_ownership {
+                        ui.memory_mut(|memory| memory.surrender_focus(editor_id));
+                    }
+
                     let mut output = egui::TextEdit::multiline(&mut tab.buffer)
-                        .id_source("script_multiline_view")
+                        .id(editor_id)
                         .font(egui::FontId::monospace(self.font_size))
                         .code_editor()
                         .desired_width(if self.editor_word_wrap { ui.available_width().max(240.0) } else { f32::INFINITY })
@@ -2006,11 +2024,29 @@ ui.label("Place ID:");
                         .lock_focus(true)
                         .layouter(&mut layouter)
                         .show(ui);
-                    if focus_editor_requested {
+                    self.script_editor_touch_rect = Some(output.response.rect);
+                    if focus_editor_requested || release_drag_ownership {
                         output.response.request_focus();
                     }
                     let mut reported_range = output.cursor_range;
                     let mut store_cursor = false;
+                    // A long touch is Android's selection gesture. TextEdit is
+                    // click-only for that gesture so ScrollArea can own normal
+                    // swipes; explicitly select the touched Luau word and show
+                    // the Copy/Cut/Paste actions already provided above.
+                    if output.response.long_touched() {
+                        if let Some(pos) = output.response.interact_pointer_pos() {
+                            let cursor = output.galley
+                                .cursor_from_pos(pos - output.galley_pos)
+                                .index;
+                            let (start, end) = word_selection_at(&tab.buffer, cursor);
+                            reported_range = Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(end),
+                                egui::text::CCursor::new(start),
+                            ));
+                            store_cursor = true;
+                        }
+                    }
                     if let Some(cursor) = self.pending_script_cursor.take() {
                         output.response.request_focus();
                         reported_range = Some(egui::text::CCursorRange::one(
@@ -2048,68 +2084,6 @@ ui.label("Place ID:");
                         }
                     }
 
-                    // A normal one-finger swipe in Android editors scrolls the
-                    // document. egui's desktop TextEdit instead turns every
-                    // swipe into a text selection, making navigation with the
-                    // keyboard open nearly impossible. Preserve the selection
-                    // from the start of the gesture and pan the enclosing code
-                    // ScrollArea by the finger movement. A stationary
-                    // tap/long-press is untouched, so caret/selection actions
-                    // still work.
-                    #[cfg(target_os = "android")]
-                    {
-                        // Only override TextEdit gestures while the software
-                        // keyboard is actually visible. With the IME closed,
-                        // leave egui's native kinetic ScrollArea handling alone
-                        // so ordinary browsing remains smooth.
-                        let ime_visible = crate::jni_bridge::is_ime_visible();
-                        let (pressed, down, origin, delta) = ui.input(|input| (
-                            input.pointer.any_pressed(),
-                            input.pointer.any_down(),
-                            input.pointer.press_origin(),
-                            input.pointer.delta(),
-                        ));
-                        if ime_visible
-                            && pressed
-                            && origin.is_some_and(|pos| output.response.rect.contains(pos))
-                        {
-                            self.script_touch_drag_selection = self.script_selection;
-                            self.script_touch_drag_started_at = Some(std::time::Instant::now());
-                            self.script_touch_drag_distance = egui::Vec2::ZERO;
-                            self.script_touch_scrolling = false;
-                        } else if ime_visible && down && self.script_touch_drag_started_at.is_some() {
-                            // Do not use pointer.delta() on the DOWN frame. On
-                            // Android/egui it can contain the distance from the
-                            // previous gesture and cause a jump.
-                            self.script_touch_drag_distance += delta;
-                            let held = self.script_touch_drag_started_at
-                                .map_or(std::time::Duration::ZERO, |at| at.elapsed());
-                            if held < std::time::Duration::from_millis(450)
-                                && self.script_touch_drag_distance.length() > 6.0
-                            {
-                                self.script_touch_scrolling = true;
-                            }
-                            if self.script_touch_scrolling {
-                                // Ui::scroll_with_delta describes movement of
-                                // the content, so it uses the finger delta (not
-                                // its inverse): swiping up moves code up.
-                                ui.scroll_with_delta(delta);
-                                if let Some((anchor, primary)) = self.script_touch_drag_selection {
-                                    reported_range = Some(egui::text::CCursorRange::two(
-                                        egui::text::CCursor::new(primary),
-                                        egui::text::CCursor::new(anchor),
-                                    ));
-                                    store_cursor = true;
-                                }
-                            }
-                        }
-                        if !ime_visible || !down {
-                            self.script_touch_drag_selection = None;
-                            self.script_touch_drag_started_at = None;
-                            self.script_touch_drag_distance = egui::Vec2::ZERO;
-                            self.script_touch_scrolling = false;
-                        }
-                    }
                     if store_cursor {
                         output.state.cursor.set_char_range(reported_range);
                         let id = output.response.id;
@@ -5531,3 +5505,35 @@ fn edit_color_sequence_field(
     Some(ColorSequence { keypoints })
 }
 
+
+/// Character range selected by an Android long-press. Luau identifiers include
+/// ASCII letters, digits, and underscores; punctuation/whitespace selects the
+/// touched character so the action toolbar still has a useful target.
+fn word_selection_at(source: &str, cursor: usize) -> (usize, usize) {
+    let chars: Vec<char> = source.chars().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let mut at = cursor.min(chars.len().saturating_sub(1));
+    if at > 0 && (at == chars.len() || !is_luau_word_char(chars[at])) {
+        if is_luau_word_char(chars[at - 1]) {
+            at -= 1;
+        }
+    }
+    if !is_luau_word_char(chars[at]) {
+        return (at, (at + 1).min(chars.len()));
+    }
+    let mut start = at;
+    while start > 0 && is_luau_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at + 1;
+    while end < chars.len() && is_luau_word_char(chars[end]) {
+        end += 1;
+    }
+    (start, end)
+}
+
+fn is_luau_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
