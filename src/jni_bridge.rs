@@ -219,6 +219,19 @@ pub fn with_env(f: impl FnOnce(&mut JNIEnv, &JClass) -> Result<(), jni::errors::
     }
 }
 
+/// Whether Android currently reports the software keyboard as visible.
+/// Unlike egui focus this becomes false when the user dismisses the IME with
+/// Back or the keyboard's hide button.
+pub fn is_ime_visible() -> bool {
+    let visible = std::sync::atomic::AtomicBool::new(false);
+    with_env(|env, class| {
+        let value = env.call_static_method(class, "isImeVisibleStatic", "()Z", &[])?;
+        visible.store(value.z()?, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    });
+    visible.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn trigger_open_document() {
     with_env(|env, class| {
         let _ = env.call_static_method(class, "openDocumentStatic", "()V", &[])?;

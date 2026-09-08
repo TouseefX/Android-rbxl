@@ -65,6 +65,9 @@ mod imp {
         /// Last fully committed GameTextInput contents. Composition candidates
         /// are deliberately excluded so Samsung Keyboard can replace them.
         mirror: String,
+        /// Set after WindowInsets confirms the keyboard appeared. Once this is
+        /// true, a later invisible inset means the user explicitly dismissed it.
+        seen_visible: bool,
         /// Whether the keyboard currently owns a composing region.
         composing: bool,
         /// Last candidate sent to egui, used to suppress duplicate preedits.
@@ -74,6 +77,7 @@ mod imp {
     static STATE: Mutex<State> = Mutex::new(State {
         active: false,
         mirror: String::new(),
+        seen_visible: false,
         composing: false,
         last_preedit: String::new(),
     });
@@ -236,6 +240,20 @@ mod imp {
         let wants_keyboard = ctx.wants_keyboard_input();
         let mut state = STATE.lock().unwrap();
 
+        // Android Back/the keyboard's down-arrow hides the IME without changing
+        // egui's widget focus. Honor that action instead of immediately showing
+        // it again and leaving the editor in a phantom editing state.
+        let system_visible = crate::jni_bridge::is_ime_visible();
+        if state.active && system_visible {
+            state.seen_visible = true;
+        }
+        if state.active && state.seen_visible && !system_visible {
+            if let Some(focused) = ctx.memory(|memory| memory.focused()) {
+                ctx.memory_mut(|memory| memory.surrender_focus(focused));
+            }
+        }
+        let wants_keyboard = ctx.wants_keyboard_input();
+
         if wants_keyboard && !state.active {
             // This is a source-code field, so disable Samsung/Gboard word
             // correction. Luau suggestions are rendered by the editor itself;
@@ -251,6 +269,7 @@ mod imp {
                 ImeOptions::IME_FLAG_NO_FULLSCREEN,
             );
             state.active = true;
+            state.seen_visible = false;
             reseed(app, &mut state);
             ctx.input_mut(|input| {
                 input.events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
@@ -267,6 +286,7 @@ mod imp {
                 input.events.push(egui::Event::Ime(egui::ImeEvent::Disabled));
             });
             state.active = false;
+            state.seen_visible = false;
             state.composing = false;
             state.last_preedit.clear();
             app.hide_soft_input(false);

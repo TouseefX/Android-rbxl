@@ -144,6 +144,10 @@ pub struct EditorApp {
     script_completion_dismissed_at: Option<(Ref, usize)>,
     /// Anchor/primary character positions from the previous editor frame.
     script_selection: Option<(usize, usize)>,
+    /// Android one-finger drags pan the code viewport rather than extending a
+    /// selection. Long-press/tap remains available for caret placement.
+    script_touch_drag_selection: Option<(usize, usize)>,
+    script_touch_drag_delta: egui::Vec2,
     /// Character position to apply after opening a definition in another tab.
     pending_script_cursor: Option<usize>,
     script_references: Vec<luau_intelligence::Reference>,
@@ -316,6 +320,8 @@ impl Default for EditorApp {
             script_completion_selected: 0,
             script_completion_dismissed_at: None,
             script_selection: None,
+            script_touch_drag_selection: None,
+            script_touch_drag_delta: egui::Vec2::ZERO,
             pending_script_cursor: None,
             script_references: Vec::new(),
             show_symbol_rename: false,
@@ -778,7 +784,14 @@ impl EditorApp {
             egui::Area::new(egui::Id::new("focus_mode_exit"))
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 52.0))
                 .show(ctx, |ui| {
-                    if ui.button("↙ Exit Focus").clicked() { self.editor_focus_mode = false; }
+                    if ui.button("↙ Exit Focus").clicked() {
+                        self.editor_focus_mode = false;
+                        ui.memory_mut(|memory| {
+                            if let Some(focused) = memory.focused() {
+                                memory.surrender_focus(focused);
+                            }
+                        });
+                    }
                 });
         }
         let mut jump: Option<(Ref, usize)> = None;
@@ -1612,6 +1625,20 @@ ui.label("Place ID:");
 
             if ui.button(if self.editor_focus_mode { "↙ Exit Focus" } else { "⛶ Focus" }).clicked() {
                 self.editor_focus_mode = !self.editor_focus_mode;
+                if !self.editor_focus_mode {
+                    ui.memory_mut(|memory| {
+                        if let Some(focused) = memory.focused() {
+                            memory.surrender_focus(focused);
+                        }
+                    });
+                }
+            }
+            if ui.button("⌄ Keyboard").clicked() {
+                ui.memory_mut(|memory| {
+                    if let Some(focused) = memory.focused() {
+                        memory.surrender_focus(focused);
+                    }
+                });
             }
 
             if ui.button("📱 Edit in External App").clicked() {
@@ -1981,6 +2008,39 @@ ui.label("Place ID:");
                             reported_range = Some(egui::text::CCursorRange::one(
                                 egui::text::CCursor::new(new_cursor)));
                             store_cursor = true;
+                        }
+                    }
+
+                    // A normal one-finger swipe in Android editors scrolls the
+                    // document. egui's desktop TextEdit instead turns every
+                    // swipe into a text selection, making navigation with the
+                    // keyboard open nearly impossible. Preserve the selection
+                    // from the start of the gesture and pan the enclosing code
+                    // ScrollArea by the finger movement. A stationary
+                    // tap/long-press is untouched, so caret/selection actions
+                    // still work.
+                    #[cfg(target_os = "android")]
+                    {
+                        if output.response.drag_started() {
+                            self.script_touch_drag_selection = self.script_selection;
+                            self.script_touch_drag_delta = egui::Vec2::ZERO;
+                        }
+                        if output.response.dragged() {
+                            let total = output.response.drag_delta();
+                            let frame_delta = total - self.script_touch_drag_delta;
+                            self.script_touch_drag_delta = total;
+                            ui.scroll_with_delta(-frame_delta);
+                            if let Some((anchor, primary)) = self.script_touch_drag_selection {
+                                reported_range = Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(primary),
+                                    egui::text::CCursor::new(anchor),
+                                ));
+                                store_cursor = true;
+                            }
+                        }
+                        if !ui.input(|input| input.pointer.any_down()) {
+                            self.script_touch_drag_selection = None;
+                            self.script_touch_drag_delta = egui::Vec2::ZERO;
                         }
                     }
                     if store_cursor {

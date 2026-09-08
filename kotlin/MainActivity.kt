@@ -108,6 +108,7 @@ class MainActivity : GameActivity() {
         ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             val keyboardVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            imeVisible = keyboardVisible
             val bottom = if (keyboardVisible) ime.bottom else 0
             if (view.paddingBottom != bottom) {
                 view.setPadding(view.paddingLeft, view.paddingTop, view.paddingRight, bottom)
@@ -560,6 +561,10 @@ class MainActivity : GameActivity() {
         @Volatile
         private var sInstance: MainActivity? = null
 
+        /** Updated from WindowInsets, including when Back dismisses the IME. */
+        @Volatile
+        private var imeVisible: Boolean = false
+
         private var sPlayer: MediaPlayer? = null
 
         init {
@@ -570,6 +575,9 @@ class MainActivity : GameActivity() {
         }
 
         // ---- called from Rust via JNI (see src/jni_bridge.rs) ---------------
+
+        @JvmStatic
+        fun isImeVisibleStatic(): Boolean = imeVisible
 
         @JvmStatic
         fun openDocumentStatic() {
