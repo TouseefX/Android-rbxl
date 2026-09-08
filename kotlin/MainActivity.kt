@@ -457,7 +457,7 @@ class MainActivity : GameActivity() {
                 setPadding(18, 14, 18, 28)
                 inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-                    InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
+                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
                 setHorizontallyScrolling(true)
                 isVerticalScrollBarEnabled = true
                 isHorizontalScrollBarEnabled = true
@@ -511,7 +511,11 @@ class MainActivity : GameActivity() {
                         }
                     }
                     editor.postDelayed(highlightTask, if (composing) 220 else 110)
-                    if (!composing) editor.postDelayed(intelligenceTask, 75)
+                    // Request Luau suggestions from the current composing text
+                    // too. Samsung keeps identifiers such as `loc` composing
+                    // until Space, so waiting for commit made completion appear
+                    // only after Space+Backspace.
+                    editor.postDelayed(intelligenceTask, if (composing) 95 else 65)
                 }
             })
             editor.post(highlightTask)
@@ -611,6 +615,11 @@ class MainActivity : GameActivity() {
                 val item = array.getJSONObject(position)
                 val replace = item.optInt("replaceChars", 0)
                 val insert = item.getString("insertText")
+                // End Samsung's composing ownership before applying a Luau
+                // completion. Otherwise the keyboard can subsequently replace
+                // `RagdollSystem.Init` with an unrelated dictionary candidate
+                // such as `RRadio`.
+                BaseInputConnection.removeComposingSpans(editor.text)
                 val end = editor.selectionStart.coerceAtLeast(0)
                 val start = (end - replace).coerceAtLeast(0)
                 editor.text.replace(start, end, insert)
