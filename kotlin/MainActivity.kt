@@ -30,6 +30,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ArrayAdapter
 import android.widget.ListPopupWindow
+import android.widget.HorizontalScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.view.WindowCompat
@@ -390,7 +391,7 @@ class MainActivity : GameActivity() {
      * is a real EditText, so Android owns caret placement, kinetic scrolling,
      * blue selection handles, and the system Copy/Cut/Paste ActionMode.
      */
-    fun showNativeEditor(scriptId: Long, fileName: String, source: String) {
+    fun showNativeEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int = 0) {
         runOnUiThread {
             nativeEditorDialog?.dismiss()
 
@@ -428,11 +429,19 @@ class MainActivity : GameActivity() {
                 setPadding(10, 2, 10, 2)
                 setBackgroundColor(Color.rgb(36, 36, 38))
             }
-            val checkLuau = Button(this).apply { text = "✓ Check Luau" }
+            val checkLuau = Button(this).apply { text = "✓ Check" }
             val formatLuau = Button(this).apply { text = "✨ Format" }
+            val goDefinition = Button(this).apply { text = "↗ Definition" }
+            val findReferences = Button(this).apply { text = "⌕ References" }
             actions.addView(checkLuau)
             actions.addView(formatLuau)
-            root.addView(actions, LinearLayout.LayoutParams(
+            actions.addView(goDefinition)
+            actions.addView(findReferences)
+            val actionScroller = HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(actions)
+            }
+            root.addView(actionScroller, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
@@ -453,7 +462,7 @@ class MainActivity : GameActivity() {
                 isVerticalScrollBarEnabled = true
                 isHorizontalScrollBarEnabled = true
                 isLongClickable = true
-                setSelection(0)
+                setSelection(initialCursor.coerceIn(0, source.length))
             }
             var applyingPair = false
             var changedStart = 0
@@ -511,6 +520,12 @@ class MainActivity : GameActivity() {
             }
             formatLuau.setOnClickListener {
                 nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), editor.selectionStart)
+            }
+            goDefinition.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), editor.selectionStart)
+            }
+            findReferences.setOnClickListener {
+                nativeOnNativeEditorCommand(scriptId, "references", editor.text.toString(), editor.selectionStart)
             }
             root.addView(editor, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
@@ -898,8 +913,15 @@ class MainActivity : GameActivity() {
         @JvmStatic
         fun showNativeEditorStatic(scriptId: Long, fileName: String, source: String) {
             val act = sInstance
-            if (act != null) act.showNativeEditor(scriptId, fileName, source)
+            if (act != null) act.showNativeEditor(scriptId, fileName, source, 0)
             else Log.e(TAG, "showNativeEditorStatic: MainActivity instance is null")
+        }
+
+        @JvmStatic
+        fun showNativeEditorAtStatic(scriptId: Long, fileName: String, source: String, cursor: Int) {
+            val act = sInstance
+            if (act != null) act.showNativeEditor(scriptId, fileName, source, cursor)
+            else Log.e(TAG, "showNativeEditorAtStatic: MainActivity instance is null")
         }
 
         @JvmStatic

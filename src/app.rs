@@ -230,6 +230,7 @@ pub struct EditorApp {
     // External edit mapping
     pending_external_edits: HashMap<u64, Ref>,
     next_external_id: u64,
+    native_editor_initial_cursor: Option<usize>,
 
     // Bevy 3D scene rebuild flag: set when the opened place changes, cleared
     // by the Bevy system that (re)builds the meshes.
@@ -383,6 +384,7 @@ impl Default for EditorApp {
             output_logs: Vec::new(),
             pending_external_edits: HashMap::new(),
             next_external_id: 1,
+            native_editor_initial_cursor: None,
             needs_3d_rebuild: false,
             cam_move_speed: 4.0,
             pending_asset_refresh_at: None,
@@ -1486,11 +1488,14 @@ ui.label("Place ID:");
 
     fn open_active_script_natively(&mut self) {
         #[cfg(target_os = "android")]
-        if let Some(tab) = self.open_tabs.get(self.active_script_idx) {
-            let id = self.next_external_id;
-            self.next_external_id += 1;
-            self.pending_external_edits.insert(id, tab.referent);
-            jni_bridge::trigger_native_editor(id, &tab.name, &tab.buffer);
+        {
+            let cursor = self.native_editor_initial_cursor.take().unwrap_or(0);
+            if let Some(tab) = self.open_tabs.get(self.active_script_idx) {
+                let id = self.next_external_id;
+                self.next_external_id += 1;
+                self.pending_external_edits.insert(id, tab.referent);
+                jni_bridge::trigger_native_editor_at(id, &tab.name, &tab.buffer, cursor);
+            }
         }
     }
 
@@ -3835,6 +3840,57 @@ ui.label("Place ID:");
                                 jni_bridge::update_native_editor_result(
                                     script_id, "check", &text, &message,
                                 );
+                            }
+                            "definition" | "references" => {
+                                if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                                    tab.buffer = text.clone();
+                                }
+                                let cursor_char = utf16_to_char_index(&text, cursor);
+                                let index = self.dom.as_ref().map(|dom| {
+                                    luau_intelligence::ProjectIndex::build_with_overrides(
+                                        dom,
+                                        self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                                    )
+                                });
+                                let definition = index.as_ref().and_then(|index| {
+                                    index.definition_at(referent, &text, cursor_char)
+                                });
+                                if command == "definition" {
+                                    if let Some(definition) = definition {
+                                        self.native_editor_initial_cursor = self.dom.as_ref()
+                                            .and_then(|dom| rbxl::get_source(dom, definition.referent))
+                                            .map(|source| source.lines()
+                                                .take(definition.line.saturating_sub(1))
+                                                .map(|line| line.encode_utf16().count() + 1)
+                                                .sum());
+                                        self.open_script_tab(definition.referent);
+                                        self.status = format!("Opened native definition at line {}", definition.line);
+                                    } else {
+                                        jni_bridge::update_native_editor_result(
+                                            script_id, "definition", &text,
+                                            "No ModuleScript definition found at the caret",
+                                        );
+                                    }
+                                } else if let (Some(index), Some(definition)) = (index.as_ref(), definition.as_ref()) {
+                                    let references = index.references(definition);
+                                    let message = if references.is_empty() {
+                                        "No project references found".to_string()
+                                    } else {
+                                        let preview = references.iter().take(5)
+                                            .map(|reference| format!("Line {}: {}", reference.line, reference.preview))
+                                            .collect::<Vec<_>>().join("\n");
+                                        format!("{} reference(s)\n{}", references.len(), preview)
+                                    };
+                                    self.script_references = references;
+                                    jni_bridge::update_native_editor_result(
+                                        script_id, "references", &text, &message,
+                                    );
+                                } else {
+                                    jni_bridge::update_native_editor_result(
+                                        script_id, "references", &text,
+                                        "No resolvable symbol found at the caret",
+                                    );
+                                }
                             }
                             _ => {}
                         }

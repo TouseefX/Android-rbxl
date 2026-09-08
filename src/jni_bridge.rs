@@ -291,6 +291,23 @@ pub fn trigger_export_project(bundle_json: &str) {
     });
 }
 
+pub fn trigger_native_editor_at(script_id: u64, name: &str, source: &str, cursor: usize) {
+    with_env(|env, class| {
+        let jname = env.new_string(name)?;
+        let jsource = env.new_string(source)?;
+        let _ = env.call_static_method(
+            class,
+            "showNativeEditorAtStatic",
+            "(JLjava/lang/String;Ljava/lang/String;I)V",
+            &[
+                JValue::Long(script_id as i64), JValue::Object(&jname),
+                JValue::Object(&jsource), JValue::Int(cursor.min(i32::MAX as usize) as i32),
+            ],
+        )?;
+        Ok(())
+    });
+}
+
 pub fn trigger_native_editor(script_id: u64, name: &str, source: &str) {
     with_env(|env, class| {
         let jname = env.new_string(name)?;
