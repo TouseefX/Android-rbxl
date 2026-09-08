@@ -151,6 +151,9 @@ pub struct EditorApp {
     /// Raw-touch fallback for Android backends where overlapping egui Areas do
     /// not reliably win drag ownership from the code ScrollArea.
     script_active_selection_handle: Option<u8>,
+    /// Previous-frame hit targets let us suppress the underlying TextEdit click
+    /// before it can collapse the selected range.
+    script_selection_handle_rects: Option<[egui::Rect; 2]>,
     script_references: Vec<luau_intelligence::Reference>,
     show_symbol_rename: bool,
     symbol_rename_input: String,
@@ -324,6 +327,7 @@ impl Default for EditorApp {
             pending_script_cursor: None,
             pending_script_selection: None,
             script_active_selection_handle: None,
+            script_selection_handle_rects: None,
             script_references: Vec::new(),
             show_symbol_rename: false,
             symbol_rename_input: String::new(),
@@ -1999,6 +2003,28 @@ ui.label("Place ID:");
                         ui.fonts_mut(|fonts| fonts.layout_job(job))
                     };
 
+                    // Handle Areas are painted after TextEdit, but their
+                    // previous-frame rectangles are known now. Mark the touch
+                    // before TextEdit runs so its click cannot collapse the
+                    // selection underneath the blue handle.
+                    let handle_touch = ui.input(|input| {
+                        if !input.pointer.any_pressed() {
+                            return None;
+                        }
+                        let origin = input.pointer.press_origin()?;
+                        self.script_selection_handle_rects.and_then(|rects| {
+                            rects.iter().position(|rect| rect.contains(origin))
+                                .map(|index| index as u8)
+                        })
+                    });
+                    if let Some(handle) = handle_touch {
+                        self.script_active_selection_handle = Some(handle);
+                    }
+                    ui.ctx().data_mut(|data| data.insert_temp(
+                        egui::Id::new("openrbxl_suppress_textedit_pointer"),
+                        handle_touch.is_some() || self.script_active_selection_handle.is_some(),
+                    ));
+
                     let mut output = egui::TextEdit::multiline(&mut tab.buffer)
                         .id_source("script_multiline_view")
                         .font(egui::FontId::monospace(self.font_size))
@@ -2096,9 +2122,17 @@ ui.label("Place ID:");
         // Android-style draggable selection handles. They are rendered in the
         // foreground because GameActivity has no native EditText from which the
         // platform could create its standard blue handles.
+        if self.script_selection.is_none_or(|(anchor, primary)| anchor == primary) {
+            self.script_selection_handle_rects = None;
+        }
         if let (Some((galley, galley_pos, anchor_pos, primary_pos)), Some((anchor, primary))) =
             (touch_selection_geometry, self.script_selection)
         {
+            let handle_size = egui::vec2(60.0, 64.0);
+            self.script_selection_handle_rects = Some([
+                egui::Rect::from_min_size(anchor_pos - egui::vec2(30.0, 12.0), handle_size),
+                egui::Rect::from_min_size(primary_pos - egui::vec2(30.0, 12.0), handle_size),
+            ]);
             for (handle_index, handle_pos, current_anchor, current_primary) in [
                 (0_u8, anchor_pos, anchor, primary),
                 (1_u8, primary_pos, anchor, primary),

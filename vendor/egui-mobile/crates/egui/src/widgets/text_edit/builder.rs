@@ -582,7 +582,11 @@ impl TextEdit<'_> {
         let interaction_pos = response
             .interact_pointer_pos()
             .or_else(|| ui.input(|input| input.pointer.interact_pos()));
-        if interactive && let Some(pointer_pos) = interaction_pos {
+        let suppress_pointer_interaction = ui.ctx().data(|data| {
+            data.get_temp::<bool>(Id::new("openrbxl_suppress_textedit_pointer"))
+                .unwrap_or(false)
+        });
+        if interactive && !suppress_pointer_interaction && let Some(pointer_pos) = interaction_pos {
             if response.hovered() && text.is_mutable() {
                 ui.output_mut(|o| o.mutable_text_under_cursor = true);
             }
