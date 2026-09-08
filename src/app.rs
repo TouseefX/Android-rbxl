@@ -2098,20 +2098,23 @@ ui.label("Place ID:");
                 let mut dragged_to = None;
                 egui::Area::new(egui::Id::new(("touch_selection_handle", handle_index)))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(handle_pos - egui::vec2(13.0, 5.0))
+                    // Keep a large invisible touch target around the visible
+                    // handle. Samsung's high-density screens made the previous
+                    // 26×32 point target difficult to grab accurately.
+                    .fixed_pos(handle_pos - egui::vec2(24.0, 9.0))
                     .show(ui.ctx(), |ui| {
                         let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(26.0, 32.0),
-                            egui::Sense::drag(),
+                            egui::vec2(48.0, 56.0),
+                            egui::Sense::click_and_drag(),
                         );
-                        let center = egui::pos2(rect.center().x, rect.top() + 10.0);
+                        let center = egui::pos2(rect.center().x, rect.top() + 15.0);
                         ui.painter().line_segment(
                             [egui::pos2(center.x, rect.top()), center],
-                            egui::Stroke::new(2.0, Color32::from_rgb(40, 135, 255)),
+                            egui::Stroke::new(3.0, Color32::from_rgb(40, 135, 255)),
                         );
                         ui.painter().circle_filled(
                             center,
-                            7.0,
+                            10.0,
                             Color32::from_rgb(40, 135, 255),
                         );
                         if response.dragged() {

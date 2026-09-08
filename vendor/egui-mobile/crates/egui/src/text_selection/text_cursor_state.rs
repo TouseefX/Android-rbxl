@@ -86,8 +86,23 @@ impl TextCursorState {
             // Touch TextEdits use click-only Sense so their ScrollArea can own
             // swipes. Click-only widgets still need to move the insertion caret;
             // upstream only did this as the first step of a drag interaction.
-            self.set_char_range(Some(CCursorRange::one(cursor_at_pointer)));
-            true
+            //
+            // The app draws selection handles above TextEdit. Some Android
+            // backends still report the same release as a TextEdit click. Do
+            // not collapse an existing selection when that click lands at one
+            // of its endpoints—the foreground handle owns that gesture.
+            let touching_selection_endpoint = ui.input(|i| i.has_touch_screen())
+                && self.range(galley).is_some_and(|range| {
+                    range.primary.index != range.secondary.index
+                        && (cursor_at_pointer.index.abs_diff(range.primary.index) <= 1
+                            || cursor_at_pointer.index.abs_diff(range.secondary.index) <= 1)
+                });
+            if touching_selection_endpoint {
+                false
+            } else {
+                self.set_char_range(Some(CCursorRange::one(cursor_at_pointer)));
+                true
+            }
         } else if response.sense.senses_drag() {
             if response.hovered() && ui.input(|i| i.pointer.any_pressed()) {
                 // The start of a drag (or a click).
