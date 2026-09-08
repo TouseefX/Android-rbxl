@@ -3810,7 +3810,7 @@ ui.label("Place ID:");
                         }
                     }
                 }
-                FileEvent::NativeEditorCommand { script_id, command, text, cursor: _ } => {
+                FileEvent::NativeEditorCommand { script_id, command, text, cursor } => {
                     if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
                         match command.as_str() {
                             "format" => {
