@@ -4,6 +4,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.app.Dialog
+import android.graphics.Color
+import android.graphics.Typeface
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
@@ -12,8 +15,15 @@ import android.os.Environment
 import android.os.Looper
 import android.os.StrictMode
 import android.util.Log
+import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
+import android.text.InputType
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -57,6 +67,7 @@ class MainActivity : GameActivity() {
     private var lastExternalModifiedTime: Long = 0
     private var activeProjectRoot: File? = null
     private val projectModifiedTimes = HashMap<String, Long>()
+    private var nativeEditorDialog: Dialog? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Register the instance BEFORE super.onCreate(): GameActivity's
@@ -329,6 +340,87 @@ class MainActivity : GameActivity() {
      * whatever editor app the user picks. Luau-aware editors use the extension
      * for the correct grammar while text/plain keeps broad Android app support.
      */
+    /**
+     * Full-screen native Android Luau editor. Unlike the Bevy SurfaceView this
+     * is a real EditText, so Android owns caret placement, kinetic scrolling,
+     * blue selection handles, and the system Copy/Cut/Paste ActionMode.
+     */
+    fun showNativeEditor(scriptId: Long, fileName: String, source: String) {
+        runOnUiThread {
+            nativeEditorDialog?.dismiss()
+
+            val dialog = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
+            val root = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.rgb(30, 30, 30))
+            }
+            val toolbar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(12, 8, 12, 8)
+                setBackgroundColor(Color.rgb(42, 42, 44))
+            }
+            val title = TextView(this).apply {
+                text = fileName
+                setTextColor(Color.WHITE)
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            toolbar.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+            val cancel = Button(this).apply { text = "Cancel" }
+            val done = Button(this).apply { text = "Done" }
+            toolbar.addView(cancel)
+            toolbar.addView(done)
+            root.addView(toolbar, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+
+            val editor = EditText(this).apply {
+                setText(source)
+                setTextColor(Color.rgb(225, 225, 225))
+                setHintTextColor(Color.GRAY)
+                setBackgroundColor(Color.rgb(30, 30, 30))
+                typeface = Typeface.MONOSPACE
+                textSize = 15f
+                gravity = Gravity.TOP or Gravity.START
+                setPadding(18, 14, 18, 28)
+                inputType = InputType.TYPE_CLASS_TEXT or
+                    InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                setHorizontallyScrolling(true)
+                isVerticalScrollBarEnabled = true
+                isHorizontalScrollBarEnabled = true
+                isLongClickable = true
+                setSelection(0)
+            }
+            root.addView(editor, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            ))
+
+            fun close(apply: Boolean) {
+                if (apply) nativeOnExternalEditReturned(scriptId, editor.text.toString())
+                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                imm?.hideSoftInputFromWindow(editor.windowToken, 0)
+                dialog.dismiss()
+                nativeEditorDialog = null
+            }
+            cancel.setOnClickListener { close(false) }
+            done.setOnClickListener { close(true) }
+            dialog.setOnCancelListener { nativeEditorDialog = null }
+            dialog.setContentView(root)
+            dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            dialog.show()
+            nativeEditorDialog = dialog
+            editor.requestFocus()
+            editor.post {
+                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                imm?.showSoftInput(editor, InputMethodManager.SHOW_IMPLICIT)
+            }
+        }
+    }
+
     fun editExternally(scriptId: Long, fileName: String, source: String) {
         runOnUiThread {
             try {
@@ -613,6 +705,13 @@ class MainActivity : GameActivity() {
             val act = sInstance
             if (act != null) act.exportProject(bundleJson)
             else Log.e(TAG, "exportProjectStatic: MainActivity instance is null")
+        }
+
+        @JvmStatic
+        fun showNativeEditorStatic(scriptId: Long, fileName: String, source: String) {
+            val act = sInstance
+            if (act != null) act.showNativeEditor(scriptId, fileName, source)
+            else Log.e(TAG, "showNativeEditorStatic: MainActivity instance is null")
         }
 
         @JvmStatic

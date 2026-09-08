@@ -1454,6 +1454,7 @@ ui.label("Place ID:");
         // Check if tab already open
         if let Some(pos) = self.open_tabs.iter().position(|t| t.referent == referent) {
             self.active_script_idx = pos;
+            self.open_active_script_natively();
             return;
         }
 
@@ -1480,6 +1481,17 @@ ui.label("Place ID:");
             diagnostics,
         });
         self.active_script_idx = self.open_tabs.len() - 1;
+        self.open_active_script_natively();
+    }
+
+    fn open_active_script_natively(&mut self) {
+        #[cfg(target_os = "android")]
+        if let Some(tab) = self.open_tabs.get(self.active_script_idx) {
+            let id = self.next_external_id;
+            self.next_external_id += 1;
+            self.pending_external_edits.insert(id, tab.referent);
+            jni_bridge::trigger_native_editor(id, &tab.name, &tab.buffer);
+        }
     }
 
     fn show_script_editor_ui(&mut self, ui: &mut egui::Ui) {
@@ -1497,6 +1509,7 @@ ui.label("Place ID:");
 
         // Script Tabs Header
         let mut close_tab_idx = None;
+        let mut native_tab_idx = None;
         egui::ScrollArea::horizontal()
             .id_salt("script_tabs_scroll")
             .show(ui, |ui| {
@@ -1523,6 +1536,7 @@ ui.label("Place ID:");
                         if ui.selectable_label(is_active, text).clicked() {
                             self.active_script_idx = idx;
                             self.selected = Some(tab.referent);
+                            native_tab_idx = Some(idx);
                         }
 
                         if ui.small_button("✖").clicked() {
@@ -1531,6 +1545,11 @@ ui.label("Place ID:");
                     }
                 });
             });
+
+        if let Some(idx) = native_tab_idx {
+            self.active_script_idx = idx;
+            self.open_active_script_natively();
+        }
 
         if let Some(idx) = close_tab_idx {
             self.open_tabs.remove(idx);
@@ -1644,6 +1663,14 @@ ui.label("Place ID:");
                         memory.surrender_focus(focused);
                     }
                 });
+            }
+
+            #[cfg(target_os = "android")]
+            if ui.button("📱 Native Android Editor").clicked() {
+                let id = self.next_external_id;
+                self.next_external_id += 1;
+                self.pending_external_edits.insert(id, tab_ref);
+                jni_bridge::trigger_native_editor(id, &tab_name, &tab.buffer);
             }
 
             if ui.button("📱 Edit in External App").clicked() {
