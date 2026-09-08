@@ -2058,25 +2058,29 @@ ui.label("Place ID:");
                     // still work.
                     #[cfg(target_os = "android")]
                     {
-                        // TextEdit consumes the pointer drag while selecting, so
-                        // Response::dragged() is not reliable on every Samsung
-                        // input path. Classify the raw pointer gesture by where
-                        // it began instead. Moving promptly pans; holding for
-                        // 450 ms first leaves TextEdit's normal selection drag
-                        // intact (the familiar Android hold-then-select action).
+                        // Only override TextEdit gestures while the software
+                        // keyboard is actually visible. With the IME closed,
+                        // leave egui's native kinetic ScrollArea handling alone
+                        // so ordinary browsing remains smooth.
+                        let ime_visible = crate::jni_bridge::is_ime_visible();
                         let (pressed, down, origin, delta) = ui.input(|input| (
                             input.pointer.any_pressed(),
                             input.pointer.any_down(),
                             input.pointer.press_origin(),
                             input.pointer.delta(),
                         ));
-                        if pressed && origin.is_some_and(|pos| output.response.rect.contains(pos)) {
+                        if ime_visible
+                            && pressed
+                            && origin.is_some_and(|pos| output.response.rect.contains(pos))
+                        {
                             self.script_touch_drag_selection = self.script_selection;
                             self.script_touch_drag_started_at = Some(std::time::Instant::now());
                             self.script_touch_drag_distance = egui::Vec2::ZERO;
                             self.script_touch_scrolling = false;
-                        }
-                        if down && self.script_touch_drag_started_at.is_some() {
+                        } else if ime_visible && down && self.script_touch_drag_started_at.is_some() {
+                            // Do not use pointer.delta() on the DOWN frame. On
+                            // Android/egui it can contain the distance from the
+                            // previous gesture and cause a jump.
                             self.script_touch_drag_distance += delta;
                             let held = self.script_touch_drag_started_at
                                 .map_or(std::time::Duration::ZERO, |at| at.elapsed());
@@ -2086,7 +2090,10 @@ ui.label("Place ID:");
                                 self.script_touch_scrolling = true;
                             }
                             if self.script_touch_scrolling {
-                                ui.scroll_with_delta(-delta);
+                                // Ui::scroll_with_delta describes movement of
+                                // the content, so it uses the finger delta (not
+                                // its inverse): swiping up moves code up.
+                                ui.scroll_with_delta(delta);
                                 if let Some((anchor, primary)) = self.script_touch_drag_selection {
                                     reported_range = Some(egui::text::CCursorRange::two(
                                         egui::text::CCursor::new(primary),
@@ -2096,7 +2103,7 @@ ui.label("Place ID:");
                                 }
                             }
                         }
-                        if !down {
+                        if !ime_visible || !down {
                             self.script_touch_drag_selection = None;
                             self.script_touch_drag_started_at = None;
                             self.script_touch_drag_distance = egui::Vec2::ZERO;
