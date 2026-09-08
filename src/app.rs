@@ -5898,10 +5898,10 @@ mod format_tests {
         assert_eq!(
             format_luau_indentation(source),
             "const Registry = table.freeze(setmetatable({\n\
-             \tInit = init,\n\
-             \tIsNPC = function(target: Instance): boolean\n\
-             \t\treturn isNPC(target)\n\
-             \tend,\n\
+             \u{20}   Init = init,\n\
+             \u{20}   IsNPC = function(target: Instance): boolean\n\
+             \u{20}       return isNPC(target)\n\
+             \u{20}   end,\n\
              }, Metatable)) :: any\n\
              return Registry"
         );
