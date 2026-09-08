@@ -147,7 +147,9 @@ pub struct EditorApp {
     /// Android one-finger drags pan the code viewport rather than extending a
     /// selection. Long-press/tap remains available for caret placement.
     script_touch_drag_selection: Option<(usize, usize)>,
-    script_touch_drag_delta: egui::Vec2,
+    script_touch_drag_started_at: Option<std::time::Instant>,
+    script_touch_drag_distance: egui::Vec2,
+    script_touch_scrolling: bool,
     /// Character position to apply after opening a definition in another tab.
     pending_script_cursor: Option<usize>,
     script_references: Vec<luau_intelligence::Reference>,
@@ -321,7 +323,9 @@ impl Default for EditorApp {
             script_completion_dismissed_at: None,
             script_selection: None,
             script_touch_drag_selection: None,
-            script_touch_drag_delta: egui::Vec2::ZERO,
+            script_touch_drag_started_at: None,
+            script_touch_drag_distance: egui::Vec2::ZERO,
+            script_touch_scrolling: false,
             pending_script_cursor: None,
             script_references: Vec::new(),
             show_symbol_rename: false,
@@ -1782,6 +1786,39 @@ ui.label("Place ID:");
                 jni_bridge::trigger_copy_to_clipboard(&tab.buffer);
                 self.status = "Copied script to Android clipboard".into();
             }
+
+            // GameActivity renders a native surface rather than an Android
+            // EditText, so Android cannot create its stock selection action
+            // popup for us. Mirror the useful actions whenever TextEdit has a
+            // real selection (including hold-then-drag on touch).
+            if let Some((anchor, primary)) = self.script_selection {
+                if anchor != primary {
+                    let start = anchor.min(primary);
+                    let end = anchor.max(primary);
+                    let start_byte = tab.buffer.char_indices().nth(start)
+                        .map_or(tab.buffer.len(), |(byte, _)| byte);
+                    let end_byte = tab.buffer.char_indices().nth(end)
+                        .map_or(tab.buffer.len(), |(byte, _)| byte);
+                    let selected = tab.buffer[start_byte..end_byte].to_owned();
+                    ui.separator();
+                    ui.label("Selection:");
+                    if ui.button("Copy").clicked() {
+                        jni_bridge::trigger_copy_to_clipboard(&selected);
+                    }
+                    if ui.button("Cut").clicked() {
+                        jni_bridge::trigger_copy_to_clipboard(&selected);
+                        tab.buffer.replace_range(start_byte..end_byte, "");
+                        self.pending_script_cursor = Some(start);
+                        self.script_selection = Some((start, start));
+                    }
+                    if ui.button("Paste").clicked() {
+                        let pasted = jni_bridge::get_clipboard_text();
+                        tab.buffer.replace_range(start_byte..end_byte, &pasted);
+                        self.pending_script_cursor = Some(start + pasted.chars().count());
+                        self.script_selection = self.pending_script_cursor.map(|at| (at, at));
+                    }
+                }
+            }
 });
 
         // Quick Luau Symbol Bar
@@ -2021,26 +2058,49 @@ ui.label("Place ID:");
                     // still work.
                     #[cfg(target_os = "android")]
                     {
-                        if output.response.drag_started() {
+                        // TextEdit consumes the pointer drag while selecting, so
+                        // Response::dragged() is not reliable on every Samsung
+                        // input path. Classify the raw pointer gesture by where
+                        // it began instead. Moving promptly pans; holding for
+                        // 450 ms first leaves TextEdit's normal selection drag
+                        // intact (the familiar Android hold-then-select action).
+                        let (pressed, down, origin, delta) = ui.input(|input| (
+                            input.pointer.any_pressed(),
+                            input.pointer.any_down(),
+                            input.pointer.press_origin(),
+                            input.pointer.delta(),
+                        ));
+                        if pressed && origin.is_some_and(|pos| output.response.rect.contains(pos)) {
                             self.script_touch_drag_selection = self.script_selection;
-                            self.script_touch_drag_delta = egui::Vec2::ZERO;
+                            self.script_touch_drag_started_at = Some(std::time::Instant::now());
+                            self.script_touch_drag_distance = egui::Vec2::ZERO;
+                            self.script_touch_scrolling = false;
                         }
-                        if output.response.dragged() {
-                            let total = output.response.drag_delta();
-                            let frame_delta = total - self.script_touch_drag_delta;
-                            self.script_touch_drag_delta = total;
-                            ui.scroll_with_delta(-frame_delta);
-                            if let Some((anchor, primary)) = self.script_touch_drag_selection {
-                                reported_range = Some(egui::text::CCursorRange::two(
-                                    egui::text::CCursor::new(primary),
-                                    egui::text::CCursor::new(anchor),
-                                ));
-                                store_cursor = true;
+                        if down && self.script_touch_drag_started_at.is_some() {
+                            self.script_touch_drag_distance += delta;
+                            let held = self.script_touch_drag_started_at
+                                .map_or(std::time::Duration::ZERO, |at| at.elapsed());
+                            if held < std::time::Duration::from_millis(450)
+                                && self.script_touch_drag_distance.length() > 6.0
+                            {
+                                self.script_touch_scrolling = true;
+                            }
+                            if self.script_touch_scrolling {
+                                ui.scroll_with_delta(-delta);
+                                if let Some((anchor, primary)) = self.script_touch_drag_selection {
+                                    reported_range = Some(egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(primary),
+                                        egui::text::CCursor::new(anchor),
+                                    ));
+                                    store_cursor = true;
+                                }
                             }
                         }
-                        if !ui.input(|input| input.pointer.any_down()) {
+                        if !down {
                             self.script_touch_drag_selection = None;
-                            self.script_touch_drag_delta = egui::Vec2::ZERO;
+                            self.script_touch_drag_started_at = None;
+                            self.script_touch_drag_distance = egui::Vec2::ZERO;
+                            self.script_touch_scrolling = false;
                         }
                     }
                     if store_cursor {
