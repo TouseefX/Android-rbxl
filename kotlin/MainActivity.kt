@@ -595,7 +595,14 @@ class MainActivity : GameActivity() {
                 val detail = item.optString("detail")
                 labels.add(if (detail.isBlank()) item.getString("label") else "${item.getString("label")}  —  $detail")
             }
-            val popup = nativeCompletionPopup ?: ListPopupWindow(this).also {
+            // ListPopupWindow copies its item-click listener into the internal
+            // drop-down ListView when first shown. Reusing the same popup can
+            // update its visible adapter to `require` while its ListView still
+            // invokes the older listener that captured `return`. Recreate the
+            // popup so displayed rows and accepted completion always share the
+            // exact same immutable result snapshot.
+            nativeCompletionPopup?.dismiss()
+            val popup = ListPopupWindow(this).also {
                 it.anchorView = editor
                 it.isModal = false
                 nativeCompletionPopup = it
@@ -627,7 +634,7 @@ class MainActivity : GameActivity() {
                 popup.dismiss()
                 editor.requestFocus()
             }
-            if (!popup.isShowing) popup.show() else popup.show()
+            popup.show()
         }
     }
 
