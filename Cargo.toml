@@ -119,3 +119,8 @@ desktop_audio = ["rodio"]
 [dependencies.rodio]
 version = "0.20"
 optional = true
+
+# Mobile TextEdit patch: focused text fields otherwise steal every touch drag
+# from their ScrollArea, making code impossible to pan while the IME is open.
+[patch.crates-io]
+egui = { path = "vendor/egui-mobile/crates/egui" }

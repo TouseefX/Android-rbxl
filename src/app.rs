@@ -144,12 +144,6 @@ pub struct EditorApp {
     script_completion_dismissed_at: Option<(Ref, usize)>,
     /// Anchor/primary character positions from the previous editor frame.
     script_selection: Option<(usize, usize)>,
-    /// Android one-finger drags pan the code viewport rather than extending a
-    /// selection. Long-press/tap remains available for caret placement.
-    script_touch_drag_selection: Option<(usize, usize)>,
-    script_touch_drag_started_at: Option<std::time::Instant>,
-    script_touch_drag_distance: egui::Vec2,
-    script_touch_scrolling: bool,
     /// Character position to apply after opening a definition in another tab.
     pending_script_cursor: Option<usize>,
     script_references: Vec<luau_intelligence::Reference>,
@@ -322,10 +316,6 @@ impl Default for EditorApp {
             script_completion_selected: 0,
             script_completion_dismissed_at: None,
             script_selection: None,
-            script_touch_drag_selection: None,
-            script_touch_drag_started_at: None,
-            script_touch_drag_distance: egui::Vec2::ZERO,
-            script_touch_scrolling: false,
             pending_script_cursor: None,
             script_references: Vec::new(),
             show_symbol_rename: false,
@@ -2048,68 +2038,6 @@ ui.label("Place ID:");
                         }
                     }
 
-                    // A normal one-finger swipe in Android editors scrolls the
-                    // document. egui's desktop TextEdit instead turns every
-                    // swipe into a text selection, making navigation with the
-                    // keyboard open nearly impossible. Preserve the selection
-                    // from the start of the gesture and pan the enclosing code
-                    // ScrollArea by the finger movement. A stationary
-                    // tap/long-press is untouched, so caret/selection actions
-                    // still work.
-                    #[cfg(target_os = "android")]
-                    {
-                        // Only override TextEdit gestures while the software
-                        // keyboard is actually visible. With the IME closed,
-                        // leave egui's native kinetic ScrollArea handling alone
-                        // so ordinary browsing remains smooth.
-                        let ime_visible = crate::jni_bridge::is_ime_visible();
-                        let (pressed, down, origin, delta) = ui.input(|input| (
-                            input.pointer.any_pressed(),
-                            input.pointer.any_down(),
-                            input.pointer.press_origin(),
-                            input.pointer.delta(),
-                        ));
-                        if ime_visible
-                            && pressed
-                            && origin.is_some_and(|pos| output.response.rect.contains(pos))
-                        {
-                            self.script_touch_drag_selection = self.script_selection;
-                            self.script_touch_drag_started_at = Some(std::time::Instant::now());
-                            self.script_touch_drag_distance = egui::Vec2::ZERO;
-                            self.script_touch_scrolling = false;
-                        } else if ime_visible && down && self.script_touch_drag_started_at.is_some() {
-                            // Do not use pointer.delta() on the DOWN frame. On
-                            // Android/egui it can contain the distance from the
-                            // previous gesture and cause a jump.
-                            self.script_touch_drag_distance += delta;
-                            let held = self.script_touch_drag_started_at
-                                .map_or(std::time::Duration::ZERO, |at| at.elapsed());
-                            if held < std::time::Duration::from_millis(450)
-                                && self.script_touch_drag_distance.length() > 6.0
-                            {
-                                self.script_touch_scrolling = true;
-                            }
-                            if self.script_touch_scrolling {
-                                // Ui::scroll_with_delta describes movement of
-                                // the content, so it uses the finger delta (not
-                                // its inverse): swiping up moves code up.
-                                ui.scroll_with_delta(delta);
-                                if let Some((anchor, primary)) = self.script_touch_drag_selection {
-                                    reported_range = Some(egui::text::CCursorRange::two(
-                                        egui::text::CCursor::new(primary),
-                                        egui::text::CCursor::new(anchor),
-                                    ));
-                                    store_cursor = true;
-                                }
-                            }
-                        }
-                        if !ime_visible || !down {
-                            self.script_touch_drag_selection = None;
-                            self.script_touch_drag_started_at = None;
-                            self.script_touch_drag_distance = egui::Vec2::ZERO;
-                            self.script_touch_scrolling = false;
-                        }
-                    }
                     if store_cursor {
                         output.state.cursor.set_char_range(reported_range);
                         let id = output.response.id;
