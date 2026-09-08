@@ -573,7 +573,16 @@ impl TextEdit<'_> {
         let text_clip_rect = rect;
         let painter = ui.painter_at(text_clip_rect.expand(1.0)); // expand to avoid clipping cursor
 
-        if interactive && let Some(pointer_pos) = response.interact_pointer_pos() {
+        // `Response::interact_pointer_pos` may be empty on the release frame of
+        // an Android tap even though `response.clicked()`/`long_touched()` is
+        // true. PointerState::interact_pos deliberately retains that touch
+        // location for the frame, so use it as the mobile fallback. Without
+        // this, click-only TextEdit can scroll correctly but cannot place a
+        // caret or establish the long-press selection range.
+        let interaction_pos = response
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|input| input.pointer.interact_pos()));
+        if interactive && let Some(pointer_pos) = interaction_pos {
             if response.hovered() && text.is_mutable() {
                 ui.output_mut(|o| o.mutable_text_under_cursor = true);
             }

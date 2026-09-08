@@ -10,7 +10,9 @@ the Android IME is visible.
 Local changes:
 
 - `widgets/text_edit/builder.rs`: touch drags remain owned by the parent
-  `ScrollArea`, regardless of editor focus.
+  `ScrollArea`, regardless of editor focus. Android release-frame taps fall
+  back to `PointerState::interact_pos`, preserving exact caret placement and
+  long-press coordinates.
 - `text_selection/text_cursor_state.rs`: a normal click moves the caret even
   with click-only touch interaction, and a long touch selects the touched word,
   preserving mobile selection and the app's floating Copy/Cut/Paste toolbar.

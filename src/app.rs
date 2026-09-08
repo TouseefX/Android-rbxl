@@ -146,6 +146,8 @@ pub struct EditorApp {
     script_selection: Option<(usize, usize)>,
     /// Character position to apply after opening a definition in another tab.
     pending_script_cursor: Option<usize>,
+    /// Selection range requested by draggable Android selection handles.
+    pending_script_selection: Option<(usize, usize)>,
     script_references: Vec<luau_intelligence::Reference>,
     show_symbol_rename: bool,
     symbol_rename_input: String,
@@ -317,6 +319,7 @@ impl Default for EditorApp {
             script_completion_dismissed_at: None,
             script_selection: None,
             pending_script_cursor: None,
+            pending_script_selection: None,
             script_references: Vec::new(),
             show_symbol_rename: false,
             symbol_rename_input: String::new(),
@@ -1953,6 +1956,7 @@ ui.label("Place ID:");
 
         let mut cursor_char = self.script_completion_cursor;
         let mut completion_popup_pos = None;
+        let mut touch_selection_geometry = None;
         let active_line = cursor_char.map_or(1, |cursor| {
             tab.buffer.chars().take(cursor).filter(|c| *c == '\n').count() + 1
         });
@@ -2007,6 +2011,14 @@ ui.label("Place ID:");
                             egui::text::CCursor::new(cursor.min(tab.buffer.chars().count())),
                         ));
                         store_cursor = true;
+                    } else if let Some((anchor, primary)) = self.pending_script_selection.take() {
+                        output.response.request_focus();
+                        let count = tab.buffer.chars().count();
+                        reported_range = Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(primary.min(count)),
+                            egui::text::CCursor::new(anchor.min(count)),
+                        ));
+                        store_cursor = true;
                     } else if let Some((anchor, primary)) = pending_selection {
                         reported_range = Some(egui::text::CCursorRange::two(
                             egui::text::CCursor::new(primary),
@@ -2049,6 +2061,16 @@ ui.label("Place ID:");
                         completion_popup_pos = Some(
                             output.galley_pos + caret.left_bottom().to_vec2() + egui::vec2(0.0, 6.0),
                         );
+                        if range.primary.index != range.secondary.index {
+                            let anchor_rect = output.galley.pos_from_cursor(range.secondary);
+                            let primary_rect = output.galley.pos_from_cursor(range.primary);
+                            touch_selection_geometry = Some((
+                                output.galley.clone(),
+                                output.galley_pos,
+                                output.galley_pos + anchor_rect.left_bottom().to_vec2(),
+                                output.galley_pos + primary_rect.left_bottom().to_vec2(),
+                            ));
+                        }
                     }
                     // Buttons and the floating completion popup temporarily
                     // take egui focus, which makes TextEdit report no range.
@@ -2062,6 +2084,54 @@ ui.label("Place ID:");
                     }
                 });
             });
+
+        // Android-style draggable selection handles. They are rendered in the
+        // foreground because GameActivity has no native EditText from which the
+        // platform could create its standard blue handles.
+        if let (Some((galley, galley_pos, anchor_pos, primary_pos)), Some((anchor, primary))) =
+            (touch_selection_geometry, self.script_selection)
+        {
+            for (handle_index, handle_pos, current_anchor, current_primary) in [
+                (0_u8, anchor_pos, anchor, primary),
+                (1_u8, primary_pos, anchor, primary),
+            ] {
+                let mut dragged_to = None;
+                egui::Area::new(egui::Id::new(("touch_selection_handle", handle_index)))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(handle_pos - egui::vec2(13.0, 5.0))
+                    .show(ui.ctx(), |ui| {
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(26.0, 32.0),
+                            egui::Sense::drag(),
+                        );
+                        let center = egui::pos2(rect.center().x, rect.top() + 10.0);
+                        ui.painter().line_segment(
+                            [egui::pos2(center.x, rect.top()), center],
+                            egui::Stroke::new(2.0, Color32::from_rgb(40, 135, 255)),
+                        );
+                        ui.painter().circle_filled(
+                            center,
+                            7.0,
+                            Color32::from_rgb(40, 135, 255),
+                        );
+                        if response.dragged() {
+                            if let Some(pos) = response.interact_pointer_pos() {
+                                dragged_to = Some(
+                                    galley.cursor_from_pos(pos - galley_pos).index,
+                                );
+                            }
+                        }
+                    });
+                if let Some(index) = dragged_to {
+                    self.pending_script_selection = Some(if handle_index == 0 {
+                        (index, current_primary)
+                    } else {
+                        (current_anchor, index)
+                    });
+                    self.script_selection = self.pending_script_selection;
+                }
+            }
+        }
 
         // GameActivity has no native EditText, so Android cannot display its
         // stock floating selection ActionMode. Provide the equivalent controls
