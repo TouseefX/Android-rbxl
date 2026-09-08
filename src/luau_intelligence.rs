@@ -519,6 +519,20 @@ impl ProjectIndex {
                 continue;
             };
 
+            // Only report unknown members when the target module's public
+            // shape is actually knowable. Modules that build their exports
+            // dynamically (`M[name] = ...`), forward another module, or
+            // return a bare function have no statically complete member list,
+            // and flagging every access against an empty/partial map produced
+            // a wall of false "Unknown member" warnings.
+            let module_source = self.resolve_module_ref(current_script, &request)
+                .and_then(|referent| self.module_sources.get(&referent));
+            let shape_is_known = !members.is_empty()
+                && !module_source.is_some_and(|source| has_dynamic_exports(source));
+            if !shape_is_known {
+                continue;
+            }
+
             let needle = format!("{alias}.");
             for (line_index, line) in source.lines().enumerate() {
                 let code = line.split("--").next().unwrap_or("");
@@ -1617,7 +1631,7 @@ fn returned_binding_members(source: &str) -> BTreeMap<String, String> {
             .unwrap_or(code);
         let Some(rest) = code.strip_prefix(&owner_prefix) else { continue };
         let member = identifier_start(rest);
-        if !is_identifier(member) { continue }
+        if !is_identifier(member) || is_metamethod(member) { continue }
         let tail = rest[member.len()..].trim_start();
         let detail = if tail.starts_with('(') {
             function_signature(member, &rest[member.len()..])
@@ -1690,11 +1704,51 @@ fn type_declaration_members(source: &str, type_name: &str) -> BTreeMap<String, S
     BTreeMap::new()
 }
 
+/// Luau metamethods (`__index`, `__tostring`, ...) are implementation detail
+/// of the metatable, never a member a user means to autocomplete.
+fn is_metamethod(name: &str) -> bool {
+    name.starts_with("__")
+}
+
+/// Whether a module's public surface cannot be fully determined by reading
+/// the source: computed keys, forwarded modules, callable modules, or an
+/// `__index` fallback to another table. Completion still offers whatever was
+/// found, but "unknown member" diagnostics must stay silent for these.
+pub(crate) fn has_dynamic_exports(source: &str) -> bool {
+    let returned = returned_binding_name(source);
+    for raw in source.lines() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        // `return require(...)` / `return function(...)` — no member table.
+        if let Some(rest) = code.strip_prefix("return ") {
+            let rest = rest.split("::").next().unwrap_or(rest).trim();
+            if rest.starts_with("require(") || rest.starts_with("function") {
+                return true;
+            }
+        }
+        let Some(name) = returned else { continue };
+        // `M[key] = ...` builds exports with a computed key.
+        if code.starts_with(&format!("{name}[")) {
+            return true;
+        }
+        // `M.__index = Other` forwards lookups to a table we did not scan.
+        if let Some(rest) = code.strip_prefix(&format!("{name}.__index")) {
+            let target = rest.trim_start().strip_prefix('=').map(str::trim).unwrap_or("");
+            if is_identifier(target) && target != name {
+                return true;
+            }
+        }
+        if code.contains("setmetatable(") && code.contains("__index") {
+            return true;
+        }
+    }
+    false
+}
+
 fn collect_table_fields(body: &str, result: &mut BTreeMap<String, String>) {
     for field in split_top_level_fields(body) {
         let field = field.trim().trim_end_matches([',', ';']).trim();
         let name = identifier_start(field);
-        if !is_identifier(name) { continue }
+        if !is_identifier(name) || is_metamethod(name) { continue }
         let rest = field[name.len()..].trim_start();
         if let Some(value) = rest.strip_prefix('=') {
             let value = value.trim();
@@ -2001,6 +2055,56 @@ mod tests {
         assert!(!members.contains_key("RegistryMetatable"));
         assert!(!members.contains_key("freeze"));
         assert!(!members.contains_key("setmetatable"));
+    }
+
+    #[test]
+    fn metamethods_are_not_offered_as_module_members() {
+        let source = "local Class = {}\n\
+             Class.__index = Class\n\
+             function Class.new()\nend\n\
+             function Class:Destroy()\nend\n\
+             return Class\n";
+        let members = exported_members(source);
+        assert!(members.contains_key("new"));
+        assert!(members.contains_key("Destroy"));
+        assert!(!members.contains_key("__index"));
+    }
+
+    #[test]
+    fn dynamically_built_modules_suppress_unknown_member_warnings() {
+        // Computed keys, forwarded requires, and callable modules have no
+        // statically complete member list.
+        assert!(has_dynamic_exports(
+            "local M = {}\nfor _, name in ipairs(list) do\n\tM[name] = build(name)\nend\nreturn M",
+        ));
+        assert!(has_dynamic_exports("return require(script.Parent.Real)"));
+        assert!(has_dynamic_exports("return function(a, b)\n\treturn a + b\nend"));
+        // A plain static module, and the `Class.__index = Class` self
+        // reference, must stay strictly checked.
+        assert!(!has_dynamic_exports("local M = {}\nM.A = 1\nreturn M"));
+        assert!(!has_dynamic_exports("local C = {}\nC.__index = C\nreturn C"));
+    }
+
+    #[test]
+    fn no_unknown_member_warnings_for_dynamic_modules() {
+        let module = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.paths.insert(module, "Dynamic".into());
+        index.module_refs.insert("dynamic".into(), module);
+        let dynamic = "local M = {}\nM.Known = 1\nM[key] = 2\nreturn M";
+        index.module_sources.insert(module, dynamic.into());
+        index.modules.insert(
+            "dynamic".into(),
+            BTreeMap::from([("Known".into(), "field Known".into())]),
+        );
+        let warnings = index.diagnostics(
+            Ref::none(),
+            "const D = require(\"./Dynamic\")\nD.Whatever()",
+        );
+        assert!(
+            !warnings.iter().any(|warning| warning.message.contains("Unknown member")),
+            "dynamic module produced false positives: {warnings:?}",
+        );
     }
 
     #[test]
