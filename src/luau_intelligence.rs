@@ -1496,9 +1496,13 @@ fn skip_type_annotation(source: &str, index: usize, line: &mut usize) -> (Option
                 i += 2;
                 continue;
             }
+            // An unterminated string inside the type ends at the newline; stop
+            // WITHOUT consuming it so the scope scanner still sees the Newline
+            // token and commits the `local name` declaration.
             if byte == b'\n' {
-                quote = None;
-            } else if byte == active {
+                break;
+            }
+            if byte == active {
                 quote = None;
             }
             i += 1;
@@ -1510,11 +1514,7 @@ fn skip_type_annotation(source: &str, index: usize, line: &mut usize) -> (Option
             b')' | b']' | b'}' | b'>' if depth > 0 => depth -= 1,
             b')' | b',' | b'=' | b';' if depth == 0 => break,
             b'-' if bytes.get(i + 1) == Some(&b'-') => skip_comment(source, &mut i, line),
-            b'\n' => {
-                *line += 1;
-                i += 1;
-                continue;
-            }
+            b'\n' => break,
             _ if is_identifier_start(Some(byte)) && first_identifier.is_none() && depth == 0 => {
                 let start = i;
                 i = read_identifier_end(source, i);
@@ -1727,7 +1727,9 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
     let mut names: Vec<RawBinding> = Vec::new();
     let mut expect_name = false;
     let mut for_vars: Vec<RawBinding> = Vec::new();
-    let mut in_for_header = false;
+    /// None = not in a for header; Some(false) = headers still collecting the
+    /// loop variables; Some(true) = variables collected, awaiting `do`.
+    let mut in_for_header: Option<bool> = None;
 
     while let Some(token) = next_token(source, &mut index, &mut line) {
         match token {
@@ -1792,13 +1794,17 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                     scopes.push((ScopeKind::Function, function_scope));
                 }
                 "for" => {
-                    in_for_header = true;
+                    in_for_header = Some(false);
                     for_vars.clear();
                     expect_name = false;
                 }
-                "in" => in_for_header = false,
+                "in" => {
+                    if in_for_header.is_some() {
+                        in_for_header = Some(true);
+                    }
+                }
                 "do" => {
-                    if in_for_header && !for_vars.is_empty() {
+                    if in_for_header.is_some() {
                         let mut loop_scope = LocalScope::default();
                         for var in for_vars.drain(..) {
                             loop_scope.bindings.push(LocalBinding {
@@ -1809,10 +1815,10 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                             });
                         }
                         scopes.push((ScopeKind::Loop, loop_scope));
+                        in_for_header = None;
                     } else {
                         scopes.push((ScopeKind::Block, LocalScope::default()));
                     }
-                    in_for_header = false;
                 }
                 "then" => scopes.push((ScopeKind::IfBranch, LocalScope::default())),
                 "elseif" => {
@@ -1862,7 +1868,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                             }
                             DeclState::Names { .. } => {}
                         }
-                    } else if in_for_header {
+                    } else if matches!(in_for_header, Some(false)) {
                         for_vars.push(RawBinding {
                             name: word.to_string(),
                             annotation: None,
@@ -1887,8 +1893,8 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                         }
                         commit_bindings(&mut scopes, &mut names, is_const);
                     }
-                    if in_for_header {
-                        in_for_header = false;
+                    if matches!(in_for_header, Some(false)) {
+                        in_for_header = Some(true);
                     }
                     expect_name = false;
                 }
