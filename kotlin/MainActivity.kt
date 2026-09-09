@@ -29,7 +29,9 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.ViewCompat
 import com.google.androidgamesdk.GameActivity
+import io.github.rosemoe.sora.event.ContentChangeEvent
 import io.github.rosemoe.sora.widget.CodeEditor
+import io.github.rosemoe.sora.widget.component.EditorAutoCompletion
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -517,6 +519,25 @@ class MainActivity : GameActivity() {
             getProps().cancelCompletionNs = 0L
             setText(normalizedSource)
         }
+        // Re-ask for completions after an auto-paired quote or bracket.
+        //
+        // commitText() inserts the pair and then calls setSelection() with
+        // CAUSE_UNKNOWN, and EditorAutoCompletion.onSelectionChange() hides the
+        // window unconditionally for that cause. So typing the opening quote of
+        // require('') showed nothing, while typing a '.' afterwards -- a plain
+        // insert with no pairing -- worked. Re-requesting on the next frame
+        // runs after the hide() and puts the path list back.
+        editor.subscribeEvent(ContentChangeEvent::class.java) { event, _ ->
+            if (event.action == ContentChangeEvent.ACTION_INSERT &&
+                event.changedText.length == 1 &&
+                event.changedText[0] in PAIRED_OPENERS
+            ) {
+                editor.post {
+                    editor.getComponent(EditorAutoCompletion::class.java).requireCompletion()
+                }
+            }
+        }
+
         // Position the caret by translating the Rust character index into
         // the (line, column) pair sora addresses text with.
         val caret = editor.text.getIndexer().getCharPosition(
@@ -893,6 +914,13 @@ class MainActivity : GameActivity() {
          */
         const val INDENT_WIDTH = 4
         val INDENT_UNIT = " ".repeat(INDENT_WIDTH)
+
+        /**
+         * Openers that LuauLanguage auto-pairs. Inserting one ends with a
+         * setSelection(CAUSE_UNKNOWN) that hides the completion window, so
+         * these are the characters after which it has to be re-requested.
+         */
+        val PAIRED_OPENERS = charArrayOf('"', '\'', '(', '[', '{')
 
         /** Quick-insert symbol row for keys Android keyboards bury in submenus. */
         val EXTRA_KEYS = listOf(
