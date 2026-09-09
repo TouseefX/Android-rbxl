@@ -201,95 +201,261 @@ class LuauLanguage(
             val value = text.toString()
             var line = 0
             var lineStart = 0
+            // Last significant character, used to tell `a.b` / `a:b` members
+            // from free variables.
+            var previousSignificant = ' '
+
+            /** Emits a span, advancing the row counters across any newlines. */
+            fun spanTo(index: Int, colorId: Int) {
+                builder.addIfNeeded(line, (index - lineStart).coerceAtLeast(0), TextStyle.makeStyle(colorId))
+            }
+
+            /**
+             * Moves the cursor to [target], keeping line/column in sync. Tokens
+             * may span lines (long strings and comments), and MappedSpans
+             * throws if spans arrive on a decreasing line, so the counters have
+             * to be advanced across every newline that is skipped over.
+             */
+            fun advance(from: Int, target: Int, colorId: Int) {
+                for (i in from until target) {
+                    if (value[i] == '\n') {
+                        line++
+                        lineStart = i + 1
+                        builder.addIfNeeded(line, 0, TextStyle.makeStyle(colorId))
+                    }
+                }
+            }
+
             var index = 0
-
-            fun span(column: Int, colorId: Int) =
-                builder.addIfNeeded(line, column, TextStyle.makeStyle(colorId))
-
-            span(0, EditorColorScheme.TEXT_NORMAL)
+            spanTo(0, EditorColorScheme.TEXT_NORMAL)
             while (index < value.length) {
                 if (delegate.isCancelled) break
                 val character = value[index]
-                when {
-                    character == '\n' -> {
-                        line++
-                        index++
-                        lineStart = index
-                        span(0, EditorColorScheme.TEXT_NORMAL)
-                        continue
-                    }
-                    // Comments run to end of line; long comments to their close.
-                    character == '-' && value.getOrNull(index + 1) == '-' -> {
-                        span(index - lineStart, EditorColorScheme.COMMENT)
-                        val long = longBracketLength(value, index + 2)
-                        val commentEnd = if (long > 0) {
-                            skipLongBracket(value, index + 2 + long, long)
-                        } else {
-                            val newline = value.indexOf('\n', index)
-                            if (newline < 0) value.length else newline
-                        }
-                        // A long comment may span lines, so the line counters
-                        // have to be resynced across the skipped region --
-                        // otherwise every span below it lands on the wrong row.
-                        for (i in index until commentEnd) {
-                            if (value[i] == '\n') {
-                                line++
-                                lineStart = i + 1
-                                span(0, EditorColorScheme.COMMENT)
-                            }
-                        }
-                        index = commentEnd
-                        span(index - lineStart, EditorColorScheme.TEXT_NORMAL)
-                        continue
-                    }
-                    character == '"' || character == '\'' || character == '`' -> {
-                        span(index - lineStart, EditorColorScheme.LITERAL)
-                        index++
-                        while (index < value.length && value[index] != character) {
-                            if (value[index] == '\\' && index + 1 < value.length) {
-                                index++
-                            } else if (value[index] == '\n') {
-                                // Backtick interpolated strings may span lines.
-                                line++
-                                lineStart = index + 1
-                                span(0, EditorColorScheme.LITERAL)
-                            }
-                            index++
-                        }
-                        if (index < value.length) index++
-                        span(index - lineStart, EditorColorScheme.TEXT_NORMAL)
-                        continue
-                    }
-                    character.isDigit() -> {
-                        span(index - lineStart, EditorColorScheme.LITERAL)
-                        while (index < value.length &&
-                            (value[index].isLetterOrDigit() || value[index] == '.' || value[index] == '_')
-                        ) index++
-                        span(index - lineStart, EditorColorScheme.TEXT_NORMAL)
-                        continue
-                    }
-                    character.isLetter() || character == '_' -> {
-                        val start = index
-                        while (index < value.length &&
-                            (value[index].isLetterOrDigit() || value[index] == '_')
-                        ) index++
-                        val word = value.substring(start, index)
-                        // A name followed by '(' reads as a call, which is the
-                        // cheap way to get function coloring without a parser.
-                        var probe = index
-                        while (probe < value.length && value[probe] == ' ') probe++
-                        val colorId = when {
-                            word in KEYWORDS -> EditorColorScheme.KEYWORD
-                            word in LITERALS -> EditorColorScheme.LITERAL
-                            value.getOrNull(probe) == '(' -> EditorColorScheme.FUNCTION_NAME
-                            else -> EditorColorScheme.IDENTIFIER_NAME
-                        }
-                        span(start - lineStart, colorId)
-                        span(index - lineStart, EditorColorScheme.TEXT_NORMAL)
-                        continue
-                    }
-                    else -> index++
+
+                if (character == '\n') {
+                    line++
+                    index++
+                    lineStart = index
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    continue
                 }
+                if (character == ' ' || character == '\t' || character == '\r') {
+                    index++
+                    continue
+                }
+
+                // Comments: `--` to end of line, or --[[ ]] / --[==[ ]==].
+                if (character == '-' && value.getOrNull(index + 1) == '-') {
+                    val level = longBracketLength(value, index + 2)
+                    val end = if (level > 0) {
+                        skipLongBracket(value, index + 2 + level, level)
+                    } else {
+                        val newline = value.indexOf('\n', index)
+                        if (newline < 0) value.length else newline
+                    }
+                    spanTo(index, EditorColorScheme.COMMENT)
+                    advance(index, end, EditorColorScheme.COMMENT)
+                    index = end
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    continue
+                }
+
+                // Long strings: [[ ]] and [==[ ]==].
+                val openLevel = longBracketLength(value, index)
+                if (openLevel > 0) {
+                    val end = skipLongBracket(value, index + openLevel, openLevel)
+                    spanTo(index, EditorColorScheme.LITERAL)
+                    advance(index, end, EditorColorScheme.LITERAL)
+                    index = end
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    continue
+                }
+
+                // Interpolated strings: the {...} holes contain real code, so
+                // they are highlighted as code rather than as string body.
+                if (character == '`') {
+                    spanTo(index, EditorColorScheme.LITERAL)
+                    var scan = index + 1
+                    while (scan < value.length && value[scan] != '`') {
+                        val c = value[scan]
+                        if (c == '\\') {
+                            if (value.getOrNull(scan + 1) == '\n') {
+                                line++
+                                lineStart = scan + 2
+                                builder.addIfNeeded(line, 0, TextStyle.makeStyle(EditorColorScheme.LITERAL))
+                            }
+                            scan += 2
+                            continue
+                        }
+                        if (c == '\n') {
+                            line++
+                            lineStart = scan + 1
+                            builder.addIfNeeded(line, 0, TextStyle.makeStyle(EditorColorScheme.LITERAL))
+                            scan++
+                            continue
+                        }
+                        if (c == '{') {
+                            spanTo(scan, EditorColorScheme.OPERATOR)
+                            spanTo(scan + 1, EditorColorScheme.TEXT_NORMAL)
+                            var depth = 1
+                            var k = scan + 1
+                            while (k < value.length && depth > 0) {
+                                when (value[k]) {
+                                    '{' -> depth++
+                                    '}' -> depth--
+                                    '\\' -> {
+                                        if (value.getOrNull(k + 1) == '\n') {
+                                            line++
+                                            lineStart = k + 2
+                                            builder.addIfNeeded(line, 0, TextStyle.makeStyle(EditorColorScheme.TEXT_NORMAL))
+                                        }
+                                        k++
+                                    }
+                                    '\n' -> {
+                                        line++
+                                        lineStart = k + 1
+                                        builder.addIfNeeded(line, 0, TextStyle.makeStyle(EditorColorScheme.TEXT_NORMAL))
+                                    }
+                                }
+                                k++
+                            }
+                            if (depth == 0) {
+                                spanTo(k - 1, EditorColorScheme.OPERATOR)
+                                spanTo(k, EditorColorScheme.LITERAL)
+                            }
+                            scan = k
+                            continue
+                        }
+                        scan++
+                    }
+                    val end = (scan + 1).coerceAtMost(value.length)
+                    index = end
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    continue
+                }
+
+                // Quoted strings; a bare newline ends them, as in Luau.
+                if (character == '"' || character == '\'') {
+                    spanTo(index, EditorColorScheme.LITERAL)
+                    var scan = index + 1
+                    while (scan < value.length && value[scan] != character) {
+                        if (value[scan] == '\\') {
+                            // A backslash-escaped newline stays inside the
+                            // string, so the row counter has to follow it.
+                            if (value.getOrNull(scan + 1) == '\n') {
+                                line++
+                                lineStart = scan + 2
+                                builder.addIfNeeded(line, 0, TextStyle.makeStyle(EditorColorScheme.LITERAL))
+                                scan += 2
+                                continue
+                            }
+                            scan++
+                        }
+                        if (scan < value.length && value[scan] == '\n') break
+                        scan++
+                    }
+                    // An unterminated string stops AT the newline. Consuming it
+                    // here would leave `line` behind the real text and produce
+                    // a column past the end of the row.
+                    index = if (scan < value.length && value[scan] == '\n') {
+                        scan
+                    } else {
+                        (scan + 1).coerceAtMost(value.length)
+                    }
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    continue
+                }
+
+                // Numbers: 0xFF_A0, 0b1010, 1_000.5e-3, .5
+                if (character.isDigit() ||
+                    (character == '.' && value.getOrNull(index + 1)?.isDigit() == true)
+                ) {
+                    var scan = index
+                    val second = value.getOrNull(index + 1)
+                    if (character == '0' && (second == 'x' || second == 'X')) {
+                        scan = index + 2
+                        while (scan < value.length &&
+                            (value[scan].isDigit() || value[scan] in "abcdefABCDEF_")
+                        ) scan++
+                    } else if (character == '0' && (second == 'b' || second == 'B')) {
+                        scan = index + 2
+                        while (scan < value.length && (value[scan] == '0' || value[scan] == '1' || value[scan] == '_')) scan++
+                    } else {
+                        while (scan < value.length && (value[scan].isDigit() || value[scan] == '_')) scan++
+                        if (scan < value.length && value[scan] == '.') {
+                            scan++
+                            while (scan < value.length && (value[scan].isDigit() || value[scan] == '_')) scan++
+                        }
+                        if (scan < value.length && (value[scan] == 'e' || value[scan] == 'E')) {
+                            var exponent = scan + 1
+                            if (exponent < value.length && (value[exponent] == '+' || value[exponent] == '-')) exponent++
+                            if (exponent < value.length && value[exponent].isDigit()) {
+                                scan = exponent
+                                while (scan < value.length && value[scan].isDigit()) scan++
+                            }
+                        }
+                    }
+                    spanTo(index, EditorColorScheme.LITERAL)
+                    index = scan
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    continue
+                }
+
+                // Attributes: @native, @checked.
+                if (character == '@') {
+                    var scan = index + 1
+                    while (scan < value.length && (value[scan].isLetterOrDigit() || value[scan] == '_')) scan++
+                    spanTo(index, EditorColorScheme.ANNOTATION)
+                    index = scan
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    continue
+                }
+
+                // Identifiers and keywords.
+                if (character.isLetter() || character == '_') {
+                    var scan = index
+                    while (scan < value.length && (value[scan].isLetterOrDigit() || value[scan] == '_')) scan++
+                    val word = value.substring(index, scan)
+                    var probe = scan
+                    while (probe < value.length && (value[probe] == ' ' || value[probe] == '\t')) probe++
+                    val next = value.getOrNull(probe)
+                    val colorId = when {
+                        word in KEYWORDS -> EditorColorScheme.KEYWORD
+                        word in LITERALS -> EditorColorScheme.LITERAL
+                        word in BUILTIN_TYPES -> EditorColorScheme.KEYWORD
+                        // A name applied to a call, string or table literal is
+                        // a call: f(), f"s", f{...}, f`s`.
+                        next == '(' || next == '`' || next == '{' || next == '"' || next == '\'' ->
+                            EditorColorScheme.FUNCTION_NAME
+                        previousSignificant == ':' || previousSignificant == '.' ->
+                            EditorColorScheme.IDENTIFIER_NAME
+                        else -> EditorColorScheme.IDENTIFIER_VAR
+                    }
+                    spanTo(index, colorId)
+                    index = scan
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    previousSignificant = 'w'
+                    continue
+                }
+
+                // Operators and punctuation, longest match first so that `::`,
+                // `->`, `+=` and `...` are single tokens.
+                if (character in OPERATOR_CHARS) {
+                    val three = value.substring(index, (index + 3).coerceAtMost(value.length))
+                    val two = value.substring(index, (index + 2).coerceAtMost(value.length))
+                    val width = when {
+                        three in OPERATORS_3 -> 3
+                        two in OPERATORS_2 -> 2
+                        else -> 1
+                    }
+                    spanTo(index, EditorColorScheme.OPERATOR)
+                    previousSignificant = if (width == 1) character else 'o'
+                    index += width
+                    spanTo(index, EditorColorScheme.TEXT_NORMAL)
+                    continue
+                }
+
+                index++
             }
             builder.determine(line)
             return Styles(builder.build())
@@ -313,6 +479,26 @@ class LuauLanguage(
             "and", "or", "not", "in", "export", "type", "self"
         )
         private val LITERALS = setOf("true", "false", "nil")
+
+        /**
+         * Builtin type names. Coloured as keywords wherever they appear:
+         * they are not reserved words, but shadowing them is rare enough that
+         * treating them as types reads better than treating them as variables.
+         */
+        private val BUILTIN_TYPES = setOf(
+            "number", "string", "boolean", "thread", "userdata", "any",
+            "unknown", "never", "buffer", "vector", "typeof", "keyof"
+        )
+
+        private const val OPERATOR_CHARS = "+-*/%^#=~<>(){}[];:,.|&?"
+
+        /** Three-character operators, matched before the two-character set. */
+        private val OPERATORS_3 = setOf("...", "//=", "..=")
+
+        private val OPERATORS_2 = setOf(
+            "==", "~=", "<=", ">=", "..", "->", "+=", "-=", "*=", "/=",
+            "%=", "^=", "::", "//"
+        )
 
         /** `[[`, `[=[` ... : returns the number of '=' signs, or -1 if absent. */
         private fun longBracketLength(text: String, at: Int): Int {
@@ -445,10 +631,15 @@ class LuauLanguage(
             setColor(EditorColorScheme.KEYWORD, android.graphics.Color.rgb(205, 125, 255))
             setColor(EditorColorScheme.COMMENT, android.graphics.Color.rgb(105, 170, 105))
             setColor(EditorColorScheme.LITERAL, android.graphics.Color.rgb(225, 190, 125))
-            setColor(EditorColorScheme.IDENTIFIER_NAME, android.graphics.Color.rgb(225, 225, 225))
+            // Members after '.' or ':' get their own tint so `obj.field` reads
+            // differently from a free variable.
+            setColor(EditorColorScheme.IDENTIFIER_NAME, android.graphics.Color.rgb(156, 220, 254))
             setColor(EditorColorScheme.IDENTIFIER_VAR, android.graphics.Color.rgb(225, 225, 225))
             setColor(EditorColorScheme.FUNCTION_NAME, android.graphics.Color.rgb(115, 195, 255))
-            setColor(EditorColorScheme.OPERATOR, android.graphics.Color.rgb(225, 225, 225))
+            // Dimmer than text so punctuation recedes and names stand out.
+            setColor(EditorColorScheme.OPERATOR, android.graphics.Color.rgb(190, 190, 195))
+            // Attributes such as @native / @checked.
+            setColor(EditorColorScheme.ANNOTATION, android.graphics.Color.rgb(220, 220, 145))
             setColor(EditorColorScheme.CURRENT_LINE, android.graphics.Color.rgb(42, 42, 44))
             setColor(EditorColorScheme.SELECTION_INSERT, android.graphics.Color.rgb(120, 190, 255))
             setColor(EditorColorScheme.SELECTION_HANDLE, android.graphics.Color.rgb(120, 190, 255))
