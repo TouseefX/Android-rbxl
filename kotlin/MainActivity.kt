@@ -508,6 +508,13 @@ class MainActivity : GameActivity() {
             setWordwrap(nativeEditorWordWrap)
             tabWidth = INDENT_WIDTH
             isHighlightCurrentLine = true
+            // Two completion requests closer together than this are dropped
+            // and the window is hidden. The 70ms default assumes a language
+            // that answers instantly; ours makes a round trip to the Rust
+            // index, so ordinary typing kept landing inside the window and
+            // the popup only appeared after a pause -- which is why typing a
+            // space and deleting it "fixed" it. Effectively disabled.
+            getProps().cancelCompletionNs = 0L
             setText(normalizedSource)
         }
         // Position the caret by translating the Rust character index into

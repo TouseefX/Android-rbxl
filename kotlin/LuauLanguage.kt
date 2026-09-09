@@ -2,6 +2,7 @@ package com.yourname.rbxleditor
 
 import android.os.Bundle
 import io.github.rosemoe.sora.lang.EmptyLanguage
+import io.github.rosemoe.sora.lang.Language
 import io.github.rosemoe.sora.lang.analysis.AnalyzeManager
 import io.github.rosemoe.sora.lang.analysis.SimpleAnalyzeManager
 import io.github.rosemoe.sora.lang.completion.CompletionCancelledException
@@ -86,6 +87,15 @@ class LuauLanguage(
 
     override fun getAnalyzeManager(): AnalyzeManager = analyzer
 
+    /**
+     * SLIGHT, not the inherited STRONG. This language blocks in
+     * requireAutoComplete waiting on the Rust index; STRONG lets sora call
+     * interrupt() on that thread when a newer keystroke supersedes the
+     * request, which aborts the in-flight wait rather than letting it finish
+     * cheaply. The generation check already discards stale replies.
+     */
+    override fun getInterruptionLevel(): Int = Language.INTERRUPTION_LEVEL_SLIGHT
+
     override fun getIndentAdvance(content: ContentReference, line: Int, column: Int): Int {
         val text = content.getLine(line).substring(0, column.coerceAtMost(content.getColumnCount(line)))
         return if (opensLuauBlock(stripLuauComment(text).trimEnd())) INDENT_WIDTH else 0
@@ -159,10 +169,24 @@ class LuauLanguage(
         // The reply is produced by the Rust event loop, which drains the JNI
         // channel once per frame, so the budget has to cover a few frames
         // rather than just the indexing cost.
-        val items = inbox.poll(COMPLETION_TIMEOUT_MS, TimeUnit.MILLISECONDS) ?: return
+        //
+        // getInterruptionLevel() is SLIGHT rather than the inherited STRONG,
+        // so a superseded request no longer interrupt()s this thread while it
+        // is parked here. Under STRONG the InterruptedException landed inside
+        // poll(), the reply was discarded, and the suggestion for the
+        // keystroke that actually mattered went missing.
+        val items = try {
+            inbox.poll(COMPLETION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return
+        } ?: return
         if (request != generation) return
         publisher.addItems(items)
-        publisher.updateList()
+        // forced=true takes the lock instead of tryLock: with the default the
+        // update is silently dropped whenever the UI thread happens to hold
+        // it, which showed up as completions that appeared only sometimes.
+        publisher.updateList(true)
     }
 
     override fun destroy() {
@@ -494,8 +518,11 @@ class LuauLanguage(
          * How long the completion worker waits for the Rust index to answer.
          * Sora cancels and re-requests on the next keystroke anyway, so a miss
          * here costs one stale popup frame, not a lost suggestion.
+         *
+         * Kept modest deliberately: sora runs one completion thread, so a long
+         * wait here delays the *next* keystroke's request as well as this one.
          */
-        const val COMPLETION_TIMEOUT_MS = 400L
+        const val COMPLETION_TIMEOUT_MS = 250L
 
         private val KEYWORDS = setOf(
             "local", "function", "end", "if", "then", "else", "elseif", "for",
