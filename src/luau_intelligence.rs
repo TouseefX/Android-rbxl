@@ -4,6 +4,7 @@
 //! modern string requires (`./`, `../`, and `@self`), and exposes ModuleScript
 //! members without requiring a filesystem or an external language server.
 
+use crate::roblox_api_data as api;
 use crate::{rbxl, schema};
 use rbx_dom_weak::{types::Ref, WeakDom};
 use std::collections::{BTreeMap, HashMap};
@@ -214,7 +215,36 @@ impl ProjectIndex {
         if let Some(typed) = require_string_at_cursor(&source[..cursor_byte]) {
             return self.complete_require_path(current_script, typed);
         }
-        if let Some((root, parent, prefix)) = nested_member_expression_at_end(&source[..cursor_byte]) {
+        if let Some((root, parent, prefix, nested_separator)) =
+            nested_member_expression_at_end(&source[..cursor_byte])
+        {
+            // `Enum.KeyCode.K` — enum container completes to enum names, and
+            // an enum name completes to its items.
+            if root.eq_ignore_ascii_case("Enum") {
+                if parent.contains('.') {
+                    return Vec::new();
+                }
+                return if api::enum_items(&parent).is_some() {
+                    enum_item_completions(&parent, prefix)
+                } else {
+                    enum_name_completions(prefix)
+                };
+            }
+            // Type-flow through API members: `player.CharacterAdded.Co` →
+            // Player → CharacterAdded (RBXScriptSignal) → Connect/Wait.
+            let root_type = innermost_local(&locals, root)
+                .and_then(|binding| binding.instance_class.clone())
+                .or_else(|| match api::global_type(root) {
+                    Some(api_type) if api_type.starts_with("@lib:") || api_type == "@enum" => None,
+                    Some(api_type) => Some(api_type.to_string()),
+                    None => None,
+                });
+            if let Some(owner) = parent_type_for_path(root_type.as_deref(), &parent) {
+                let members = api_member_completions(&owner, prefix, nested_separator);
+                if !members.is_empty() {
+                    return members;
+                }
+            }
             let aliases = require_aliases(source);
             // Only resolve modules that are actually bound in this script's
             // scope. Previously a module name alone (`Module.Create().x`) was
@@ -285,13 +315,18 @@ impl ProjectIndex {
                 }
             }
 
-            // Reflection-backed properties for locals whose class is known
-            // (`local part = Instance.new("Part")` or `local part: BasePart`).
-            // Only these can describe instance members; a plain unknown local
-            // must not fall back to a ModuleScript of the same name, because
+            // Typed locals (annotations, Instance.new, GetService, property
+            // chains) get kind-aware API members: properties/events/statics
+            // through `.`, methods ONLY through `:` — `part.Destroy` is never
+            // offered, `part:Destroy` is. A plain unknown local must not fall
+            // back to a ModuleScript of the same name, because
             // `local Debris = {}` is not the Debris module.
             if let Some(binding) = local {
                 if let Some(class_name) = &binding.instance_class {
+                    let members = api_member_completions(class_name, prefix, separator);
+                    if !members.is_empty() {
+                        return members;
+                    }
                     if separator == '.' {
                         let properties: Vec<_> = schema::get_class_schema_properties(class_name)
                             .into_iter()
@@ -309,25 +344,15 @@ impl ProjectIndex {
                         }
                     }
                 }
+                // Local shadows any built-in of the same name; never invent
+                // members for an untyped local.
+                return Vec::new();
             }
 
-            // Roblox datatypes/globals take precedence over a coincidentally
-            // named ModuleScript (for example Color3 must keep fromRGB casing).
-            // A local binding of the same name shadows the global in Luau, so
-            // only offer them when no local is in scope.
-            let builtin: Vec<_> = if local.is_none() {
-                roblox_member_completions(alias, prefix)
-                    .into_iter().filter(|item| roblox_access_matches(alias, &item.label, separator)).collect()
-            } else {
-                Vec::new()
-            };
-            if !builtin.is_empty() { return builtin; }
-
-            // A dotted expression is a member lookup, never a new lexical
-            // keyword. Falling through used to turn `game.f` into `game.game`.
-            // Note: module members are intentionally NOT offered for a bare
-            // module name here — the script must have bound it via require.
-            builtin
+            // No local: built-in globals/services/datatypes/libraries/enums
+            // complete from the generated API data (kind-aware). A bare module
+            // name is still never resolved — it must be require()d.
+            return global_member_completions(alias, prefix, separator);
         }
         let before_cursor = &source[..cursor_byte];
         // Nested member chains (e.g. Module.Factory().value) need type-flow
@@ -369,6 +394,22 @@ impl ProjectIndex {
                         label: binding.name.clone(),
                         detail,
                         insert_text: binding.name.clone(),
+                        replace_chars: prefix.chars().count(),
+                    });
+                }
+            }
+            // Generated Roblox globals/datatypes/libraries (Vector3, task,
+            // game, script, ...) — never ModuleScript names.
+            for &(label, detail, insert) in api::BARE_GLOBALS {
+                let candidate = label.to_ascii_lowercase();
+                if (candidate.starts_with(&lower)
+                    || (lower.len() >= 3 && common_prefix_len(&candidate, &lower) >= 2))
+                    && seen.insert(candidate)
+                {
+                    completions.push(Completion {
+                        label: label.to_string(),
+                        detail: detail.to_string(),
+                        insert_text: insert.to_string(),
                         replace_chars: prefix.chars().count(),
                     });
                 }
@@ -1037,64 +1078,121 @@ fn require_path(expression: &str) -> String {
         .replace("\")", "").replace('.', "/")
 }
 
-fn roblox_access_matches(owner: &str, member: &str, separator: char) -> bool {
-    let method = match owner {
-        "game" | "Game" => matches!(member, "GetService" | "FindService" | "IsLoaded" | "GetDescendants" | "GetChildren"),
-        "workspace" | "Workspace" => member != "CurrentCamera",
-        "script" => !matches!(member, "Parent" | "Name"),
-        // Constructors/static datatype functions use dot syntax.
-        _ => false,
-    };
-    if separator == ':' { method } else { !method }
+/// Kind-aware completions for a known API type: properties/events/statics
+/// complete through `.`; methods complete ONLY through `:` (Roblox methods
+/// are colon functions — `part.Destroy` is never offered).
+fn api_member_completions(owner_type: &str, prefix: &str, separator: char) -> Vec<Completion> {
+    let lower = prefix.to_ascii_lowercase();
+    let owner = owner_type.strip_prefix("Enum:").unwrap_or(owner_type);
+    api::members_of(owner)
+        .into_iter()
+        .filter(|(name, _, kind, _)| {
+            api::kind_matches_separator(*kind, separator)
+                && name.to_ascii_lowercase().starts_with(&lower)
+        })
+        .take(12)
+        .map(|(name, detail, _, _)| Completion {
+            label: name.to_string(),
+            detail: format!("{detail}  ·  {owner_type}"),
+            insert_text: name.to_string(),
+            replace_chars: prefix.chars().count(),
+        })
+        .collect()
 }
 
-fn roblox_member_completions(owner: &str, prefix: &str) -> Vec<Completion> {
-    // Instance properties are handled by complete_at from the scope-aware
-    // local binding table (with typed/new annotation), so this only covers
-    // Roblox datatype constructors and global services.
-    let items: &[(&str, &str)] = match owner {
-        "Color3" => &[
-            ("fromRGB", "Color3 from 0–255 red, green, and blue"),
-            ("fromHSV", "Color3 from hue, saturation, and value"),
-            ("new", "Color3 from 0–1 red, green, and blue"),
-        ],
-        "Vector3" => &[("new", "Create a Vector3"), ("zero", "Zero vector"), ("one", "Unit vector")],
-        "Vector2" => &[("new", "Create a Vector2"), ("zero", "Zero vector"), ("one", "Unit vector")],
-        "CFrame" => &[("new", "Create a CFrame"), ("lookAt", "Create an oriented CFrame"), ("Angles", "Create a rotation CFrame")],
-        "UDim2" => &[("new", "Create a UDim2"), ("fromScale", "Create from scale values"), ("fromOffset", "Create from pixel offsets")],
-        "game" | "Game" => &[
-            ("GetService", "Roblox DataModel service lookup"),
-            ("FindService", "Find a loaded Roblox service"),
-            ("IsLoaded", "Whether the place finished loading"),
-            ("GetDescendants", "All descendants of the DataModel"),
-            ("GetChildren", "Children of the DataModel"),
-            ("Workspace", "Workspace service"),
-            ("Players", "Players service"),
-            ("ReplicatedStorage", "ReplicatedStorage service"),
-        ],
-        "workspace" | "Workspace" => &[
-            ("CurrentCamera", "Current workspace camera"),
-            ("FindFirstChild", "Find a child instance"),
-            ("WaitForChild", "Wait for a child instance"),
-            ("GetChildren", "Children of Workspace"),
-            ("GetDescendants", "All Workspace descendants"),
-            ("Raycast", "Cast a ray through Workspace"),
-        ],
-        "script" => &[
-            ("Parent", "Parent instance"),
-            ("Name", "Instance name"),
-            ("FindFirstChild", "Find a child instance"),
-            ("WaitForChild", "Wait for a child instance"),
-            ("GetChildren", "Child instances"),
-        ],
-        _ => return Vec::new(),
+/// Members of the built-in globals/services/datatypes/libraries (`game`,
+/// `workspace`, `script`, `Vector3`, `task`, `Enum`, ...) from the generated
+/// API tables. Kind-aware: methods only via `:`.
+fn global_member_completions(owner: &str, prefix: &str, separator: char) -> Vec<Completion> {
+    if owner.eq_ignore_ascii_case("Enum") {
+        return enum_name_completions(prefix);
+    }
+    let Some(api_type) = api::global_type(owner) else {
+        return Vec::new();
     };
+    if let Some(library) = api_type.strip_prefix("@lib:") {
+        let lower = prefix.to_ascii_lowercase();
+        let Some(members) = api::library(library) else {
+            return Vec::new();
+        };
+        return members
+            .iter()
+            .filter(|(name, _, kind, _)| {
+                api::kind_matches_separator(*kind, separator)
+                    && name.to_ascii_lowercase().starts_with(&lower)
+            })
+            .take(12)
+            .map(|(name, detail, _, _)| Completion {
+                label: name.to_string(),
+                detail: format!("{detail}  ·  {library}"),
+                insert_text: name.to_string(),
+                replace_chars: prefix.chars().count(),
+            })
+            .collect();
+    }
+    if api_type == "@enum" {
+        return Vec::new();
+    }
+    api_member_completions(api_type, prefix, separator)
+}
+
+/// `Enum.` → enum type names.
+fn enum_name_completions(prefix: &str) -> Vec<Completion> {
     let lower = prefix.to_ascii_lowercase();
-    items.iter().filter(|(name, _)| name.to_ascii_lowercase().starts_with(&lower))
-        .take(12).map(|(name, detail)| Completion {
-            label: (*name).into(), detail: (*detail).into(), insert_text: (*name).into(),
+    let mut names: Vec<&'static str> = api::ENUMS
+        .iter()
+        .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&lower))
+        .map(|(name, _)| *name)
+        .collect();
+    names.sort_by_key(|name| name.to_ascii_lowercase());
+    names.truncate(12);
+    names
+        .into_iter()
+        .map(|name| Completion {
+            label: name.to_string(),
+            detail: format!("Roblox enum · {name}"),
+            insert_text: name.to_string(),
             replace_chars: prefix.chars().count(),
-        }).collect()
+        })
+        .collect()
+}
+
+/// `Enum.KeyCode.` → enum items.
+fn enum_item_completions(enum_name: &str, prefix: &str) -> Vec<Completion> {
+    let lower = prefix.to_ascii_lowercase();
+    let mut items: Vec<&'static str> = api::enum_items(enum_name)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.to_ascii_lowercase().starts_with(&lower))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default();
+    items.sort();
+    items.truncate(12);
+    items
+        .into_iter()
+        .map(|item| Completion {
+            label: item.to_string(),
+            detail: format!("Enum.{enum_name} · {item}"),
+            insert_text: item.to_string(),
+            replace_chars: prefix.chars().count(),
+        })
+        .collect()
+}
+
+/// Walks a dotted parent path (`CharacterAdded` or `Moves.Items`) through the
+/// API member types, returning the final owner type for member completion.
+fn parent_type_for_path(root: Option<&str>, parent: &str) -> Option<String> {
+    let mut current = root?.to_string();
+    for segment in parent.split('.') {
+        current = api::member_type(&current, segment)?;
+        // RBXScriptSignal gives event access (`.Connect`), but the signal's
+        // own members are colon methods, which nested completion uses as dot
+        // for events — see kind rules.
+    }
+    Some(current)
 }
 
 fn identifier_fragment(source_before_cursor: &str) -> &str {
@@ -1659,6 +1757,13 @@ fn parse_parameters(source: &str, open: usize, line: &mut usize) -> (Vec<RawBind
     (params, i)
 }
 
+/// Whether `name` is a known Roblox class, datatype, or enum — usable as a
+/// typed annotation or as the result of type inference. Combines the
+/// generated API dump tables with the embedded rbx_reflection database.
+fn api_type_known(name: &str) -> bool {
+    api::is_api_type(name) || schema::class_exists(name)
+}
+
 /// Infers the Roblox class of a binding from its initializer
 /// (`Instance.new("Part")`, `game:GetService("Players")`, ...).
 fn instance_class_from_initializer(rest: &str) -> Option<String> {
@@ -1682,7 +1787,228 @@ fn instance_class_from_initializer(rest: &str) -> Option<String> {
     let inner = &inner[quote.len_utf8()..];
     let end = inner.find(quote)?;
     let class = &inner[..end];
-    schema::class_exists(class).then(|| class.to_string())
+    api_type_known(class).then(|| class.to_string())
+}
+
+/// Flatten every binding currently pushed into the scope stack, innermost
+/// first — used while an initializer is being lexed (the RHS may reference
+/// locals declared earlier in the same scope).
+fn visible_bindings(scopes: &[(ScopeKind, LocalScope)]) -> Vec<LocalBinding> {
+    let mut visible = Vec::new();
+    for (_, scope) in scopes.iter().rev() {
+        visible.extend(scope.bindings.iter().cloned());
+    }
+    visible
+}
+
+fn skip_ascii_ws(bytes: &[u8], mut index: usize) -> usize {
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        index += 1;
+    }
+    index
+}
+
+fn read_ascii_ident(bytes: &[u8], mut index: usize) -> (&str, usize) {
+    let start = index;
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+        index += 1;
+    }
+    let end = index;
+    let text = std::str::from_utf8(&bytes[start..end]).unwrap_or("");
+    (text, end)
+}
+
+/// Skips a balanced argument list starting at `(`; returns the index just
+/// after the matching `)` (strings and nested brackets are handled).
+fn skip_call_args(source: &str, mut index: usize) -> usize {
+    let bytes = source.as_bytes();
+    if bytes.get(index) != Some(&b'(') {
+        return index;
+    }
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    while let Some(&byte) = bytes.get(index) {
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth > 1 => depth -= 1,
+            b')' if depth == 1 => return index + 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    index
+}
+
+/// First quoted argument of a call expression (`("Players")` → `Players`).
+fn first_quoted_call_arg(expr: &str) -> Option<&str> {
+    let bytes = expr.as_bytes();
+    let index = skip_ascii_ws(bytes, 0);
+    if bytes.get(index) != Some(&b'(') {
+        return None;
+    }
+    let mut quote_index = index + 1;
+    while let Some(&byte) = bytes.get(quote_index) {
+        if byte == b'"' || byte == b'\'' {
+            break;
+        }
+        if byte == b')' {
+            return None;
+        }
+        quote_index += 1;
+    }
+    let quote = *bytes.get(quote_index)?;
+    let start = quote_index + 1;
+    let mut end = start;
+    while let Some(&byte) = bytes.get(end) {
+        if byte == quote {
+            let value = &expr[start..end];
+            return (!value.is_empty()).then_some(value);
+        }
+        end += 1;
+    }
+    None
+}
+
+/// The initializer expression after `=`, up to a top-level `,`/`;`/newline
+/// (strings, brackets, and nested calls are respected).
+fn expression_fragment(source: &str, mut index: usize) -> &str {
+    let bytes = source.as_bytes();
+    index = skip_ascii_ws(bytes, index);
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    while let Some(&byte) = bytes.get(index) {
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth > 0 => depth -= 1,
+            b'\n' | b';' if depth == 0 => break,
+            b',' if depth == 0 => break,
+            _ => {}
+        }
+        index += 1;
+    }
+    &source[..index]
+}
+
+/// Infers the API type of an initializer: identifier, member chain
+/// (`Actor.Player`), or service call (`game:GetService("Players")`), using
+/// already-visible local bindings and the generated API tables.
+fn infer_expression_type(rest: &str, locals: &[LocalBinding]) -> Option<String> {
+    let fragment = expression_fragment(rest, 0);
+    let bytes = fragment.as_bytes();
+    let mut index = skip_ascii_ws(bytes, 0);
+    let (base, after) = read_ascii_ident(bytes, index);
+    if base.is_empty() {
+        return None;
+    }
+    index = after;
+
+    // A local shadows the built-in even when its type is unknown.
+    let local_binding = locals.iter().find(|binding| binding.name == base);
+    let mut current = local_binding
+        .and_then(|binding| binding.instance_class.clone())
+        .or_else(|| {
+            if local_binding.is_some() {
+                return None;
+            }
+            match api::global_type(base) {
+                Some(api_type) if api_type.starts_with("@lib:") || api_type == "@enum" => None,
+                Some(api_type) => Some(api_type.to_string()),
+                None => None,
+            }
+        })?;
+
+    loop {
+        index = skip_ascii_ws(bytes, index);
+        let separator = match bytes.get(index) {
+            Some(b'.') => '.',
+            Some(b':') => ':',
+            _ => break,
+        };
+        index += 1;
+        index = skip_ascii_ws(bytes, index);
+        let (member, after) = read_ascii_ident(bytes, index);
+        if member.is_empty() {
+            return None;
+        }
+        index = after;
+        index = skip_ascii_ws(bytes, index);
+        let call_start = index;
+        let is_call = bytes.get(index) == Some(&b'(');
+        if is_call {
+            index = skip_call_args(fragment, index);
+        }
+
+        // game:GetService("Players") / game:FindService(...) → the service
+        // class is the quoted argument, which beats the generic Instance
+        // return type declared by the API dump.
+        if matches!(member, "GetService" | "FindService") {
+            let quoted = first_quoted_call_arg(&fragment[call_start..]);
+            if let Some(class) = quoted.filter(|class| api_type_known(class)) {
+                current = class.to_string();
+                continue;
+            }
+        }
+        // `Instance.new("Part")` / `Instance.create("Part")` — the quoted
+        // class argument is the result type.
+        if is_call && matches!(member, "new" | "create") && current == "Instance" {
+            if let Some(class) = first_quoted_call_arg(&fragment[call_start..])
+                .filter(|class| api_type_known(class))
+            {
+                current = class.to_string();
+                continue;
+            }
+        }
+        if is_call
+            && matches!(
+                member,
+                "FindFirstChild" | "WaitForChild" | "FindFirstChildOfClass" | "FindFirstAncestor"
+            )
+        {
+            current = "Instance".to_string();
+            continue;
+        }
+        // Datatype constructors (`Vector3.new(...)`, `CFrame.new(...)`, ...)
+        // return the datatype itself.
+        if is_call && member == "new"
+            && api::find_class(&current).is_some_and(|class| class.datatype)
+        {
+            continue;
+        }
+        current = api::member_type(&current, member)?;
+    }
+    Some(current)
+}
+
+/// Best-effort class for `local x = <initializer>`. The generic chain
+/// inference runs first because it handles `game:GetService("Players")
+/// .LocalPlayer` (→ Player) where the special-cased helper would stop at
+/// the service (`Players`).
+fn infer_binding_type(rest: &str, locals: &[LocalBinding]) -> Option<String> {
+    infer_expression_type(rest, locals).or_else(|| instance_class_from_initializer(rest))
 }
 
 fn commit_bindings(scopes: &mut [(ScopeKind, LocalScope)], names: &mut Vec<RawBinding>, is_const: bool) {
@@ -1694,7 +2020,7 @@ fn commit_bindings(scopes: &mut [(ScopeKind, LocalScope)], names: &mut Vec<RawBi
     for binding in names.drain(..) {
         let instance_class = binding
             .instance_class
-            .or_else(|| binding.annotation.clone().filter(|class| schema::class_exists(class)));
+            .or_else(|| binding.annotation.clone().filter(|class| api_type_known(class)));
         let detail = instance_class
             .as_ref()
             .map_or_else(|| base.to_string(), |class| format!("{base} · {class}"));
@@ -1778,7 +2104,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                         let instance_class = param
                             .annotation
                             .clone()
-                            .filter(|class| schema::class_exists(class));
+                            .filter(|class| api_type_known(class));
                         let detail = instance_class.as_ref().map_or_else(
                             || "parameter".to_string(),
                             |class| format!("parameter · {class}"),
@@ -1885,7 +2211,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                 }
                 "=" => {
                     if let Some(DeclState::Names { is_const }) = decl.take() {
-                        if let Some(class) = instance_class_from_initializer(&source[index..]) {
+                        if let Some(class) = infer_binding_type(&source[index..], &visible_bindings(&scopes)) {
                             if let Some(last) = names.last_mut() {
                                 last.instance_class = Some(class);
                             }
@@ -1926,11 +2252,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
     // Pending names are deliberately NOT committed at EOF: while the caret is
     // still inside `local pa|`, the in-progress name must not shadow existing
     // locals (and must not be offered as a completion of itself).
-    let mut visible = Vec::new();
-    for (_, scope) in scopes.iter().rev() {
-        visible.extend(scope.bindings.iter().cloned());
-    }
-    visible
+    visible_bindings(&scopes)
 }
 
 fn innermost_local<'a>(locals: &'a [LocalBinding], name: &str) -> Option<&'a LocalBinding> {
@@ -1953,15 +2275,17 @@ fn constructor_module_alias<'a>(source: &'a str, variable: &str) -> Option<&'a s
     })
 }
 
-fn nested_member_expression_at_end(source: &str) -> Option<(&str, String, &str)> {
+fn nested_member_expression_at_end(source: &str) -> Option<(&str, String, &str, char)> {
     let tail = source.trim_end_matches(char::is_whitespace)
-        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).next()?;
-    let parts: Vec<&str> = tail.split('.').collect();
+        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || matches!(c, '.' | ':'))).next()?;
+    let last_separator = tail.rfind(|c| c == '.' || c == ':')?;
+    let separator = tail.as_bytes()[last_separator] as char;
+    let parts: Vec<&str> = tail.split(|c| c == '.' || c == ':').collect();
     if parts.len() < 3 || !is_identifier(parts[0]) { return None; }
     if !parts[1..parts.len() - 1].iter().all(|part| is_identifier(part)) { return None; }
     let prefix = parts.last().copied().unwrap_or("");
     if !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return None; }
-    Some((parts[0], parts[1..parts.len() - 1].join("."), prefix))
+    Some((parts[0], parts[1..parts.len() - 1].join("."), prefix, separator))
 }
 
 fn member_expression_at_end(source: &str) -> Option<(&str, &str, char)> {
@@ -3179,6 +3503,97 @@ mod tests {
         assert_eq!(
             members.get("Item").map(String::as_str),
             Some("type Item = { Name: string }")
+        );
+    }
+
+    #[test]
+    fn generated_api_covers_libraries_datatypes_and_globals() {
+        let index = ProjectIndex::default();
+
+        // `task.wait` and stock library members.
+        let task = index.complete_at(Ref::none(), "task.wa", "task.wa".chars().count());
+        assert!(task.iter().any(|item| item.label == "wait"), "{task:?}");
+
+        // `Vector3` statics (dot) vs methods (colon only).
+        let vector_new = index.complete_at(Ref::none(), "Vector3.ne", "Vector3.ne".chars().count());
+        assert!(vector_new.iter().any(|item| item.label == "new"), "{vector_new:?}");
+        let vector_dot = index.complete_at(Ref::none(), "Vector3.Cr", "Vector3.Cr".chars().count());
+        assert!(
+            !vector_dot.iter().any(|item| item.label == "Cross"),
+            "datatype methods must not complete on dot: {vector_dot:?}"
+        );
+        let vector_colon = index.complete_at(Ref::none(), "Vector3:Cr", "Vector3:Cr".chars().count());
+        assert!(vector_colon.iter().any(|item| item.label == "Cross"), "{vector_colon:?}");
+
+        // `script.Parent` (property/dot) and `script:Destroy` (method/colon).
+        let script_parent = index.complete_at(Ref::none(), "script.Par", "script.Par".chars().count());
+        assert!(script_parent.iter().any(|item| item.label == "Parent"), "{script_parent:?}");
+        let script_dot = index.complete_at(Ref::none(), "script.Des", "script.Des".chars().count());
+        assert!(
+            !script_dot.iter().any(|item| item.label == "Destroy"),
+            "methods must not complete on dot: {script_dot:?}"
+        );
+        let script_colon = index.complete_at(Ref::none(), "script:Des", "script:Des".chars().count());
+        assert!(script_colon.iter().any(|item| item.label == "Destroy"), "{script_colon:?}");
+    }
+
+    #[test]
+    fn typed_annotations_and_service_chains_infer_types() {
+        let index = ProjectIndex::default();
+
+        // `local Player : Player = Actor.Player` — annotation types the local,
+        // so it is offered and gets member completions.
+        let declared = "local Player : Player = Actor.Player\nPlay";
+        let suggestions = index.complete_at(Ref::none(), declared, declared.chars().count());
+        assert!(suggestions.iter().any(|item| item.label == "Player"), "{suggestions:?}");
+
+        // function parameters with typed annotations are in scope and typed.
+        let params = "function test(Player: Player)\nPlay";
+        let param_locals = local_bindings_at(params, params.chars().count());
+        let player = param_locals.iter().find(|binding| binding.name == "Player");
+        assert_eq!(
+            player.and_then(|binding| binding.instance_class.as_deref()),
+            Some("Player")
+        );
+
+        // `game:GetService("Players").LocalPlayer` → Player, methods via colon.
+        let chain = "local p = game:GetService(\"Players\").LocalPlayer\np:Dis";
+        let chain_suggestions = index.complete_at(Ref::none(), chain, chain.chars().count());
+        assert!(
+            chain_suggestions.iter().any(|item| item.label == "DistanceFromCharacter"),
+            "{chain_suggestions:?}"
+        );
+
+        // `game:GetService("RunService")` → RunService members (event dot,
+        // method colon).
+        let run = "local RunService = game:GetService(\"RunService\")\nRunService.Hear";
+        let run_suggestions = index.complete_at(Ref::none(), run, run.chars().count());
+        assert!(run_suggestions.iter().any(|item| item.label == "Heartbeat"), "{run_suggestions:?}");
+        let run_method = "local RunService = game:GetService(\"RunService\")\nRunService:IsS";
+        let method_suggestions = index.complete_at(Ref::none(), run_method, run_method.chars().count());
+        assert!(method_suggestions.iter().any(|item| item.label == "IsServer"), "{method_suggestions:?}");
+    }
+
+    #[test]
+    fn nested_type_flow_and_enum_members_complete() {
+        let index = ProjectIndex::default();
+
+        // Enum. → enum names; Enum.KeyCode. → items.
+        let enum_names = index.complete_at(Ref::none(), "Enum.KeyC", "Enum.KeyC".chars().count());
+        assert!(enum_names.iter().any(|item| item.label == "KeyCode"), "{enum_names:?}");
+        let enum_items = index.complete_at(Ref::none(), "Enum.KeyCode.A", "Enum.KeyCode.A".chars().count());
+        assert!(enum_items.iter().any(|item| item.label == "A"), "{enum_items:?}");
+
+        // player.CharacterAdded:Co → RBXScriptSignal.Connect (colon method),
+        // while the dot form stays member-free.
+        let signal = "local p = game:GetService(\"Players\").LocalPlayer\np.CharacterAdded:Co";
+        let signal_suggestions = index.complete_at(Ref::none(), signal, signal.chars().count());
+        assert!(signal_suggestions.iter().any(|item| item.label == "Connect"), "{signal_suggestions:?}");
+        let signal_dot = "local p = game:GetService(\"Players\").LocalPlayer\np.CharacterAdded.Co";
+        let dot_suggestions = index.complete_at(Ref::none(), signal_dot, signal_dot.chars().count());
+        assert!(
+            !dot_suggestions.iter().any(|item| item.label == "Connect"),
+            "signal methods must not complete on dot: {dot_suggestions:?}"
         );
     }
 }

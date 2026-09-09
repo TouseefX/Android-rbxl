@@ -3,3 +3,4 @@
 **/*.rs.bk
 *.apk
 keystore.jks
+dump/cache/
