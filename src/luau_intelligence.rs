@@ -1431,7 +1431,7 @@ fn next_token<'a>(source: &'a str, index: &mut usize, line: &mut usize) -> Optio
             }
             _ => {
                 let rest = &source[i..];
-                if let Some(operator) = MULTI_CHAR_OPS.iter().find(|op| rest.starts_with(*op)) {
+                if let Some(&operator) = MULTI_CHAR_OPS.iter().find(|op| rest.starts_with(*op)) {
                     *index += operator.len();
                     return Some(Token::Op(operator));
                 }
@@ -1761,12 +1761,11 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                     }
                     let (name, params, next_index) = parse_function_header(source, index, &mut line);
                     index = next_index;
-                    if let Some(name) = name.as_deref() {
-                        let detail = match local_function {
-                            Some(true) => "const function",
-                            Some(false) => "local function",
-                            None => "function",
-                        };
+                    // Only `local function` / `const function` create a local
+                    // binding. A bare `function Foo()` is a global, which must
+                    // not be offered as an in-scope local.
+                    if let (Some(is_const), Some(name)) = (local_function, name.as_deref()) {
+                        let detail = if is_const { "const function" } else { "local function" };
                         scopes.last_mut().unwrap().1.bindings.push(LocalBinding {
                             name: name.to_string(),
                             detail: detail.into(),
@@ -3083,6 +3082,19 @@ mod tests {
         let method_locals = local_bindings_at(method_source, method_source.chars().count());
         assert!(method_locals.iter().any(|binding| binding.name == "self"));
         assert!(method_locals.iter().any(|binding| binding.name == "foo"));
+    }
+
+    #[test]
+    fn global_functions_are_not_offered_as_locals() {
+        let global = "function Fred(a)\nFr";
+        assert!(
+            !local_bindings_at(global, global.chars().count())
+                .iter().any(|binding| binding.name == "Fred"),
+            "bare global function offered as a local",
+        );
+        let local = "local function Fred(a)\nFr";
+        assert!(local_bindings_at(local, local.chars().count())
+            .iter().any(|binding| binding.name == "Fred"));
     }
 
     #[test]
