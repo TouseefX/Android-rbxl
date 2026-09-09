@@ -199,8 +199,10 @@ impl ProjectIndex {
         result
     }
 
-    /// Complete `Alias.partial` at a character cursor position, resolving Alias
-    /// from a require declaration anywhere in the file.
+    /// Complete `Alias.partial` at a character cursor position. Bare
+    /// identifiers only offer locals that are actually in scope at the caret
+    /// (plus Luau keywords/globals) — a ModuleScript is never offered as a
+    /// free variable unless the script has bound it with `local X = require(…)`.
     pub fn complete_at(
         &self,
         current_script: Ref,
@@ -208,14 +210,20 @@ impl ProjectIndex {
         cursor_char: usize,
     ) -> Vec<Completion> {
         let cursor_byte = char_to_byte(source, cursor_char);
+        let locals = local_bindings_at(source, cursor_char);
         if let Some(typed) = require_string_at_cursor(&source[..cursor_byte]) {
             return self.complete_require_path(current_script, typed);
         }
         if let Some((root, parent, prefix)) = nested_member_expression_at_end(&source[..cursor_byte]) {
             let aliases = require_aliases(source);
-            let target = aliases.get(root)
-                .and_then(|request| self.resolve_module_ref(current_script, request))
-                .or_else(|| self.module_refs.get(&normalize_path(root)).copied());
+            // Only resolve modules that are actually bound in this script's
+            // scope. Previously a module name alone (`Module.Create().x`) was
+            // treated as if the script required it, which invented members for
+            // names the script never declared.
+            let target = innermost_local(&locals, root).is_some()
+                .then(|| aliases.get(root))
+                .flatten()
+                .and_then(|request| self.resolve_module_ref(current_script, request));
             if let Some(paths) = target.and_then(|referent| self.module_member_paths.get(&referent)) {
                 let wanted = format!("{parent}.");
                 let lower = prefix.to_ascii_lowercase();
@@ -232,7 +240,8 @@ impl ProjectIndex {
         }
         if let Some((alias, prefix, separator)) = member_expression_at_end(&source[..cursor_byte]) {
             let aliases = require_aliases(source);
-            if let Some(request) = aliases.get(alias) {
+            let local = innermost_local(&locals, alias);
+            if let Some(request) = local.and_then(|_| aliases.get(alias)) {
                 let resolved = self.resolve_request(current_script, request);
                 let key = normalize_path(&resolved);
                 let members = self.modules.get(&key).or_else(|| {
@@ -246,7 +255,7 @@ impl ProjectIndex {
                         .take(12)
                         .map(|(member, signature)| Completion {
                             label: member.clone(),
-                            detail: format!("{signature}  ·  {request} → {resolved}"),
+                            detail: format!("{signature}  ·  {request} → {resolved}  ·  local variable"),
                             insert_text: member.clone(),
                             replace_chars: prefix.chars().count(),
                         })
@@ -256,49 +265,69 @@ impl ProjectIndex {
             // Infer objects created by a module constructor:
             // `local weld = Module.new(args)` makes `weld.` use that module's
             // returned API instead of being treated as an unknown plain table.
-            if let Some(module_alias) = constructor_module_alias(source, alias) {
-                let target = aliases.get(module_alias)
-                    .and_then(|request| self.resolve_module_ref(current_script, request))
-                    .or_else(|| self.module_refs.get(&normalize_path(module_alias)).copied());
-                if let Some(members) = target.and_then(|target| self.module_sources.get(&target))
-                    .map(|source| constructed_object_members(source))
-                {
-                    return members.into_iter()
-                        .filter(|(member, detail)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
-                            && member_matches_access(detail, separator))
-                        .take(12)
-                        .map(|(member, detail)| Completion {
-                            label: member.clone(),
-                            detail: format!("constructed {module_alias} object · {detail}"),
-                            insert_text: member,
-                            replace_chars: prefix.chars().count(),
-                        }).collect();
+            if let Some(module_alias) = local.and_then(|_| constructor_module_alias(source, alias)) {
+                if let Some(request) = aliases.get(module_alias) {
+                    let target = self.resolve_module_ref(current_script, request);
+                    if let Some(members) = target.and_then(|target| self.module_sources.get(&target))
+                        .map(|source| constructed_object_members(source))
+                    {
+                        return members.into_iter()
+                            .filter(|(member, detail)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
+                                && member_matches_access(detail, separator))
+                            .take(12)
+                            .map(|(member, detail)| Completion {
+                                label: member.clone(),
+                                detail: format!("constructed {module_alias} object · {detail}"),
+                                insert_text: member,
+                                replace_chars: prefix.chars().count(),
+                            }).collect();
+                    }
+                }
+            }
+
+            // Reflection-backed properties for locals whose class is known
+            // (`local part = Instance.new("Part")` or `local part: BasePart`).
+            // Only these can describe instance members; a plain unknown local
+            // must not fall back to a ModuleScript of the same name, because
+            // `local Debris = {}` is not the Debris module.
+            if let Some(binding) = local {
+                if let Some(class_name) = &binding.instance_class {
+                    if separator == '.' {
+                        let properties: Vec<_> = schema::get_class_schema_properties(class_name)
+                            .into_iter()
+                            .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+                            .take(12)
+                            .map(|(name, detail)| Completion {
+                                label: name.clone(),
+                                detail: format!("{class_name} property · {detail}"),
+                                insert_text: name,
+                                replace_chars: prefix.chars().count(),
+                            })
+                            .collect();
+                        if !properties.is_empty() {
+                            return properties;
+                        }
+                    }
                 }
             }
 
             // Roblox datatypes/globals take precedence over a coincidentally
             // named ModuleScript (for example Color3 must keep fromRGB casing).
-            let builtin: Vec<_> = roblox_member_completions(alias, prefix, &source[..cursor_byte])
-                .into_iter().filter(|item| roblox_access_matches(alias, &item.label, separator)).collect();
+            // A local binding of the same name shadows the global in Luau, so
+            // only offer them when no local is in scope.
+            let builtin: Vec<_> = if local.is_none() {
+                roblox_member_completions(alias, prefix)
+                    .into_iter().filter(|item| roblox_access_matches(alias, &item.label, separator)).collect()
+            } else {
+                Vec::new()
+            };
             if !builtin.is_empty() { return builtin; }
 
-            // Also allow `Inventory.Member` when Inventory is an unambiguous
-            // ModuleScript name, even before a local require alias is written.
-            let module_key = normalize_path(alias);
-            if let Some(members) = self.modules.get(&module_key) {
-                return members.iter()
-                    .filter(|(member, detail)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
-                        && member_matches_access(detail, separator))
-                    .take(12)
-                    .map(|(member, detail)| Completion {
-                        label: member.clone(), detail: detail.clone(), insert_text: member.clone(),
-                        replace_chars: prefix.chars().count(),
-                    }).collect();
-            }
             // A dotted expression is a member lookup, never a new lexical
             // keyword. Falling through used to turn `game.f` into `game.game`.
-            return roblox_member_completions(alias, prefix, &source[..cursor_byte])
-                .into_iter().filter(|item| roblox_access_matches(alias, &item.label, separator)).collect();
+            // Note: module members are intentionally NOT offered for a bare
+            // module name here — the script must have bound it via require.
+            builtin
         }
         let before_cursor = &source[..cursor_byte];
         // Nested member chains (e.g. Module.Factory().value) need type-flow
@@ -310,27 +339,48 @@ impl ProjectIndex {
         if expression_tail.contains('.') {
             return Vec::new();
         }
-        let mut completions = lexical_completions(before_cursor);
+        let mut completions = Vec::new();
         let prefix = identifier_fragment(before_cursor);
         if prefix.len() >= 2 {
             let lower = prefix.to_ascii_lowercase();
-            let mut seen: std::collections::HashSet<String> =
-                completions.iter().map(|item| item.label.to_ascii_lowercase()).collect();
-            for (&referent, path) in &self.paths {
-                if !self.module_sources.contains_key(&referent) { continue; }
-                let name = path.rsplit('/').next().unwrap_or(path);
-                let candidate = name.to_ascii_lowercase();
-                if (candidate.starts_with(&lower) || (lower.len() >= 3 && common_prefix_len(&candidate, &lower) >= 2))
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let aliases = require_aliases(source);
+
+            // In-scope locals win over keywords: a local `game` shadows the
+            // Roblox global, and `local Debris = require(...)` is the only way
+            // a module name is offered as a bare identifier. ModuleScripts are
+            // never invented as locals.
+            for binding in &locals {
+                let candidate = binding.name.to_ascii_lowercase();
+                if (candidate.starts_with(&lower)
+                    || (lower.len() >= 3 && common_prefix_len(&candidate, &lower) >= 2))
                     && seen.insert(candidate)
                 {
+                    let detail = if let Some(request) = aliases.get(binding.name.as_str()) {
+                        format!(
+                            "{}  ·  ModuleScript → {}",
+                            binding.detail,
+                            self.resolve_request(current_script, request),
+                        )
+                    } else {
+                        binding.detail.clone()
+                    };
                     completions.push(Completion {
-                        label: name.to_string(),
-                        detail: format!("ModuleScript · {path}"),
-                        insert_text: name.to_string(),
+                        label: binding.name.clone(),
+                        detail,
+                        insert_text: binding.name.clone(),
                         replace_chars: prefix.chars().count(),
                     });
                 }
             }
+            for item in lexical_completions(before_cursor) {
+                if seen.insert(item.label.to_ascii_lowercase()) {
+                    completions.push(item);
+                }
+            }
+            // ModuleScript names that are not bound as locals are deliberately
+            // not offered; typing `Debris` must not insert a module name into
+            // a script that never require()d it.
         }
         completions.truncate(12);
         completions
@@ -998,26 +1048,10 @@ fn roblox_access_matches(owner: &str, member: &str, separator: char) -> bool {
     if separator == ':' { method } else { !method }
 }
 
-fn roblox_member_completions(owner: &str, prefix: &str, source: &str) -> Vec<Completion> {
-    // Reflection-backed properties for straightforward Instance.new bindings.
-    for raw in source.lines().rev() {
-        let code = raw.split("--").next().unwrap_or("").trim();
-        if let Some(declaration) = code.strip_prefix("local ").or_else(|| code.strip_prefix("const ")) {
-            if let Some((name, rhs)) = declaration.split_once('=') {
-                if name.trim() == owner {
-                    if let Some(class_name) = quoted_call_arguments(rhs, "Instance.new(").next() {
-                        return schema::get_class_schema_properties(class_name).into_iter()
-                            .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
-                            .take(12).map(|(name, detail)| Completion {
-                                label: name.clone(), detail: format!("{class_name} property · {detail}"),
-                                insert_text: name, replace_chars: prefix.chars().count(),
-                            }).collect();
-                    }
-                }
-            }
-        }
-    }
-
+fn roblox_member_completions(owner: &str, prefix: &str) -> Vec<Completion> {
+    // Instance properties are handled by complete_at from the scope-aware
+    // local binding table (with typed/new annotation), so this only covers
+    // Roblox datatype constructors and global services.
     let items: &[(&str, &str)] = match owner {
         "Color3" => &[
             ("fromRGB", "Color3 from 0–255 red, green, and blue"),
@@ -1134,6 +1168,768 @@ fn lexical_completions(source_before_cursor: &str) -> Vec<Completion> {
     });
     matches.truncate(12);
     matches
+}
+
+/// A local binding that is in scope at the completion caret.
+#[derive(Debug, Clone)]
+struct LocalBinding {
+    name: String,
+    detail: String,
+    line: usize,
+    /// Roblox class when the binding's type is known (`Instance.new("Part")`
+    /// or a typed annotation such as `local part: BasePart`).
+    instance_class: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RawBinding {
+    name: String,
+    annotation: Option<String>,
+    instance_class: Option<String>,
+    line: usize,
+}
+
+#[derive(Debug, Default)]
+struct LocalScope {
+    bindings: Vec<LocalBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    File,
+    Block,
+    Function,
+    Loop,
+    Repeat,
+    IfBranch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token<'a> {
+    Word(&'a str),
+    Op(&'static str),
+    Newline,
+}
+
+const MULTI_CHAR_OPS: &[&str] = &[
+    "...", "//=", "..=", "->", "::", "==", "~=", "<=", ">=", "..", "//", "+=", "-=", "*=", "/=",
+    "%=", "^=", "<<", ">>",
+];
+
+fn single_operator(byte: u8) -> &'static str {
+    match byte {
+        b'(' => "(",
+        b')' => ")",
+        b'[' => "[",
+        b']' => "]",
+        b'{' => "{",
+        b'}' => "}",
+        b',' => ",",
+        b';' => ";",
+        b':' => ":",
+        b'.' => ".",
+        b'<' => "<",
+        b'>' => ">",
+        b'=' => "=",
+        b'+' => "+",
+        b'-' => "-",
+        b'*' => "*",
+        b'/' => "/",
+        b'%' => "%",
+        b'^' => "^",
+        b'#' => "#",
+        b'|' => "|",
+        b'&' => "&",
+        b'~' => "~",
+        b'?' => "?",
+        b'@' => "@",
+        _ => "",
+    }
+}
+
+/// Returns the number of `=` signs of a long bracket starting at `at`
+/// (`[[`, `[==[` …), or `None` when `[` is not a long-bracket opener.
+fn long_bracket_level(source: &str, at: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(at) != Some(&b'[') {
+        return None;
+    }
+    let mut index = at + 1;
+    while bytes.get(index) == Some(&b'=') {
+        index += 1;
+    }
+    (bytes.get(index) == Some(&b'[')).then_some(index - at - 1)
+}
+
+fn skip_long_bracket(source: &str, index: &mut usize, line: &mut usize, level: usize) {
+    let closer = format!("]{}]", "=".repeat(level));
+    let rest = &source[*index..];
+    if let Some(position) = rest.find(closer.as_str()) {
+        *line += rest[..position].bytes().filter(|byte| *byte == b'\n').count();
+        *index += position + closer.len();
+    } else {
+        *line += rest.bytes().filter(|byte| *byte == b'\n').count();
+        *index = source.len();
+    }
+}
+
+/// Skips a `--` comment (line or long-bracket form), keeping `line` accurate.
+fn skip_comment(source: &str, index: &mut usize, line: &mut usize) {
+    if let Some(level) = long_bracket_level(source, *index) {
+        *index += 2 + level;
+        skip_long_bracket(source, index, line, level);
+        return;
+    }
+    while let Some(&byte) = source.as_bytes().get(*index) {
+        if byte == b'\n' {
+            return;
+        }
+        *index += 1;
+    }
+}
+
+fn skip_quoted_string(source: &str, index: &mut usize, line: &mut usize) {
+    let bytes = source.as_bytes();
+    let quote = bytes[*index];
+    *index += 1;
+    while let Some(&byte) = bytes.get(*index) {
+        match byte {
+            b'\\' => {
+                if bytes.get(*index + 1) == Some(&b'\n') {
+                    *line += 1;
+                    *index += 2;
+                } else if bytes.get(*index + 1).is_some() {
+                    *index += 2;
+                } else {
+                    *index += 1;
+                }
+            }
+            b'\n' => return, // unterminated; the newline token is handled by the caller
+            _ if byte == quote => {
+                *index += 1;
+                return;
+            }
+            _ => *index += 1,
+        }
+    }
+}
+
+/// Skips a Luau interpolated string (`` `...` ``). The `{...}` holes can
+/// contain real code, but never declarations, so the whole string is trivia
+/// for scope purposes.
+fn skip_interpolated_string(source: &str, index: &mut usize, line: &mut usize) {
+    let bytes = source.as_bytes();
+    *index += 1; // opening backtick
+    let mut braces = 0i32;
+    while let Some(&byte) = bytes.get(*index) {
+        match byte {
+            b'\\' => {
+                if bytes.get(*index + 1) == Some(&b'\n') {
+                    *line += 1;
+                    *index += 2;
+                } else if bytes.get(*index + 1).is_some() {
+                    *index += 2;
+                } else {
+                    *index += 1;
+                }
+            }
+            b'{' => braces += 1,
+            b'}' if braces > 0 => braces -= 1,
+            b'`' if braces == 0 => {
+                *index += 1;
+                return;
+            }
+            b'"' | b'\'' if braces > 0 => skip_quoted_string(source, index, line),
+            b'\n' => *line += 1,
+            _ => {}
+        }
+        *index += 1;
+    }
+}
+
+fn skip_number(source: &str, index: &mut usize) {
+    let bytes = source.as_bytes();
+    let mut i = *index;
+    if bytes.get(i) == Some(&b'0')
+        && bytes
+            .get(i + 1)
+            .copied()
+            .is_some_and(|byte| matches!(byte, b'x' | b'X' | b'b' | b'B' | b'o' | b'O'))
+    {
+        i += 2;
+        while bytes.get(i).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+            i += 1;
+        }
+    } else {
+        while bytes.get(i).is_some_and(|byte| byte.is_ascii_digit() || *byte == b'_') {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'.') {
+            i += 1;
+            while bytes.get(i).is_some_and(|byte| byte.is_ascii_digit() || *byte == b'_') {
+                i += 1;
+            }
+        }
+        if bytes.get(i).copied().is_some_and(|byte| matches!(byte, b'e' | b'E')) {
+            let mut exponent = i + 1;
+            if bytes.get(exponent).copied().is_some_and(|byte| matches!(byte, b'+' | b'-')) {
+                exponent += 1;
+            }
+            if bytes.get(exponent).is_some_and(|byte| byte.is_ascii_digit()) {
+                i = exponent;
+                while bytes.get(i).is_some_and(|byte| byte.is_ascii_digit() || *byte == b'_') {
+                    i += 1;
+                }
+            }
+        }
+    }
+    *index = i;
+}
+
+/// One lexical token, skipping comments, strings, numbers, and whitespace.
+fn next_token<'a>(source: &'a str, index: &mut usize, line: &mut usize) -> Option<Token<'a>> {
+    let bytes = source.as_bytes();
+    loop {
+        let i = *index;
+        let Some(&byte) = bytes.get(i) else { return None };
+        match byte {
+            b'\n' => {
+                *index += 1;
+                *line += 1;
+                return Some(Token::Newline);
+            }
+            b' ' | b'\t' | b'\r' | 0x0b | 0x0c => *index += 1,
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                *index += 2;
+                skip_comment(source, index, line);
+            }
+            b'"' | b'\'' => skip_quoted_string(source, index, line),
+            b'`' => skip_interpolated_string(source, index, line),
+            b'[' => {
+                if let Some(level) = long_bracket_level(source, i) {
+                    *index += 2 + level;
+                    skip_long_bracket(source, index, line, level);
+                } else {
+                    *index += 1;
+                    return Some(Token::Op("["));
+                }
+            }
+            b'0'..=b'9' => skip_number(source, index),
+            b'.' if bytes.get(i + 1).is_some_and(|byte| byte.is_ascii_digit()) => {
+                skip_number(source, index);
+            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
+                let start = i;
+                *index += 1;
+                while bytes
+                    .get(*index)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    *index += 1;
+                }
+                return Some(Token::Word(&source[start..*index]));
+            }
+            _ => {
+                let rest = &source[i..];
+                if let Some(operator) = MULTI_CHAR_OPS.iter().find(|op| rest.starts_with(*op)) {
+                    *index += operator.len();
+                    return Some(Token::Op(operator));
+                }
+                let operator = single_operator(byte);
+                if !operator.is_empty() {
+                    *index += 1;
+                    return Some(Token::Op(operator));
+                }
+                *index += 1;
+            }
+        }
+    }
+}
+
+fn skip_whitespace(source: &str, mut index: usize, line: &mut usize) -> usize {
+    let bytes = source.as_bytes();
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'\n' {
+            *line += 1;
+            index += 1;
+        } else if byte.is_ascii_whitespace() {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    index
+}
+
+fn is_identifier_start(byte: Option<u8>) -> bool {
+    byte.is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+}
+
+fn read_identifier_end(source: &str, mut index: usize) -> usize {
+    while source
+        .as_bytes()
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        index += 1;
+    }
+    index
+}
+
+/// Reads a type annotation starting right after `:`. Returns the first bare
+/// identifier of the type (so `BasePart` is usable for property completion)
+/// and the index just after the annotation, stopping at `,`, `=`, `)`, or `;`
+/// at bracket depth zero.
+fn skip_type_annotation(source: &str, index: usize, line: &mut usize) -> (Option<String>, usize) {
+    let bytes = source.as_bytes();
+    let mut i = skip_whitespace(source, index, line);
+    let mut first_identifier = None;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    while i < source.len() {
+        let byte = bytes[i];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    *line += 1;
+                }
+                i += 2;
+                continue;
+            }
+            if byte == b'\n' {
+                quote = None;
+            } else if byte == active {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b')' | b']' | b'}' | b'>' if depth > 0 => depth -= 1,
+            b')' | b',' | b'=' | b';' if depth == 0 => break,
+            b'-' if bytes.get(i + 1) == Some(&b'-') => skip_comment(source, &mut i, line),
+            b'\n' => {
+                *line += 1;
+                i += 1;
+                continue;
+            }
+            _ if is_identifier_start(Some(byte)) && first_identifier.is_none() && depth == 0 => {
+                let start = i;
+                i = read_identifier_end(source, i);
+                first_identifier = Some(source[start..i].to_string());
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (first_identifier, i)
+}
+
+/// Skips an expression (function-parameter default) until `,` or `)` at depth
+/// zero, honoring strings/comments so their contents cannot end it early.
+fn skip_expression(source: &str, index: usize, line: &mut usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = skip_whitespace(source, index, line);
+    let mut depth = 0i32;
+    while i < source.len() {
+        let byte = bytes[i];
+        match byte {
+            b'"' | b'\'' | b'`' => {
+                let mut cursor = i;
+                if byte == b'`' {
+                    skip_interpolated_string(source, &mut cursor, line);
+                } else {
+                    skip_quoted_string(source, &mut cursor, line);
+                }
+                i = cursor;
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth > 0 => depth -= 1,
+            b')' | b',' if depth == 0 => break,
+            b'-' if bytes.get(i + 1) == Some(&b'-') => skip_comment(source, &mut i, line),
+            b'\n' => *line += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Parses `function name(params)` headers. Returns the bound function name
+/// (only meaningful for `local function` / `const function`), the parameter
+/// bindings, and the index just after the closing parenthesis.
+fn parse_function_header(
+    source: &str,
+    index: usize,
+    line: &mut usize,
+) -> (Option<String>, Vec<RawBinding>, usize) {
+    let bytes = source.as_bytes();
+    let mut i = skip_whitespace(source, index, line);
+    let mut name = None;
+    let mut is_method = false;
+
+    if is_identifier_start(bytes.get(i).copied()) {
+        let start = i;
+        i = read_identifier_end(source, i);
+        name = Some(source[start..i].to_string());
+        // `function Foo.bar()` / `function Foo:bar()` is a member assignment,
+        // not a local declaration; the method form gets an implicit `self`.
+        loop {
+            let mut probe = skip_whitespace(source, i, line);
+            let separator = match bytes.get(probe) {
+                Some(&b'.') => Some('.'),
+                Some(&b':') => Some(':'),
+                _ => None,
+            };
+            let Some(separator) = separator else { break };
+            if separator == ':' {
+                is_method = true;
+            }
+            probe += 1;
+            let member_start = skip_whitespace(source, probe, line);
+            if is_identifier_start(bytes.get(member_start).copied()) {
+                i = read_identifier_end(source, member_start);
+                name = None;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Advance past optional generics (`function foo<T>(`) to the parameter list.
+    while let Some(&byte) = bytes.get(i) {
+        if byte == b'(' {
+            break;
+        }
+        if byte == b'\n' {
+            *line += 1;
+        }
+        i += 1;
+    }
+
+    let (mut params, after) = parse_parameters(source, i, line);
+    if is_method {
+        params.insert(
+            0,
+            RawBinding { name: "self".into(), annotation: None, instance_class: None, line: *line },
+        );
+    }
+    (name, params, after)
+}
+
+fn parse_parameters(source: &str, open: usize, line: &mut usize) -> (Vec<RawBinding>, usize) {
+    let mut params = Vec::new();
+    let bytes = source.as_bytes();
+    let mut i = skip_whitespace(source, open + 1, line);
+    let param_line = *line;
+    while i < source.len() {
+        i = skip_whitespace(source, i, line);
+        let Some(&byte) = bytes.get(i) else { break };
+        match byte {
+            b')' => {
+                i += 1;
+                break;
+            }
+            b',' => i += 1,
+            _ if is_identifier_start(Some(byte)) => {
+                let start = i;
+                i = read_identifier_end(source, i);
+                let name = source[start..i].to_string();
+                i = skip_whitespace(source, i, line);
+                let mut annotation = None;
+                if bytes.get(i) == Some(&b':') {
+                    let (parsed, next) = skip_type_annotation(source, i + 1, line);
+                    annotation = parsed;
+                    i = next;
+                    i = skip_whitespace(source, i, line);
+                }
+                if bytes.get(i) == Some(&b'=') {
+                    i = skip_expression(source, i + 1, line);
+                    i = skip_whitespace(source, i, line);
+                }
+                params.push(RawBinding { name, annotation, instance_class: None, line: param_line });
+            }
+            _ => i += 1,
+        }
+    }
+    (params, i)
+}
+
+/// Infers the Roblox class of a binding from its initializer
+/// (`Instance.new("Part")`, `game:GetService("Players")`, ...).
+fn instance_class_from_initializer(rest: &str) -> Option<String> {
+    let trimmed = rest.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let call = [
+        "instance.new(",
+        "instance.create(",
+        "game.getservice(",
+        "game:getservice(",
+        "game.findservice(",
+        "game:findservice(",
+    ]
+    .iter()
+    .find_map(|call| lower.starts_with(*call).then_some(call.len()))?;
+    let inner = trimmed[call..].trim_start();
+    let quote = inner.chars().next()?;
+    if !matches!(quote, '"' | '\'') {
+        return None;
+    }
+    let inner = &inner[quote.len_utf8()..];
+    let end = inner.find(quote)?;
+    let class = &inner[..end];
+    schema::class_exists(class).then(|| class.to_string())
+}
+
+fn commit_bindings(scopes: &mut [(ScopeKind, LocalScope)], names: &mut Vec<RawBinding>, is_const: bool) {
+    if names.is_empty() {
+        return;
+    }
+    let base = if is_const { "const variable" } else { "local variable" };
+    let target = &mut scopes.last_mut().unwrap().1;
+    for binding in names.drain(..) {
+        let instance_class = binding
+            .instance_class
+            .or_else(|| binding.annotation.clone().filter(|class| schema::class_exists(class)));
+        let detail = instance_class
+            .as_ref()
+            .map_or_else(|| base.to_string(), |class| format!("{base} · {class}"));
+        target.bindings.push(LocalBinding {
+            name: binding.name,
+            detail,
+            line: binding.line,
+            instance_class,
+        });
+    }
+}
+
+/// Locals that are actually in scope at the caret, walking Luau block scopes
+/// (`function`/`if`/`for`/`while`/`do`/`repeat`). Bindings are returned
+/// innermost-first so a shadowing binding wins over an outer one.
+fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
+    let cursor_byte = char_to_byte(source, cursor_char);
+    let source = &source[..cursor_byte];
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DeclState {
+        Seen { is_const: bool },
+        Names { is_const: bool },
+    }
+
+    let mut scopes: Vec<(ScopeKind, LocalScope)> = vec![(ScopeKind::File, LocalScope::default())];
+    let mut index = 0usize;
+    let mut line = 1usize;
+    let mut decl: Option<DeclState> = None;
+    let mut names: Vec<RawBinding> = Vec::new();
+    let mut expect_name = false;
+    let mut for_vars: Vec<RawBinding> = Vec::new();
+    let mut in_for_header = false;
+
+    while let Some(token) = next_token(source, &mut index, &mut line) {
+        match token {
+            Token::Newline => {
+                // `local x` without `=` is still a declaration once the
+                // statement ends.
+                if let Some(DeclState::Names { is_const }) = decl.take() {
+                    commit_bindings(&mut scopes, &mut names, is_const);
+                }
+                expect_name = false;
+            }
+            Token::Word(word) => match word.to_ascii_lowercase().as_str() {
+                "local" | "const" => {
+                    if let Some(DeclState::Names { is_const }) = decl.take() {
+                        commit_bindings(&mut scopes, &mut names, is_const);
+                    }
+                    decl = Some(DeclState::Seen { is_const: word.eq_ignore_ascii_case("const") });
+                    expect_name = false;
+                }
+                "function" => {
+                    let mut local_function = None;
+                    if let Some(state) = decl.take() {
+                        match state {
+                            DeclState::Seen { is_const } => local_function = Some(is_const),
+                            DeclState::Names { is_const } => {
+                                commit_bindings(&mut scopes, &mut names, is_const);
+                            }
+                        }
+                    }
+                    let (name, params, next_index) = parse_function_header(source, index, &mut line);
+                    index = next_index;
+                    if let Some(name) = name.as_deref() {
+                        let detail = match local_function {
+                            Some(true) => "const function",
+                            Some(false) => "local function",
+                            None => "function",
+                        };
+                        scopes.last_mut().unwrap().1.bindings.push(LocalBinding {
+                            name: name.to_string(),
+                            detail: detail.into(),
+                            line,
+                            instance_class: None,
+                        });
+                    }
+                    let mut function_scope = LocalScope::default();
+                    for param in params {
+                        let instance_class = param
+                            .annotation
+                            .clone()
+                            .filter(|class| schema::class_exists(class));
+                        let detail = instance_class.as_ref().map_or_else(
+                            || "parameter".to_string(),
+                            |class| format!("parameter · {class}"),
+                        );
+                        function_scope.bindings.push(LocalBinding {
+                            name: param.name,
+                            detail,
+                            line: param.line,
+                            instance_class,
+                        });
+                    }
+                    scopes.push((ScopeKind::Function, function_scope));
+                }
+                "for" => {
+                    in_for_header = true;
+                    for_vars.clear();
+                    expect_name = false;
+                }
+                "in" => in_for_header = false,
+                "do" => {
+                    if in_for_header && !for_vars.is_empty() {
+                        let mut loop_scope = LocalScope::default();
+                        for var in for_vars.drain(..) {
+                            loop_scope.bindings.push(LocalBinding {
+                                name: var.name,
+                                detail: "loop variable".into(),
+                                line: var.line,
+                                instance_class: None,
+                            });
+                        }
+                        scopes.push((ScopeKind::Loop, loop_scope));
+                    } else {
+                        scopes.push((ScopeKind::Block, LocalScope::default()));
+                    }
+                    in_for_header = false;
+                }
+                "then" => scopes.push((ScopeKind::IfBranch, LocalScope::default())),
+                "elseif" => {
+                    if scopes.last().is_some_and(|(kind, _)| *kind == ScopeKind::IfBranch) {
+                        scopes.pop();
+                    }
+                }
+                "else" => {
+                    // The else-branch has its own scope: replace the previous
+                    // branch scope so its locals die at the matching `end`.
+                    if scopes.last().is_some_and(|(kind, _)| *kind == ScopeKind::IfBranch) {
+                        scopes.pop();
+                        scopes.push((ScopeKind::IfBranch, LocalScope::default()));
+                    }
+                }
+                "repeat" => scopes.push((ScopeKind::Repeat, LocalScope::default())),
+                "until" => {
+                    if scopes.last().is_some_and(|(kind, _)| *kind == ScopeKind::Repeat) {
+                        scopes.pop();
+                    }
+                }
+                "end" => {
+                    if scopes.len() > 1 {
+                        scopes.pop();
+                    }
+                }
+                _ => {
+                    if let Some(state) = decl {
+                        match state {
+                            DeclState::Seen { is_const } => {
+                                names.push(RawBinding {
+                                    name: word.to_string(),
+                                    annotation: None,
+                                    instance_class: None,
+                                    line,
+                                });
+                                decl = Some(DeclState::Names { is_const });
+                            }
+                            DeclState::Names { .. } if expect_name => {
+                                names.push(RawBinding {
+                                    name: word.to_string(),
+                                    annotation: None,
+                                    instance_class: None,
+                                    line,
+                                });
+                                expect_name = false;
+                            }
+                            DeclState::Names { .. } => {}
+                        }
+                    } else if in_for_header {
+                        for_vars.push(RawBinding {
+                            name: word.to_string(),
+                            annotation: None,
+                            instance_class: None,
+                            line,
+                        });
+                    }
+                }
+            },
+            Token::Op(operator) => match operator {
+                "," => {
+                    if matches!(decl, Some(DeclState::Names { .. })) {
+                        expect_name = true;
+                    }
+                }
+                "=" => {
+                    if let Some(DeclState::Names { is_const }) = decl.take() {
+                        if let Some(class) = instance_class_from_initializer(&source[index..]) {
+                            if let Some(last) = names.last_mut() {
+                                last.instance_class = Some(class);
+                            }
+                        }
+                        commit_bindings(&mut scopes, &mut names, is_const);
+                    }
+                    if in_for_header {
+                        in_for_header = false;
+                    }
+                    expect_name = false;
+                }
+                ";" => {
+                    if let Some(DeclState::Names { is_const }) = decl.take() {
+                        commit_bindings(&mut scopes, &mut names, is_const);
+                    }
+                    expect_name = false;
+                }
+                ":" => {
+                    // `local name: Type` — the type must not be scanned for
+                    // more names, so skip it and remember the class name.
+                    if let Some(DeclState::Names { .. }) = decl {
+                        if !expect_name && names.last().is_some() {
+                            let (annotation, next) = skip_type_annotation(source, index, &mut line);
+                            index = next;
+                            if let Some(annotation) = annotation {
+                                if let Some(last) = names.last_mut() {
+                                    last.annotation = Some(annotation);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    // Pending names are deliberately NOT committed at EOF: while the caret is
+    // still inside `local pa|`, the in-progress name must not shadow existing
+    // locals (and must not be offered as a completion of itself).
+    let mut visible = Vec::new();
+    for (_, scope) in scopes.iter().rev() {
+        visible.extend(scope.bindings.iter().cloned());
+    }
+    visible
+}
+
+fn innermost_local<'a>(locals: &'a [LocalBinding], name: &str) -> Option<&'a LocalBinding> {
+    locals.iter().find(|binding| binding.name == name)
 }
 
 fn constructor_module_alias<'a>(source: &'a str, variable: &str) -> Option<&'a str> {
@@ -2170,9 +2966,144 @@ mod tests {
             ("Moves.Base".into(), "table Base".into()),
             ("Moves.Ultimate".into(), "table Ultimate".into()),
         ]));
-        let suggestions = index.complete_at(Ref::none(), "Module.Moves.", 13);
+        // The module must be bound as a local before `Module.Moves.` is
+        // allowed to resolve; a bare module name is not in scope.
+        let source = "local Module = require(\"Module\")\nModule.Moves.";
+        let suggestions = index.complete_at(Ref::none(), source, source.chars().count());
         assert!(suggestions.iter().any(|item| item.label == "Base"));
         assert!(suggestions.iter().any(|item| item.label == "Ultimate"));
+    }
+
+    #[test]
+    fn completes_in_scope_locals_but_not_unbound_module_names() {
+        let debris = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.paths.insert(debris, "Debris".into());
+        index.module_refs.insert("debris".into(), debris);
+        index.module_sources.insert(debris, "return { CleanUp = true }".into());
+        index.modules.insert("debris".into(), BTreeMap::from([("CleanUp".into(), "field CleanUp".into())]));
+
+        // `Debris` exists as a ModuleScript, but nothing in this script bound
+        // it, so it must not be offered as if it were a local variable.
+        let unbound = index.complete_at(Ref::none(), "Deb", 3);
+        assert!(
+            !unbound.iter().any(|item| item.label == "Debris"),
+            "unbound module offered as a local: {unbound:?}",
+        );
+
+        // After `local Debris = require(...)`, the name is a real local and
+        // should complete with the module annotation.
+        let bound = "local Debris = require(\"./Debris\")\nDeb";
+        let suggestions = index.complete_at(Ref::none(), bound, bound.chars().count());
+        let debris = suggestions.iter().find(|item| item.label == "Debris");
+        assert!(debris.is_some(), "bound module missing from locals: {suggestions:?}");
+        assert!(debris.unwrap().detail.contains("ModuleScript"));
+    }
+
+    #[test]
+    fn module_members_require_an_in_scope_alias() {
+        let inventory = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.paths.insert(inventory, "ReplicatedStorage/Inventory".into());
+        index.module_refs.insert("inventory".into(), inventory);
+        index.module_sources.insert(inventory, "return { AddItem = function() end }".into());
+        index.modules.insert(
+            "inventory".into(),
+            BTreeMap::from([("AddItem".into(), "function AddItem()".into())]),
+        );
+
+        // A module name without a local binding is not a variable; `Debris.`
+        // style access must not invent module members.
+        let unbound = "Inventory.AddI";
+        assert!(
+            index.complete_at(Ref::none(), unbound, unbound.chars().count())
+                .iter().all(|item| item.label != "AddItem"),
+            "unbound module members were offered",
+        );
+
+        let source = "local Inventory = require(\"./Inventory\")\nInventory.AddI";
+        let suggestions = index.complete_at(Ref::none(), source, source.chars().count());
+        assert!(suggestions.iter().any(|item| item.label == "AddItem"));
+    }
+
+    #[test]
+    fn local_declarations_are_scoped_and_typed() {
+        let source = "if true then\nlocal inner = 1\nend\ninn";
+        // `inner` was declared inside the block and is not visible after `end`.
+        let outside = local_bindings_at(source, source.chars().count());
+        assert!(
+            !outside.iter().any(|binding| binding.name == "inner"),
+            "block local leaked: {outside:?}",
+        );
+
+        let inside = "if true then\nlocal inner = 1\ninn";
+        let in_scope = local_bindings_at(inside, inside.chars().count());
+        assert!(in_scope.iter().any(|binding| binding.name == "inner"));
+
+        let typed = "local part: BasePart\npar";
+        let typed_locals = local_bindings_at(typed, typed.chars().count());
+        let part = typed_locals.iter().find(|binding| binding.name == "part");
+        assert_eq!(part.and_then(|binding| binding.instance_class.as_deref()), Some("BasePart"));
+
+        let newed = "local part = Instance.new(\"Part\")\npar";
+        let newed_locals = local_bindings_at(newed, newed.chars().count());
+        assert_eq!(
+            newed_locals.iter().find(|binding| binding.name == "part")
+                .and_then(|binding| binding.instance_class.as_deref()),
+            Some("Part"),
+        );
+    }
+
+    #[test]
+    fn function_params_loop_vars_and_self_are_completed_in_scope() {
+        let function_source = "local function go(foo: number, bar)\nfo";
+        let locals = local_bindings_at(function_source, function_source.chars().count());
+        assert!(locals.iter().any(|binding| binding.name == "foo"));
+        assert!(locals.iter().any(|binding| binding.name == "bar"));
+        assert!(locals.iter().any(|binding| binding.name == "go"));
+
+        let after = "local function go(foo)\nend\nfo";
+        assert!(
+            !local_bindings_at(after, after.chars().count())
+                .iter().any(|binding| binding.name == "foo"),
+            "parameter leaked after function end",
+        );
+
+        let loop_source = "for k, v in pairs(items) do\nv";
+        assert!(local_bindings_at(loop_source, loop_source.chars().count())
+            .iter().any(|binding| binding.name == "v"));
+
+        let method_source = "function Obj:Destroy(foo)\nsel";
+        let method_locals = local_bindings_at(method_source, method_source.chars().count());
+        assert!(method_locals.iter().any(|binding| binding.name == "self"));
+        assert!(method_locals.iter().any(|binding| binding.name == "foo"));
+    }
+
+    #[test]
+    fn instance_properties_come_from_scope_aware_locals() {
+        let index = ProjectIndex::default();
+        let source = "local part = Instance.new(\"Part\")\npart.Trans";
+        let suggestions = index.complete_at(Ref::none(), source, source.chars().count());
+        assert!(suggestions.iter().any(|item| item.label == "Transparency"));
+
+        let typed = "local part: BasePart\npart.Anch";
+        let typed_suggestions = index.complete_at(Ref::none(), typed, typed.chars().count());
+        assert!(typed_suggestions.iter().any(|item| item.label == "Anchored"));
+
+        // A plain ambiguous local (no known class) must not fall through to a
+        // ModuleScript of the same name.
+        let debris = Ref::new();
+        let mut with_module = index;
+        with_module.paths.insert(debris, "Debris".into());
+        with_module.module_refs.insert("debris".into(), debris);
+        with_module.module_sources.insert(debris, "return { CleanUp = true }".into());
+        with_module.modules.insert("debris".into(), BTreeMap::from([("CleanUp".into(), "field CleanUp".into())]));
+        let ambiguous = "local Debris = {}\nDebris.Cle";
+        let ambiguous_suggestions = with_module.complete_at(Ref::none(), ambiguous, ambiguous.chars().count());
+        assert!(
+            !ambiguous_suggestions.iter().any(|item| item.label == "CleanUp"),
+            "plain local fell back to module members: {ambiguous_suggestions:?}",
+        );
     }
 
     #[test]
