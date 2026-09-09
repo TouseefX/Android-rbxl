@@ -19,17 +19,8 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
-import android.text.Editable
-import android.text.InputType
-import android.text.Spannable
-import android.text.TextWatcher
-import android.text.style.ForegroundColorSpan
-import android.view.inputmethod.BaseInputConnection
 import android.widget.Button
-import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.ArrayAdapter
-import android.widget.ListPopupWindow
 import android.widget.HorizontalScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -38,6 +29,9 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.ViewCompat
 import com.google.androidgamesdk.GameActivity
+import io.github.rosemoe.sora.event.ContentChangeEvent
+import io.github.rosemoe.sora.widget.CodeEditor
+import io.github.rosemoe.sora.widget.component.EditorAutoCompletion
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -76,9 +70,16 @@ class MainActivity : GameActivity() {
     private var activeProjectRoot: File? = null
     private val projectModifiedTimes = HashMap<String, Long>()
     private var nativeEditorDialog: Dialog? = null
-    private var nativeEditorView: EditText? = null
     private var nativeEditorScriptId: Long = -1
-    private var nativeCompletionPopup: ListPopupWindow? = null
+    /** Native editor line-wrap preference; off keeps code on one visual line. */
+    private var nativeEditorWordWrap: Boolean = false
+
+    /** The script editor and its language, non-null only while one is open. */
+    private var soraEditorView: CodeEditor? = null
+    private var soraLanguage: LuauLanguage? = null
+
+    /** Last sora construction failure, shown on screen when adb is unavailable. */
+    private var lastSoraError: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Register the instance BEFORE super.onCreate(): GameActivity's
@@ -351,227 +352,317 @@ class MainActivity : GameActivity() {
      * whatever editor app the user picks. Luau-aware editors use the extension
      * for the correct grammar while text/plain keeps broad Android app support.
      */
-    /** Apply lightweight Luau colors without replacing text or composing spans. */
-    private fun highlightNativeLuau(editor: EditText) {
-        val editable = editor.text ?: return
-        if (BaseInputConnection.getComposingSpanStart(editable) >= 0) {
-            editor.postDelayed({ highlightNativeLuau(editor) }, 180)
-            return
-        }
-        val selectionStart = editor.selectionStart
-        val selectionEnd = editor.selectionEnd
-        editable.getSpans(0, editable.length, ForegroundColorSpan::class.java)
-            .forEach { editable.removeSpan(it) }
-        val value = editable.toString()
-        val rules = listOf(
-            Regex("\\b(local|const|function|end|if|then|else|elseif|for|while|repeat|until|do|return|break|continue|and|or|not|in|export|type)\\b") to Color.rgb(205, 125, 255),
-            Regex("\\b(true|false|nil)\\b") to Color.rgb(255, 155, 105),
-            Regex("(?m)--.*$") to Color.rgb(105, 170, 105),
-            Regex("\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'") to Color.rgb(225, 190, 125),
-            Regex("\\b\\d+(?:\\.\\d+)?\\b") to Color.rgb(115, 195, 255)
-        )
-        rules.forEach { (regex, color) ->
-            regex.findAll(value).forEach { match ->
-                editable.setSpan(
-                    ForegroundColorSpan(color), match.range.first, match.range.last + 1,
-                    Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
+
+
+
+
+
+    /**
+     * Full-screen native Luau editor, built on sora-editor. Unlike the Bevy
+     * SurfaceView this is a real Android view, so the platform owns caret
+     * placement, kinetic scrolling, selection handles and the system
+     * Copy/Cut/Paste ActionMode.
+     */
+    fun showNativeEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int = 0) {
+        // Built defensively: anything thrown while constructing the editor
+        // would otherwise take the whole process down with no way to see why
+        // on a device without adb, so the exception is surfaced on screen
+        // instead.
+        //
+        // The guard must run *inside* runOnUiThread. This method is called
+        // from the Rust thread through JNI, so a try/catch out here would
+        // return before the posted work ever executes and would catch nothing.
+        runOnUiThread {
+            try {
+                showSoraEditor(scriptId, fileName, source, initialCursor)
+            } catch (error: Throwable) {
+                Log.e(TAG, "sora editor failed to open", error)
+                lastSoraError = describeThrowable(error)
+                nativeEditorDialog?.dismiss()
+                nativeEditorDialog = null
+                soraEditorView = null
+                soraLanguage = null
+                showSoraErrorDialog()
             }
         }
-        if (selectionStart >= 0 && selectionEnd >= 0) {
-            editor.setSelection(
-                selectionStart.coerceAtMost(editable.length),
-                selectionEnd.coerceAtMost(editable.length)
-            )
+    }
+
+    /** Exception text and top frames, formatted for on-screen reporting. */
+    private fun describeThrowable(error: Throwable): String {
+        val text = StringBuilder()
+        var current: Throwable? = error
+        var depth = 0
+        while (current != null && depth < 4) {
+            if (depth > 0) text.append("\nCaused by: ")
+            text.append(current.javaClass.name)
+            current.message?.let { text.append(": ").append(it) }
+            current.stackTrace.take(6).forEach { text.append("\n    at ").append(it) }
+            current = current.cause
+            depth++
         }
+        return text.toString()
     }
 
     /**
-     * Full-screen native Android Luau editor. Unlike the Bevy SurfaceView this
-     * is a real EditText, so Android owns caret placement, kinetic scrolling,
-     * blue selection handles, and the system Copy/Cut/Paste ActionMode.
+     * Shows why the editor could not open, with the trace selectable and
+     * copyable so it can be reported off a device that has no adb.
      */
-    fun showNativeEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int = 0) {
-        runOnUiThread {
-            nativeEditorDialog?.dismiss()
+    private fun showSoraErrorDialog() {
+        val dialog = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.rgb(30, 30, 30))
+            setPadding(20, 20, 20, 20)
+        }
+        root.addView(TextView(this).apply {
+            text = "The new editor failed to open"
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        val trace = TextView(this).apply {
+            text = lastSoraError ?: "(no detail captured)"
+            setTextColor(Color.rgb(255, 170, 170))
+            typeface = Typeface.MONOSPACE
+            textSize = 11f
+            setTextIsSelectable(true)
+        }
+        root.addView(android.widget.ScrollView(this).apply { addView(trace) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
-            val dialog = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
-            val root = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.rgb(30, 30, 30))
+        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        buttons.addView(Button(this).apply {
+            text = "Copy"
+            setOnClickListener {
+                val clip = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                clip?.setPrimaryClip(ClipData.newPlainText("sora error", lastSoraError ?: ""))
+                Toast.makeText(this@MainActivity, "Copied", Toast.LENGTH_SHORT).show()
             }
-            val toolbar = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(12, 8, 12, 8)
-                setBackgroundColor(Color.rgb(42, 42, 44))
-            }
-            val title = TextView(this).apply {
-                text = fileName
-                setTextColor(Color.WHITE)
-                textSize = 16f
-                typeface = Typeface.DEFAULT_BOLD
-            }
-            toolbar.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-
-            val cancel = Button(this).apply { text = "Cancel" }
-            val done = Button(this).apply { text = "Done" }
-            toolbar.addView(cancel)
-            toolbar.addView(done)
-            root.addView(toolbar, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-
-            val actions = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(10, 2, 10, 2)
-                setBackgroundColor(Color.rgb(36, 36, 38))
-            }
-            val checkLuau = Button(this).apply { text = "✓ Check" }
-            val formatLuau = Button(this).apply { text = "✨ Format" }
-            val goDefinition = Button(this).apply { text = "↗ Definition" }
-            val findReferences = Button(this).apply { text = "⌕ References" }
-            actions.addView(checkLuau)
-            actions.addView(formatLuau)
-            actions.addView(goDefinition)
-            actions.addView(findReferences)
-            val actionScroller = HorizontalScrollView(this).apply {
-                isHorizontalScrollBarEnabled = false
-                addView(actions)
-            }
-            root.addView(actionScroller, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-
-            val editor = EditText(this).apply {
-                setText(source)
-                setTextColor(Color.rgb(225, 225, 225))
-                setHintTextColor(Color.GRAY)
-                setBackgroundColor(Color.rgb(30, 30, 30))
-                typeface = Typeface.MONOSPACE
-                textSize = 15f
-                gravity = Gravity.TOP or Gravity.START
-                setPadding(18, 14, 18, 28)
-                inputType = InputType.TYPE_CLASS_TEXT or
-                    InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                setHorizontallyScrolling(true)
-                isVerticalScrollBarEnabled = true
-                isHorizontalScrollBarEnabled = true
-                isLongClickable = true
-                setSelection(initialCursor.coerceIn(0, source.length))
-            }
-            var applyingPair = false
-            var changedStart = 0
-            var changedBefore = 0
-            var changedCount = 0
-            val highlightTask = Runnable { highlightNativeLuau(editor) }
-            val intelligenceTask = Runnable {
-                if (nativeEditorScriptId == scriptId) {
-                    nativeOnNativeEditorChanged(
-                        scriptId, editor.text.toString(),
-                        editor.selectionStart.coerceAtLeast(0),
-                        editor.selectionEnd.coerceAtLeast(0)
-                    )
-                }
-            }
-            editor.addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                    changedStart = start
-                    changedBefore = before
-                    changedCount = count
-                }
-                override fun afterTextChanged(text: Editable?) {
-                    if (text == null || applyingPair) return
-                    editor.removeCallbacks(highlightTask)
-                    editor.removeCallbacks(intelligenceTask)
-                    val composing = BaseInputConnection.getComposingSpanStart(text) >= 0
-                    if (!composing && changedBefore == 0 && changedCount == 1 && changedStart < text.length) {
-                        val opener = text[changedStart]
-                        val closer = when (opener) {
-                            '(' -> ')'
-                            '[' -> ']'
-                            '{' -> '}'
-                            '"' -> '"'
-                            '\'' -> '\''
-                            else -> null
-                        }
-                        if (closer != null) {
-                            val next = text.getOrNull(changedStart + 1)
-                            if (next != closer) {
-                                applyingPair = true
-                                text.insert(changedStart + 1, closer.toString())
-                                editor.setSelection(changedStart + 1)
-                                applyingPair = false
-                            }
-                        }
-                    }
-                    editor.postDelayed(highlightTask, if (composing) 220 else 110)
-                    // Request Luau suggestions from the current composing text
-                    // too. Samsung keeps identifiers such as `loc` composing
-                    // until Space, so waiting for commit made completion appear
-                    // only after Space+Backspace.
-                    editor.postDelayed(intelligenceTask, if (composing) 95 else 65)
-                }
-            })
-            editor.post(highlightTask)
-            checkLuau.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "check", editor.text.toString(), editor.selectionStart)
-            }
-            formatLuau.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), editor.selectionStart)
-            }
-            goDefinition.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), editor.selectionStart)
-            }
-            findReferences.setOnClickListener {
-                nativeOnNativeEditorCommand(scriptId, "references", editor.text.toString(), editor.selectionStart)
-            }
-            root.addView(editor, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            ))
-
-            fun close(apply: Boolean) {
-                if (apply) nativeOnExternalEditReturned(scriptId, editor.text.toString())
-                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                imm?.hideSoftInputFromWindow(editor.windowToken, 0)
-                nativeCompletionPopup?.dismiss()
-                nativeCompletionPopup = null
-                nativeEditorView = null
-                nativeEditorScriptId = -1
+        })
+        buttons.addView(Button(this).apply {
+            text = "Close"
+            setOnClickListener {
                 dialog.dismiss()
                 nativeEditorDialog = null
             }
-            cancel.setOnClickListener { close(false) }
-            done.setOnClickListener { close(true) }
-            dialog.setOnCancelListener { nativeEditorDialog = null }
-            dialog.setContentView(root)
-            dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-            dialog.show()
-            nativeEditorDialog = dialog
-            nativeEditorView = editor
-            nativeEditorScriptId = scriptId
-            editor.requestFocus()
-            editor.post {
-                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                imm?.showSoftInput(editor, InputMethodManager.SHOW_IMPLICIT)
+        })
+        root.addView(buttons)
+        dialog.setContentView(root)
+        dialog.show()
+        nativeEditorDialog = dialog
+    }
+
+    /**
+     * Script editor built on sora-editor: the gutter, syntax highlighting,
+     * bracket pairing, smart Enter and the completion window all come from
+     * the library, so the only wiring left here is the toolbar, the symbol
+     * row and the Rust intelligence bridge.
+     */
+    private fun showSoraEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int) {
+        // Runs on the UI thread already: the caller wraps this in
+        // runOnUiThread so construction failures are catchable.
+        nativeEditorDialog?.dismiss()
+
+        val dialog = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.rgb(30, 30, 30))
+        }
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(12, 8, 12, 8)
+            setBackgroundColor(Color.rgb(42, 42, 44))
+        }
+        val title = TextView(this).apply {
+            text = fileName
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        toolbar.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val cancel = Button(this).apply { text = "Cancel" }
+        val done = Button(this).apply { text = "Done" }
+        toolbar.addView(cancel)
+        toolbar.addView(done)
+        root.addView(toolbar, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        val language = LuauLanguage(scriptId) { id, text, cursor ->
+            // Called on sora's completion worker; the JNI bridge is
+            // thread-safe and the reply comes back through
+            // updateNativeCompletions -> deliverCompletions.
+            nativeOnNativeEditorChanged(id, text, cursor, cursor)
+        }
+
+        // Tabs already stored in the script become spaces so on-screen
+        // columns match what the indent logic produces.
+        val normalizedSource = source.replace("\t", INDENT_UNIT)
+        val editor = CodeEditor(this).apply {
+            setEditorLanguage(language)
+            colorScheme = LuauLanguage.darkScheme()
+            typefaceText = Typeface.MONOSPACE
+            setTextSize(15f)
+            setLineNumberEnabled(true)
+            setPinLineNumber(true)
+            setWordwrap(nativeEditorWordWrap)
+            tabWidth = INDENT_WIDTH
+            isHighlightCurrentLine = true
+            // Two completion requests closer together than this are dropped
+            // and the window is hidden. The 70ms default assumes a language
+            // that answers instantly; ours makes a round trip to the Rust
+            // index, so ordinary typing kept landing inside the window and
+            // the popup only appeared after a pause -- which is why typing a
+            // space and deleting it "fixed" it. Effectively disabled.
+            getProps().cancelCompletionNs = 0L
+            setText(normalizedSource)
+        }
+        // Re-ask for completions after an auto-paired quote or bracket.
+        //
+        // commitText() inserts the pair and then calls setSelection() with
+        // CAUSE_UNKNOWN, and EditorAutoCompletion.onSelectionChange() hides the
+        // window unconditionally for that cause. So typing the opening quote of
+        // require('') showed nothing, while typing a '.' afterwards -- a plain
+        // insert with no pairing -- worked. Re-requesting on the next frame
+        // runs after the hide() and puts the path list back.
+        editor.subscribeEvent(ContentChangeEvent::class.java) { event, _ ->
+            if (event.action == ContentChangeEvent.ACTION_INSERT &&
+                event.changedText.length == 1 &&
+                event.changedText[0] in PAIRED_OPENERS
+            ) {
+                editor.post {
+                    editor.getComponent(EditorAutoCompletion::class.java).requireCompletion()
+                }
             }
         }
+
+        // Position the caret by translating the Rust character index into
+        // the (line, column) pair sora addresses text with.
+        val caret = editor.text.getIndexer().getCharPosition(
+            initialCursor.coerceIn(0, normalizedSource.length)
+        )
+        editor.setSelection(caret.line, caret.column)
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10, 2, 10, 2)
+            setBackgroundColor(Color.rgb(36, 36, 38))
+        }
+        val checkLuau = Button(this).apply { text = "✓ Check" }
+        val formatLuau = Button(this).apply { text = "✨ Format" }
+        val goDefinition = Button(this).apply { text = "↗ Definition" }
+        val findReferences = Button(this).apply { text = "⌕ References" }
+        val toggleWrap = Button(this).apply {
+            text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
+        }
+        actions.addView(checkLuau)
+        actions.addView(formatLuau)
+        actions.addView(toggleWrap)
+        actions.addView(goDefinition)
+        actions.addView(findReferences)
+        root.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(actions)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        fun caretIndex(): Int = editor.cursor.left
+
+        checkLuau.setOnClickListener {
+            nativeOnNativeEditorCommand(scriptId, "check", editor.text.toString(), caretIndex())
+        }
+        formatLuau.setOnClickListener {
+            nativeOnNativeEditorCommand(scriptId, "format", editor.text.toString(), caretIndex())
+        }
+        goDefinition.setOnClickListener {
+            nativeOnNativeEditorCommand(scriptId, "definition", editor.text.toString(), caretIndex())
+        }
+        findReferences.setOnClickListener {
+            nativeOnNativeEditorCommand(scriptId, "references", editor.text.toString(), caretIndex())
+        }
+        toggleWrap.setOnClickListener {
+            nativeEditorWordWrap = !nativeEditorWordWrap
+            toggleWrap.text = if (nativeEditorWordWrap) "↩ Wrap: On" else "↩ Wrap: Off"
+            editor.setWordwrap(nativeEditorWordWrap)
+        }
+
+        root.addView(editor, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+        ))
+
+        // Symbol row for characters Android keyboards bury in submenus.
+        val symbolRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(6, 2, 6, 2)
+            setBackgroundColor(Color.rgb(42, 42, 44))
+        }
+        for (symbol in EXTRA_KEYS) {
+            val key = Button(this).apply {
+                text = if (symbol == "\t") "⇥" else symbol
+                textSize = 15f
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(20, 4, 20, 4)
+                setOnClickListener {
+                    // insertText replaces the selection and moves the caret.
+                    // The offset must be the full length so the caret lands
+                    // after the inserted text, not one character into it.
+                    val insert = if (symbol == "\t") INDENT_UNIT else symbol
+                    editor.insertText(insert, insert.length)
+                    editor.requestFocus()
+                }
+            }
+            symbolRow.addView(key)
+        }
+        root.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(symbolRow)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        fun close(apply: Boolean) {
+            if (apply) nativeOnExternalEditReturned(scriptId, editor.text.toString())
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(editor.windowToken, 0)
+            soraEditorView = null
+            soraLanguage = null
+            nativeEditorScriptId = -1
+            // Frees the editor's threads and the language's analyzer.
+            editor.release()
+            dialog.dismiss()
+            nativeEditorDialog = null
+        }
+        cancel.setOnClickListener { close(false) }
+        done.setOnClickListener { close(true) }
+        dialog.setOnCancelListener { nativeEditorDialog = null }
+        dialog.setContentView(root)
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        dialog.show()
+        nativeEditorDialog = dialog
+        soraEditorView = editor
+        soraLanguage = language
+        nativeEditorScriptId = scriptId
+        editor.requestFocus()
     }
+
 
     fun updateNativeEditorResult(scriptId: Long, command: String, text: String, message: String) {
         runOnUiThread {
-            val editor = nativeEditorView ?: return@runOnUiThread
+            val editor = soraEditorView ?: return@runOnUiThread
             if (nativeEditorScriptId != scriptId) return@runOnUiThread
             if (command == "format" && editor.text.toString() != text) {
-                val cursor = editor.selectionStart.coerceAtLeast(0)
+                val cursor = editor.cursor.left
                 editor.setText(text)
-                editor.setSelection(cursor.coerceAtMost(text.length))
-                highlightNativeLuau(editor)
+                val position = editor.text.getIndexer()
+                    .getCharPosition(cursor.coerceIn(0, text.length))
+                editor.setSelection(position.line, position.column)
             }
             if (message.isNotBlank()) {
                 Toast.makeText(this, message, Toast.LENGTH_LONG).show()
@@ -582,59 +673,12 @@ class MainActivity : GameActivity() {
 
     fun updateNativeCompletions(scriptId: Long, json: String) {
         runOnUiThread {
-            val editor = nativeEditorView ?: return@runOnUiThread
-            if (nativeEditorScriptId != scriptId || !editor.hasFocus()) return@runOnUiThread
-            val array = try { JSONArray(json) } catch (_: Exception) { return@runOnUiThread }
-            if (array.length() == 0) {
-                nativeCompletionPopup?.dismiss()
-                return@runOnUiThread
-            }
-            val labels = ArrayList<String>()
-            for (i in 0 until array.length()) {
-                val item = array.getJSONObject(i)
-                val detail = item.optString("detail")
-                labels.add(if (detail.isBlank()) item.getString("label") else "${item.getString("label")}  —  $detail")
-            }
-            // ListPopupWindow copies its item-click listener into the internal
-            // drop-down ListView when first shown. Reusing the same popup can
-            // update its visible adapter to `require` while its ListView still
-            // invokes the older listener that captured `return`. Recreate the
-            // popup so displayed rows and accepted completion always share the
-            // exact same immutable result snapshot.
-            nativeCompletionPopup?.dismiss()
-            val popup = ListPopupWindow(this).also {
-                it.anchorView = editor
-                it.isModal = false
-                nativeCompletionPopup = it
-            }
-            popup.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, labels))
-            popup.width = (320 * resources.displayMetrics.density).toInt()
-            popup.height = (220 * resources.displayMetrics.density).toInt()
-            val cursor = editor.selectionStart.coerceAtLeast(0)
-            val layout = editor.layout
-            if (layout != null) {
-                val safeCursor = cursor.coerceAtMost(editor.text.length)
-                val line = layout.getLineForOffset(safeCursor)
-                popup.horizontalOffset = (layout.getPrimaryHorizontal(safeCursor) - editor.scrollX).toInt()
-                popup.verticalOffset = layout.getLineBottom(line) - editor.scrollY - editor.height
-            }
-            popup.setOnItemClickListener { _, _, position, _ ->
-                val item = array.getJSONObject(position)
-                val replace = item.optInt("replaceChars", 0)
-                val insert = item.getString("insertText")
-                // End Samsung's composing ownership before applying a Luau
-                // completion. Otherwise the keyboard can subsequently replace
-                // `RagdollSystem.Init` with an unrelated dictionary candidate
-                // such as `RRadio`.
-                BaseInputConnection.removeComposingSpans(editor.text)
-                val end = editor.selectionStart.coerceAtLeast(0)
-                val start = (end - replace).coerceAtLeast(0)
-                editor.text.replace(start, end, insert)
-                editor.setSelection(start + insert.length)
-                popup.dismiss()
-                editor.requestFocus()
-            }
-            popup.show()
+            // Hand straight to the language, which unparks the worker blocked
+            // in requireAutoComplete. Sora owns the popup, so there is no
+            // ListPopupWindow to build, position or dismiss here.
+            val language = soraLanguage ?: return@runOnUiThread
+            if (nativeEditorScriptId != scriptId) return@runOnUiThread
+            language.deliverCompletions(json)
         }
     }
 
@@ -860,6 +904,28 @@ class MainActivity : GameActivity() {
 
     companion object {
         private const val TAG = "rbxl_editor"
+
+        /**
+         * Indentation width in spaces.
+         *
+         * Spaces rather than '\t', matching LuauLanguage.INDENT_WIDTH and
+         * app::INDENT_WIDTH on the Rust side so a column means the same
+         * thing everywhere.
+         */
+        const val INDENT_WIDTH = 4
+        val INDENT_UNIT = " ".repeat(INDENT_WIDTH)
+
+        /**
+         * Openers that LuauLanguage auto-pairs. Inserting one ends with a
+         * setSelection(CAUSE_UNKNOWN) that hides the completion window, so
+         * these are the characters after which it has to be re-requested.
+         */
+        val PAIRED_OPENERS = charArrayOf('"', '\'', '(', '[', '{')
+
+        /** Quick-insert symbol row for keys Android keyboards bury in submenus. */
+        val EXTRA_KEYS = listOf(
+            "\t", "(", ")", "\"", "{", "}", "[", "]", ";", ":", ",", ".", "=", "-", "_", "#"
+        )
 
         private const val REQ_OPEN = 1001
         private const val REQ_CREATE = 1002

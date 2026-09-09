@@ -16,6 +16,14 @@ use crate::settings::EditorSettings;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
+/// One indentation level, as spaces.
+///
+/// Spaces rather than '\t' so a level occupies the same visual width in the
+/// egui editor, the native Android EditText (whose tab stop is very wide and
+/// not adjustable), and exported files.
+pub const INDENT_WIDTH: usize = 4;
+pub const INDENT_UNIT: &str = "    ";
+
 /// Log line emitted by a background plugin run.
 enum PluginLogLine {
     Output(lua_runtime::OutputLine),
@@ -1859,13 +1867,13 @@ ui.label("Place ID:");
                     ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
 
                     let symbols = [
-                        ("Tab", "\t"), ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
+                        ("Tab", INDENT_UNIT), ("()", "()"), ("{}", "{}"), ("[]", "[]"), ("\"\"", "\"\""), ("''", "''"),
                         ("=", " = "), ("==", " == "), ("~=", " ~= "), ("<=", " <= "), (">=", " >= "),
                         ("..", " .. "), (":", ":"), (".", "."), (",", ", "), ("->", " -> "), ("::", " :: "),
                         ("local", "local "), ("const", "const "), ("function", "function "), ("end", "end"),
-                        ("then", "then\n\t"), ("do", "do\n\t"), ("return", "return "),
-                        ("if", "if "), ("else", "else\n\t"), ("elseif", "elseif "),
-                        ("for", "for i, v in pairs() do\n\tend"), ("while", "while true do\n\ttask.wait()\nend"),
+                        ("then", "then\n    "), ("do", "do\n    "), ("return", "return "),
+                        ("if", "if "), ("else", "else\n    "), ("elseif", "elseif "),
+                        ("for", "for i, v in pairs() do\n    end"), ("while", "while true do\n    task.wait()\nend"),
                         ("task.wait()", "task.wait()"), ("print()", "print()"),
                         ("game:GetService()", "game:GetService(\"\")"),
                     ];
@@ -2379,7 +2387,7 @@ ui.label("Place ID:");
             ) {
                 luau_intelligence::apply_suggestion_at(&mut tab.buffer, at, &completion)
             } else {
-                insert_at_selection(&mut tab.buffer, self.script_selection, "\t")
+                insert_at_selection(&mut tab.buffer, self.script_selection, INDENT_UNIT)
             };
             self.pending_script_cursor = Some(cursor);
             self.script_completion_cursor = Some(cursor);
@@ -5461,25 +5469,88 @@ fn format_luau_indentation(source: &str) -> String {
     let mut output = Vec::new();
     for raw in source.lines() {
         let trimmed = raw.trim();
-        let code = trimmed.split("--").next().unwrap_or("").trim();
-        let closes = code == "end" || code.starts_with("end ") || code.starts_with("end;")
-            || code.starts_with("until ") || code == "else" || code.starts_with("elseif ");
+        let code = strip_luau_comment(trimmed);
+        let code = code.trim();
+        // A line that only closes brackets/blocks belongs one level out.
+        let leading_bracket_close = code.starts_with('}') || code.starts_with(')') || code.starts_with(']');
+        let closes = code == "end" || code.starts_with("end ") || code.starts_with("end)")
+            || code.starts_with("end,") || code.starts_with("end;")
+            || code.starts_with("until ") || code == "else" || code.starts_with("elseif ")
+            || leading_bracket_close;
         if closes { depth = depth.saturating_sub(1); }
         if trimmed.is_empty() {
             output.push(String::new());
         } else {
-            output.push(format!("{}{}", "\t".repeat(depth), trimmed));
+            output.push(format!("{}{}", INDENT_UNIT.repeat(depth), trimmed));
         }
-        let opens = (code.starts_with("if ") && code.ends_with("then"))
+        // Block keywords add a level unless the same line already closed it.
+        let block_opens = (code.starts_with("if ") && code.ends_with("then"))
             || ((code.starts_with("for ") || code.starts_with("while ")) && code.ends_with("do"))
             || code.starts_with("function ") || code.starts_with("local function ")
             || code.starts_with("const function ") || code == "do" || code == "repeat"
-            || code == "else" || code.starts_with("elseif ");
-        if opens && !code.ends_with(" end") { depth += 1; }
+            || code == "else" || code.starts_with("elseif ")
+            || code.contains("= function(") || code.contains("= function (");
+        // The display dedent above is temporary for bracket closers; the real
+        // level change comes from the balanced bracket count of the line.
+        let mut delta = if leading_bracket_close { 1 } else { 0 };
+        if block_opens && !code.ends_with("end") { delta += 1; }
+        if code.ends_with("end") && !block_opens && !closes { delta -= 1; }
+        // Unbalanced brackets left open at the end of a line (tables, long
+        // argument lists) also indent their continuation lines.
+        // Clamp so `table.freeze(setmetatable({` indents its body by one
+        // level rather than three, and its closer dedents symmetrically.
+        delta += luau_bracket_delta(code).clamp(-1, 1);
+        depth = (depth as i32 + delta).max(0) as usize;
     }
     let mut formatted = output.join("\n");
     if source.ends_with('\n') { formatted.push('\n'); }
     formatted
+}
+
+/// Remove a trailing `--` comment without cutting inside a string literal.
+fn strip_luau_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let character = bytes[index];
+        match quote {
+            Some(active) => {
+                if character == b'\\' { index += 2; continue }
+                if character == active { quote = None; }
+            }
+            None => {
+                if matches!(character, b'"' | b'\'' | b'`') { quote = Some(character); }
+                else if character == b'-' && bytes.get(index + 1) == Some(&b'-') {
+                    return &line[..index];
+                }
+            }
+        }
+        index += 1;
+    }
+    line
+}
+
+/// Net bracket balance of a code line, ignoring brackets in string literals.
+fn luau_bracket_delta(code: &str) -> i32 {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut delta = 0;
+    for character in code.chars() {
+        if escaped { escaped = false; continue }
+        if let Some(active) = quote {
+            if character == '\\' { escaped = true; }
+            else if character == active { quote = None; }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => quote = Some(character),
+            '{' | '(' | '[' => delta += 1,
+            '}' | ')' | ']' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
 }
 
 fn insert_at_selection(source: &mut String, selection: Option<(usize, usize)>, text: &str) -> usize {
@@ -5809,4 +5880,36 @@ fn utf16_to_char_index(text: &str, utf16_index: usize) -> usize {
         units += ch.len_utf16();
     }
     text.chars().count()
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn indents_tables_and_wrapped_calls() {
+        let source = "const Registry = table.freeze(setmetatable({\n\
+            Init = init,\n\
+            IsNPC = function(target: Instance): boolean\n\
+            return isNPC(target)\n\
+            end,\n\
+            }, Metatable)) :: any\n\
+            return Registry";
+        assert_eq!(
+            format_luau_indentation(source),
+            "const Registry = table.freeze(setmetatable({\n\
+             \u{20}   Init = init,\n\
+             \u{20}   IsNPC = function(target: Instance): boolean\n\
+             \u{20}       return isNPC(target)\n\
+             \u{20}   end,\n\
+             }, Metatable)) :: any\n\
+             return Registry"
+        );
+    }
+
+    #[test]
+    fn brackets_inside_strings_and_comments_do_not_indent() {
+        let source = "print(\"{{{\") -- }}} not real\nprint(1)";
+        assert_eq!(format_luau_indentation(source), "print(\"{{{\") -- }}} not real\nprint(1)");
+    }
 }

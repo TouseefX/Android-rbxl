@@ -519,6 +519,20 @@ impl ProjectIndex {
                 continue;
             };
 
+            // Only report unknown members when the target module's public
+            // shape is actually knowable. Modules that build their exports
+            // dynamically (`M[name] = ...`), forward another module, or
+            // return a bare function have no statically complete member list,
+            // and flagging every access against an empty/partial map produced
+            // a wall of false "Unknown member" warnings.
+            let module_source = self.resolve_module_ref(current_script, &request)
+                .and_then(|referent| self.module_sources.get(&referent));
+            let shape_is_known = !members.is_empty()
+                && !module_source.is_some_and(|source| has_dynamic_exports(source));
+            if !shape_is_known {
+                continue;
+            }
+
             let needle = format!("{alias}.");
             for (line_index, line) in source.lines().enumerate() {
                 let code = line.split("--").next().unwrap_or("");
@@ -1540,7 +1554,272 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
             return_depth = (next > 0).then_some(next);
         }
     }
+    // Modules very often build their public API in a named table and then
+    // `return TheTable` at the very end — frequently wrapped in
+    // `table.freeze(setmetatable({ ... }, mt)) :: any` and typed with an
+    // `export type` interface. None of that is a literal `return {`, so the
+    // scanning above saw no exports at all. Recover those members from the
+    // returned binding, and enrich them with the annotated interface.
+    for (name, detail) in returned_binding_members(source) {
+        result.entry(name).or_insert(detail);
+    }
     result
+}
+
+/// Name of the identifier the module returns (`return Foo`, `return Foo :: any`).
+fn returned_binding_name(source: &str) -> Option<&str> {
+    source.lines().rev().find_map(|raw| {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let rest = code.strip_prefix("return ")?;
+        let mut rest = rest.split("::").next().unwrap_or(rest).trim();
+        // Unwrap the usual export wrappers: `return table.freeze(Module)`,
+        // `return setmetatable(Module, mt)`, `return (Module)`.
+        loop {
+            let unwrapped = ["table.freeze(", "table.clone(", "setmetatable(", "("]
+                .into_iter()
+                .find_map(|prefix| rest.strip_prefix(prefix));
+            let Some(inner) = unwrapped else { break };
+            rest = inner.split(',').next().unwrap_or(inner).trim_end_matches(')').trim();
+        }
+        is_identifier(rest).then_some(rest)
+    })
+}
+
+/// Locate `local/const Name[: Type] = ...`, returning the annotation (if any)
+/// and the zero-based line index of the declaration.
+fn binding_declaration<'a>(source: &'a str, name: &str) -> Option<(Option<&'a str>, usize)> {
+    source.lines().enumerate().find_map(|(index, raw)| {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let rest = code.strip_prefix("local ")
+            .or_else(|| code.strip_prefix("const "))
+            .unwrap_or(code);
+        let rest = rest.strip_prefix(name)?;
+        // `Registry` must not match the declaration of `RegistryMetatable`.
+        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') { return None }
+        let rest = rest.trim_start();
+        let (annotation, rest) = match rest.strip_prefix(':') {
+            Some(tail) => {
+                let (annotation, value) = tail.split_once('=')?;
+                (Some(annotation.trim()), value)
+            }
+            None => (None, rest.strip_prefix('=')?),
+        };
+        // The value itself is parsed separately by table_literal_members.
+        let _value = rest;
+        Some((annotation, index))
+    })
+}
+
+/// Public members of the returned table, taken from the table literal at the
+/// declaration and from its annotated `export type` interface (which carries
+/// the richer function signatures).
+fn returned_binding_members(source: &str) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    let Some(name) = returned_binding_name(source) else { return result };
+    let Some((annotation, line)) = binding_declaration(source, name) else { return result };
+    for (member, detail) in table_literal_members(source, line) {
+        result.insert(member, detail);
+    }
+    // Members attached after the declaration: `Module.Value = 5`,
+    // `Module.Client = {}`, `Module.Nested.Thing = ...` (Knit/Fusion style).
+    let owner_prefix = format!("{name}.");
+    for raw in source.lines() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let code = code.strip_prefix("function ")
+            .or_else(|| code.strip_prefix("local function "))
+            .or_else(|| code.strip_prefix("const function "))
+            .unwrap_or(code);
+        let Some(rest) = code.strip_prefix(&owner_prefix) else { continue };
+        let member = identifier_start(rest);
+        if !is_identifier(member) || is_metamethod(member) { continue }
+        let tail = rest[member.len()..].trim_start();
+        let detail = if tail.starts_with('(') {
+            function_signature(member, &rest[member.len()..])
+                .unwrap_or_else(|| format!("function {member}"))
+        } else if let Some(value) = tail.strip_prefix('=') {
+            if value.trim_start().starts_with("function") {
+                format!("function {member}")
+            } else {
+                format!("field {member}")
+            }
+        } else {
+            continue;
+        };
+        result.insert(member.to_string(), detail);
+    }
+    if let Some(annotation) = annotation {
+        // A `Registry` style interface documents the real signatures, so it
+        // wins over the bare `field X` inferred from the literal.
+        let type_name = identifier_start(annotation);
+        for (member, detail) in type_declaration_members(source, type_name) {
+            result.insert(member, detail);
+        }
+    }
+    result
+}
+
+/// Fields of the first table literal starting at (or just after) `start_line`,
+/// ignoring nested tables. Wrappers such as `table.freeze(setmetatable({` are
+/// skipped because only the brace depth is tracked.
+fn table_literal_members(source: &str, start_line: usize) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    let mut depth = 0i32;
+    let mut started = false;
+    for raw in source.lines().skip(start_line) {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        if !started {
+            let Some(open) = code.find('{') else {
+                // Only keep looking while the declaration is still an open
+                // call such as `table.freeze(`; otherwise this binding is not
+                // a table literal and an unrelated table must not be adopted.
+                if structural_paren_delta(code) > 0 { continue } else { break }
+            };
+            started = true;
+            depth = structural_brace_delta(code);
+            if depth == 1 {
+                collect_table_fields(&code[open + 1..], &mut result);
+            }
+            if depth <= 0 { break }
+            continue;
+        }
+        if depth == 1 {
+            collect_table_fields(code, &mut result);
+        }
+        depth += structural_brace_delta(code);
+        if depth <= 0 { break }
+    }
+    result
+}
+
+/// Members declared by `type Name = { ... }` / `export type Name = { ... }`.
+fn type_declaration_members(source: &str, type_name: &str) -> BTreeMap<String, String> {
+    for (index, raw) in source.lines().enumerate() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let rest = code.strip_prefix("export type ").or_else(|| code.strip_prefix("type "));
+        let Some(rest) = rest else { continue };
+        if identifier_start(rest) == type_name && code.contains('{') {
+            return table_literal_members(source, index);
+        }
+    }
+    BTreeMap::new()
+}
+
+/// Luau metamethods (`__index`, `__tostring`, ...) are implementation detail
+/// of the metatable, never a member a user means to autocomplete.
+fn is_metamethod(name: &str) -> bool {
+    name.starts_with("__")
+}
+
+/// Whether a module's public surface cannot be fully determined by reading
+/// the source: computed keys, forwarded modules, callable modules, or an
+/// `__index` fallback to another table. Completion still offers whatever was
+/// found, but "unknown member" diagnostics must stay silent for these.
+pub(crate) fn has_dynamic_exports(source: &str) -> bool {
+    let returned = returned_binding_name(source);
+    for raw in source.lines() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        // `return require(...)` / `return function(...)` — no member table.
+        if let Some(rest) = code.strip_prefix("return ") {
+            let rest = rest.split("::").next().unwrap_or(rest).trim();
+            if rest.starts_with("require(") || rest.starts_with("function") {
+                return true;
+            }
+        }
+        let Some(name) = returned else { continue };
+        // `M[key] = ...` builds exports with a computed key.
+        if code.starts_with(&format!("{name}[")) {
+            return true;
+        }
+        // `M.__index = Other` forwards lookups to a table we did not scan.
+        if let Some(rest) = code.strip_prefix(&format!("{name}.__index")) {
+            let target = rest.trim_start().strip_prefix('=').map(str::trim).unwrap_or("");
+            if is_identifier(target) && target != name {
+                return true;
+            }
+        }
+        if code.contains("setmetatable(") && code.contains("__index") {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_table_fields(body: &str, result: &mut BTreeMap<String, String>) {
+    for field in split_top_level_fields(body) {
+        let field = field.trim().trim_end_matches([',', ';']).trim();
+        let name = identifier_start(field);
+        if !is_identifier(name) || is_metamethod(name) { continue }
+        let rest = field[name.len()..].trim_start();
+        if let Some(value) = rest.strip_prefix('=') {
+            let value = value.trim();
+            let detail = if let Some(tail) = value.strip_prefix("function") {
+                function_signature(name, tail).unwrap_or_else(|| format!("function {name}"))
+            } else {
+                format!("field {name}")
+            };
+            result.entry(name.to_string()).or_insert(detail);
+        } else if let Some(annotation) = rest.strip_prefix(':') {
+            // Interface entry: `Get: (target: StateTarget) -> StateProxy?`
+            let annotation = annotation.trim();
+            if annotation.is_empty() { continue }
+            let detail = if annotation.contains("->") {
+                format!("function {name}{annotation}")
+            } else {
+                format!("field {name}: {annotation}")
+            };
+            result.entry(name.to_string()).or_insert(detail);
+        }
+    }
+}
+
+/// Split a table body on commas/semicolons that are not nested inside
+/// brackets, braces, parentheses, or string literals.
+fn split_top_level_fields(body: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in body.chars() {
+        if escaped { current.push(character); escaped = false; continue }
+        if let Some(active) = quote {
+            current.push(character);
+            if character == '\\' { escaped = true; }
+            else if character == active { quote = None; }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => { quote = Some(character); current.push(character); }
+            '{' | '(' | '[' => { depth += 1; current.push(character); }
+            '}' | ')' | ']' => { depth -= 1; current.push(character); }
+            ',' | ';' if depth <= 0 => { result.push(std::mem::take(&mut current)); }
+            _ => current.push(character),
+        }
+    }
+    result.push(current);
+    result
+}
+
+/// Net parenthesis balance outside string literals.
+fn structural_paren_delta(code: &str) -> i32 {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut delta = 0;
+    for character in code.chars() {
+        if escaped { escaped = false; continue }
+        if let Some(active) = quote {
+            if character == '\\' { escaped = true; }
+            else if character == active { quote = None; }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => quote = Some(character),
+            '(' => delta += 1,
+            ')' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
 }
 
 fn structural_brace_delta(code: &str) -> i32 {
@@ -1743,6 +2022,102 @@ mod tests {
         assert!(members.contains_key("Size"));
         assert!(!members.contains_key("fromRGB"));
         assert!(!members.contains_key("new"));
+    }
+
+    #[test]
+    fn exports_frozen_setmetatable_registry_with_typed_interface() {
+        // `return SomeTable` (not `return {`), wrapped in
+        // table.freeze(setmetatable(...)) and typed by an exported interface.
+        let source = "export type Registry = {\n\
+             \tInitializeNPC: (npc: Model) -> StateProxy?,\n\
+             \tCleanupNPC: (npc: Model) -> boolean,\n\
+             \tGetCharacterAndPlayer: (target: Instance) -> (Model?, Player?),\n\
+             \tSetTimed: (target: StateTarget, key: StateKey, duration: number) -> boolean,\n\
+             \t[StateTarget]: StateProxy?,\n\
+             }\n\
+             const StatsRegistry: Registry = table.freeze(setmetatable({\n\
+             \tInitializeNPC = initializeNPC,\n\
+             \tCleanupNPC = cleanupNPC,\n\
+             \tGetCharacterAndPlayer = function(target: Instance): (Model?, Player?)\n\
+             \t\treturn getCharacterAndPlayer(target)\n\
+             \tend,\n\
+             \tSetTimed = setTimedState,\n\
+             }, RegistryMetatable)) :: any\n\
+             \n\
+             return StatsRegistry\n";
+        let members = exported_members(source);
+        for member in ["InitializeNPC", "CleanupNPC", "GetCharacterAndPlayer", "SetTimed"] {
+            assert!(members.contains_key(member), "missing {member} in {members:?}");
+        }
+        // Signatures come from the annotated interface, not just `field X`.
+        assert!(members["SetTimed"].starts_with("function SetTimed("));
+        // Metatable/wrapper identifiers are not module members.
+        assert!(!members.contains_key("RegistryMetatable"));
+        assert!(!members.contains_key("freeze"));
+        assert!(!members.contains_key("setmetatable"));
+    }
+
+    #[test]
+    fn metamethods_are_not_offered_as_module_members() {
+        let source = "local Class = {}\n\
+             Class.__index = Class\n\
+             function Class.new()\nend\n\
+             function Class:Destroy()\nend\n\
+             return Class\n";
+        let members = exported_members(source);
+        assert!(members.contains_key("new"));
+        assert!(members.contains_key("Destroy"));
+        assert!(!members.contains_key("__index"));
+    }
+
+    #[test]
+    fn dynamically_built_modules_suppress_unknown_member_warnings() {
+        // Computed keys, forwarded requires, and callable modules have no
+        // statically complete member list.
+        assert!(has_dynamic_exports(
+            "local M = {}\nfor _, name in ipairs(list) do\n\tM[name] = build(name)\nend\nreturn M",
+        ));
+        assert!(has_dynamic_exports("return require(script.Parent.Real)"));
+        assert!(has_dynamic_exports("return function(a, b)\n\treturn a + b\nend"));
+        // A plain static module, and the `Class.__index = Class` self
+        // reference, must stay strictly checked.
+        assert!(!has_dynamic_exports("local M = {}\nM.A = 1\nreturn M"));
+        assert!(!has_dynamic_exports("local C = {}\nC.__index = C\nreturn C"));
+    }
+
+    #[test]
+    fn no_unknown_member_warnings_for_dynamic_modules() {
+        let module = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.paths.insert(module, "Dynamic".into());
+        index.module_refs.insert("dynamic".into(), module);
+        let dynamic = "local M = {}\nM.Known = 1\nM[key] = 2\nreturn M";
+        index.module_sources.insert(module, dynamic.into());
+        index.modules.insert(
+            "dynamic".into(),
+            BTreeMap::from([("Known".into(), "field Known".into())]),
+        );
+        let warnings = index.diagnostics(
+            Ref::none(),
+            "const D = require(\"./Dynamic\")\nD.Whatever()",
+        );
+        assert!(
+            !warnings.iter().any(|warning| warning.message.contains("Unknown member")),
+            "dynamic module produced false positives: {warnings:?}",
+        );
+    }
+
+    #[test]
+    fn exports_members_assigned_after_a_returned_table_declaration() {
+        let source = "local Module = {}\n\
+             Module.Version = 3\n\
+             function Module.Start(config)\nend\n\
+             function Module:Stop()\nend\n\
+             return Module\n";
+        let members = exported_members(source);
+        assert_eq!(members.get("Version"), Some(&"field Version".to_string()));
+        assert_eq!(members.get("Start"), Some(&"function Start(config)".to_string()));
+        assert!(members["Stop"].starts_with("method "));
     }
 
     #[test]

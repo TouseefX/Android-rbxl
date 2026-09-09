@@ -113,3 +113,18 @@ so `windowSoftInputMode=adjustResize` cannot shrink the window — the keyboard
 overlays the bottom of the screen instead of pushing the UI up. If a field ends
 up underneath it, the fix is to read `AndroidApp::content_rect()` while the IME
 is up and reserve that much space at the bottom of the egui layout.
+
+## Third-party licenses
+
+The native script editor uses
+[sora-editor](https://github.com/Rosemoe/sora-editor) (`io.github.Rosemoe.sora-editor:editor`),
+copyright Rosemoe, licensed under the
+[GNU LGPL v2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt).
+
+It is consumed as an **unmodified binary AAR** resolved from Maven Central at
+build time. No sora-editor source is vendored into or modified by this
+repository, so the library remains dynamically linked in the sense the LGPL
+requires, and only sora-editor itself stays under the LGPL — this project's own
+sources are unaffected. To use a different build of the library, replace the
+`io.github.Rosemoe.sora-editor:editor` coordinate in `manifest.yaml` and
+rebuild.

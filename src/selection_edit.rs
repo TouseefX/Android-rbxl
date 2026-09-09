@@ -1,5 +1,7 @@
 //! Selection-aware text transformations used by the Luau editor.
 
+use crate::app::{INDENT_UNIT, INDENT_WIDTH};
+
 /// Indent or unindent every line touched by a character-indexed selection.
 /// Returns updated anchor/primary positions while preserving selection direction.
 pub fn indent_lines(
@@ -20,40 +22,49 @@ pub fn indent_lines(
         last_limit = high - 1;
     }
 
+    // Line starts touched by the selection. `first_start` can coincide with a
+    // newline-derived start (a selection beginning exactly at column zero), so
+    // duplicates must be dropped: indenting the same line twice corrupted the
+    // text and left the other selected lines untouched.
     let mut starts = vec![first_start];
     for (index, ch) in chars.iter().enumerate().take(last_limit) {
-        if *ch == '\n' && index + 1 < last_limit {
+        if *ch == '\n' && index + 1 < last_limit && index + 1 != first_start {
             starts.push(index + 1);
         }
     }
+    starts.dedup();
 
     #[derive(Clone, Copy)]
     struct Edit { start: usize, remove: usize, insert: usize }
     let edits: Vec<Edit> = starts.into_iter().map(|start| {
         if !unindent {
-            Edit { start, remove: 0, insert: 1 }
+            Edit { start, remove: 0, insert: INDENT_WIDTH }
         } else if chars.get(start) == Some(&'\t') {
             Edit { start, remove: 1, insert: 0 }
         } else {
-            let spaces = chars.iter().skip(start).take(4).take_while(|c| **c == ' ').count();
+            let spaces = chars.iter().skip(start).take(INDENT_WIDTH)
+                .take_while(|c| **c == ' ').count();
             Edit { start, remove: spaces, insert: 0 }
         }
     }).filter(|edit| edit.remove != 0 || edit.insert != 0).collect();
 
-    let map_position = |mut position: usize| {
+    // Every `edit.start` is in ORIGINAL coordinates, so the comparison must
+    // use the original position and only the accumulated delta is applied at
+    // the end. Mutating `position` inside the loop made it drift past later
+    // edit starts and shift twice.
+    let map_position = |position: usize| {
+        let mut delta: isize = 0;
         for edit in &edits {
             if position < edit.start {
                 continue;
             }
             if position <= edit.start + edit.remove {
-                position = edit.start + edit.insert;
-            } else if edit.insert >= edit.remove {
-                position += edit.insert - edit.remove;
-            } else {
-                position -= edit.remove - edit.insert;
+                delta = (edit.start + edit.insert) as isize - position as isize;
+                break;
             }
+            delta += edit.insert as isize - edit.remove as isize;
         }
-        position
+        (position as isize + delta).max(0) as usize
     };
     let new_anchor = map_position(anchor);
     let new_primary = map_position(primary);
@@ -61,7 +72,7 @@ pub fn indent_lines(
     for edit in edits.iter().rev() {
         let start_byte = char_to_byte(source, edit.start);
         let end_byte = char_to_byte(source, edit.start + edit.remove);
-        let replacement = if edit.insert == 1 { "\t" } else { "" };
+        let replacement = if edit.insert > 0 { INDENT_UNIT } else { "" };
         source.replace_range(start_byte..end_byte, replacement);
     }
     (new_anchor, new_primary)
@@ -144,7 +155,7 @@ pub fn enhance_typed_edit(before: &str, after: &mut String, cursor: usize) -> Op
             || trimmed.ends_with('{') || trimmed.ends_with('[') || trimmed.ends_with('(')
             || trimmed.starts_with("function ") || trimmed.starts_with("local function ")
             || trimmed.starts_with("const function ");
-        let addition = if opens_block { format!("{indent}\t") } else { indent };
+        let addition = if opens_block { format!("{indent}{INDENT_UNIT}") } else { indent };
         if !addition.is_empty() {
             let byte = char_to_byte(after, cursor);
             after.insert_str(byte, &addition);
@@ -166,7 +177,7 @@ mod tests {
     fn indents_and_unindents_selected_lines() {
         let mut text = "one\ntwo\nthree".to_string();
         let range = indent_lines(&mut text, 1, 7, false);
-        assert_eq!(text, "\tone\n\ttwo\nthree");
+        assert_eq!(text, "    one\n    two\nthree");
         let range = indent_lines(&mut text, range.0, range.1, true);
         assert_eq!(text, "one\ntwo\nthree");
         assert_eq!(range, (1, 7));
@@ -181,13 +192,13 @@ mod tests {
 
     #[test]
     fn indents_after_luau_block_openers() {
-        let mut after = "\tif ready then\n".to_string();
+        let mut after = "    if ready then\n".to_string();
         let cursor = after.chars().count();
         assert_eq!(
-            enhance_typed_edit("\tif ready then", &mut after, cursor),
-            Some(cursor + 2)
+            enhance_typed_edit("    if ready then", &mut after, cursor),
+            Some(cursor + 8)
         );
-        assert_eq!(after, "\tif ready then\n\t\t");
+        assert_eq!(after, "    if ready then\n        ");
     }
 
     #[test]
@@ -195,6 +206,29 @@ mod tests {
         let mut after = "call())".to_string();
         assert_eq!(enhance_typed_edit("call()", &mut after, 6), Some(6));
         assert_eq!(after, "call()");
+    }
+
+    #[test]
+    fn indents_every_selected_line_exactly_once() {
+        // A selection starting at column zero makes the first line start
+        // coincide with a newline-derived one. Before dedup that indented the
+        // second line twice and skipped the first.
+        let mut text = "one\ntwo\nthree".to_string();
+        let range = indent_lines(&mut text, 0, 8, false);
+        assert_eq!(text, "    one\n    two\nthree");
+        indent_lines(&mut text, range.0, range.1, true);
+        assert_eq!(text, "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn maps_positions_across_multiple_indents() {
+        // Positions past several edits must shift by the summed delta, not be
+        // re-shifted after drifting past a later edit's start offset.
+        let mut text = "one\ntwo\nthree".to_string();
+        let range = indent_lines(&mut text, 1, 7, false);
+        assert_eq!(text, "    one\n    two\nthree");
+        // 'n' of "one" moves 1 -> 5; the newline after "two" moves 7 -> 15.
+        assert_eq!(range, (5, 15));
     }
 
     #[test]

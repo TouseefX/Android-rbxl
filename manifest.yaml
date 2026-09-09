@@ -22,16 +22,28 @@ android:
   # writer. Required for anything with Java/Kotlin sources or AAR deps.
   gradle: true
 
-  # Resolved from Google's Maven repo by Gradle and packaged into the APK.
+  # Resolved by Gradle (xbuild's generated settings.gradle declares both
+  # google() and mavenCentral()) and packaged into the APK.
   # games-activity 4.4.0 is the version required by android-activity 0.6.x
   # (the GameActivity glue Bevy links through `android-game-activity`).
   # appcompat is needed because GameActivity is an AppCompatActivity: without
   # an AppCompat theme the app crashes on start with
   # "You need to use a Theme.AppCompat theme (or descendant)".
+  #
+  # sora-editor (LGPL-2.1, Maven Central) is the code editor widget used by
+  # the native script editor. It is consumed as an unmodified binary AAR, which
+  # is what keeps LGPL linking permissible; its source is not vendored here.
+  # Pinned to 0.23.6 deliberately:
+  #   * 0.23.6 builds against kotlin-stdlib 2.1.21, matching the Kotlin plugin
+  #     pinned in .github/workflows/main.yml.
+  #   * 0.24.x requires kotlin-stdlib 2.3.x, which would force a Kotlin 2.3
+  #     compiler and therefore an AGP/Gradle upgrade beyond AGP 8.7.3.
+  # Its minSdk is 21, below this project's 26, so it imposes no floor.
   dependencies:
     - "androidx.games:games-activity:4.4.0"
     - "androidx.appcompat:appcompat:1.7.0"
     - "androidx.core:core:1.13.1"
+    - "io.github.Rosemoe.sora-editor:editor:0.23.6"
 
   manifest:
     package: "com.yourname.rbxleditor"

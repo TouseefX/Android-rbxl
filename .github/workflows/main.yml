@@ -30,7 +30,7 @@ env:
   NDK_VERSION: r27c
   GRADLE_VERSION: "8.11.1"
   AGP_VERSION: "8.7.3"
-  KOTLIN_PLUGIN_VERSION: "2.0.21"
+  KOTLIN_PLUGIN_VERSION: "2.1.21"
   # Pinned xbuild revision (master @ 2025-08-15) so builds are reproducible.
   XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
   CARGO_BUILD_JOBS: 2                 # Matches the 2-core runner hardware
