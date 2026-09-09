@@ -6,7 +6,9 @@ import io.github.rosemoe.sora.lang.analysis.AnalyzeManager
 import io.github.rosemoe.sora.lang.analysis.SimpleAnalyzeManager
 import io.github.rosemoe.sora.lang.completion.CompletionCancelledException
 import io.github.rosemoe.sora.lang.completion.CompletionItem
+import io.github.rosemoe.sora.lang.completion.CompletionItemKind
 import io.github.rosemoe.sora.lang.completion.CompletionPublisher
+import io.github.rosemoe.sora.lang.completion.SimpleCompletionIconDrawer
 import io.github.rosemoe.sora.lang.completion.SimpleCompletionItem
 import io.github.rosemoe.sora.lang.smartEnter.NewlineHandleResult
 import io.github.rosemoe.sora.lang.smartEnter.NewlineHandler
@@ -136,9 +138,15 @@ class LuauLanguage(
         publisher: CompletionPublisher
     ) {
         val prefix = prefixAt(content, position)
-        // An empty prefix on a non-member position would match the whole index
-        // and is never useful, so skip the round trip entirely.
-        if (prefix.isEmpty() && !isMemberAccess(content, position)) return
+        // Decide whether this caret position is worth a round trip. An empty
+        // prefix in ordinary code would match the whole index, but an empty
+        // prefix is exactly the normal case just after `.`, `:` or the opening
+        // quote of a require -- gating those out suppressed module member and
+        // require-path completion entirely.
+        val trigger = prefix.isNotEmpty() ||
+            isMemberAccess(content, position) ||
+            isRequireString(content, position)
+        if (!trigger) return
 
         val request = ++generation
         pendingPrefixLength = prefix.length
@@ -168,6 +176,22 @@ class LuauLanguage(
         var start = position.column.coerceIn(0, line.length)
         while (start > 0 && (line[start - 1].isLetterOrDigit() || line[start - 1] == '_')) start--
         return line.substring(start, position.column.coerceIn(start, line.length))
+    }
+
+    /**
+     * Whether the caret sits inside the string of a `require(...)` call, where
+     * the Rust index offers module paths. Mirrors require_string_at_cursor in
+     * luau_intelligence.rs: find the opening quote, then check the call before
+     * it. A path fragment contains '/' and '.', so the identifier prefix is
+     * usually empty here and this is the only thing that triggers the request.
+     */
+    private fun isRequireString(content: ContentReference, position: CharPosition): Boolean {
+        val line = content.getLine(position.line)
+        val caret = position.column.coerceIn(0, line.length)
+        val quote = line.lastIndexOf('"', (caret - 1).coerceAtLeast(0))
+            .coerceAtLeast(line.lastIndexOf('\'', (caret - 1).coerceAtLeast(0)))
+        if (quote < 0 || quote >= caret) return false
+        return line.substring(0, quote).trimEnd().endsWith("require(")
     }
 
     /** Whether the caret sits after a `.` or `:`, where members are offered. */
@@ -647,7 +671,34 @@ class LuauLanguage(
         }
 
         /** Builds a sora completion item from one Rust suggestion. */
-        fun completionItem(label: String, detail: String, insert: String, prefixLength: Int): CompletionItem =
-            SimpleCompletionItem(label, detail, prefixLength, insert)
+        fun completionItem(label: String, detail: String, insert: String, prefixLength: Int): CompletionItem {
+            val kind = kindFor(detail)
+            return SimpleCompletionItem(label, detail, prefixLength, insert)
+                .kind(kind)
+                .icon(SimpleCompletionIconDrawer.draw(kind))
+        }
+
+        /**
+         * Classifies a suggestion from the detail string the Rust index emits,
+         * so the popup can show a coloured badge instead of an undifferentiated
+         * list. The strings are produced in luau_intelligence.rs; anything
+         * unrecognised falls back to a plain identifier.
+         */
+        fun kindFor(detail: String): CompletionItemKind = when {
+            detail.startsWith("ModuleScript") -> CompletionItemKind.Module
+            detail.contains("require path") || detail.contains("ModuleScript path") ->
+                CompletionItemKind.File
+            detail.startsWith("constructed") -> CompletionItemKind.Constructor
+            detail.contains("property") -> CompletionItemKind.Property
+            detail.contains("Luau keyword") || detail.contains("Luau operator") ||
+                detail.contains("declaration") || detail.contains("type operator") ->
+                CompletionItemKind.Keyword
+            detail == "boolean" -> CompletionItemKind.Value
+            // Signatures from module exports read as "(a, b) -> c".
+            detail.startsWith("(") || detail.contains("->") || detail.contains("function") ->
+                CompletionItemKind.Function
+            detail.isBlank() -> CompletionItemKind.Identifier
+            else -> CompletionItemKind.Field
+        }
     }
 }
