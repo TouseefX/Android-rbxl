@@ -77,6 +77,8 @@ pub struct ProjectIndex {
     module_member_returns: HashMap<Ref, BTreeMap<String, String>>,
     /// What `Module[key]` yields (index signature or `__index` return).
     module_index_results: HashMap<Ref, String>,
+    /// What calling the module itself yields (`return function(...): Player`).
+    module_callable_returns: HashMap<Ref, String>,
 }
 
 impl ProjectIndex {
@@ -140,6 +142,11 @@ impl ProjectIndex {
                 } else {
                     index.module_index_results.remove(&referent);
                 }
+                if let Some(callable) = module_callable_return(source) {
+                    index.module_callable_returns.insert(referent, callable);
+                } else {
+                    index.module_callable_returns.remove(&referent);
+                }
                 let members = exported_members(source);
                 let keys: Vec<String> = index.module_refs.iter()
                     .filter_map(|(key, value)| (*value == referent).then_some(key.clone()))
@@ -202,6 +209,9 @@ impl ProjectIndex {
             self.module_member_returns.insert(referent, member_returns);
             if let Some(result) = index_result {
                 self.module_index_results.insert(referent, result);
+            }
+            if let Some(callable) = module_callable_return(&source) {
+                self.module_callable_returns.insert(referent, callable);
             }
             self.module_sources.insert(referent, source);
         }
@@ -2427,6 +2437,7 @@ fn infer_expression_type(
     rest: &str,
     locals: &[LocalBinding],
     aliases: &HashMap<&str, String>,
+    function_returns: &BTreeMap<String, String>,
     current_script: Ref,
 ) -> InferredType {
     let fragment = expression_fragment(rest, 0);
@@ -2468,10 +2479,32 @@ fn infer_expression_type(
         };
         inferred.class = Some(class.to_string());
         inferred.path = path;
-    } else {
-        return InferredType::default();
     }
-    if inferred.is_unknown() {
+
+    i = skip_ascii_ws(bytes, i);
+    // A direct call on the base itself: the declared return type becomes the
+    // value's type. This covers script functions with return annotations
+    // (`function makePart(): Model` → `local part = makePart()`) and modules
+    // that return a function (`return function(player: Player): Model` →
+    // `local getChar = require(M)` → `local char = getChar(player)`).
+    if bytes.get(i) == Some(&b'(') {
+        let (type_owner, ret) = match inferred.module {
+            Some(module_ref) => (
+                module_ref,
+                index.module_callable_returns.get(&module_ref).cloned(),
+            ),
+            None if inferred.is_unknown() => (current_script, function_returns.get(base).cloned()),
+            None => (current_script, None),
+        };
+        let Some(ret) = ret else {
+            return InferredType::default();
+        };
+        inferred = index.resolve_named_type(type_owner, &ret);
+        i = skip_call_args(fragment, i);
+        if inferred.is_unknown() {
+            return inferred;
+        }
+    } else if inferred.is_unknown() {
         return inferred;
     }
 
@@ -2716,9 +2749,11 @@ fn infer_binding_type(
     rest: &str,
     locals: &[LocalBinding],
     aliases: &HashMap<&str, String>,
+    function_returns: &BTreeMap<String, String>,
     current_script: Ref,
 ) -> InferredType {
-    let inferred = infer_expression_type(index, rest, locals, aliases, current_script);
+    let inferred =
+        infer_expression_type(index, rest, locals, aliases, function_returns, current_script);
     if inferred.is_unknown() {
         if let Some(class) = instance_class_from_initializer(rest) {
             let mut fallback = InferredType::default();
@@ -2766,6 +2801,9 @@ fn local_bindings_at(
     // Require aliases resolve from the whole script; the scope walk below
     // only sees text before the cursor.
     let aliases = require_aliases(source);
+    // Same for function return annotations: `local part = makePart()` flows
+    // the declared return type wherever `makePart` is defined in the script.
+    let function_returns = script_function_returns(source);
     let cursor_byte = char_to_byte(source, cursor_char);
     let source = &source[..cursor_byte];
 
@@ -2963,6 +3001,7 @@ fn local_bindings_at(
                             &source[cursor..],
                             &visible_bindings(&scopes),
                             &aliases,
+                            &function_returns,
                             current_script,
                         );
                         if let Some(last) = names.last_mut() {
@@ -3083,38 +3122,58 @@ fn split_member_tail(source: &str) -> Option<(&str, &str, char)> {
     Some((&head[..head.len() - 1], prefix, separator))
 }
 
+/// The identifier at the very end of `text`, plus everything before it.
+fn trailing_identifier(text: &str) -> Option<(&str, &str)> {
+    let ident_bytes: usize = text
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .map(char::len_utf8)
+        .sum();
+    if ident_bytes == 0 {
+        return None;
+    }
+    let (rest, ident) = text.split_at(text.len() - ident_bytes);
+    is_identifier(ident).then_some((rest, ident))
+}
+
 /// `Alias[expr].prefix` / `Alias[expr]:prefix` at the end of the cursor
-/// text: module index access (`StatsRegistry[player].St`).
+/// text: module index access (`StatsRegistry[player].St`). The alias is the
+/// identifier immediately before the `[` — everything further left is other
+/// statements on the line and must not be treated as part of the name.
 fn module_index_expression_at_end(source: &str) -> Option<(&str, &str, char)> {
     let (head, prefix, separator) = split_member_tail(source)?;
     if !head.ends_with(']') {
         return None;
     }
     let open = match_backward(head, b']', b'[')?;
-    let alias = head[..open].trim_end();
-    is_identifier(alias).then_some((alias, prefix, separator))
+    let (rest, alias) = trailing_identifier(head[..open].trim_end())?;
+    // `a.b[x]` / `a:b[x]` chains are not bare module aliases.
+    if rest.trim_end().ends_with(['.', ':']) {
+        return None;
+    }
+    Some((alias, prefix, separator))
 }
 
 /// `Alias.member(args).prefix` / `Alias:member(args).prefix`: module call
-/// result (`StatsRegistry.Get(player).St`).
+/// result (`StatsRegistry.Get(player).St`). Both the member and the alias
+/// are taken as the identifiers directly left of `(` and of the separator.
 fn module_call_expression_at_end(source: &str) -> Option<(&str, &str, &str, char)> {
     let (head, prefix, separator) = split_member_tail(source)?;
     if !head.ends_with(')') {
         return None;
     }
     let open = match_backward(head, b')', b'(')?;
-    let before = head[..open].trim_end();
-    let dot = before.rfind('.');
-    let colon = before.rfind(':');
-    let position = match (dot, colon) {
-        (Some(a), Some(b)) if b > a => b,
-        (Some(a), _) => a,
-        (_, Some(b)) => b,
-        _ => return None,
-    };
-    let alias = &before[..position];
-    let member = &before[position + 1..];
-    if !is_identifier(alias) || !is_identifier(member) {
+    let (rest, member) = trailing_identifier(head[..open].trim_end())?;
+    let rest = rest.trim_end();
+    let sep = rest.chars().next_back()?;
+    if !matches!(sep, '.' | ':') {
+        return None;
+    }
+    let rest = &rest[..rest.len() - sep.len_utf8()];
+    let (rest, alias) = trailing_identifier(rest.trim_end())?;
+    // `a.b.C(x)` chains are not bare module aliases.
+    if rest.trim_end().ends_with(['.', ':']) {
         return None;
     }
     Some((alias, member, prefix, separator))
@@ -3768,6 +3827,110 @@ fn metatable_index_return(source: &str) -> Option<String> {
         let (_, tail) = tail.split_once("function")?;
         function_value_return(tail)
     })
+}
+
+/// Declared return types of a script's own functions, keyed by the bare
+/// callable name: `function makePart(): Model`, `local function f(x): Player`,
+/// `const function g(): ()`, and `local f = function(): Model`. Dotted names
+/// (`function M.new(): X`) are table members, not free callables, and are
+/// skipped. Multi-line parameter lists are not followed — best effort.
+fn script_function_returns(source: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for raw in source.lines() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        if let Some(declaration) = code
+            .strip_prefix("function ")
+            .or_else(|| code.strip_prefix("local function "))
+            .or_else(|| code.strip_prefix("const function "))
+        {
+            let name = identifier_start(declaration);
+            if is_identifier(name) && declaration[name.len()..].trim_start().starts_with('(') {
+                if let Some(ret) = function_value_return(&declaration[name.len()..]) {
+                    out.entry(name.to_string()).or_insert(ret);
+                }
+            }
+            continue;
+        }
+        let Some(rest) = code
+            .strip_prefix("local ")
+            .or_else(|| code.strip_prefix("const "))
+        else {
+            continue;
+        };
+        let name = identifier_start(rest);
+        if !is_identifier(name) {
+            continue;
+        }
+        let Some(value) = rest[name.len()..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let Some(tail) = value.trim_start().strip_prefix("function") else {
+            continue;
+        };
+        if let Some(ret) = function_value_return(tail) {
+            out.entry(name.to_string()).or_insert(ret);
+        }
+    }
+    out
+}
+
+/// A module can itself be callable: `return function(player: Player): Model`.
+/// What requiring and then calling the module yields is that function's
+/// declared return type. `return someName` is callable too when `someName`
+/// is a function declared in the same script. Returns inside nested blocks
+/// are skipped by walking backward with a block-depth counter, so the first
+/// file-scope `return` (the module's own) wins.
+fn module_callable_return(source: &str) -> Option<String> {
+    let function_returns = script_function_returns(source);
+    let mut depth = 0i32;
+    for raw in source.lines().rev() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        if code.starts_with("end") || code.starts_with("until") {
+            depth += 1;
+            continue;
+        }
+        if let Some(rest) = code.strip_prefix("return ") {
+            if let Some(tail) = rest.strip_prefix("function") {
+                // `return function(...)` — the anonymous body is one level
+                // deeper than the return itself, and that level is already
+                // counted (its `end` was seen below), so the return runs at
+                // `depth - 1`.
+                if depth - 1 <= 0 {
+                    return function_value_return(tail);
+                }
+                if depth > 0 {
+                    depth -= 1;
+                }
+                continue;
+            }
+            if depth == 0 {
+                let name = identifier_start(rest);
+                return (is_identifier(name) && function_returns.contains_key(name))
+                    .then(|| function_returns[name].clone());
+            }
+            // A return inside a function/if/for body: keep scanning outward.
+            continue;
+        }
+        // Block openers (going backward they close one level): function
+        // headers, lambdas, `if ... then`, `for/while ... do`, `repeat`.
+        let opens = code.starts_with("function ")
+            || code.starts_with("local function ")
+            || code.starts_with("const function ")
+            || code.contains("= function")
+            || code.contains("(function")
+            || code.ends_with(" then")
+            || code == "then"
+            || code.ends_with(" do")
+            || code == "do"
+            || code == "repeat";
+        if opens && depth > 0 {
+            depth -= 1;
+        }
+    }
+    None
 }
 
 /// Declared return types of function values in a table block starting at
@@ -4998,5 +5161,71 @@ return Registry
         let bare_name = "StatsRegistry[player].Kil";
         let nothing = index.complete_at(script, bare_name, bare_name.chars().count());
         assert!(!nothing.iter().any(|item| item.label == "KillCount"), "{nothing:?}");
+    }
+
+    #[test]
+    fn api_call_return_types_flow_into_locals() {
+        let index = ProjectIndex::default();
+
+        // `Players:GetPlayerFromCharacter(model)` returns a Player, so the
+        // local bound to the call gets Player members.
+        let source = "local Players = game:GetService(\"Players\")\nlocal character = Players:GetPlayerFromCharacter(model)\ncharacter.Na";
+        let suggestions = index.complete_at(Ref::none(), source, source.chars().count());
+        assert!(suggestions.iter().any(|item| item.label == "Name"), "{suggestions:?}");
+
+        // Property returns flow too: `Player.Character` is a Model.
+        let via_property = "local Players = game:GetService(\"Players\")\nlocal character = Players.LocalPlayer.Character\ncharacter.Pri";
+        let members = index.complete_at(Ref::none(), via_property, via_property.chars().count());
+        assert!(members.iter().any(|item| item.label == "PrimaryPart"), "{members:?}");
+    }
+
+    #[test]
+    fn script_function_return_types_flow_into_locals() {
+        let index = ProjectIndex::default();
+
+        // `function makePart(): Model` — calling it types the local.
+        let source = "function makePart(): Model\n\treturn nil\nend\nlocal part = makePart()\npart.Na";
+        let suggestions = index.complete_at(Ref::none(), source, source.chars().count());
+        assert!(suggestions.iter().any(|item| item.label == "Name"), "{suggestions:?}");
+
+        // `local function` and tuple/optional returns (first tuple value).
+        let local_fn = "local function getCharacterAndPlayer(target: Instance): (Model?, Player?)\n\treturn nil, nil\nend\nlocal character = getCharacterAndPlayer(target)\ncharacter.Pri";
+        let members = index.complete_at(Ref::none(), local_fn, local_fn.chars().count());
+        assert!(members.iter().any(|item| item.label == "PrimaryPart"), "{members:?}");
+
+        // `local f = function(): Ret` assignment form.
+        let assigned = "local getPart = function(): Model\n\treturn nil\nend\nlocal part = getPart()\npart.Na";
+        let assigned_suggestions = index.complete_at(Ref::none(), assigned, assigned.chars().count());
+        assert!(assigned_suggestions.iter().any(|item| item.label == "Name"), "{assigned_suggestions:?}");
+    }
+
+    #[test]
+    fn module_returning_function_flows_into_locals() {
+        // The module itself is callable: requiring it and calling the result
+        // yields the function's declared return type.
+        let module = "return function(player: Player): Model\n\treturn player.Character\nend";
+        let getter = Ref::new();
+        let script = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.paths.insert(getter, "ReplicatedStorage/CharGetter".into());
+        index.paths.insert(script, "ReplicatedStorage/Client".into());
+        index.module_refs.insert("chargetter".into(), getter);
+        index.module_sources.insert(getter, module.into());
+        index.modules.insert("chargetter".into(), exported_members(module));
+        if let Some(ret) = module_callable_return(module) {
+            index.module_callable_returns.insert(getter, ret);
+        }
+
+        let source = "local GetCharacter = require(game.ReplicatedStorage.CharGetter)\nlocal character = GetCharacter(player)\ncharacter.Na";
+        let suggestions = index.complete_at(script, source, source.chars().count());
+        assert!(suggestions.iter().any(|item| item.label == "Name"), "{suggestions:?}");
+
+        // A non-callable module (plain table return) offers no call result.
+        let plain = "return {\n\tValue = 1,\n}";
+        assert!(module_callable_return(plain).is_none());
+        // The StatsRegistry-style module returns a table binding, not a
+        // function, so it must not be treated as callable either.
+        let registry = "const StatsRegistry = {}\nreturn StatsRegistry";
+        assert!(module_callable_return(registry).is_none());
     }
 }
