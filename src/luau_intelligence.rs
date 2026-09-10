@@ -1187,7 +1187,7 @@ fn enum_item_completions(enum_name: &str, prefix: &str) -> Vec<Completion> {
 fn parent_type_for_path(root: Option<&str>, parent: &str) -> Option<String> {
     let mut current = root?.to_string();
     for segment in parent.split('.') {
-        current = api::member_type(&current, segment)?;
+        current = api::member_type(&current, segment)?.to_string();
         // RBXScriptSignal gives event access (`.Connect`), but the signal's
         // own members are colon methods, which nested completion uses as dot
         // for events — see kind rules.
@@ -1943,7 +1943,7 @@ fn infer_expression_type(rest: &str, locals: &[LocalBinding]) -> Option<String> 
 
     loop {
         index = skip_ascii_ws(bytes, index);
-        let separator = match bytes.get(index) {
+        let _separator = match bytes.get(index) {
             Some(b'.') => '.',
             Some(b':') => ':',
             _ => break,
@@ -1998,7 +1998,7 @@ fn infer_expression_type(rest: &str, locals: &[LocalBinding]) -> Option<String> 
         {
             continue;
         }
-        current = api::member_type(&current, member)?;
+        current = api::member_type(&current, member)?.to_string();
     }
     Some(current)
 }
