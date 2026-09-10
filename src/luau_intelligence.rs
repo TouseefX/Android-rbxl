@@ -156,7 +156,7 @@ impl ProjectIndex {
         let Some(instance) = dom.get_by_ref(referent) else { return };
         let is_root = referent == dom.root_ref();
         if !is_root {
-            path.push(instance.name.clone());
+            path.push(instance.name.to_string());
             self.paths.insert(referent, path.join("/"));
         }
         // Path-based intelligence: every node's class plus the parent->child
@@ -167,13 +167,13 @@ impl ProjectIndex {
         } else {
             self.path_refs.insert(path.join("/"), referent);
         }
-        self.instance_classes.insert(referent, instance.class.clone());
+        self.instance_classes.insert(referent, instance.class.to_string());
         for &child in instance.children() {
             if let Some(node) = dom.get_by_ref(child) {
                 self.instance_children
                     .entry(referent)
                     .or_default()
-                    .push((node.name.clone(), child));
+                    .push((node.name.to_string(), child));
             }
         }
 
