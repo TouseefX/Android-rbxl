@@ -71,6 +71,12 @@ pub struct ProjectIndex {
     instance_children: HashMap<Ref, Vec<(String, Ref)>>,
     /// Slash path ("ReplicatedStorage/Remotes/Hit") -> ref ("" is the root).
     path_refs: HashMap<String, Ref>,
+    /// Module-local `type` / `export type` tables: module -> type -> info.
+    module_types: HashMap<Ref, BTreeMap<String, ModuleTypeInfo>>,
+    /// Module member -> declared return type (`Get` -> `StateProxy?`).
+    module_member_returns: HashMap<Ref, BTreeMap<String, String>>,
+    /// What `Module[key]` yields (index signature or `__index` return).
+    module_index_results: HashMap<Ref, String>,
 }
 
 impl ProjectIndex {
@@ -125,6 +131,15 @@ impl ProjectIndex {
             if index.module_sources.contains_key(&referent) {
                 index.module_sources.insert(referent, source.to_string());
                 index.module_member_paths.insert(referent, returned_member_paths(source));
+                let type_blocks = module_type_blocks(source);
+                let (member_returns, index_result) = module_signature_info(source, &type_blocks);
+                index.module_types.insert(referent, type_blocks);
+                index.module_member_returns.insert(referent, member_returns);
+                if let Some(result) = index_result {
+                    index.module_index_results.insert(referent, result);
+                } else {
+                    index.module_index_results.remove(&referent);
+                }
                 let members = exported_members(source);
                 let keys: Vec<String> = index.module_refs.iter()
                     .filter_map(|(key, value)| (*value == referent).then_some(key.clone()))
@@ -181,6 +196,13 @@ impl ProjectIndex {
             self.module_refs.insert(full_key, referent);
             self.module_refs.entry(name_key).or_insert(referent);
             self.module_member_paths.insert(referent, returned_member_paths(&source));
+            let type_blocks = module_type_blocks(&source);
+            let (member_returns, index_result) = module_signature_info(&source, &type_blocks);
+            self.module_types.insert(referent, type_blocks);
+            self.module_member_returns.insert(referent, member_returns);
+            if let Some(result) = index_result {
+                self.module_index_results.insert(referent, result);
+            }
             self.module_sources.insert(referent, source);
         }
 
@@ -238,6 +260,30 @@ impl ProjectIndex {
         if let Some(typed) = require_string_at_cursor(&source[..cursor_byte]) {
             return self.complete_require_path(current_script, typed);
         }
+        if let Some((alias, prefix, separator)) = module_index_expression_at_end(&source[..cursor_byte])
+        {
+            return self.module_index_completions(
+                current_script,
+                source,
+                &locals,
+                alias,
+                prefix,
+                separator,
+            );
+        }
+        if let Some((alias, member, prefix, separator)) =
+            module_call_expression_at_end(&source[..cursor_byte])
+        {
+            return self.module_call_completions(
+                current_script,
+                source,
+                &locals,
+                alias,
+                member,
+                prefix,
+                separator,
+            );
+        }
         if let Some((root, parent, prefix, nested_separator)) =
             nested_member_expression_at_end(&source[..cursor_byte])
         {
@@ -259,6 +305,8 @@ impl ProjectIndex {
                 .map(|binding| InferredType {
                     class: binding.instance_class.clone(),
                     path: binding.instance_path.clone(),
+                    module: binding.module,
+                    module_type: binding.module_type.clone(),
                 })
                 .unwrap_or_default();
             if root_inferred.is_unknown() {
@@ -269,7 +317,23 @@ impl ProjectIndex {
                     }
                 }
             }
+            // An untyped require-bound root IS the module table.
+            if root_inferred.is_unknown() && innermost_local(&locals, root).is_some() {
+                let aliases = require_aliases(source);
+                if let Some(request) = aliases.get(root) {
+                    if let Some(referent) = self.resolve_module_ref(current_script, request) {
+                        root_inferred.module = Some(referent);
+                    }
+                }
+            }
             let resolved = parent_type_for_path(self, &root_inferred, &parent);
+            if let Some((module_ref, type_name)) = &resolved.module_type {
+                let members =
+                    self.module_type_completions(*module_ref, type_name, prefix, nested_separator);
+                if !members.is_empty() {
+                    return members;
+                }
+            }
             if let Some(class) = &resolved.class {
                 let mut members = api_member_completions(class, prefix, nested_separator);
                 if nested_separator == '.' {
@@ -361,6 +425,36 @@ impl ProjectIndex {
             // back to a ModuleScript of the same name, because
             // `local Debris = {}` is not the Debris module.
             if let Some(binding) = local {
+                // `local m = Module` — the module table itself.
+                if let Some(module_ref) = binding.module {
+                    if let Some(source) = self.module_sources.get(&module_ref) {
+                        let lower = prefix.to_ascii_lowercase();
+                        let path = self
+                            .paths
+                            .get(&module_ref)
+                            .map(String::as_str)
+                            .unwrap_or("ModuleScript");
+                        return exported_members(source)
+                            .iter()
+                            .filter(|(member, detail)| {
+                                member.to_ascii_lowercase().starts_with(&lower)
+                                    && member_matches_access(detail, separator)
+                            })
+                            .take(12)
+                            .map(|(member, signature)| Completion {
+                                label: member.clone(),
+                                detail: format!("{signature}  \u{b7}  {path}  \u{b7}  local variable"),
+                                insert_text: member.clone(),
+                                replace_chars: prefix.chars().count(),
+                            })
+                            .collect();
+                    }
+                    return Vec::new();
+                }
+                // A module-typed value (`local s = Module[key]`).
+                if let Some((module_ref, type_name)) = &binding.module_type {
+                    return self.module_type_completions(*module_ref, type_name, prefix, separator);
+                }
                 if let Some(class_name) = &binding.instance_class {
                     let mut members = api_member_completions(class_name, prefix, separator);
                     // A local with a DataModel location also offers the
@@ -879,6 +973,162 @@ impl ProjectIndex {
             return Some(api_type.to_string());
         }
         None
+    }
+
+    /// Resolves a Luau type name (possibly `T?` or a `(First, ...)` tuple)
+    /// found in `module` to an API class or a module-local type.
+    /// Primitives and `any`/`unknown` carry no completable members.
+    fn resolve_named_type(&self, module: Ref, name: &str) -> InferredType {
+        let mut cleaned = name.trim();
+        // `(Model?, Player?)` tuples: flow uses the first value.
+        if let Some(inner) = cleaned
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            cleaned = inner.split(',').next().unwrap_or("").trim();
+        }
+        cleaned = cleaned.trim_end_matches('?').trim();
+        if cleaned.is_empty()
+            || matches!(
+                cleaned,
+                "any" | "unknown" | "never" | "nil" | "string" | "number" | "boolean" | "table"
+                    | "function" | "thread" | "buffer"
+            )
+        {
+            return InferredType::default();
+        }
+        if self
+            .module_types
+            .get(&module)
+            .is_some_and(|types| types.contains_key(cleaned))
+        {
+            return InferredType {
+                module_type: Some((module, cleaned.to_string())),
+                ..Default::default()
+            };
+        }
+        if api_type_known(cleaned) {
+            let mut resolved = InferredType::default();
+            set_api_class(&mut resolved, cleaned);
+            return resolved;
+        }
+        InferredType::default()
+    }
+
+    /// Module behind a require-bound alias: the name must be an in-scope
+    /// local AND bound by `local alias = require(...)` — never a bare
+    /// module name.
+    fn require_bound_module(
+        &self,
+        source: &str,
+        current_script: Ref,
+        locals: &[LocalBinding],
+        alias: &str,
+    ) -> Option<Ref> {
+        innermost_local(locals, alias)?;
+        let request = require_aliases(source).get(alias)?.clone();
+        self.resolve_module_ref(current_script, &request)
+    }
+
+    /// Members of the Luau type that a module member/index access yields:
+    /// a module-local type's fields, or API members when the result is a
+    /// Roblox class (`GetCharacterAndPlayer` -> `Model`).
+    fn type_name_completions(
+        &self,
+        module: Ref,
+        name: &str,
+        prefix: &str,
+        separator: char,
+    ) -> Vec<Completion> {
+        let resolved = self.resolve_named_type(module, name);
+        if let Some((type_module, type_name)) = resolved.module_type {
+            return self.module_type_completions(type_module, &type_name, prefix, separator);
+        }
+        if let Some(class) = resolved.class {
+            return api_member_completions(&class, prefix, separator);
+        }
+        Vec::new()
+    }
+
+    /// Members of a module-local Luau type (`StateProxy` fields after
+    /// `Module[key].` / `Module.Get(x).`). Type members are fields and dot
+    /// functions — never colon methods.
+    fn module_type_completions(
+        &self,
+        module: Ref,
+        type_name: &str,
+        prefix: &str,
+        separator: char,
+    ) -> Vec<Completion> {
+        if separator != '.' {
+            return Vec::new();
+        }
+        let lower = prefix.to_ascii_lowercase();
+        let Some(info) = self
+            .module_types
+            .get(&module)
+            .and_then(|types| types.get(type_name))
+        else {
+            return Vec::new();
+        };
+        info.members
+            .iter()
+            .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&lower))
+            .take(12)
+            .map(|(name, detail)| Completion {
+                label: name.clone(),
+                detail: format!("{detail} \u{b7} {type_name}"),
+                insert_text: name.clone(),
+                replace_chars: prefix.chars().count(),
+            })
+            .collect()
+    }
+
+    /// `Alias[expr].prefix`: members of what the module's index access
+    /// yields (`StatsRegistry[player].St` -> `Stun`, `IFrame`, ...).
+    fn module_index_completions(
+        &self,
+        current_script: Ref,
+        source: &str,
+        locals: &[LocalBinding],
+        alias: &str,
+        prefix: &str,
+        separator: char,
+    ) -> Vec<Completion> {
+        let Some(target) = self.require_bound_module(source, current_script, locals, alias)
+        else {
+            return Vec::new();
+        };
+        let Some(result) = self.module_index_results.get(&target) else {
+            return Vec::new();
+        };
+        self.type_name_completions(target, result, prefix, separator)
+    }
+
+    /// `Alias.member(args).prefix`: members of what the module call yields
+    /// (`StatsRegistry.Get(player).Kil` -> `KillCount`).
+    fn module_call_completions(
+        &self,
+        current_script: Ref,
+        source: &str,
+        locals: &[LocalBinding],
+        alias: &str,
+        member: &str,
+        prefix: &str,
+        separator: char,
+    ) -> Vec<Completion> {
+        let Some(target) = self.require_bound_module(source, current_script, locals, alias)
+        else {
+            return Vec::new();
+        };
+        let Some(ret) = self
+            .module_member_returns
+            .get(&target)
+            .and_then(|returns| returns.get(member))
+        else {
+            return Vec::new();
+        };
+        self.type_name_completions(target, ret, prefix, separator)
     }
 }
 
@@ -1458,6 +1708,10 @@ struct LocalBinding {
     /// DataModel path when the value's location is known
     /// (`game:GetService("ReplicatedStorage")` -> `"ReplicatedStorage"`).
     instance_path: Option<String>,
+    /// The value IS this module's table (`local m = Module`).
+    module: Option<Ref>,
+    /// The value HAS this module-local Luau type (`Module[key]`).
+    module_type: Option<(Ref, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1466,6 +1720,8 @@ struct RawBinding {
     annotation: Option<String>,
     instance_class: Option<String>,
     instance_path: Option<String>,
+    module: Option<Ref>,
+    module_type: Option<(Ref, String)>,
     line: usize,
 }
 
@@ -1895,7 +2151,7 @@ fn parse_function_header(
     if is_method {
         params.insert(
             0,
-            RawBinding { name: "self".into(), annotation: None, instance_class: None, instance_path: None, line: *line },
+            RawBinding { name: "self".into(), annotation: None, instance_class: None, instance_path: None, module: None, module_type: None, line: *line },
         );
     }
     (name, params, after)
@@ -1931,7 +2187,7 @@ fn parse_parameters(source: &str, open: usize, line: &mut usize) -> (Vec<RawBind
                     i = skip_expression(source, i + 1, line);
                     i = skip_whitespace(source, i, line);
                 }
-                params.push(RawBinding { name, annotation, instance_class: None, instance_path: None, line: param_line });
+                params.push(RawBinding { name, annotation, instance_class: None, instance_path: None, module: None, module_type: None, line: param_line });
             }
             _ => i += 1,
         }
@@ -1947,11 +2203,15 @@ fn parse_parameters(source: &str, open: usize, line: &mut usize) -> (Vec<RawBind
 struct InferredType {
     class: Option<String>,
     path: Option<String>,
+    /// The value IS this module's table (`local m = Module`).
+    module: Option<Ref>,
+    /// The value HAS this module-local Luau type (`Module[key]`).
+    module_type: Option<(Ref, String)>,
 }
 
 impl InferredType {
     fn is_unknown(&self) -> bool {
-        self.class.is_none() && self.path.is_none()
+        self.class.is_none() && self.path.is_none() && self.module.is_none() && self.module_type.is_none()
     }
 }
 
@@ -1960,6 +2220,8 @@ impl InferredType {
 /// `local rs = game:GetService("ReplicatedStorage")` keeps resolving
 /// `rs.SomeChild` afterwards.
 fn set_api_class(inferred: &mut InferredType, class: &str) {
+    inferred.module = None;
+    inferred.module_type = None;
     inferred.path = if schema::class_is_service(class) {
         Some(class.to_string())
     } else {
@@ -2063,6 +2325,39 @@ fn skip_call_args(source: &str, mut index: usize) -> usize {
 }
 
 /// First quoted argument of a call expression (`("Players")` → `Players`).
+/// Skips a balanced bracket run starting at `[`; returns the index just
+/// after the matching `]` (strings and nested brackets are handled).
+fn skip_bracket_args(source: &str, mut index: usize) -> usize {
+    let bytes = source.as_bytes();
+    if bytes.get(index) != Some(&b'[') {
+        return index;
+    }
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    while let Some(&byte) = bytes.get(index) {
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'[' | b'(' | b'{' => depth += 1,
+            b']' | b')' | b'}' if depth > 1 => depth -= 1,
+            b']' if depth == 1 => return index + 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    index
+}
+
 fn first_quoted_call_arg(expr: &str) -> Option<&str> {
     let bytes = expr.as_bytes();
     let index = skip_ascii_ws(bytes, 0);
@@ -2131,6 +2426,7 @@ fn infer_expression_type(
     index: &ProjectIndex,
     rest: &str,
     locals: &[LocalBinding],
+    aliases: &HashMap<&str, String>,
     current_script: Ref,
 ) -> InferredType {
     let fragment = expression_fragment(rest, 0);
@@ -2147,6 +2443,16 @@ fn infer_expression_type(
         // A local shadows the built-in even when its type is unknown.
         inferred.class = binding.instance_class.clone();
         inferred.path = binding.instance_path.clone();
+        inferred.module = binding.module;
+        inferred.module_type = binding.module_type.clone();
+        // An untyped require-bound local IS the module table.
+        if inferred.is_unknown() {
+            if let Some(request) = aliases.get(base) {
+                if let Some(referent) = index.resolve_module_ref(current_script, request) {
+                    inferred.module = Some(referent);
+                }
+            }
+        }
     } else if let Some(api_type) = api::global_type(base) {
         if api_type.starts_with("@lib:") || api_type == "@enum" {
             return InferredType::default();
@@ -2171,6 +2477,19 @@ fn infer_expression_type(
 
     loop {
         i = skip_ascii_ws(bytes, i);
+        // `Module[key]` index step (only the module table has a known
+        // indexed-result type).
+        if bytes.get(i) == Some(&b'[') {
+            let Some(module_ref) = inferred.module else {
+                return InferredType::default();
+            };
+            let Some(result) = index.module_index_results.get(&module_ref) else {
+                return InferredType::default();
+            };
+            inferred = index.resolve_named_type(module_ref, result);
+            i = skip_bracket_args(fragment, i);
+            continue;
+        }
         let _separator = match bytes.get(i) {
             Some(b'.') => '.',
             Some(b':') => ':',
@@ -2278,6 +2597,52 @@ fn infer_step(
         }
     }
 
+    // The module table itself: `M.member(args)` flows to the declared
+    // return type, and `M.field` to the annotation interface member type.
+    if let Some(module_ref) = inferred.module {
+        if is_call {
+            let next = index
+                .module_member_returns
+                .get(&module_ref)
+                .and_then(|returns| returns.get(member))
+                .map(|ret| index.resolve_named_type(module_ref, ret));
+            if let Some(next) = next {
+                *inferred = next;
+                return true;
+            }
+            return false;
+        }
+        if let Some(next) = index.module_sources.get(&module_ref).and_then(|source| {
+            let name = returned_binding_name(source)?;
+            let (annotation, _) = binding_declaration(source, name)?;
+            let type_name = identifier_start(annotation?);
+            index
+                .module_types
+                .get(&module_ref)
+                .and_then(|types| types.get(type_name))
+                .and_then(|info| info.member_types.get(member))
+                .map(|member_type| index.resolve_named_type(module_ref, member_type))
+        }) {
+            *inferred = next;
+            return true;
+        }
+        return false;
+    }
+    // A module-local type (`StateProxy`): `.field` flows to the declared
+    // field type.
+    if let Some((type_module, type_name)) = &inferred.module_type {
+        let next = index
+            .module_types
+            .get(type_module)
+            .and_then(|types| types.get(type_name))
+            .and_then(|info| info.member_types.get(member))
+            .map(|member_type| index.resolve_named_type(*type_module, member_type));
+        if let Some(next) = next {
+            *inferred = next;
+            return true;
+        }
+        return false;
+    }
     // `x:FindFirstChildOfClass("RemoteEvent")` -> the class itself.
     if is_call
         && matches!(
@@ -2350,9 +2715,10 @@ fn infer_binding_type(
     index: &ProjectIndex,
     rest: &str,
     locals: &[LocalBinding],
+    aliases: &HashMap<&str, String>,
     current_script: Ref,
 ) -> InferredType {
-    let inferred = infer_expression_type(index, rest, locals, current_script);
+    let inferred = infer_expression_type(index, rest, locals, aliases, current_script);
     if inferred.is_unknown() {
         if let Some(class) = instance_class_from_initializer(rest) {
             let mut fallback = InferredType::default();
@@ -2382,6 +2748,8 @@ fn commit_bindings(scopes: &mut [(ScopeKind, LocalScope)], names: &mut Vec<RawBi
             line: binding.line,
             instance_class,
             instance_path: binding.instance_path,
+            module: binding.module,
+            module_type: binding.module_type,
         });
     }
 }
@@ -2395,6 +2763,9 @@ fn local_bindings_at(
     cursor_char: usize,
     current_script: Ref,
 ) -> Vec<LocalBinding> {
+    // Require aliases resolve from the whole script; the scope walk below
+    // only sees text before the cursor.
+    let aliases = require_aliases(source);
     let cursor_byte = char_to_byte(source, cursor_char);
     let source = &source[..cursor_byte];
 
@@ -2456,6 +2827,8 @@ fn local_bindings_at(
                             line,
                             instance_class: None,
                             instance_path: None,
+                            module: None,
+                            module_type: None,
                         });
                     }
                     let mut function_scope = LocalScope::default();
@@ -2474,6 +2847,8 @@ fn local_bindings_at(
                             line: param.line,
                             instance_class,
                             instance_path: None,
+                            module: None,
+                            module_type: None,
                         });
                     }
                     scopes.push((ScopeKind::Function, function_scope));
@@ -2498,6 +2873,8 @@ fn local_bindings_at(
                                 line: var.line,
                                 instance_class: None,
                                 instance_path: None,
+                                module: None,
+                                module_type: None,
                             });
                         }
                         scopes.push((ScopeKind::Loop, loop_scope));
@@ -2540,6 +2917,8 @@ fn local_bindings_at(
                                     annotation: None,
                                     instance_class: None,
                                     instance_path: None,
+                                    module: None,
+                                    module_type: None,
                                     line,
                                 });
                                 decl = Some(DeclState::Names { is_const });
@@ -2550,6 +2929,8 @@ fn local_bindings_at(
                                     annotation: None,
                                     instance_class: None,
                                     instance_path: None,
+                                    module: None,
+                                    module_type: None,
                                     line,
                                 });
                                 expect_name = false;
@@ -2562,6 +2943,8 @@ fn local_bindings_at(
                             annotation: None,
                             instance_class: None,
                             instance_path: None,
+                            module: None,
+                            module_type: None,
                             line,
                         });
                     }
@@ -2579,11 +2962,14 @@ fn local_bindings_at(
                             index,
                             &source[cursor..],
                             &visible_bindings(&scopes),
+                            &aliases,
                             current_script,
                         );
                         if let Some(last) = names.last_mut() {
                             last.instance_class = inferred.class;
                             last.instance_path = inferred.path;
+                            last.module = inferred.module;
+                            last.module_type = inferred.module_type;
                         }
                         commit_bindings(&mut scopes, &mut names, is_const);
                     }
@@ -2642,6 +3028,96 @@ fn constructor_module_alias<'a>(source: &'a str, variable: &str) -> Option<&'a s
         (is_identifier(module_alias) && matches!(method, "new" | "create" | "Create"))
             .then_some(module_alias)
     })
+}
+
+/// Index of the `[` / `(` matching the final `]` / `)`, scanning backward.
+/// Strings are honored naively (an escaped quote inside one may confuse it).
+fn match_backward(text: &str, close: u8, open: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        let byte = bytes[i];
+        if let Some(active) = quote {
+            if byte == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(byte, b'"' | b'\'' | b'`') {
+            quote = Some(byte);
+            continue;
+        }
+        if byte == close {
+            depth += 1;
+            continue;
+        }
+        if byte == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Splits trailing `...<sep>prefix` (`.`, `:`) off cursor text: (head,
+/// prefix, separator). The prefix is identifier characters only.
+fn split_member_tail(source: &str) -> Option<(&str, &str, char)> {
+    let tail = source.trim_end_matches(char::is_whitespace);
+    let prefix_bytes: usize = tail
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .map(char::len_utf8)
+        .sum();
+    let head = &tail[..tail.len() - prefix_bytes];
+    let prefix = &tail[tail.len() - prefix_bytes..];
+    let separator = head.chars().next_back()?;
+    if !matches!(separator, '.' | ':') {
+        return None;
+    }
+    Some((&head[..head.len() - 1], prefix, separator))
+}
+
+/// `Alias[expr].prefix` / `Alias[expr]:prefix` at the end of the cursor
+/// text: module index access (`StatsRegistry[player].St`).
+fn module_index_expression_at_end(source: &str) -> Option<(&str, &str, char)> {
+    let (head, prefix, separator) = split_member_tail(source)?;
+    if !head.ends_with(']') {
+        return None;
+    }
+    let open = match_backward(head, b']', b'[')?;
+    let alias = head[..open].trim_end();
+    is_identifier(alias).then_some((alias, prefix, separator))
+}
+
+/// `Alias.member(args).prefix` / `Alias:member(args).prefix`: module call
+/// result (`StatsRegistry.Get(player).St`).
+fn module_call_expression_at_end(source: &str) -> Option<(&str, &str, &str, char)> {
+    let (head, prefix, separator) = split_member_tail(source)?;
+    if !head.ends_with(')') {
+        return None;
+    }
+    let open = match_backward(head, b')', b'(')?;
+    let before = head[..open].trim_end();
+    let dot = before.rfind('.');
+    let colon = before.rfind(':');
+    let position = match (dot, colon) {
+        (Some(a), Some(b)) if b > a => b,
+        (Some(a), _) => a,
+        (_, Some(b)) => b,
+        _ => return None,
+    };
+    let alias = &before[..position];
+    let member = &before[position + 1..];
+    if !is_identifier(alias) || !is_identifier(member) {
+        return None;
+    }
+    Some((alias, member, prefix, separator))
 }
 
 fn nested_member_expression_at_end(source: &str) -> Option<(&str, String, &str, char)> {
@@ -3060,6 +3536,383 @@ fn exported_members(source: &str) -> BTreeMap<String, String> {
     result
 }
 
+/// One `type` / `export type` table block: its members plus the declared
+/// types needed for type-flow (`Module[key]` -> `StateProxy` -> fields).
+#[derive(Debug, Clone, Default)]
+struct ModuleTypeInfo {
+    /// Field name -> detail (`field Stun: boolean`, `function Get...`).
+    members: BTreeMap<String, String>,
+    /// Field name -> declared type (`AttackingEnemy` -> `Model?`).
+    member_types: BTreeMap<String, String>,
+    /// Function field -> declared return type (`Get` -> `StateProxy?`).
+    returns: BTreeMap<String, String>,
+    /// Index-signature result (`[StateTarget]: StateProxy?` -> `StateProxy?`).
+    index_result: Option<String>,
+}
+
+/// All `type` / `export type` table blocks in a module source.
+fn module_type_blocks(source: &str) -> BTreeMap<String, ModuleTypeInfo> {
+    let mut out = BTreeMap::new();
+    let lines: Vec<&str> = source.lines().collect();
+    for (number, raw) in lines.iter().enumerate() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let rest = code
+            .strip_prefix("export type ")
+            .or_else(|| code.strip_prefix("type "));
+        let Some(rest) = rest else { continue };
+        let name = identifier_start(rest);
+        if !is_identifier(name) {
+            continue;
+        }
+        // Table blocks only (`export type X = { ... }`); aliases and unions
+        // (`export type X = Player | Model`) carry no members.
+        let after_name = &rest[name.len()..];
+        let Some((_, after_eq)) = after_name.split_once('=') else {
+            continue;
+        };
+        if !after_eq.contains('{') {
+            continue;
+        }
+        out.insert(name.to_string(), parse_type_block(&lines, number));
+    }
+    out
+}
+
+/// Parses one type-table block starting at `start` (the `export type X = {`
+/// line), mirroring `table_literal_members`.
+fn parse_type_block(lines: &[&str], start: usize) -> ModuleTypeInfo {
+    let mut info = ModuleTypeInfo::default();
+    let mut depth = 0i32;
+    let mut started = false;
+    for raw in lines.iter().skip(start) {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        if !started {
+            let Some(open) = code.find('{') else {
+                if structural_paren_delta(code) > 0 {
+                    continue;
+                } else {
+                    break;
+                }
+            };
+            started = true;
+            depth = structural_brace_delta(code);
+            if depth == 1 {
+                collect_type_fields(&code[open + 1..], &mut info);
+            }
+            if depth <= 0 {
+                break;
+            }
+            continue;
+        }
+        if depth == 1 {
+            collect_type_fields(code, &mut info);
+        }
+        depth += structural_brace_delta(code);
+        if depth <= 0 {
+            break;
+        }
+    }
+    info
+}
+
+/// Records one depth-1 line of a type-table block: `Name = value`,
+/// `Name: Type`, `read Name: Type`, function entries (which also record
+/// their return type), and `[Key]: Value` index signatures.
+fn collect_type_fields(body: &str, info: &mut ModuleTypeInfo) {
+    for field in split_top_level_fields(body) {
+        let field = field.trim().trim_end_matches([',', ';']).trim();
+        if field.is_empty() {
+            continue;
+        }
+        // Index signature: `[StateTarget]: StateProxy?` — enables `Module[key]`.
+        if let Some(rest) = field.strip_prefix('[') {
+            if let Some((_, value)) = rest.split_once(']') {
+                if let Some(result) = value.trim().strip_prefix(':') {
+                    let result = result.trim();
+                    if !result.is_empty() && info.index_result.is_none() {
+                        info.index_result = Some(result.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        let (field, readonly) = strip_read_prefix(field);
+        let name = identifier_start(field);
+        if !is_identifier(name) || is_metamethod(name) {
+            continue;
+        }
+        let rest = field[name.len()..].trim_start();
+        if let Some(value) = rest.strip_prefix('=') {
+            let value = value.trim();
+            let detail = if let Some(tail) = value.strip_prefix("function") {
+                function_signature(name, tail).unwrap_or_else(|| format!("function {name}"))
+            } else {
+                format!("{}field {name}", if readonly { "read " } else { "" })
+            };
+            info.members.entry(name.to_string()).or_insert(detail);
+        } else if let Some(annotation) = rest.strip_prefix(':') {
+            let annotation = annotation.trim();
+            if annotation.is_empty() {
+                continue;
+            }
+            info.member_types.insert(name.to_string(), annotation.to_string());
+            let detail = if annotation.contains("->") {
+                if let Some(ret) = function_type_return(annotation) {
+                    info.returns.insert(name.to_string(), ret);
+                }
+                format!("function {name}{annotation}")
+            } else {
+                format!("{}field {name}: {annotation}", if readonly { "read " } else { "" })
+            };
+            info.members.entry(name.to_string()).or_insert(detail);
+        }
+    }
+}
+
+/// Return type of a function-type annotation
+/// (`(target: StateTarget) -> StateProxy?` -> `StateProxy?`): the type after
+/// the top-level `->`.
+fn function_type_return(annotation: &str) -> Option<String> {
+    let bytes = annotation.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let byte = bytes[i];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'(' | b'{' | b'[' | b'<' => depth += 1,
+            b')' | b'}' | b']' | b'>' if depth > 0 => depth -= 1,
+            b'-' if bytes[i + 1] == b'>' && depth == 0 => {
+                let ret = annotation[i + 2..]
+                    .trim()
+                    .trim_end_matches([',', ';'])
+                    .trim();
+                return (!ret.is_empty()).then_some(ret.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Return annotation of a function value (`(a: T): Ret` -> `Ret`): the type
+/// after the parameter list's closing `)`.
+fn function_value_return(tail: &str) -> Option<String> {
+    let open = tail.find('(')?;
+    let bytes = tail.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = open;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth > 1 => depth -= 1,
+            b')' if depth == 1 => {
+                let after = tail[i + 1..].trim();
+                let ret = after.strip_prefix(':')?.trim();
+                let mut inner = 0i32;
+                let mut cut = ret.len();
+                for (offset, character) in ret.char_indices() {
+                    match character {
+                        '(' | '{' | '[' | '<' => inner += 1,
+                        ')' | '}' | ']' | '>' if inner > 0 => inner -= 1,
+                        ',' | ';' if inner == 0 => {
+                            cut = offset;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let clean = ret[..cut].trim();
+                return (!clean.is_empty()).then_some(clean.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Return annotation of a `__index = function(...): Ret` metamethod, so
+/// `Module[key]` flows even without an `[Key]: Value` index signature.
+fn metatable_index_return(source: &str) -> Option<String> {
+    source.lines().find_map(|raw| {
+        let code = raw.split("--").next().unwrap_or("");
+        let (_, tail) = code.split_once("__index")?;
+        let (_, tail) = tail.split_once("function")?;
+        function_value_return(tail)
+    })
+}
+
+/// Declared return types of function values in a table block starting at
+/// `start_line` (`IsNPC = function(t: Instance): boolean` -> `boolean`).
+/// Used for the returned table literal (and `return { ... }`), mirroring
+/// `table_literal_members`.
+fn function_returns_in_table(source: &str, start_line: usize) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut depth = 0i32;
+    let mut started = false;
+    for raw in source.lines().skip(start_line) {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        if !started {
+            let Some(open) = code.find('{') else {
+                if structural_paren_delta(code) > 0 {
+                    continue;
+                } else {
+                    break;
+                }
+            };
+            started = true;
+            depth = structural_brace_delta(code);
+            if depth == 1 {
+                table_function_returns(&code[open + 1..], &mut out);
+            }
+            if depth <= 0 {
+                break;
+            }
+            continue;
+        }
+        if depth == 1 {
+            table_function_returns(code, &mut out);
+        }
+        depth += structural_brace_delta(code);
+        if depth <= 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Records `name = function...: Ret` entries from one depth-1 table line.
+fn table_function_returns(body: &str, out: &mut BTreeMap<String, String>) {
+    for field in split_top_level_fields(body) {
+        let field = field.trim().trim_end_matches([',', ';']).trim();
+        let name = identifier_start(field);
+        if !is_identifier(name) {
+            continue;
+        }
+        let rest = field[name.len()..].trim_start();
+        let Some(value) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let Some(tail) = value.trim_start().strip_prefix("function") else {
+            continue;
+        };
+        if let Some(ret) = function_value_return(tail) {
+            out.entry(name.to_string()).or_insert(ret);
+        }
+    }
+}
+
+/// Declared return types from `function M.name(...)...: Ret` declarations
+/// and `M.name = function...: Ret` assignments for the returned binding.
+fn declared_function_returns(source: &str, binding: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let dot_prefix = format!("{binding}.");
+    let colon_prefix = format!("{binding}:");
+    for raw in source.lines() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        if let Some(declaration) = code.strip_prefix("function ") {
+            let member = declaration
+                .strip_prefix(&dot_prefix)
+                .or_else(|| declaration.strip_prefix(&colon_prefix));
+            if let Some(member) = member {
+                let name = identifier_start(member);
+                if is_identifier(name) {
+                    if let Some(ret) = function_value_return(&member[name.len()..]) {
+                        out.entry(name.to_string()).or_insert(ret);
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = code.strip_prefix(&dot_prefix) {
+            let name = identifier_start(rest);
+            if !is_identifier(name) {
+                continue;
+            }
+            let tail = rest[name.len()..].trim_start();
+            let Some(value) = tail.strip_prefix('=') else {
+                continue;
+            };
+            let Some(tail) = value.trim_start().strip_prefix("function") else {
+                continue;
+            };
+            if let Some(ret) = function_value_return(tail) {
+                out.entry(name.to_string()).or_insert(ret);
+            }
+        }
+    }
+    out
+}
+
+/// Declared return types of a module's members plus what `Module[key]`
+/// yields: literal/table-declared function annotations first, then the
+/// returned binding's annotation interface (authoritative), then the
+/// `__index` metamethod's return as a final fallback for indexing.
+fn module_signature_info(
+    source: &str,
+    blocks: &BTreeMap<String, ModuleTypeInfo>,
+) -> (BTreeMap<String, String>, Option<String>) {
+    let mut returns = BTreeMap::new();
+    let mut index_result = None;
+    if let Some(name) = returned_binding_name(source) {
+        if let Some((annotation, line)) = binding_declaration(source, name) {
+            returns.extend(function_returns_in_table(source, line));
+            if let Some(annotation) = annotation {
+                let type_name = identifier_start(annotation);
+                if let Some(info) = blocks.get(type_name) {
+                    returns.extend(
+                        info.returns
+                            .iter()
+                            .map(|(member, ret)| (member.clone(), ret.clone())),
+                    );
+                    index_result = info.index_result.clone();
+                }
+            }
+        }
+        returns.extend(declared_function_returns(source, name));
+    } else {
+        // `return { ... }` with no named binding.
+        if let Some(line) = source.lines().enumerate().find_map(|(number, raw)| {
+            let code = raw.split("--").next().unwrap_or("").trim();
+            code.starts_with("return {").then_some(number)
+        }) {
+            returns.extend(function_returns_in_table(source, line));
+        }
+    }
+    if index_result.is_none() {
+        index_result = metatable_index_return(source);
+    }
+    (returns, index_result)
+}
+
 /// Name of the identifier the module returns (`return Foo`, `return Foo :: any`).
 fn returned_binding_name(source: &str) -> Option<&str> {
     source.lines().rev().find_map(|raw| {
@@ -3096,7 +3949,16 @@ fn binding_declaration<'a>(source: &'a str, name: &str) -> Option<(Option<&'a st
                 let (annotation, value) = tail.split_once('=')?;
                 (Some(annotation.trim()), value)
             }
-            None => (None, rest.strip_prefix('=')?),
+            None => {
+                let value = rest.strip_prefix('=')?;
+                // `local Registry = StatsRegistry :: Registry` — a cast on
+                // the value IS the annotation (chained casts: last wins).
+                let cast = value.contains("::").then(|| {
+                    value.rsplit("::").next().unwrap_or("").trim()
+                });
+                let cast = cast.filter(|tail| !tail.is_empty());
+                (cast, value)
+            }
         };
         // The value itself is parsed separately by table_literal_members.
         let _value = rest;
@@ -3238,9 +4100,24 @@ pub(crate) fn has_dynamic_exports(source: &str) -> bool {
     false
 }
 
+/// Splits `read name: Type` (Luau read-only property) into the remainder
+/// after `read ` plus a flag; anything else passes through unchanged.
+fn strip_read_prefix(field: &str) -> (&str, bool) {
+    let readonly = field.strip_prefix("read ").is_some_and(|tail| {
+        let candidate = identifier_start(tail);
+        is_identifier(candidate) && tail[candidate.len()..].trim_start().starts_with(':')
+    });
+    if readonly {
+        (&field["read ".len()..], true)
+    } else {
+        (field, false)
+    }
+}
+
 fn collect_table_fields(body: &str, result: &mut BTreeMap<String, String>) {
     for field in split_top_level_fields(body) {
         let field = field.trim().trim_end_matches([',', ';']).trim();
+        let (field, readonly) = strip_read_prefix(field);
         let name = identifier_start(field);
         if !is_identifier(name) || is_metamethod(name) { continue }
         let rest = field[name.len()..].trim_start();
@@ -3259,7 +4136,7 @@ fn collect_table_fields(body: &str, result: &mut BTreeMap<String, String>) {
             let detail = if annotation.contains("->") {
                 format!("function {name}{annotation}")
             } else {
-                format!("field {name}: {annotation}")
+                format!("{}field {name}: {annotation}", if readonly { "read " } else { "" })
             };
             result.entry(name.to_string()).or_insert(detail);
         }
@@ -4052,5 +4929,74 @@ mod tests {
         let parented = "local owner = script.Parent\nowner:Wait";
         let wait = index.complete_at(script, parented, parented.chars().count());
         assert!(wait.iter().any(|item| item.label == "WaitForChild"), "{wait:?}");
+    }
+
+    #[test]
+    fn module_interfaces_complete_and_flow_through_calls_and_indexing() {
+        // Mirrors the repo's StatsRegistry fixture: a returned binding
+        // annotated with an interface, an index signature, and function
+        // values with return annotations.
+        let module = r#"
+local StatsRegistry = {}
+export type StateTarget = Player
+export type StateProxy = {
+    read KillCount: number,
+    read Team: string,
+    Stun: boolean?,
+}
+export type Registry = {
+    read Reset: (target: StateTarget) -> (),
+    Get: (target: StateTarget) -> StateProxy?,
+    [StateTarget]: StateProxy?,
+}
+local Registry = StatsRegistry :: Registry
+function Registry.Get(target: StateTarget): StateProxy?
+    return nil
+end
+return Registry
+"#;
+        let stats = Ref::new();
+        let script = Ref::new();
+        let mut index = ProjectIndex::default();
+        index.paths.insert(stats, "ReplicatedStorage/StatsRegistry".into());
+        index.paths.insert(script, "ReplicatedStorage/Client".into());
+        index.module_refs.insert("statsregistry".into(), stats);
+        index.module_sources.insert(stats, module.into());
+        index
+            .modules
+            .insert("statsregistry".into(), exported_members(module));
+        // Same indexes `walk` builds for every ModuleScript.
+        let type_blocks = module_type_blocks(module);
+        let (member_returns, index_result) = module_signature_info(module, &type_blocks);
+        index.module_types.insert(stats, type_blocks);
+        index.module_member_returns.insert(stats, member_returns);
+        if let Some(result) = index_result {
+            index.module_index_results.insert(stats, result);
+        }
+
+        // Literal members still complete on the bare alias.
+        let bare = "local StatsRegistry = require(game.ReplicatedStorage.StatsRegistry)\nStatsRegistry.Ge";
+        let literal = index.complete_at(script, bare, bare.chars().count());
+        assert!(literal.iter().any(|item| item.label == "Get"), "{literal:?}");
+
+        // `Alias[expr].prefix` resolves through the index signature.
+        let indexed = "local StatsRegistry = require(game.ReplicatedStorage.StatsRegistry)\nStatsRegistry[player].Kil";
+        let kill = index.complete_at(script, indexed, indexed.chars().count());
+        assert!(kill.iter().any(|item| item.label == "KillCount"), "{kill:?}");
+
+        // `Alias.member(args).prefix` resolves through the call return.
+        let called = "local StatsRegistry = require(game.ReplicatedStorage.StatsRegistry)\nStatsRegistry.Get(player).St";
+        let stun = index.complete_at(script, called, called.chars().count());
+        assert!(stun.iter().any(|item| item.label == "Stun"), "{stun:?}");
+
+        // `local x = Alias[...]` binds x to the interface type.
+        let flowed = "local StatsRegistry = require(game.ReplicatedStorage.StatsRegistry)\nlocal state = StatsRegistry[player]\nstate.Te";
+        let team = index.complete_at(script, flowed, flowed.chars().count());
+        assert!(team.iter().any(|item| item.label == "Team"), "{team:?}");
+
+        // A bare module name with no require binding stays unknown.
+        let bare_name = "StatsRegistry[player].Kil";
+        let nothing = index.complete_at(script, bare_name, bare_name.chars().count());
+        assert!(!nothing.iter().any(|item| item.label == "KillCount"), "{nothing:?}");
     }
 }
