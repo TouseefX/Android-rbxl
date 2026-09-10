@@ -655,6 +655,32 @@ class LuauLanguage(
                 val line = text.getLineString(position.line)
                 val before = line.substring(0, position.column.coerceIn(0, line.length))
                 val indent = indentOf(before)
+
+                // Enter between an empty pair of brackets -- {}, () or [] --
+                // expands the pair to three lines and leaves the caret on the
+                // indented middle one, the way PC editors do:
+                //
+                //     local t = {|}      local t = {
+                //            ->              <caret>
+                //                        }
+                //
+                // Without this, sora's plain auto-indent leaves the closer
+                // right after the caret on the new line ("{\n    }").
+                val col = position.column
+                if (col in 1 until line.length) {
+                    val closer = when (line[col - 1]) {
+                        '{' -> '}'
+                        '(' -> ')'
+                        '[' -> ']'
+                        else -> null
+                    }
+                    if (closer != null && line[col] == closer) {
+                        val inner = indent + INDENT_UNIT
+                        val tail = "\n$indent"
+                        return NewlineHandleResult("\n$inner$tail", tail.length)
+                    }
+                }
+
                 val code = stripLuauComment(before).trimEnd()
 
                 if (!opensLuauBlock(code)) {
