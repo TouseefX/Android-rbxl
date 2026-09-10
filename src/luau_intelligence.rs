@@ -65,6 +65,12 @@ pub struct ProjectIndex {
     script_sources: HashMap<Ref, String>,
     /// Every script's slash-separated virtual path in the DataModel.
     paths: HashMap<Ref, String>,
+    /// Every instance's class, for path-based type resolution.
+    instance_classes: HashMap<Ref, String>,
+    /// Parent -> (child name, child ref) in DataModel order.
+    instance_children: HashMap<Ref, Vec<(String, Ref)>>,
+    /// Slash path ("ReplicatedStorage/Remotes/Hit") -> ref ("" is the root).
+    path_refs: HashMap<String, Ref>,
 }
 
 impl ProjectIndex {
@@ -137,6 +143,23 @@ impl ProjectIndex {
         if !is_root {
             path.push(instance.name.clone());
             self.paths.insert(referent, path.join("/"));
+        }
+        // Path-based intelligence: every node's class plus the parent->child
+        // links, so `game.ReplicatedStorage.ClientRenderRequest` resolves to
+        // the real instance's class without annotations.
+        if is_root {
+            self.path_refs.insert(String::new(), referent);
+        } else {
+            self.path_refs.insert(path.join("/"), referent);
+        }
+        self.instance_classes.insert(referent, instance.class.clone());
+        for &child in instance.children() {
+            if let Some(node) = dom.get_by_ref(child) {
+                self.instance_children
+                    .entry(referent)
+                    .or_default()
+                    .push((node.name.clone(), child));
+            }
         }
 
         let is_script = matches!(
@@ -211,7 +234,7 @@ impl ProjectIndex {
         cursor_char: usize,
     ) -> Vec<Completion> {
         let cursor_byte = char_to_byte(source, cursor_char);
-        let locals = local_bindings_at(source, cursor_char);
+        let locals = local_bindings_at(self, source, cursor_char, current_script);
         if let Some(typed) = require_string_at_cursor(&source[..cursor_byte]) {
             return self.complete_require_path(current_script, typed);
         }
@@ -232,15 +255,31 @@ impl ProjectIndex {
             }
             // Type-flow through API members: `player.CharacterAdded.Co` →
             // Player → CharacterAdded (RBXScriptSignal) → Connect/Wait.
-            let root_type = innermost_local(&locals, root)
-                .and_then(|binding| binding.instance_class.clone())
-                .or_else(|| match api::global_type(root) {
-                    Some(api_type) if api_type.starts_with("@lib:") || api_type == "@enum" => None,
-                    Some(api_type) => Some(api_type.to_string()),
-                    None => None,
-                });
-            if let Some(owner) = parent_type_for_path(root_type.as_deref(), &parent) {
-                let members = api_member_completions(&owner, prefix, nested_separator);
+            let mut root_inferred = innermost_local(&locals, root)
+                .map(|binding| InferredType {
+                    class: binding.instance_class.clone(),
+                    path: binding.instance_path.clone(),
+                })
+                .unwrap_or_default();
+            if root_inferred.is_unknown() {
+                if let Some(api_type) = api::global_type(root) {
+                    if !api_type.starts_with("@lib:") && api_type != "@enum" {
+                        root_inferred.class = Some(api_type.to_string());
+                        root_inferred.path = self.global_path(root, api_type, current_script);
+                    }
+                }
+            }
+            let resolved = parent_type_for_path(self, &root_inferred, &parent);
+            if let Some(class) = &resolved.class {
+                let mut members = api_member_completions(class, prefix, nested_separator);
+                if nested_separator == '.' {
+                    if let Some(location) = &resolved.path {
+                        merge_child_completions(
+                            &mut members,
+                            self.dom_child_completions(location, prefix),
+                        );
+                    }
+                }
                 if !members.is_empty() {
                     return members;
                 }
@@ -323,7 +362,18 @@ impl ProjectIndex {
             // `local Debris = {}` is not the Debris module.
             if let Some(binding) = local {
                 if let Some(class_name) = &binding.instance_class {
-                    let members = api_member_completions(class_name, prefix, separator);
+                    let mut members = api_member_completions(class_name, prefix, separator);
+                    // A local with a DataModel location also offers the
+                    // real children (`local rs = ...ReplicatedStorage` ->
+                    // `rs.ClientRenderRequest`).
+                    if separator == '.' {
+                        if let Some(location) = &binding.instance_path {
+                            merge_child_completions(
+                                &mut members,
+                                self.dom_child_completions(location, prefix),
+                            );
+                        }
+                    }
                     if !members.is_empty() {
                         return members;
                     }
@@ -352,7 +402,7 @@ impl ProjectIndex {
             // No local: built-in globals/services/datatypes/libraries/enums
             // complete from the generated API data (kind-aware). A bare module
             // name is still never resolved — it must be require()d.
-            return global_member_completions(alias, prefix, separator);
+            return global_member_completions(self, alias, prefix, separator, current_script);
         }
         let before_cursor = &source[..cursor_byte];
         // Nested member chains (e.g. Module.Factory().value) need type-flow
@@ -742,6 +792,94 @@ impl ProjectIndex {
         }
         collapse_path(request)
     }
+
+    /// Ref of the DataModel node at `path` ("" is the root), if the open
+    /// place actually contains it.
+    fn dom_ref_at_path(&self, path: &str) -> Option<Ref> {
+        self.path_refs.get(path).copied()
+    }
+
+    /// Class of the DataModel node at `path`.
+    fn dom_class_at_path(&self, path: &str) -> Option<&str> {
+        let referent = self.dom_ref_at_path(path)?;
+        self.instance_classes.get(&referent).map(String::as_str)
+    }
+
+    /// One exact-name child step: (child path, child class). Member access
+    /// in Luau is case-sensitive, so this match is too.
+    fn dom_child(&self, parent_path: &str, name: &str) -> Option<(String, String)> {
+        let parent = self.dom_ref_at_path(parent_path)?;
+        let children = self.instance_children.get(&parent)?;
+        let (child_name, child_ref) = children
+            .iter()
+            .find(|(child_name, _)| child_name.as_str() == name)?;
+        let class = self.instance_classes.get(child_ref)?.clone();
+        let child_path = if parent_path.is_empty() {
+            child_name.clone()
+        } else {
+            format!("{parent_path}/{child_name}")
+        };
+        Some((child_path, class))
+    }
+
+    /// Children of a DataModel node as (name, class) in tree order.
+    fn dom_children(&self, path: &str) -> Vec<(String, String)> {
+        let Some(parent) = self.dom_ref_at_path(path) else {
+            return Vec::new();
+        };
+        let Some(children) = self.instance_children.get(&parent) else {
+            return Vec::new();
+        };
+        children
+            .iter()
+            .filter_map(|(name, referent)| {
+                self.instance_classes
+                    .get(referent)
+                    .map(|class| (name.clone(), class.clone()))
+            })
+            .collect()
+    }
+
+    /// Children of a DataModel node as dot-only completions, so
+    /// `game.ReplicatedStorage` and `ReplicatedStorage.Things` complete from
+    /// the open place instead of needing annotations.
+    fn dom_child_completions(&self, path: &str, prefix: &str) -> Vec<Completion> {
+        let lower = prefix.to_ascii_lowercase();
+        self.dom_children(path)
+            .into_iter()
+            .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&lower))
+            .take(12)
+            .map(|(name, class)| {
+                let child_path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}/{name}")
+                };
+                Completion {
+                    label: name.clone(),
+                    detail: format!("{class} \u{b7} {child_path}"),
+                    insert_text: name,
+                    replace_chars: prefix.chars().count(),
+                }
+            })
+            .collect()
+    }
+
+    /// DataModel location of a built-in global: `game` is the root,
+    /// `script` is the script being edited, and service globals
+    /// (`workspace`, ...) live at the root under their class name.
+    fn global_path(&self, global: &str, api_type: &str, current_script: Ref) -> Option<String> {
+        if global == "game" {
+            return Some(String::new());
+        }
+        if global == "script" {
+            return self.paths.get(&current_script).cloned();
+        }
+        if schema::class_is_service(api_type) {
+            return Some(api_type.to_string());
+        }
+        None
+    }
 }
 
 /// Replace the identifier fragment immediately before the caret while
@@ -1103,7 +1241,13 @@ fn api_member_completions(owner_type: &str, prefix: &str, separator: char) -> Ve
 /// Members of the built-in globals/services/datatypes/libraries (`game`,
 /// `workspace`, `script`, `Vector3`, `task`, `Enum`, ...) from the generated
 /// API tables. Kind-aware: methods only via `:`.
-fn global_member_completions(owner: &str, prefix: &str, separator: char) -> Vec<Completion> {
+fn global_member_completions(
+    index: &ProjectIndex,
+    owner: &str,
+    prefix: &str,
+    separator: char,
+    current_script: Ref,
+) -> Vec<Completion> {
     if owner.eq_ignore_ascii_case("Enum") {
         return enum_name_completions(prefix);
     }
@@ -1133,7 +1277,25 @@ fn global_member_completions(owner: &str, prefix: &str, separator: char) -> Vec<
     if api_type == "@enum" {
         return Vec::new();
     }
-    api_member_completions(api_type, prefix, separator)
+    let path = index.global_path(owner, api_type, current_script);
+    // `script` takes the class of the script being edited.
+    let class_name = if owner == "script" {
+        path.as_deref()
+            .and_then(|script_path| index.dom_class_at_path(script_path))
+            .unwrap_or(api_type)
+            .to_string()
+    } else {
+        api_type.to_string()
+    };
+    let mut members = api_member_completions(&class_name, prefix, separator);
+    // DataModel children (`game.ReplicatedStorage`, `workspace.Baseplate`)
+    // complete through `.` alongside the API members.
+    if separator == '.' {
+        if let Some(location) = &path {
+            merge_child_completions(&mut members, index.dom_child_completions(location, prefix));
+        }
+    }
+    members
 }
 
 /// `Enum.` → enum type names.
@@ -1182,17 +1344,33 @@ fn enum_item_completions(enum_name: &str, prefix: &str) -> Vec<Completion> {
         .collect()
 }
 
-/// Walks a dotted parent path (`CharacterAdded` or `Moves.Items`) through the
-/// API member types, returning the final owner type for member completion.
-fn parent_type_for_path(root: Option<&str>, parent: &str) -> Option<String> {
-    let mut current = root?.to_string();
-    for segment in parent.split('.') {
-        current = api::member_type(&current, segment)?.to_string();
-        // RBXScriptSignal gives event access (`.Connect`), but the signal's
-        // own members are colon methods, which nested completion uses as dot
-        // for events — see kind rules.
+/// Appends DataModel children to API members, skipping names the API
+/// already offered (`game.Workspace` exists in both tables).
+fn merge_child_completions(members: &mut Vec<Completion>, children: Vec<Completion>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for member in members.iter() {
+        seen.insert(member.label.to_ascii_lowercase());
     }
-    Some(current)
+    for child in children {
+        if seen.insert(child.label.to_ascii_lowercase()) {
+            members.push(child);
+        }
+    }
+    members.truncate(12);
+}
+
+/// Walks a dotted parent path (`CharacterAdded`, `ReplicatedStorage.Hit`,
+/// or `Moves.Items`) through DataModel children and API member types,
+/// returning the final owner type for member completion.
+fn parent_type_for_path(index: &ProjectIndex, root: &InferredType, parent: &str) -> InferredType {
+    let mut current = root.clone();
+    for segment in parent.split('.') {
+        // Nested chains are plain `.name` steps (no calls).
+        if !infer_step(index, &mut current, segment, false, "") {
+            return InferredType::default();
+        }
+    }
+    current
 }
 
 fn identifier_fragment(source_before_cursor: &str) -> &str {
@@ -1277,6 +1455,9 @@ struct LocalBinding {
     /// Roblox class when the binding's type is known (`Instance.new("Part")`
     /// or a typed annotation such as `local part: BasePart`).
     instance_class: Option<String>,
+    /// DataModel path when the value's location is known
+    /// (`game:GetService("ReplicatedStorage")` -> `"ReplicatedStorage"`).
+    instance_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1284,6 +1465,7 @@ struct RawBinding {
     name: String,
     annotation: Option<String>,
     instance_class: Option<String>,
+    instance_path: Option<String>,
     line: usize,
 }
 
@@ -1713,7 +1895,7 @@ fn parse_function_header(
     if is_method {
         params.insert(
             0,
-            RawBinding { name: "self".into(), annotation: None, instance_class: None, line: *line },
+            RawBinding { name: "self".into(), annotation: None, instance_class: None, instance_path: None, line: *line },
         );
     }
     (name, params, after)
@@ -1749,12 +1931,41 @@ fn parse_parameters(source: &str, open: usize, line: &mut usize) -> (Vec<RawBind
                     i = skip_expression(source, i + 1, line);
                     i = skip_whitespace(source, i, line);
                 }
-                params.push(RawBinding { name, annotation, instance_class: None, line: param_line });
+                params.push(RawBinding { name, annotation, instance_class: None, instance_path: None, line: param_line });
             }
             _ => i += 1,
         }
     }
     (params, i)
+}
+
+/// The inferred type of an expression: a Roblox API class plus, when the
+/// value has a statically known location, its DataModel path ("" is the
+/// root). The path is what lets `game.ReplicatedStorage.ClientRenderRequest`
+/// resolve to a RemoteEvent with no annotation.
+#[derive(Debug, Clone, Default)]
+struct InferredType {
+    class: Option<String>,
+    path: Option<String>,
+}
+
+impl InferredType {
+    fn is_unknown(&self) -> bool {
+        self.class.is_none() && self.path.is_none()
+    }
+}
+
+/// Assigns an API class, tracking the DataModel path when the value is a
+/// service (services live at the root under their class name), so
+/// `local rs = game:GetService("ReplicatedStorage")` keeps resolving
+/// `rs.SomeChild` afterwards.
+fn set_api_class(inferred: &mut InferredType, class: &str) {
+    inferred.path = if schema::class_is_service(class) {
+        Some(class.to_string())
+    } else {
+        None
+    };
+    inferred.class = Some(class.to_string());
 }
 
 /// Whether `name` is a known Roblox class, datatype, or enum — usable as a
@@ -1916,99 +2127,240 @@ fn expression_fragment(source: &str, mut index: usize) -> &str {
 /// Infers the API type of an initializer: identifier, member chain
 /// (`Actor.Player`), or service call (`game:GetService("Players")`), using
 /// already-visible local bindings and the generated API tables.
-fn infer_expression_type(rest: &str, locals: &[LocalBinding]) -> Option<String> {
+fn infer_expression_type(
+    index: &ProjectIndex,
+    rest: &str,
+    locals: &[LocalBinding],
+    current_script: Ref,
+) -> InferredType {
     let fragment = expression_fragment(rest, 0);
     let bytes = fragment.as_bytes();
-    let mut index = skip_ascii_ws(bytes, 0);
-    let (base, after) = read_ascii_ident(bytes, index);
+    let mut i = skip_ascii_ws(bytes, 0);
+    let (base, after) = read_ascii_ident(bytes, i);
     if base.is_empty() {
-        return None;
+        return InferredType::default();
     }
-    index = after;
+    i = after;
 
-    // A local shadows the built-in even when its type is unknown.
-    let local_binding = locals.iter().find(|binding| binding.name == base);
-    let mut current = local_binding
-        .and_then(|binding| binding.instance_class.clone())
-        .or_else(|| {
-            if local_binding.is_some() {
-                return None;
-            }
-            match api::global_type(base) {
-                Some(api_type) if api_type.starts_with("@lib:") || api_type == "@enum" => None,
-                Some(api_type) => Some(api_type.to_string()),
-                None => None,
-            }
-        })?;
+    let mut inferred = InferredType::default();
+    if let Some(binding) = locals.iter().find(|binding| binding.name == base) {
+        // A local shadows the built-in even when its type is unknown.
+        inferred.class = binding.instance_class.clone();
+        inferred.path = binding.instance_path.clone();
+    } else if let Some(api_type) = api::global_type(base) {
+        if api_type.starts_with("@lib:") || api_type == "@enum" {
+            return InferredType::default();
+        }
+        let path = index.global_path(base, api_type, current_script);
+        // `script` takes the class of the script being edited.
+        let class = if base == "script" {
+            path.as_deref()
+                .and_then(|script_path| index.dom_class_at_path(script_path))
+                .unwrap_or(api_type)
+        } else {
+            api_type
+        };
+        inferred.class = Some(class.to_string());
+        inferred.path = path;
+    } else {
+        return InferredType::default();
+    }
+    if inferred.is_unknown() {
+        return inferred;
+    }
 
     loop {
-        index = skip_ascii_ws(bytes, index);
-        let _separator = match bytes.get(index) {
+        i = skip_ascii_ws(bytes, i);
+        let _separator = match bytes.get(i) {
             Some(b'.') => '.',
             Some(b':') => ':',
             _ => break,
         };
-        index += 1;
-        index = skip_ascii_ws(bytes, index);
-        let (member, after) = read_ascii_ident(bytes, index);
+        i += 1;
+        i = skip_ascii_ws(bytes, i);
+        let (member, after) = read_ascii_ident(bytes, i);
         if member.is_empty() {
-            return None;
+            return InferredType::default();
         }
-        index = after;
-        index = skip_ascii_ws(bytes, index);
-        let call_start = index;
-        let is_call = bytes.get(index) == Some(&b'(');
+        i = after;
+        i = skip_ascii_ws(bytes, i);
+        let call_start = i;
+        let is_call = bytes.get(i) == Some(&b'(');
         if is_call {
-            index = skip_call_args(fragment, index);
+            i = skip_call_args(fragment, i);
         }
 
-        // game:GetService("Players") / game:FindService(...) → the service
-        // class is the quoted argument, which beats the generic Instance
-        // return type declared by the API dump.
-        if matches!(member, "GetService" | "FindService") {
-            let quoted = first_quoted_call_arg(&fragment[call_start..]);
-            if let Some(class) = quoted.filter(|class| api_type_known(class)) {
-                current = class.to_string();
-                continue;
-            }
+        if !infer_step(index, &mut inferred, member, is_call, &fragment[call_start..]) {
+            return InferredType::default();
         }
-        // `Instance.new("Part")` / `Instance.create("Part")` — the quoted
-        // class argument is the result type.
-        if is_call && matches!(member, "new" | "create") && current == "Instance" {
-            if let Some(class) = first_quoted_call_arg(&fragment[call_start..])
-                .filter(|class| api_type_known(class))
-            {
-                current = class.to_string();
-                continue;
-            }
-        }
-        if is_call
-            && matches!(
-                member,
-                "FindFirstChild" | "WaitForChild" | "FindFirstChildOfClass" | "FindFirstAncestor"
-            )
-        {
-            current = "Instance".to_string();
-            continue;
-        }
-        // Datatype constructors (`Vector3.new(...)`, `CFrame.new(...)`, ...)
-        // return the datatype itself.
-        if is_call && member == "new"
-            && api::find_class(&current).is_some_and(|class| class.datatype)
-        {
-            continue;
-        }
-        current = api::member_type(&current, member)?.to_string();
     }
-    Some(current)
+    inferred
+}
+
+/// Advances an in-progress inference across one `.member` / `:member` step
+/// (plus the step's call arguments, if any). A value with a DataModel
+/// location resolves children exactly; otherwise the API tables apply.
+/// Returns false when the step cannot be resolved at all.
+fn infer_step(
+    index: &ProjectIndex,
+    inferred: &mut InferredType,
+    member: &str,
+    is_call: bool,
+    call_args: &str,
+) -> bool {
+    // A value with a DataModel location resolves children exactly.
+    if let Some(path) = inferred.path.clone() {
+        // `x.Parent` climbs the tree.
+        if member == "Parent" && !is_call {
+            if !path.is_empty() {
+                let parent = path
+                    .rsplit_once('/')
+                    .map(|(head, _)| head.to_string())
+                    .unwrap_or_default();
+                inferred.path = Some(parent.clone());
+                inferred.class = Some(
+                    index
+                        .dom_class_at_path(&parent)
+                        .unwrap_or("Instance")
+                        .to_string(),
+                );
+                return true;
+            }
+        }
+        // `x:WaitForChild("Name")` / `x:FindFirstChild("Name")` with a
+        // literal resolves the real child's class.
+        if is_call && matches!(member, "WaitForChild" | "FindFirstChild") {
+            if let Some(child_name) = first_quoted_call_arg(call_args) {
+                if let Some((child_path, child_class)) = index.dom_child(&path, child_name) {
+                    inferred.path = Some(child_path);
+                    inferred.class = Some(child_class);
+                    return true;
+                }
+            }
+            set_api_class(inferred, "Instance");
+            return true;
+        }
+        // `x:FindFirstAncestor("Name")` climbs by name.
+        if is_call && member == "FindFirstAncestor" {
+            if let Some(want) = first_quoted_call_arg(call_args) {
+                let mut probe = path
+                    .rsplit_once('/')
+                    .map(|(head, _)| head)
+                    .unwrap_or("");
+                loop {
+                    let name = probe.rsplit('/').next().unwrap_or("");
+                    if name == want {
+                        inferred.path = Some(probe.to_string());
+                        inferred.class = Some(
+                            index
+                                .dom_class_at_path(probe)
+                                .unwrap_or("Instance")
+                                .to_string(),
+                        );
+                        return true;
+                    }
+                    if probe.is_empty() {
+                        break;
+                    }
+                    probe = probe.rsplit_once('/').map(|(head, _)| head).unwrap_or("");
+                }
+            }
+            set_api_class(inferred, "Instance");
+            return true;
+        }
+        // Plain `.ChildName` access prefers the real DataModel child.
+        if !is_call {
+            if let Some((child_path, child_class)) = index.dom_child(&path, member) {
+                inferred.path = Some(child_path);
+                inferred.class = Some(child_class);
+                return true;
+            }
+        }
+    }
+
+    // `x:FindFirstChildOfClass("RemoteEvent")` -> the class itself.
+    if is_call
+        && matches!(
+            member,
+            "FindFirstChildOfClass"
+                | "FindFirstAncestorOfClass"
+                | "FindFirstChildWhichIsA"
+                | "FindFirstAncestorWhichIsA"
+        )
+    {
+        if let Some(class) = first_quoted_call_arg(call_args).filter(|class| api_type_known(class)) {
+            set_api_class(inferred, class);
+            return true;
+        }
+    }
+    // `game:GetService("Players")` / `game:FindService(...)` — the quoted
+    // argument beats the generic Instance return type, and services keep
+    // their root path so their children keep resolving.
+    if matches!(member, "GetService" | "FindService") {
+        if let Some(class) = first_quoted_call_arg(call_args).filter(|class| api_type_known(class)) {
+            set_api_class(inferred, class);
+            return true;
+        }
+    }
+    // `Instance.new("Part")` / `Instance.create("Part")` — the quoted
+    // class argument is the result type.
+    if is_call && matches!(member, "new" | "create") && inferred.class.as_deref() == Some("Instance")
+    {
+        if let Some(class) = first_quoted_call_arg(call_args).filter(|class| api_type_known(class)) {
+            set_api_class(inferred, class);
+            return true;
+        }
+    }
+    // Unresolvable searches stay a generic Instance.
+    if is_call
+        && matches!(
+            member,
+            "FindFirstChild" | "WaitForChild" | "FindFirstChildOfClass" | "FindFirstAncestor"
+        )
+    {
+        set_api_class(inferred, "Instance");
+        return true;
+    }
+    // Datatype constructors (`Vector3.new(...)`, `CFrame.new(...)`, ...)
+    // return the datatype itself.
+    if is_call
+        && member == "new"
+        && inferred
+            .class
+            .as_deref()
+            .is_some_and(|class| api::find_class(class).is_some_and(|found| found.datatype))
+    {
+        return true;
+    }
+    // Anything else flows through the API member types (dropping the path).
+    if let Some(class) = inferred.class.clone() {
+        if let Some(next) = api::member_type(&class, member) {
+            set_api_class(inferred, next);
+            return true;
+        }
+    }
+    false
 }
 
 /// Best-effort class for `local x = <initializer>`. The generic chain
 /// inference runs first because it handles `game:GetService("Players")
 /// .LocalPlayer` (→ Player) where the special-cased helper would stop at
 /// the service (`Players`).
-fn infer_binding_type(rest: &str, locals: &[LocalBinding]) -> Option<String> {
-    infer_expression_type(rest, locals).or_else(|| instance_class_from_initializer(rest))
+fn infer_binding_type(
+    index: &ProjectIndex,
+    rest: &str,
+    locals: &[LocalBinding],
+    current_script: Ref,
+) -> InferredType {
+    let inferred = infer_expression_type(index, rest, locals, current_script);
+    if inferred.is_unknown() {
+        if let Some(class) = instance_class_from_initializer(rest) {
+            let mut fallback = InferredType::default();
+            set_api_class(&mut fallback, &class);
+            return fallback;
+        }
+    }
+    inferred
 }
 
 fn commit_bindings(scopes: &mut [(ScopeKind, LocalScope)], names: &mut Vec<RawBinding>, is_const: bool) {
@@ -2029,6 +2381,7 @@ fn commit_bindings(scopes: &mut [(ScopeKind, LocalScope)], names: &mut Vec<RawBi
             detail,
             line: binding.line,
             instance_class,
+            instance_path: binding.instance_path,
         });
     }
 }
@@ -2036,7 +2389,12 @@ fn commit_bindings(scopes: &mut [(ScopeKind, LocalScope)], names: &mut Vec<RawBi
 /// Locals that are actually in scope at the caret, walking Luau block scopes
 /// (`function`/`if`/`for`/`while`/`do`/`repeat`). Bindings are returned
 /// innermost-first so a shadowing binding wins over an outer one.
-fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
+fn local_bindings_at(
+    index: &ProjectIndex,
+    source: &str,
+    cursor_char: usize,
+    current_script: Ref,
+) -> Vec<LocalBinding> {
     let cursor_byte = char_to_byte(source, cursor_char);
     let source = &source[..cursor_byte];
 
@@ -2047,7 +2405,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
     }
 
     let mut scopes: Vec<(ScopeKind, LocalScope)> = vec![(ScopeKind::File, LocalScope::default())];
-    let mut index = 0usize;
+    let mut cursor = 0usize;
     let mut line = 1usize;
     let mut decl: Option<DeclState> = None;
     let mut names: Vec<RawBinding> = Vec::new();
@@ -2057,7 +2415,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
     /// loop variables; Some(true) = variables collected, awaiting `do`.
     let mut in_for_header: Option<bool> = None;
 
-    while let Some(token) = next_token(source, &mut index, &mut line) {
+    while let Some(token) = next_token(source, &mut cursor, &mut line) {
         match token {
             Token::Newline => {
                 // `local x` without `=` is still a declaration once the
@@ -2085,8 +2443,8 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                             }
                         }
                     }
-                    let (name, params, next_index) = parse_function_header(source, index, &mut line);
-                    index = next_index;
+                    let (name, params, next_index) = parse_function_header(source, cursor, &mut line);
+                    cursor = next_index;
                     // Only `local function` / `const function` create a local
                     // binding. A bare `function Foo()` is a global, which must
                     // not be offered as an in-scope local.
@@ -2097,6 +2455,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                             detail: detail.into(),
                             line,
                             instance_class: None,
+                            instance_path: None,
                         });
                     }
                     let mut function_scope = LocalScope::default();
@@ -2114,6 +2473,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                             detail,
                             line: param.line,
                             instance_class,
+                            instance_path: None,
                         });
                     }
                     scopes.push((ScopeKind::Function, function_scope));
@@ -2137,6 +2497,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                                 detail: "loop variable".into(),
                                 line: var.line,
                                 instance_class: None,
+                                instance_path: None,
                             });
                         }
                         scopes.push((ScopeKind::Loop, loop_scope));
@@ -2178,6 +2539,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                                     name: word.to_string(),
                                     annotation: None,
                                     instance_class: None,
+                                    instance_path: None,
                                     line,
                                 });
                                 decl = Some(DeclState::Names { is_const });
@@ -2187,6 +2549,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                                     name: word.to_string(),
                                     annotation: None,
                                     instance_class: None,
+                                    instance_path: None,
                                     line,
                                 });
                                 expect_name = false;
@@ -2198,6 +2561,7 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                             name: word.to_string(),
                             annotation: None,
                             instance_class: None,
+                            instance_path: None,
                             line,
                         });
                     }
@@ -2211,10 +2575,15 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                 }
                 "=" => {
                     if let Some(DeclState::Names { is_const }) = decl.take() {
-                        if let Some(class) = infer_binding_type(&source[index..], &visible_bindings(&scopes)) {
-                            if let Some(last) = names.last_mut() {
-                                last.instance_class = Some(class);
-                            }
+                        let inferred = infer_binding_type(
+                            index,
+                            &source[cursor..],
+                            &visible_bindings(&scopes),
+                            current_script,
+                        );
+                        if let Some(last) = names.last_mut() {
+                            last.instance_class = inferred.class;
+                            last.instance_path = inferred.path;
                         }
                         commit_bindings(&mut scopes, &mut names, is_const);
                     }
@@ -2234,8 +2603,8 @@ fn local_bindings_at(source: &str, cursor_char: usize) -> Vec<LocalBinding> {
                     // more names, so skip it and remember the class name.
                     if let Some(DeclState::Names { .. }) = decl {
                         if !expect_name && names.last().is_some() {
-                            let (annotation, next) = skip_type_annotation(source, index, &mut line);
-                            index = next;
+                            let (annotation, next) = skip_type_annotation(source, cursor, &mut line);
+                            cursor = next;
                             if let Some(annotation) = annotation {
                                 if let Some(last) = names.last_mut() {
                                     last.annotation = Some(annotation);
@@ -2990,6 +3359,7 @@ fn is_identifier(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rbx_dom_weak::InstanceBuilder;
 
     #[test]
     fn collapses_relative_paths() {
@@ -3357,25 +3727,26 @@ mod tests {
 
     #[test]
     fn local_declarations_are_scoped_and_typed() {
+        let index = ProjectIndex::default();
         let source = "if true then\nlocal inner = 1\nend\ninn";
         // `inner` was declared inside the block and is not visible after `end`.
-        let outside = local_bindings_at(source, source.chars().count());
+        let outside = local_bindings_at(&index, source, source.chars().count(), Ref::none());
         assert!(
             !outside.iter().any(|binding| binding.name == "inner"),
             "block local leaked: {outside:?}",
         );
 
         let inside = "if true then\nlocal inner = 1\ninn";
-        let in_scope = local_bindings_at(inside, inside.chars().count());
+        let in_scope = local_bindings_at(&index, inside, inside.chars().count(), Ref::none());
         assert!(in_scope.iter().any(|binding| binding.name == "inner"));
 
         let typed = "local part: BasePart\npar";
-        let typed_locals = local_bindings_at(typed, typed.chars().count());
+        let typed_locals = local_bindings_at(&index, typed, typed.chars().count(), Ref::none());
         let part = typed_locals.iter().find(|binding| binding.name == "part");
         assert_eq!(part.and_then(|binding| binding.instance_class.as_deref()), Some("BasePart"));
 
         let newed = "local part = Instance.new(\"Part\")\npar";
-        let newed_locals = local_bindings_at(newed, newed.chars().count());
+        let newed_locals = local_bindings_at(&index, newed, newed.chars().count(), Ref::none());
         assert_eq!(
             newed_locals.iter().find(|binding| binding.name == "part")
                 .and_then(|binding| binding.instance_class.as_deref()),
@@ -3385,39 +3756,41 @@ mod tests {
 
     #[test]
     fn function_params_loop_vars_and_self_are_completed_in_scope() {
+        let index = ProjectIndex::default();
         let function_source = "local function go(foo: number, bar)\nfo";
-        let locals = local_bindings_at(function_source, function_source.chars().count());
+        let locals = local_bindings_at(&index, function_source, function_source.chars().count(), Ref::none());
         assert!(locals.iter().any(|binding| binding.name == "foo"));
         assert!(locals.iter().any(|binding| binding.name == "bar"));
         assert!(locals.iter().any(|binding| binding.name == "go"));
 
         let after = "local function go(foo)\nend\nfo";
         assert!(
-            !local_bindings_at(after, after.chars().count())
+            !local_bindings_at(&index, after, after.chars().count(), Ref::none())
                 .iter().any(|binding| binding.name == "foo"),
             "parameter leaked after function end",
         );
 
         let loop_source = "for k, v in pairs(items) do\nv";
-        assert!(local_bindings_at(loop_source, loop_source.chars().count())
+        assert!(local_bindings_at(&index, loop_source, loop_source.chars().count(), Ref::none())
             .iter().any(|binding| binding.name == "v"));
 
         let method_source = "function Obj:Destroy(foo)\nsel";
-        let method_locals = local_bindings_at(method_source, method_source.chars().count());
+        let method_locals = local_bindings_at(&index, method_source, method_source.chars().count(), Ref::none());
         assert!(method_locals.iter().any(|binding| binding.name == "self"));
         assert!(method_locals.iter().any(|binding| binding.name == "foo"));
     }
 
     #[test]
     fn global_functions_are_not_offered_as_locals() {
+        let index = ProjectIndex::default();
         let global = "function Fred(a)\nFr";
         assert!(
-            !local_bindings_at(global, global.chars().count())
+            !local_bindings_at(&index, global, global.chars().count(), Ref::none())
                 .iter().any(|binding| binding.name == "Fred"),
             "bare global function offered as a local",
         );
         let local = "local function Fred(a)\nFr";
-        assert!(local_bindings_at(local, local.chars().count())
+        assert!(local_bindings_at(&index, local, local.chars().count(), Ref::none())
             .iter().any(|binding| binding.name == "Fred"));
     }
 
@@ -3549,7 +3922,7 @@ mod tests {
 
         // function parameters with typed annotations are in scope and typed.
         let params = "function test(Player: Player)\nPlay";
-        let param_locals = local_bindings_at(params, params.chars().count());
+        let param_locals = local_bindings_at(&index, params, params.chars().count(), Ref::none());
         let player = param_locals.iter().find(|binding| binding.name == "Player");
         assert_eq!(
             player.and_then(|binding| binding.instance_class.as_deref()),
@@ -3595,5 +3968,89 @@ mod tests {
             !dot_suggestions.iter().any(|item| item.label == "Connect"),
             "signal methods must not complete on dot: {dot_suggestions:?}"
         );
+    }
+
+    /// Builds a small place: services with children plus a Script to edit.
+    fn test_place_dom() -> WeakDom {
+        WeakDom::new(
+            InstanceBuilder::new("DataModel")
+                .with_name("game")
+                .with_child(
+                    InstanceBuilder::new("ReplicatedStorage")
+                        .with_name("ReplicatedStorage")
+                        .with_child(
+                            InstanceBuilder::new("RemoteEvent").with_name("ClientRenderRequest"),
+                        )
+                        .with_child(InstanceBuilder::new("Folder").with_name("Things")),
+                )
+                .with_child(
+                    InstanceBuilder::new("Workspace")
+                        .with_name("Workspace")
+                        .with_child(InstanceBuilder::new("Terrain").with_name("Terrain"))
+                        .with_child(InstanceBuilder::new("Part").with_name("Baseplate")),
+                )
+                .with_child(InstanceBuilder::new("ServerStorage").with_name("ServerStorage"))
+                .with_child(
+                    InstanceBuilder::new("ServerScriptService")
+                        .with_name("ServerScriptService")
+                        .with_child(InstanceBuilder::new("Script").with_name("Main")),
+                ),
+        )
+    }
+
+    fn test_child_ref(dom: &WeakDom, parent: Ref, name: &str) -> Ref {
+        dom.get_by_ref(parent)
+            .expect("test parent")
+            .children()
+            .iter()
+            .find(|child| dom.get_by_ref(**child).expect("test child").name == name)
+            .map(|child| **child)
+            .expect("test child missing")
+    }
+
+    #[test]
+    fn service_and_instance_paths_complete_and_infer() {
+        let dom = test_place_dom();
+        let index = ProjectIndex::build(&dom);
+        let service = test_child_ref(&dom, dom.root_ref(), "ServerScriptService");
+        let script = test_child_ref(&dom, service, "Main");
+
+        // `game.ReplicatedStorage` / `game.ServerStorage` complete from the
+        // open place even though the API dump has no such members.
+        let services = index.complete_at(script, "game.Repli", "game.Repli".chars().count());
+        assert!(services.iter().any(|item| item.label == "ReplicatedStorage"), "{services:?}");
+        let storage = index.complete_at(script, "game.ServerSt", "game.ServerSt".chars().count());
+        assert!(storage.iter().any(|item| item.label == "ServerStorage"), "{storage:?}");
+
+        // Children of services complete: `ReplicatedStorage.Things`.
+        let via_service = "local rs = game:GetService(\"ReplicatedStorage\")\nrs.Thi";
+        let things = index.complete_at(script, via_service, via_service.chars().count());
+        assert!(things.iter().any(|item| item.label == "Things"), "{things:?}");
+
+        // A full DataModel path needs no annotation:
+        // `game.ReplicatedStorage.ClientRenderRequest` -> RemoteEvent.
+        let remote = "local request = game.ReplicatedStorage.ClientRenderRequest\nrequest:Fi";
+        let fire = index.complete_at(script, remote, remote.chars().count());
+        assert!(fire.iter().any(|item| item.label == "FireServer"), "{fire:?}");
+
+        // Nested paths flow too.
+        let nested = "game.ReplicatedStorage.ClientRenderRequest:Fi";
+        let nested_fire = index.complete_at(script, nested, nested.chars().count());
+        assert!(nested_fire.iter().any(|item| item.label == "FireServer"), "{nested_fire:?}");
+
+        // `:WaitForChild("Things")` with a literal types the real child.
+        let waited = "local folder = game.ReplicatedStorage:WaitForChild(\"Things\")\nfolder:Find";
+        let found = index.complete_at(script, waited, waited.chars().count());
+        assert!(found.iter().any(|item| item.label == "FindFirstChild"), "{found:?}");
+
+        // `:FindFirstChildOfClass("RemoteEvent")` types by the class argument.
+        let of_class = "local remote = game.ReplicatedStorage:FindFirstChildOfClass(\"RemoteEvent\")\nremote:Fi";
+        let fired = index.complete_at(script, of_class, of_class.chars().count());
+        assert!(fired.iter().any(|item| item.label == "FireServer"), "{fired:?}");
+
+        // `script.Parent` climbs to the real parent service.
+        let parented = "local owner = script.Parent\nowner:Wait";
+        let wait = index.complete_at(script, parented, parented.chars().count());
+        assert!(wait.iter().any(|item| item.label == "WaitForChild"), "{wait:?}");
     }
 }
