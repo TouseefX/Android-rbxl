@@ -36,6 +36,7 @@ mod live_session;
 mod lua_runtime;
 mod plugins;
 mod project;
+mod roblox_api_data;
 mod settings;
 mod templates;
 mod thumbnails;

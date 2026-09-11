@@ -517,6 +517,13 @@ class MainActivity : GameActivity() {
             // the popup only appeared after a pause -- which is why typing a
             // space and deleting it "fixed" it. Effectively disabled.
             getProps().cancelCompletionNs = 0L
+            // Backspace removes a whole indent level (tabWidth spaces) at
+            // once when the caret sits in a line's leading whitespace, the
+            // way PC editors treat tab stops. sora's default removes one
+            // space per press, so a 4-space indent took 4 backspaces.
+            // -1 means "follow tab size"; only leading whitespace is
+            // affected, deletes elsewhere still remove a single character.
+            getProps().deleteMultiSpaces = -1
             setText(normalizedSource)
         }
         // Re-ask for completions after an auto-paired quote or bracket.
@@ -612,12 +619,40 @@ class MainActivity : GameActivity() {
                     // insertText replaces the selection and moves the caret.
                     // The offset must be the full length so the caret lands
                     // after the inserted text, not one character into it.
-                    val insert = if (symbol == "\t") INDENT_UNIT else symbol
-                    editor.insertText(insert, insert.length)
+                    if (symbol == "\t") {
+                        // Like a PC Tab key: when several lines are selected,
+                        // indent every line of the block instead of replacing
+                        // the selection. (Shift+Tab / outdent is the ⇤ key.)
+                        val cursor = editor.cursor
+                        if (cursor.isSelected && cursor.leftLine != cursor.rightLine) {
+                            editor.indentSelection()
+                        } else {
+                            editor.insertText(INDENT_UNIT, INDENT_UNIT.length)
+                        }
+                    } else {
+                        editor.insertText(symbol, symbol.length)
+                    }
                     editor.requestFocus()
                 }
             }
             symbolRow.addView(key)
+            if (symbol == "\t") {
+                // Shift+Tab equivalent for touch: removes one indent level
+                // from every selected line (sora falls back to the caret's
+                // line when nothing is selected).
+                val outdent = Button(this).apply {
+                    text = "⇤"
+                    textSize = 15f
+                    minWidth = 0
+                    minimumWidth = 0
+                    setPadding(20, 4, 20, 4)
+                    setOnClickListener {
+                        editor.unindentSelection()
+                        editor.requestFocus()
+                    }
+                }
+                symbolRow.addView(outdent)
+            }
         }
         root.addView(HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
