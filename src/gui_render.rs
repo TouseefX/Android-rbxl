@@ -181,7 +181,30 @@ fn gui_rect(
             required.x = required.x.max((child_rect.right() - provisional_content.left()).max(0.0));
             required.y = required.y.max((child_rect.bottom() - provisional_content.top()).max(0.0));
         }
-        if let Some(layout) = child_of_class(dom, instance, "UIPageLayout") {
+        if let Some(layout) = child_of_class(dom, instance, "UITableLayout") {
+            let row_major = enum_value(layout.properties.get(&rbx_dom_weak::ustr("MajorAxis")), 0) == 0;
+            let (pxs, pxo, pys, pyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("Padding")))
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let gap = Vec2::new(provisional_content.width()*pxs+pxo*scale, provisional_content.height()*pys+pyo*scale).max(Vec2::ZERO);
+            let groups: Vec<&rbx_dom_weak::Instance> = instance.children().iter().filter_map(|referent| dom.get_by_ref(*referent)
+                .filter(|child| is_gui_object(&child.class) && visible(child))).collect();
+            let minor_count = groups.iter().map(|group| group.children().iter().filter(|referent| dom.get_by_ref(**referent)
+                .map(|cell| is_gui_object(&cell.class) && visible(cell)).unwrap_or(false)).count()).max().unwrap_or(0);
+            let (rows, columns) = if row_major { (groups.len(), minor_count) } else { (minor_count, groups.len()) };
+            let mut widths = vec![0.0f32; columns];
+            let mut heights = vec![0.0f32; rows];
+            for (major, group) in groups.iter().enumerate() {
+                for (minor, cell) in group.children().iter().filter_map(|referent| dom.get_by_ref(*referent)
+                    .filter(|cell| is_gui_object(&cell.class) && visible(cell))).enumerate() {
+                    let (row, column) = if row_major { (major, minor) } else { (minor, major) };
+                    let rect = gui_rect(dom, painter, cell, provisional_content, scale);
+                    widths[column] = widths[column].max(rect.width());
+                    heights[row] = heights[row].max(rect.height());
+                }
+            }
+            required = Vec2::new(widths.iter().sum::<f32>() + gap.x*columns.saturating_sub(1) as f32,
+                heights.iter().sum::<f32>() + gap.y*rows.saturating_sub(1) as f32);
+        } else if let Some(layout) = child_of_class(dom, instance, "UIPageLayout") {
             let requested = match layout.properties.get(&rbx_dom_weak::ustr("CurrentPage")) {
                 Some(Variant::Ref(referent)) => Some(*referent),
                 _ => None,
@@ -369,7 +392,8 @@ fn padded_rect(dom: &WeakDom, instance: &rbx_dom_weak::Instance, rect: Rect, sca
 fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
            parent_rect: Rect, parent_clip: Rect, display_order: i32,
            global_z: bool, inherited_scale: f32, parent_path: &[(i32, usize)],
-           forced_rect: Option<Rect>, sequence: &mut usize, nodes: &mut Vec<GuiNode>) {
+           forced_rect: Option<Rect>, overrides: &mut std::collections::HashMap<Ref, Rect>,
+           sequence: &mut usize, nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
     let local_scale = child_of_class(dom, instance, "UIScale")
@@ -377,7 +401,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         .unwrap_or(1.0);
     let scale = inherited_scale * local_scale;
     let is_screen = instance.class == "ScreenGui";
-    let rect = forced_rect.unwrap_or_else(|| {
+    let rect = forced_rect.or_else(|| overrides.get(&referent).copied()).unwrap_or_else(|| {
         if is_screen { parent_rect } else { gui_rect(dom, painter, instance, parent_rect, scale) }
     });
     let clips = matches!(instance.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), Some(Variant::Bool(true)));
@@ -479,7 +503,81 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     } else {
         content_rect
     };
-    if let Some(layout) = child_of_class(dom, instance, "UIPageLayout") {
+    if let Some(layout) = child_of_class(dom, instance, "UITableLayout") {
+        let row_major = enum_value(layout.properties.get(&rbx_dom_weak::ustr("MajorAxis")), 0) == 0;
+        let (pxs, pxo, pys, pyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("Padding")))
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let gap = Vec2::new(child_parent_rect.width()*pxs + pxo*scale, child_parent_rect.height()*pys + pyo*scale).max(Vec2::ZERO);
+        let fill_columns = bool_value(layout.properties.get(&rbx_dom_weak::ustr("FillEmptySpaceColumns")), false);
+        let fill_rows = bool_value(layout.properties.get(&rbx_dom_weak::ustr("FillEmptySpaceRows")), false);
+        let sort_order = enum_value(layout.properties.get(&rbx_dom_weak::ustr("SortOrder")), 0);
+        let mut groups: Vec<Ref> = instance.children().iter().filter_map(|referent| {
+            dom.get_by_ref(*referent).filter(|child| is_gui_object(&child.class) && visible(child)).map(|_| *referent)
+        }).collect();
+        groups.sort_by(|left, right| {
+            let a = dom.get_by_ref(*left).unwrap(); let b = dom.get_by_ref(*right).unwrap();
+            if sort_order == 1 {
+                enum_value(a.properties.get(&rbx_dom_weak::ustr("LayoutOrder")), 0)
+                    .cmp(&enum_value(b.properties.get(&rbx_dom_weak::ustr("LayoutOrder")), 0))
+            } else { a.name.cmp(&b.name) }
+        });
+        let mut matrix: Vec<Vec<Ref>> = Vec::new();
+        for group in &groups {
+            let Some(group_instance) = dom.get_by_ref(*group) else { continue; };
+            let mut cells: Vec<Ref> = group_instance.children().iter().filter_map(|referent| {
+                dom.get_by_ref(*referent).filter(|child| is_gui_object(&child.class) && visible(child)).map(|_| *referent)
+            }).collect();
+            cells.sort_by(|left, right| {
+                let a = dom.get_by_ref(*left).unwrap(); let b = dom.get_by_ref(*right).unwrap();
+                if sort_order == 1 {
+                    enum_value(a.properties.get(&rbx_dom_weak::ustr("LayoutOrder")), 0)
+                        .cmp(&enum_value(b.properties.get(&rbx_dom_weak::ustr("LayoutOrder")), 0))
+                } else { a.name.cmp(&b.name) }
+            });
+            matrix.push(cells);
+        }
+        let columns = if row_major { matrix.iter().map(Vec::len).max().unwrap_or(1) } else { groups.len() }.max(1);
+        let rows = if row_major { groups.len() } else { matrix.iter().map(Vec::len).max().unwrap_or(1) }.max(1);
+        let mut column_widths = vec![0.0f32; columns];
+        let mut row_heights = vec![0.0f32; rows];
+        for (major, cells) in matrix.iter().enumerate() {
+            for (minor, cell_ref) in cells.iter().enumerate() {
+                let (row, column) = if row_major { (major, minor) } else { (minor, major) };
+                let Some(cell) = dom.get_by_ref(*cell_ref) else { continue; };
+                let natural = gui_rect(dom, painter, cell, child_parent_rect, scale);
+                column_widths[column] = column_widths[column].max(natural.width());
+                row_heights[row] = row_heights[row].max(natural.height());
+            }
+        }
+        if fill_columns {
+            let width = ((child_parent_rect.width() - gap.x*(columns-1) as f32) / columns as f32).max(0.0);
+            column_widths.fill(width);
+        }
+        if fill_rows {
+            let height = ((child_parent_rect.height() - gap.y*(rows-1) as f32) / rows as f32).max(0.0);
+            row_heights.fill(height);
+        }
+        let mut ys = vec![child_parent_rect.top(); rows];
+        let mut xs = vec![child_parent_rect.left(); columns];
+        for index in 1..columns { xs[index] = xs[index-1] + column_widths[index-1] + gap.x; }
+        for index in 1..rows { ys[index] = ys[index-1] + row_heights[index-1] + gap.y; }
+        for (major, group_ref) in groups.iter().enumerate() {
+            let group_rect = if row_major {
+                Rect::from_min_size(Pos2::new(child_parent_rect.left(), ys[major]), Vec2::new(column_widths.iter().sum::<f32>() + gap.x*(columns-1) as f32, row_heights[major]))
+            } else {
+                Rect::from_min_size(Pos2::new(xs[major], child_parent_rect.top()), Vec2::new(column_widths[major], row_heights.iter().sum::<f32>() + gap.y*(rows-1) as f32))
+            };
+            overrides.insert(*group_ref, group_rect);
+            for (minor, cell_ref) in matrix.get(major).into_iter().flatten().enumerate() {
+                let (row, column) = if row_major { (major, minor) } else { (minor, major) };
+                overrides.insert(*cell_ref, Rect::from_min_size(Pos2::new(xs[column], ys[row]), Vec2::new(column_widths[column], row_heights[row])));
+            }
+        }
+        for child in instance.children() {
+            collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
+                global_z, scale, &sort_path, None, overrides, sequence, nodes);
+        }
+    } else if let Some(layout) = child_of_class(dom, instance, "UIPageLayout") {
         let sort_order = enum_value(layout.properties.get(&rbx_dom_weak::ustr("SortOrder")), 0);
         let mut pages: Vec<(usize, Ref, i32, String)> = instance.children().iter().enumerate()
             .filter_map(|(index, referent)| {
@@ -522,7 +620,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 _ => child_parent_rect.center().y - natural.height() * 0.5,
             };
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(Rect::from_min_size(Pos2::new(x, y), natural.size())), sequence, nodes);
+                global_z, scale, &sort_path, Some(Rect::from_min_size(Pos2::new(x, y), natural.size())), overrides, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
         let (cxs, cxo, cys, cyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellSize")))
@@ -583,7 +681,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             if start_corner == 2 || start_corner == 3 { row = effective_rows.saturating_sub(1).saturating_sub(row); }
             let min = origin + Vec2::new(column as f32 * (cell.x + gap.x), row as f32 * (cell.y + gap.y));
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(Rect::from_min_size(min, cell)), sequence, nodes);
+                global_z, scale, &sort_path, Some(Rect::from_min_size(min, cell)), overrides, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
         let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 1) == 0;
@@ -638,13 +736,13 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             };
             let arranged = Rect::from_min_size(min, natural.size());
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(arranged), sequence, nodes);
+                global_z, scale, &sort_path, Some(arranged), overrides, sequence, nodes);
             cursor += if horizontal { natural.width() } else { natural.height() } + padding;
         }
     } else {
         for child in instance.children() {
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, None, sequence, nodes);
+                global_z, scale, &sort_path, None, overrides, sequence, nodes);
         }
     }
 }
@@ -793,6 +891,7 @@ pub fn draw_starter_gui(
     }) else { return None; };
     let mut nodes = Vec::new();
     let mut sequence = 0;
+    let mut overrides = std::collections::HashMap::new();
     let layout_painter = ui.painter().clone();
     if let Some(starter) = dom.get_by_ref(starter) {
         for (screen_order, child) in starter.children().iter().enumerate() {
@@ -802,7 +901,7 @@ pub fn draw_starter_gui(
             let global_z = enum_value(gui.properties.get(&rbx_dom_weak::ustr("ZIndexBehavior")), 1) == 0;
             let root_path = vec![(0, screen_order)];
             collect(dom, &layout_painter, *child, viewport, viewport, display_order,
-                global_z, 1.0, &root_path, None, &mut sequence, &mut nodes);
+                global_z, 1.0, &root_path, None, &mut overrides, &mut sequence, &mut nodes);
         }
     }
     nodes.sort_by(|left, right| {
