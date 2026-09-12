@@ -132,6 +132,14 @@ enum PluginAction {
     OpenScript(String, String),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ViewportGizmoMode {
+    #[default]
+    Move,
+    Rotate,
+    Scale,
+}
+
 #[derive(bevy::prelude::Resource)]
 pub struct EditorApp {
     dom: Option<WeakDom>,
@@ -248,6 +256,7 @@ pub struct EditorApp {
     cam_move_speed: f32,
     /// World axis currently captured by the transform gizmo (X/Y/Z = 0/1/2).
     viewport_gizmo_axis: Option<usize>,
+    viewport_gizmo_mode: ViewportGizmoMode,
 
     // When Some, drain_events() will flip needs_3d_rebuild back on once this
     // deadline passes, so meshes/textures that finished downloading in the
@@ -398,6 +407,7 @@ impl Default for EditorApp {
             needs_3d_rebuild: false,
             cam_move_speed: 4.0,
             viewport_gizmo_axis: None,
+            viewport_gizmo_mode: ViewportGizmoMode::Move,
             pending_asset_refresh_at: None,
             command_input: String::new(),
             command_history: Vec::new(),
@@ -911,6 +921,9 @@ impl EditorApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
             ui.label(RichText::new("🧊 3D (Bevy)").strong().color(Color32::from_rgb(0, 230, 255)));
+            ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Move, "↔ Move");
+            ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Rotate, "⟳ Rotate");
+            ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Scale, "⤢ Scale");
 
             if ui.button("📐 Iso").clicked() { orbit.yaw = 0.785; orbit.pitch = 0.45; }
             if ui.button("📐 Top").clicked() { orbit.yaw = 0.0; orbit.pitch = 1.54; }
@@ -954,29 +967,70 @@ impl EditorApp {
         });
     }
 
-    fn move_selected_axis(&mut self, axis: usize, delta: f32) {
+    fn apply_gizmo_axis(&mut self, axis: usize, delta: f32) {
         if !delta.is_finite() || delta.abs() < 1e-5 { return; }
+        let mode = self.viewport_gizmo_mode;
         let (Some(referent), Some(dom)) = (self.selected, self.dom.as_mut()) else { return; };
         let Some(instance) = dom.get_by_ref(referent) else { return; };
-        let (property, value) = match instance.properties.get(&rbx_dom_weak::ustr("CFrame"))
-            .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("CoordinateFrame"))) {
-            Some(Variant::CFrame(frame)) => {
-                let mut position = frame.position;
-                match axis { 0 => position.x += delta, 1 => position.y += delta, _ => position.z += delta }
-                ("CFrame", Variant::CFrame(rbx_dom_weak::types::CFrame::new(position, frame.orientation)))
-            }
-            _ => {
-                let mut position = match instance.properties.get(&rbx_dom_weak::ustr("Position")) {
-                    Some(Variant::Vector3(position)) => *position,
-                    _ => Vector3::new(0.0, 0.0, 0.0),
+        let (property, value, action) = match mode {
+            ViewportGizmoMode::Scale => {
+                let mut size = match instance.properties.get(&rbx_dom_weak::ustr("Size")) {
+                    Some(Variant::Vector3(size)) => *size,
+                    _ => return,
                 };
-                match axis { 0 => position.x += delta, 1 => position.y += delta, _ => position.z += delta }
-                ("Position", Variant::Vector3(position))
+                match axis {
+                    0 => size.x = (size.x + delta).max(0.05),
+                    1 => size.y = (size.y + delta).max(0.05),
+                    _ => size.z = (size.z + delta).max(0.05),
+                }
+                ("Size", Variant::Vector3(size), "Scaled")
+            }
+            ViewportGizmoMode::Rotate => {
+                let Some(Variant::CFrame(frame)) = instance.properties.get(&rbx_dom_weak::ustr("CFrame"))
+                    .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("CoordinateFrame"))) else { return; };
+                let angle = delta * 0.08;
+                let (c, s) = (angle.cos(), angle.sin());
+                let rotation = match axis {
+                    0 => [[1.0,0.0,0.0], [0.0,c,-s], [0.0,s,c]],
+                    1 => [[c,0.0,s], [0.0,1.0,0.0], [-s,0.0,c]],
+                    _ => [[c,-s,0.0], [s,c,0.0], [0.0,0.0,1.0]],
+                };
+                let m = &frame.orientation;
+                let old = [[m.x.x,m.x.y,m.x.z], [m.y.x,m.y.y,m.y.z], [m.z.x,m.z.y,m.z.z]];
+                let mut out = [[0.0_f32; 3]; 3];
+                for row in 0..3 { for column in 0..3 {
+                    out[row][column] = (0..3).map(|k| rotation[row][k] * old[k][column]).sum();
+                }}
+                let matrix = rbx_dom_weak::types::Matrix3::new(
+                    Vector3::new(out[0][0],out[0][1],out[0][2]),
+                    Vector3::new(out[1][0],out[1][1],out[1][2]),
+                    Vector3::new(out[2][0],out[2][1],out[2][2]),
+                );
+                ("CFrame", Variant::CFrame(rbx_dom_weak::types::CFrame::new(frame.position, matrix)), "Rotated")
+            }
+            ViewportGizmoMode::Move => {
+                let (property, value) = match instance.properties.get(&rbx_dom_weak::ustr("CFrame"))
+                    .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("CoordinateFrame"))) {
+                    Some(Variant::CFrame(frame)) => {
+                        let mut position = frame.position;
+                        match axis { 0 => position.x += delta, 1 => position.y += delta, _ => position.z += delta }
+                        ("CFrame", Variant::CFrame(rbx_dom_weak::types::CFrame::new(position, frame.orientation)))
+                    }
+                    _ => {
+                        let mut position = match instance.properties.get(&rbx_dom_weak::ustr("Position")) {
+                            Some(Variant::Vector3(position)) => *position,
+                            _ => Vector3::new(0.0, 0.0, 0.0),
+                        };
+                        match axis { 0 => position.x += delta, 1 => position.y += delta, _ => position.z += delta }
+                        ("Position", Variant::Vector3(position))
+                    }
+                };
+                (property, value, "Moved")
             }
         };
         if rbxl::set_property(dom, referent, property, value).is_ok() {
             self.needs_3d_rebuild = true;
-            self.status = format!("Moved selected part on {} axis", ["X", "Y", "Z"][axis.min(2)]);
+            self.status = format!("{action} selected part on {} axis", ["X", "Y", "Z"][axis.min(2)]);
         }
     }
 
@@ -1028,7 +1082,7 @@ impl EditorApp {
                 let screen_axis = egui::vec2(ends[axis][0]-center[0], ends[axis][1]-center[1]).normalized();
                 let pixels = egui::vec2(d.x / rect.width(), d.y / rect.height()).dot(screen_axis) * rect.width();
                 let studs_per_pixel = orbit.dist * (60.0_f32.to_radians()*0.5).tan() * 2.0 / rect.height();
-                self.move_selected_axis(axis, pixels * studs_per_pixel);
+                self.apply_gizmo_axis(axis, pixels * studs_per_pixel);
             } else {
                 orbit.yaw -= d.x * 0.008;
                 orbit.pitch = (orbit.pitch + d.y * 0.008).clamp(-1.5, 1.5);
