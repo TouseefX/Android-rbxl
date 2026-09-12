@@ -9,6 +9,7 @@ struct GuiNode {
     referent: Ref,
     class: String,
     rect: Rect,
+    content_rect: Rect,
     clip: Rect,
     z: i32,
     order: usize,
@@ -95,6 +96,14 @@ fn gui_rect(
     parent: Rect,
     scale: f32,
 ) -> Rect {
+    // GuiObject.SizeConstraint controls which parent axis resolves each scale
+    // component: RelativeXY=0, RelativeXX=1, RelativeYY=2.
+    let size_constraint = enum_value(instance.properties.get(&rbx_dom_weak::ustr("SizeConstraint")), 0);
+    let (x_extent, y_extent) = match size_constraint {
+        1 => (parent.width(), parent.width()),
+        2 => (parent.height(), parent.height()),
+        _ => (parent.width(), parent.height()),
+    };
     let position = match instance.properties.get(&rbx_dom_weak::ustr("Position")) {
         Some(Variant::UDim2(v)) => Vec2::new(
             parent.width() * v.x.scale + v.x.offset as f32 * scale,
@@ -103,8 +112,8 @@ fn gui_rect(
     };
     let mut size = match instance.properties.get(&rbx_dom_weak::ustr("Size")) {
         Some(Variant::UDim2(v)) => Vec2::new(
-            parent.width() * v.x.scale + v.x.offset as f32 * scale,
-            parent.height() * v.y.scale + v.y.offset as f32 * scale),
+            x_extent * v.x.scale + v.x.offset as f32 * scale,
+            y_extent * v.y.scale + v.y.offset as f32 * scale),
         _ => Vec2::new(100.0 * scale, 100.0 * scale),
     }.max(Vec2::ZERO);
 
@@ -121,19 +130,26 @@ fn gui_rect(
             let wrapped = bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false);
             let wrap_width = if wrapped && size.x > 0.0 { size.x } else { f32::INFINITY };
             let galley = painter.layout(text, FontId::proportional(font_size), Color32::WHITE, wrap_width);
-            if automatic == 1 || automatic == 3 { size.x = size.x.max(galley.size().x); }
-            if automatic == 2 || automatic == 3 { size.y = size.y.max(galley.size().y); }
+            let provisional = Rect::from_min_size(Pos2::ZERO, size);
+            let content = padded_rect(dom, instance, provisional, scale);
+            let padding = size - content.size();
+            if automatic == 1 || automatic == 3 { size.x = size.x.max(galley.size().x + padding.x); }
+            if automatic == 2 || automatic == 3 { size.y = size.y.max(galley.size().y + padding.y); }
         }
     }
 
-    if let Some(constraint) = child_of_class(dom, instance, "UISizeConstraint") {
+    let size_limits = child_of_class(dom, instance, "UISizeConstraint").map(|constraint| {
         let min = vector2(constraint.properties.get(&rbx_dom_weak::ustr("MinSize")), Vec2::ZERO) * scale;
         let max = vector2(constraint.properties.get(&rbx_dom_weak::ustr("MaxSize")), Vec2::splat(10_000.0)) * scale;
-        size.x = size.x.clamp(min.x.min(max.x), max.x.max(min.x));
-        size.y = size.y.clamp(min.y.min(max.y), max.y.max(min.y));
+        (min.min(max), min.max(max))
+    });
+    if let Some((min, max)) = size_limits {
+        size = size.clamp(min, max);
     }
+    let mut aspect_ratio = None;
     if let Some(constraint) = child_of_class(dom, instance, "UIAspectRatioConstraint") {
         let ratio = number(constraint.properties.get(&rbx_dom_weak::ustr("AspectRatio")), 1.0).max(0.0001);
+        aspect_ratio = Some(ratio);
         // DominantAxis: Width=0, Height=1. AspectType=ScaleWithParentSize
         // uses the parent's dominant dimension before applying the ratio.
         let dominant = enum_value(constraint.properties.get(&rbx_dom_weak::ustr("DominantAxis")), 0);
@@ -145,6 +161,25 @@ fn gui_rect(
             size.x = size.y * ratio;
         } else {
             size.y = size.x / ratio;
+        }
+    }
+    // Re-apply size bounds after aspect correction while preserving the ratio.
+    // This avoids the common incorrect result where aspect expansion escapes
+    // MaxSize or aspect shrinking falls below MinSize.
+    if let Some((min, max)) = size_limits {
+        if let Some(ratio) = aspect_ratio {
+            let down = (max.x / size.x.max(0.0001)).min(max.y / size.y.max(0.0001)).min(1.0);
+            size *= down;
+            let up = (min.x / size.x.max(0.0001)).max(min.y / size.y.max(0.0001)).max(1.0);
+            size *= up;
+            // Impossible constraints favor fitting inside MaxSize, matching the
+            // visual safety expected by Roblox containers.
+            if size.x > max.x || size.y > max.y {
+                if max.x / max.y.max(0.0001) > ratio { size = Vec2::new(max.y * ratio, max.y); }
+                else { size = Vec2::new(max.x, max.x / ratio); }
+            }
+        } else {
+            size = size.clamp(min, max);
         }
     }
     let anchor = vector2(instance.properties.get(&rbx_dom_weak::ustr("AnchorPoint")), Vec2::ZERO);
@@ -167,6 +202,19 @@ fn child_of_class<'a>(dom: &'a WeakDom, instance: &rbx_dom_weak::Instance, class
     })
 }
 
+fn padded_rect(dom: &WeakDom, instance: &rbx_dom_weak::Instance, rect: Rect, scale: f32) -> Rect {
+    let Some(padding) = child_of_class(dom, instance, "UIPadding") else { return rect; };
+    let left = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingLeft")), rect.width(), scale);
+    let right = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingRight")), rect.width(), scale);
+    let top = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingTop")), rect.height(), scale);
+    let bottom = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingBottom")), rect.height(), scale);
+    Rect::from_min_max(
+        Pos2::new(rect.left() + left, rect.top() + top),
+        Pos2::new((rect.right() - right).max(rect.left() + left),
+                  (rect.bottom() - bottom).max(rect.top() + top)),
+    )
+}
+
 fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
            parent_rect: Rect, parent_clip: Rect, inherited_z: i32,
            display_order: i32, inherited_scale: f32, sequence: &mut usize,
@@ -186,6 +234,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         Some(Variant::Int64(v)) => *v as i32,
         _ => 1,
     };
+    let content_rect = padded_rect(dom, instance, rect, scale);
 
     if matches!(instance.class.as_str(), "Frame" | "TextLabel" | "TextButton" |
         "ImageLabel" | "ImageButton" | "ScrollingFrame" | "ViewportFrame") {
@@ -217,6 +266,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             referent,
             class: instance.class.to_string(),
             rect,
+            content_rect,
             clip: parent_clip.intersect(rect),
             z: display_order.saturating_mul(1_000_000).saturating_add(z),
             order,
@@ -248,16 +298,6 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             ),
         });
     }
-    let content_rect = if let Some(padding) = child_of_class(dom, instance, "UIPadding") {
-        let left = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingLeft")), rect.width(), scale);
-        let right = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingRight")), rect.width(), scale);
-        let top = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingTop")), rect.height(), scale);
-        let bottom = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingBottom")), rect.height(), scale);
-        Rect::from_min_max(
-            Pos2::new(rect.left() + left, rect.top() + top),
-            Pos2::new((rect.right() - right).max(rect.left() + left), (rect.bottom() - bottom).max(rect.top() + top)),
-        )
-    } else { rect };
     for child in instance.children() {
         collect(dom, painter, *child, content_rect, child_clip, z, display_order, scale, sequence, nodes);
     }
@@ -315,30 +355,31 @@ pub fn draw_starter_gui(
                 }
             }
             if let Some(texture) = textures.get(uri) {
-                painter.image(texture.id(), node.rect,
+                painter.image(texture.id(), node.content_rect,
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), node.image_color);
             }
         }
         if !node.text.is_empty() {
-            let wrap_width = if node.text_wrapped { node.rect.width() } else { f32::INFINITY };
-            let mut font_size = if node.text_scaled { node.rect.height().max(1.0) } else { node.text_size };
+            let text_rect = node.content_rect;
+            let wrap_width = if node.text_wrapped { text_rect.width() } else { f32::INFINITY };
+            let mut font_size = if node.text_scaled { text_rect.height().max(1.0) } else { node.text_size };
             font_size = font_size.clamp(node.text_min_size, node.text_max_size);
             let mut galley = painter.layout(node.text.clone(), FontId::proportional(font_size), node.text_color, wrap_width);
-            if node.text_scaled && (galley.size().x > node.rect.width() || galley.size().y > node.rect.height()) {
-                let scale = (node.rect.width() / galley.size().x.max(1.0))
-                    .min(node.rect.height() / galley.size().y.max(1.0));
+            if node.text_scaled && (galley.size().x > text_rect.width() || galley.size().y > text_rect.height()) {
+                let scale = (text_rect.width() / galley.size().x.max(1.0))
+                    .min(text_rect.height() / galley.size().y.max(1.0));
                 font_size = (font_size * scale).clamp(node.text_min_size, node.text_max_size);
                 galley = painter.layout(node.text.clone(), FontId::proportional(font_size), node.text_color, wrap_width);
             }
             let x = match node.text_x_alignment {
-                0 => node.rect.left(),
-                2 => node.rect.right() - galley.size().x,
-                _ => node.rect.center().x - galley.size().x * 0.5,
+                0 => text_rect.left(),
+                2 => text_rect.right() - galley.size().x,
+                _ => text_rect.center().x - galley.size().x * 0.5,
             };
             let y = match node.text_y_alignment {
-                0 => node.rect.top(),
-                2 => node.rect.bottom() - galley.size().y,
-                _ => node.rect.center().y - galley.size().y * 0.5,
+                0 => text_rect.top(),
+                2 => text_rect.bottom() - galley.size().y,
+                _ => text_rect.center().y - galley.size().y * 0.5,
             };
             let pos = Pos2::new(x, y);
             if node.text_stroke.a() > 0 {
