@@ -957,8 +957,9 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
             for (key, val) in &inst.properties {
                 let key_str = key.as_str();
                 let asset_type = match key_str {
-                    "MeshId" | "MeshID" => Some("Mesh"),
-                    "TextureId" | "TextureID" | "Texture" => Some("Texture"),
+                    "MeshId" | "MeshID" | "MeshContent" => Some("Mesh"),
+                    "TextureId" | "TextureID" | "Texture" | "TextureContent"
+                    | "ColorMap" | "ColorMapContent" => Some("Texture"),
                     "SoundId" | "SoundID" => Some("Sound"),
                     "AnimationId" => Some("Animation"),
                     _ => None,
@@ -983,8 +984,11 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
                     };
                     if let Some(s) = found {
                         if let Some(id) = extract_asset_id(&s) {
-                            if !seen_ids.contains(&id) {
-                                seen_ids.insert(id.clone());
+                            // The same numeric ID can legally be referenced by
+                            // different content properties; deduplicate within
+                            // an asset kind without suppressing another kind.
+                            let dedup_key = format!("{ty}:{id}");
+                            if seen_ids.insert(dedup_key) {
                                 out.push(DiscoveredAsset {
                                     asset_id: id,
                                     asset_type: ty,

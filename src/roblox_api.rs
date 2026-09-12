@@ -76,6 +76,33 @@ pub fn try_recv_audio_ready() -> Option<AudioReady> {
     rx.lock().ok().and_then(|r| r.try_recv().ok())
 }
 
+/// Completion event for viewport asset downloads. The UI uses this to rebuild
+/// immediately when a mesh/texture arrives instead of relying on a single
+/// four-second timer that routinely fired before large downloads completed.
+pub struct ViewportAssetReady {
+    pub id: String,
+    pub kind: &'static str,
+    pub result: Result<(), String>,
+}
+
+static VIEWPORT_ASSET_CHANNEL: OnceLock<(
+    Sender<ViewportAssetReady>, Mutex<Receiver<ViewportAssetReady>>
+)> = OnceLock::new();
+
+fn viewport_asset_channel() -> &'static (
+    Sender<ViewportAssetReady>, Mutex<Receiver<ViewportAssetReady>>
+) {
+    VIEWPORT_ASSET_CHANNEL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+pub fn try_recv_viewport_asset_ready() -> Option<ViewportAssetReady> {
+    let (_, rx) = viewport_asset_channel();
+    rx.lock().ok().and_then(|receiver| receiver.try_recv().ok())
+}
+
 pub fn fetch_and_cache_mesh_async(mesh_id_str: String, cookie_opt: Option<String>) {
     RobloxApiClient::fetch_and_cache_mesh_async(mesh_id_str, cookie_opt);
 }
@@ -580,19 +607,22 @@ impl RobloxApiClient {
         }
 
         std::thread::spawn(move || {
-            let asset_id_opt = asset_downloader::extract_asset_id(&mesh_id_str);
-            if let Some(id_str) = asset_id_opt {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    if let Ok(bytes) = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref()) {
-                        // Always stash raw bytes so callers that just want
-                        // the original file can read it; parse if we can.
-                        asset_downloader::store_cached_raw(format!("rbxassetid://{id}"), bytes.clone());
-                        if let Some(mesh) = asset_downloader::parse_roblox_mesh(&bytes) {
-                            asset_downloader::store_cached_mesh(mesh_id_str.clone(), mesh);
-                        }
-                    }
-                }
-            }
+            let result = (|| {
+                let id_text = asset_downloader::extract_asset_id(&mesh_id_str)
+                    .ok_or_else(|| "invalid mesh asset id".to_string())?;
+                let id = id_text.parse::<u64>().map_err(|_| "invalid numeric mesh id".to_string())?;
+                let bytes = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref())?;
+                asset_downloader::store_cached_raw(format!("rbxassetid://{id}"), bytes.clone());
+                let mesh = asset_downloader::parse_roblox_mesh(&bytes)
+                    .ok_or_else(|| format!("asset {id} downloaded but its mesh format could not be decoded"))?;
+                // Cache both URI and numeric aliases because compiled and XML
+                // places can refer to the same mesh in different forms.
+                asset_downloader::store_cached_mesh(mesh_id_str.clone(), mesh.clone());
+                asset_downloader::store_cached_mesh(id_text, mesh);
+                Ok(())
+            })();
+            let (tx, _) = viewport_asset_channel();
+            let _ = tx.send(ViewportAssetReady { id: mesh_id_str, kind: "mesh", result });
         });
     }
 
@@ -605,16 +635,20 @@ impl RobloxApiClient {
         }
 
         std::thread::spawn(move || {
-            let asset_id_opt = asset_downloader::extract_asset_id(&image_id_str);
-            if let Some(id_str) = asset_id_opt {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    if let Ok(bytes) = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref()) {
-                        if let Some(img) = asset_downloader::decode_image_bytes(&bytes) {
-                            asset_downloader::store_cached_image(image_id_str.clone(), std::sync::Arc::new(img));
-                        }
-                    }
-                }
-            }
+            let result = (|| {
+                let id_text = asset_downloader::extract_asset_id(&image_id_str)
+                    .ok_or_else(|| "invalid texture asset id".to_string())?;
+                let id = id_text.parse::<u64>().map_err(|_| "invalid numeric texture id".to_string())?;
+                let bytes = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref())?;
+                let image = asset_downloader::decode_image_bytes(&bytes)
+                    .ok_or_else(|| format!("asset {id} downloaded but was not a PNG/JPEG image"))?;
+                let image = std::sync::Arc::new(image);
+                asset_downloader::store_cached_image(image_id_str.clone(), image.clone());
+                asset_downloader::store_cached_image(id_text, image);
+                Ok(())
+            })();
+            let (tx, _) = viewport_asset_channel();
+            let _ = tx.send(ViewportAssetReady { id: image_id_str, kind: "texture", result });
         });
     }
 

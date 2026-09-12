@@ -3697,6 +3697,20 @@ ui.label("Place ID:");
         self.pump_plugin_logs();
         self.pump_plugin_thumbnails();
 
+        // Rebuild as each viewport asset actually completes. The previous
+        // fixed four-second refresh missed slow/mobile downloads permanently.
+        while let Some(ready) = roblox_api::try_recv_viewport_asset_ready() {
+            match ready.result {
+                Ok(()) => {
+                    self.needs_3d_rebuild = true;
+                    self.log_info(format!("Viewport {} ready: {}", ready.kind, ready.id));
+                }
+                Err(error) => {
+                    self.log_error(format!("Viewport {} failed ({}): {}", ready.kind, ready.id, error));
+                }
+            }
+        }
+
         // Auto-play (and notify) when a sound the user pressed Play on finishes
         // downloading, instead of leaving them to press Play again.
         while let Some(ready) = roblox_api::try_recv_audio_ready() {
