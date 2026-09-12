@@ -31,6 +31,7 @@ struct GuiNode {
     text_wrapped: bool,
     text_scaled: bool,
     text_truncate: i32,
+    rich_text: bool,
     line_height: f32,
     text_min_size: f32,
     text_max_size: f32,
@@ -162,10 +163,20 @@ fn gui_rect(
     // same egui font engine used for painting so layout and display agree.
     let automatic = enum_value(instance.properties.get(&rbx_dom_weak::ustr("AutomaticSize")), 0);
     if automatic != 0 && matches!(instance.class.as_str(), "TextLabel" | "TextButton" | "TextBox") {
-        let text = match instance.properties.get(&rbx_dom_weak::ustr("Text")) {
+        let mut text = match instance.properties.get(&rbx_dom_weak::ustr("Text")) {
             Some(Variant::String(text)) => text.clone(),
             _ => String::new(),
         };
+        if bool_value(instance.properties.get(&rbx_dom_weak::ustr("RichText")), false) {
+            let mut plain = String::new();
+            let mut in_tag = false;
+            for character in text.chars() {
+                if character == '<' { in_tag = true; continue; }
+                if character == '>' { in_tag = false; continue; }
+                if !in_tag { plain.push(character); }
+            }
+            text = decode_rich_entities(&plain);
+        }
         if !text.is_empty() {
             let font_size = number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0).max(1.0) * scale;
             let wrapped = bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false);
@@ -533,6 +544,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             text_wrapped: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false),
             text_scaled: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextScaled")), false),
             text_truncate: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextTruncate")), 0),
+            rich_text: bool_value(instance.properties.get(&rbx_dom_weak::ustr("RichText")), false),
             line_height: number(instance.properties.get(&rbx_dom_weak::ustr("LineHeight")), 1.0).max(0.1),
             text_min_size,
             text_max_size,
@@ -864,14 +876,112 @@ fn rotated_bounds(rect: Rect, rotation: f32) -> Rect {
     bounds
 }
 
+fn decode_rich_entities(text: &str) -> String {
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
+        .replace("&apos;", "'").replace("&amp;", "&")
+}
+
+fn parse_rich_color(value: &str, alpha: u8) -> Option<Color32> {
+    let value = value.trim();
+    let hex = value.trim_start_matches('#');
+    if hex.len() == 6 {
+        let rgb = u32::from_str_radix(hex, 16).ok()?;
+        return Some(Color32::from_rgba_unmultiplied((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, alpha));
+    }
+    let body = value.strip_prefix("rgb(").and_then(|value| value.strip_suffix(')'))?;
+    let values: Vec<u8> = body.split(',').filter_map(|part| part.trim().parse().ok()).collect();
+    (values.len() == 3).then(|| Color32::from_rgba_unmultiplied(values[0], values[1], values[2], alpha))
+}
+
+fn rich_attribute(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let start = lower.find(&format!("{name}="))? + name.len() + 1;
+    let rest = &tag[start..];
+    if let Some(quote) = rest.chars().next().filter(|value| *value == '\"' || *value == '\'') {
+        let value = &rest[quote.len_utf8()..];
+        Some(value.split(quote).next().unwrap_or_default().to_string())
+    } else {
+        Some(rest.split_whitespace().next().unwrap_or_default().trim_end_matches('/').to_string())
+    }
+}
+
+fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
+                   wrap_width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    let mut stack = vec![egui::TextFormat {
+        font_id: FontId::proportional(font_size),
+        line_height: Some(font_size * node.line_height),
+        color: base_color,
+        ..Default::default()
+    }];
+    let text = node.text.as_str();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some(relative) = text[cursor..].find('<') else {
+            job.append(&decode_rich_entities(&text[cursor..]), 0.0, stack.last().unwrap().clone());
+            break;
+        };
+        let open = cursor + relative;
+        if open > cursor {
+            job.append(&decode_rich_entities(&text[cursor..open]), 0.0, stack.last().unwrap().clone());
+        }
+        let Some(close_relative) = text[open..].find('>') else {
+            job.append(&decode_rich_entities(&text[open..]), 0.0, stack.last().unwrap().clone());
+            break;
+        };
+        let close = open + close_relative;
+        let raw_tag = text[open + 1..close].trim();
+        let tag = raw_tag.to_ascii_lowercase();
+        if tag.starts_with('/') {
+            if stack.len() > 1 { stack.pop(); }
+        } else if tag == "br" || tag == "br/" {
+            job.append("\n", 0.0, stack.last().unwrap().clone());
+        } else {
+            let mut format = stack.last().unwrap().clone();
+            if tag == "i" { format.italics = true; }
+            if tag == "u" { format.underline = Stroke::new(1.0, format.color); }
+            if tag == "s" || tag == "strike" { format.strikethrough = Stroke::new(1.0, format.color); }
+            if tag == "b" { format.extra_letter_spacing += font_size * 0.015; }
+            if tag.starts_with("font") {
+                if let Some(value) = rich_attribute(raw_tag, "size").and_then(|value| value.parse::<f32>().ok()) {
+                    let scaled = (value * font_size / node.text_size.max(1.0)).max(1.0);
+                    format.font_id.size = scaled;
+                    format.line_height = Some(scaled * node.line_height);
+                }
+                if let Some(color) = rich_attribute(raw_tag, "color")
+                    .and_then(|value| parse_rich_color(&value, base_color.a()))
+                {
+                    format.color = color;
+                }
+                if let Some(transparency) = rich_attribute(raw_tag, "transparency").and_then(|value| value.parse::<f32>().ok()) {
+                    format.color = Color32::from_rgba_unmultiplied(format.color.r(), format.color.g(), format.color.b(),
+                        (format.color.a() as f32 * (1.0-transparency.clamp(0.0,1.0))) as u8);
+                }
+                if rich_attribute(raw_tag, "face").map(|face| face.to_ascii_lowercase().contains("code")).unwrap_or(false) {
+                    format.font_id.family = egui::FontFamily::Monospace;
+                }
+            }
+            stack.push(format);
+        }
+        cursor = close + 1;
+    }
+    job
+}
+
 fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
                color: Color32, wrap_width: f32, available_height: f32) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::simple(
-        node.text.clone(), FontId::proportional(font_size), color, wrap_width,
-    );
-    if let Some(section) = job.sections.first_mut() {
-        section.format.line_height = Some(font_size * node.line_height);
-    }
+    let mut job = if node.rich_text {
+        rich_layout_job(node, font_size, color, wrap_width)
+    } else {
+        let mut job = egui::text::LayoutJob::simple(
+            node.text.clone(), FontId::proportional(font_size), color, wrap_width,
+        );
+        if let Some(section) = job.sections.first_mut() {
+            section.format.line_height = Some(font_size * node.line_height);
+        }
+        job
+    };
     if node.text_truncate != 0 {
         job.wrap.max_width = wrap_width;
         job.wrap.max_rows = ((available_height / (font_size * node.line_height).max(1.0)).floor() as usize).max(1);
@@ -882,14 +992,13 @@ fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
 }
 
 fn paint_galley(painter: &egui::Painter, pos: Pos2, galley: std::sync::Arc<egui::Galley>,
-                color: Color32, rotation: f32, pivot: Pos2) {
-    if rotation.abs() < 0.001 {
-        painter.galley(pos, galley, color);
-    } else {
-        let radians = rotation.to_radians();
-        let rotated_pos = rotate_point(pos, pivot, radians);
-        painter.add(egui::epaint::TextShape::new(rotated_pos, galley, color).with_angle(radians));
-    }
+                color: Color32, override_color: bool, rotation: f32, pivot: Pos2) {
+    let radians = rotation.to_radians();
+    let rotated_pos = if rotation.abs() < 0.001 { pos } else { rotate_point(pos, pivot, radians) };
+    let mut shape = egui::epaint::TextShape::new(rotated_pos, galley, color);
+    if override_color { shape = shape.with_override_text_color(color); }
+    if rotation.abs() >= 0.001 { shape = shape.with_angle(radians); }
+    painter.add(shape);
 }
 
 fn rotate_point(point: Pos2, pivot: Pos2, radians: f32) -> Pos2 {
@@ -1307,11 +1416,11 @@ pub fn draw_starter_gui(
             let pos = Pos2::new(x, y);
             if node.text_stroke.a() > 0 {
                 for offset in [Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, -1.0), Vec2::new(0.0, 1.0)] {
-                    paint_galley(&painter, pos + offset, galley.clone(), node.text_stroke,
+                    paint_galley(&painter, pos + offset, galley.clone(), node.text_stroke, true,
                         node.rotation, node.rect.center());
                 }
             }
-            paint_galley(&painter, pos, galley, text_color, node.rotation, node.rect.center());
+            paint_galley(&painter, pos, galley, text_color, false, node.rotation, node.rect.center());
         }
         if selected == Some(node.referent) {
             painter.rect_stroke(node.rect, 0.0, Stroke::new(2.0, Color32::from_rgb(0, 162, 255)), egui::StrokeKind::Outside);
