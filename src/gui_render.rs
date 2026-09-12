@@ -89,6 +89,12 @@ fn vector2(value: Option<&Variant>, fallback: Vec2) -> Vec2 {
 /// Resolve Roblox's absolute GuiObject rectangle, including inherited UIScale,
 /// UISizeConstraint and UIAspectRatioConstraint. Constraints are children of
 /// the object they affect, unlike CSS constraints.
+fn is_gui_object(class: &str) -> bool {
+    matches!(class, "Frame" | "CanvasGroup" | "TextLabel" | "TextButton" |
+        "TextBox" | "ImageLabel" | "ImageButton" | "ScrollingFrame" |
+        "ViewportFrame" | "VideoFrame")
+}
+
 fn gui_rect(
     dom: &WeakDom,
     painter: &egui::Painter,
@@ -136,6 +142,28 @@ fn gui_rect(
             if automatic == 1 || automatic == 3 { size.x = size.x.max(galley.size().x + padding.x); }
             if automatic == 2 || automatic == 3 { size.y = size.y.max(galley.size().y + padding.y); }
         }
+    }
+
+    // Containers automatically expand to the absolute bounds of their direct
+    // GuiObject children. Child gui_rect calls recursively resolve nested
+    // AutomaticSize, so the result propagates from leaves toward the root.
+    if automatic != 0 {
+        let provisional_outer = Rect::from_min_size(Pos2::ZERO, size);
+        let provisional_content = padded_rect(dom, instance, provisional_outer, scale);
+        let mut required = Vec2::ZERO;
+        for child_ref in instance.children() {
+            let Some(child) = dom.get_by_ref(*child_ref) else { continue; };
+            if !is_gui_object(&child.class) || !visible(child) { continue; }
+            let child_scale = child_of_class(dom, child, "UIScale")
+                .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
+                .unwrap_or(1.0);
+            let child_rect = gui_rect(dom, painter, child, provisional_content, scale * child_scale);
+            required.x = required.x.max((child_rect.right() - provisional_content.left()).max(0.0));
+            required.y = required.y.max((child_rect.bottom() - provisional_content.top()).max(0.0));
+        }
+        let padding = size - provisional_content.size();
+        if automatic == 1 || automatic == 3 { size.x = size.x.max(required.x + padding.x); }
+        if automatic == 2 || automatic == 3 { size.y = size.y.max(required.y + padding.y); }
     }
 
     let size_limits = child_of_class(dom, instance, "UISizeConstraint").map(|constraint| {
@@ -236,8 +264,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     };
     let content_rect = padded_rect(dom, instance, rect, scale);
 
-    if matches!(instance.class.as_str(), "Frame" | "TextLabel" | "TextButton" |
-        "ImageLabel" | "ImageButton" | "ScrollingFrame" | "ViewportFrame") {
+    if is_gui_object(&instance.class) {
         let transparency = number(instance.properties.get(&rbx_dom_weak::ustr("BackgroundTransparency")), 0.0).clamp(0.0, 1.0);
         let alpha = ((1.0 - transparency) * 255.0).round() as u8;
         let text_transparency = number(instance.properties.get(&rbx_dom_weak::ustr("TextTransparency")), 0.0).clamp(0.0, 1.0);
@@ -298,8 +325,17 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             ),
         });
     }
+    let child_parent_rect = if instance.class == "ScrollingFrame" {
+        let canvas_position = vector2(
+            instance.properties.get(&rbx_dom_weak::ustr("CanvasPosition")),
+            Vec2::ZERO,
+        ) * scale;
+        content_rect.translate(-canvas_position)
+    } else {
+        content_rect
+    };
     for child in instance.children() {
-        collect(dom, painter, *child, content_rect, child_clip, z, display_order, scale, sequence, nodes);
+        collect(dom, painter, *child, child_parent_rect, child_clip, z, display_order, scale, sequence, nodes);
     }
 }
 
