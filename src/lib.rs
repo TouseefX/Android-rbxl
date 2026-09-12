@@ -63,12 +63,13 @@ fn draw_editor_ui(
     mut app: ResMut<EditorApp>,
     mut orbit: ResMut<bevy_render::OrbitCam>,
     mut contexts: EguiContexts,
+    viewport_scene: Res<bevy_render::ViewportScene>,
 ) {
     if let Ok(ctx) = contexts.ctx_mut() {
         // Feed anything the Android IME produced since last frame into egui
         // BEFORE the widgets are built, so the focused TextEdit sees it.
         android_ime::begin_frame(ctx);
-        app.draw_editor(ctx, &mut orbit);
+        app.draw_editor(ctx, &mut orbit, &viewport_scene);
         // Show/hide the soft keyboard to match egui's focus and flush egui's
         // clipboard writes to Android.
         android_ime::end_frame(ctx);
@@ -133,6 +134,7 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
 
     bevy_app.insert_resource(editor);
     bevy_app.insert_resource(bevy_render::OrbitCam::default());
+    bevy_app.insert_resource(bevy_render::ViewportScene::default());
     bevy_app.insert_resource(bevy::light::AmbientLight {
         color: Color::WHITE,
         brightness: 400.0,
@@ -143,7 +145,12 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
 
     bevy_app.add_systems(Startup, setup_3d);
     // Scene rebuild + camera sync run on the main Update schedule.
-    bevy_app.add_systems(Update, (rebuild_scene_system, bevy_render::update_camera, bevy_render::update_sky_dome));
+    bevy_app.add_systems(Update, (
+        rebuild_scene_system,
+        bevy_render::update_camera,
+        bevy_render::update_sky_dome,
+        bevy_render::update_selection_visual,
+    ));
     // IMPORTANT: the egui UI must run in bevy_egui's `EguiPrimaryContextPass`
     // schedule, NOT `Update`. bevy_egui loads its fonts when it begins its
     // frame; running the UI in `Update` (before begin-pass) panics with

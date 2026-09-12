@@ -380,9 +380,23 @@ struct Tri {
 
 #[derive(Clone)]
 struct PartGeo {
+    referent: rbx_dom_weak::types::Ref,
     color: [f32; 3],
     alpha: f32,
     tris: Vec<Tri>,
+}
+
+/// Lightweight picking data retained independently from render batching.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectablePart {
+    pub referent: rbx_dom_weak::types::Ref,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+#[derive(Resource, Default)]
+pub struct ViewportScene {
+    pub parts: Vec<SelectablePart>,
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -458,7 +472,7 @@ fn extract_geometry(dom: &WeakDom) -> Vec<PartGeo> {
             "Part" | "WedgePart" | "CornerWedgePart" | "TrussPart" | "SpawnLocation" | "MeshPart" | "Seat" | "VehicleSeat" | "UnionOperation"
         );
         if is_3d {
-            if let Some(mut g) = extract_part(dom, inst) {
+            if let Some(mut g) = extract_part(dom, inst, r) {
                 // Classic Roblox builds routinely have parts that genuinely
                 // interpenetrate on purpose — a wall sunk slightly into a
                 // floor, a pillar through a decorative ball, stacked blocks
@@ -510,7 +524,7 @@ fn extract_geometry(dom: &WeakDom) -> Vec<PartGeo> {
     out
 }
 
-fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo> {
+fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_weak::types::Ref) -> Option<PartGeo> {
     let cf = extract_cframe(inst);
     let size = match inst.properties.get(&rbx_dom_weak::ustr("Size")) {
         Some(Variant::Vector3(v)) => Vec3::new(v.x.max(0.1), v.y.max(0.1), v.z.max(0.1)),
@@ -692,7 +706,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
             if tris.is_empty() {
                 return None;
             }
-            return Some(PartGeo { color, alpha, tris });
+            return Some(PartGeo { referent, color, alpha, tris });
         }
         // A mesh part whose mesh isn't available should be SKIPPED, not rendered
         // as a generic Block. Rendering it as a Block produced a wrong-shape
@@ -744,7 +758,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     if tris.is_empty() {
         return None;
     }
-    Some(PartGeo { color, alpha, tris })
+    Some(PartGeo { referent, color, alpha, tris })
 }
 
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -1298,6 +1312,18 @@ pub fn rebuild_scene(
     dom: &WeakDom,
 ) {
     let parts = extract_geometry(dom);
+    let selectable = parts.iter().filter_map(|part| {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for vertex in &part.tris {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(vertex.pos[axis]);
+                max[axis] = max[axis].max(vertex.pos[axis]);
+            }
+        }
+        min[0].is_finite().then_some(SelectablePart { referent: part.referent, min, max })
+    }).collect();
+    commands.insert_resource(ViewportScene { parts: selectable });
 
     let root = commands.spawn(RbxSceneRoot).id();
 
@@ -1489,4 +1515,110 @@ pub fn update_camera(mut q: Query<&mut Transform, With<RbxCamera>>, cam: Res<Orb
     for mut t in &mut q {
         *t = Transform::from_translation(eye_b).looking_at(target_b, BVec3::Y);
     }
+}
+
+/// Ray-cast a screen point against selectable part bounds. `screen` is in
+/// normalized viewport coordinates (0..1, top-left origin).
+pub fn pick_part(scene: &ViewportScene, cam: &OrbitCam, screen: [f32; 2], aspect: f32)
+    -> Option<rbx_dom_weak::types::Ref>
+{
+    let (eye, target) = orbit_eye_target(cam);
+    let forward = (target - eye).normalize_or_zero();
+    let right = forward.cross(BVec3::Y).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let tan_half_fov = (60.0_f32.to_radians() * 0.5).tan();
+    let x = (screen[0] * 2.0 - 1.0) * aspect * tan_half_fov;
+    let y = (1.0 - screen[1] * 2.0) * tan_half_fov;
+    let direction = (forward + right * x + up * y).normalize_or_zero();
+
+    scene.parts.iter().filter_map(|part| {
+        ray_aabb(eye.to_array(), direction.to_array(), part.min, part.max)
+            .map(|distance| (distance, part.referent))
+    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, referent)| referent)
+}
+
+fn ray_aabb(origin: [f32; 3], direction: [f32; 3], min: [f32; 3], max: [f32; 3]) -> Option<f32> {
+    let mut near: f32 = 0.0;
+    let mut far = f32::INFINITY;
+    for axis in 0..3 {
+        if direction[axis].abs() < 1e-7 {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] { return None; }
+        } else {
+            let inverse = 1.0 / direction[axis];
+            let mut a = (min[axis] - origin[axis]) * inverse;
+            let mut b = (max[axis] - origin[axis]) * inverse;
+            if a > b { std::mem::swap(&mut a, &mut b); }
+            near = near.max(a);
+            far = far.min(b);
+            if near > far { return None; }
+        }
+    }
+    (far >= 0.0).then_some(near.max(0.0))
+}
+
+#[derive(Component)]
+pub struct SelectionVisual;
+
+/// Rebuild the selected-part outline and XYZ move gizmo when selection changes.
+pub fn update_selection_visual(
+    mut commands: Commands,
+    editor: Res<crate::app::EditorApp>,
+    scene: Res<ViewportScene>,
+    mut previous: Local<Option<rbx_dom_weak::types::Ref>>,
+    old: Query<Entity, With<SelectionVisual>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<FlatMaterial>>,
+) {
+    let selected = editor.selected_ref();
+    if *previous == selected && !scene.is_changed() { return; }
+    *previous = selected;
+    for entity in &old { commands.entity(entity).despawn(); }
+    let Some(bounds) = selected.and_then(|selected| scene.parts.iter().find(|part| part.referent == selected)) else { return; };
+
+    let min = bounds.min;
+    let max = bounds.max;
+    let corners = [
+        [min[0], min[1], min[2]], [max[0], min[1], min[2]],
+        [max[0], max[1], min[2]], [min[0], max[1], min[2]],
+        [min[0], min[1], max[2]], [max[0], min[1], max[2]],
+        [max[0], max[1], max[2]], [min[0], max[1], max[2]],
+    ];
+    let edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)];
+    let outline: Vec<_> = edges.into_iter().flat_map(|(a,b)| [corners[a], corners[b]]).collect();
+    spawn_lines(&mut commands, &mut meshes, &mut materials, outline, [0.1, 0.75, 1.0]);
+
+    let center = [(min[0]+max[0])*0.5, (min[1]+max[1])*0.5, (min[2]+max[2])*0.5];
+    let extent = (max[0]-min[0]).max(max[1]-min[1]).max(max[2]-min[2]);
+    let length = (extent * 0.65).clamp(2.0, 16.0);
+    for (axis_index, axis, color) in [
+        (0, [length,0.0,0.0], [1.0,0.15,0.15]),
+        (1, [0.0,length,0.0], [0.15,1.0,0.25]),
+        (2, [0.0,0.0,length], [0.2,0.45,1.0]),
+    ] {
+        let end = [center[0]+axis[0], center[1]+axis[1], center[2]+axis[2]];
+        let wing = length * 0.12;
+        let mut left = end;
+        let mut right = end;
+        left[axis_index] -= wing;
+        right[axis_index] -= wing;
+        left[(axis_index + 1) % 3] -= wing * 0.55;
+        right[(axis_index + 1) % 3] += wing * 0.55;
+        spawn_lines(&mut commands, &mut meshes, &mut materials,
+            vec![center, end, end, left, end, right], color);
+    }
+}
+
+fn spawn_lines(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<FlatMaterial>, positions: Vec<[f32;3]>, rgb: [f32;3]) {
+    let count = positions.len() as u32;
+    let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; count as usize]);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0, 0.0]; count as usize]);
+    mesh.insert_indices(Indices::U32((0..count).collect()));
+    let material = materials.add(FlatMaterial {
+        color: Color::srgba(rgb[0], rgb[1], rgb[2], 1.0).to_linear(),
+        light_dir: Vec4::ZERO, has_texture: 0, texture: None, tint_texture: 0,
+        transparent: false, depth_bias: 8.0,
+    });
+    commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), Transform::IDENTITY, SelectionVisual));
 }

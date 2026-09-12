@@ -447,6 +447,10 @@ impl EditorApp {
         self.dom.as_ref()
     }
 
+    pub fn selected_ref(&self) -> Option<Ref> {
+        self.selected
+    }
+
     /// Load a place from raw file bytes (used at startup / desktop validation).
     pub fn load_from_bytes(&mut self, bytes: Vec<u8>) {
         self.place_format = rbxl::PlaceFormat::detect(&bytes);
@@ -526,7 +530,7 @@ impl EditorApp {
     /// Render the whole editor UI into the bevy_egui `egui::Context`. `orbit`
     /// is the Bevy viewport camera, steered by the 3D tab. Runs each frame from
     /// a Bevy system.
-    pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
+    pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam, viewport_scene: &crate::bevy_render::ViewportScene) {
         self.drain_events();
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
             self.show_quick_open = true;
@@ -750,7 +754,7 @@ impl EditorApp {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                 .show(ctx, |ui| {
-                    self.show_viewport_drag(ui, orbit);
+                    self.show_viewport_drag(ui, orbit, viewport_scene);
                 });
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -758,7 +762,7 @@ impl EditorApp {
                     ActiveTab::Explorer => self.show_explorer_ui(ui),
                     ActiveTab::Viewport3D => {
                         self.show_viewport_controls(ui, orbit);
-                        self.show_viewport_drag(ui, orbit);
+                        self.show_viewport_drag(ui, orbit, viewport_scene);
                     }
                     ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
                     ActiveTab::Properties => self.show_properties_ui(ui),
@@ -949,11 +953,25 @@ impl EditorApp {
 
     /// Transparent drag area over the Bevy 3D scene: drag to orbit, scroll to
     /// zoom.
-    fn show_viewport_drag(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
+    fn show_viewport_drag(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam, viewport_scene: &crate::bevy_render::ViewportScene) {
         let (rect, response) = ui.allocate_exact_size(
             ui.available_size().max(egui::vec2(220.0, 300.0)),
             egui::Sense::drag(),
         );
+        if response.clicked_by(egui::PointerButton::Primary) {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let screen = [
+                    ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+                    ((pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+                ];
+                self.selected = crate::bevy_render::pick_part(
+                    viewport_scene,
+                    orbit,
+                    screen,
+                    rect.width() / rect.height().max(1.0),
+                );
+            }
+        }
         if response.dragged_by(egui::PointerButton::Primary) {
             let d = response.drag_delta();
             orbit.yaw -= d.x * 0.008;
