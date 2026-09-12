@@ -10,6 +10,7 @@ struct GuiNode {
     class: String,
     rect: Rect,
     content_rect: Rect,
+    gui_scale: f32,
     clip: Rect,
     display_order: i32,
     z: i32,
@@ -53,6 +54,7 @@ struct GuiNode {
     image_rect_offset: Vec2,
     image_rect_size: Vec2,
     image_scale_type: i32,
+    image_pixelated: bool,
     tile_size: Option<(f32, f32, f32, f32)>,
     slice_center: Option<[f32; 4]>,
     slice_scale: f32,
@@ -560,6 +562,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             class: instance.class.to_string(),
             rect,
             content_rect,
+            gui_scale: scale,
             clip: parent_clip.intersect(rect),
             display_order,
             z,
@@ -617,6 +620,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             image_rect_offset: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectOffset")), Vec2::ZERO),
             image_rect_size: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectSize")), Vec2::ZERO),
             image_scale_type: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScaleType")), 0),
+            image_pixelated: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ResampleMode")), 0) == 1,
             tile_size: udim2_tuple(instance.properties.get(&rbx_dom_weak::ustr("TileSize"))),
             slice_center: match instance.properties.get(&rbx_dom_weak::ustr("SliceCenter")) {
                 Some(Variant::Rect(rect)) => Some([rect.min.x, rect.min.y, rect.max.x, rect.max.y]),
@@ -1173,8 +1177,8 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
         2 => {
             let (xs, xo, ys, yo) = node.tile_size.unwrap_or((0.0, 100.0, 0.0, 100.0));
             let tile = Vec2::new(
-                (bounds.width() * xs + xo).max(1.0),
-                (bounds.height() * ys + yo).max(1.0),
+                (bounds.width() * xs + xo * node.gui_scale).max(1.0),
+                (bounds.height() * ys + yo * node.gui_scale).max(1.0),
             );
             let columns = (bounds.width() / tile.x).ceil().max(1.0) as usize;
             let rows = (bounds.height() / tile.y).ceil().max(1.0) as usize;
@@ -1567,7 +1571,11 @@ pub fn draw_starter_gui(
             node.image.as_ref()
         };
         if let Some(uri) = displayed_image {
-            if !textures.contains_key(uri) {
+            // Sampler state belongs to the egui texture, so retain separate GPU
+            // handles when one asset is used by both Default and Pixelated
+            // ImageLabels.
+            let texture_key = if node.image_pixelated { format!("{uri}#pixelated") } else { uri.clone() };
+            if !textures.contains_key(&texture_key) {
                 let decoded = crate::asset_downloader::get_cached_image(uri).or_else(|| {
                     crate::asset_downloader::extract_asset_id(uri)
                         .and_then(|id| crate::asset_downloader::get_cached_image(&id))
@@ -1576,12 +1584,14 @@ pub fn draw_starter_gui(
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [image.width, image.height], &image.rgba,
                     );
-                    textures.insert(uri.clone(), ui.ctx().load_texture(
-                        uri, color_image, egui::TextureOptions::LINEAR,
+                    let options = if node.image_pixelated { egui::TextureOptions::NEAREST }
+                        else { egui::TextureOptions::LINEAR };
+                    textures.insert(texture_key.clone(), ui.ctx().load_texture(
+                        &texture_key, color_image, options,
                     ));
                 }
             }
-            if let Some(texture) = textures.get(uri) {
+            if let Some(texture) = textures.get(&texture_key) {
                 paint_image(&painter, &node, texture, shade_color(node.image_color, button_factor));
             }
         }
