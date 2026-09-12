@@ -1622,3 +1622,37 @@ fn spawn_lines(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &m
     });
     commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), Transform::IDENTITY, SelectionVisual));
 }
+
+/// Project the selected object's gizmo center and axis ends into normalized
+/// viewport coordinates. Used by egui to hit-test interactive axis handles.
+pub fn gizmo_screen_axes(scene: &ViewportScene, selected: rbx_dom_weak::types::Ref, cam: &OrbitCam, aspect: f32)
+    -> Option<([f32; 2], [[f32; 2]; 3])>
+{
+    let bounds = scene.parts.iter().find(|part| part.referent == selected)?;
+    let center = BVec3::new(
+        (bounds.min[0] + bounds.max[0]) * 0.5,
+        (bounds.min[1] + bounds.max[1]) * 0.5,
+        (bounds.min[2] + bounds.max[2]) * 0.5,
+    );
+    let extent = (bounds.max[0]-bounds.min[0]).max(bounds.max[1]-bounds.min[1]).max(bounds.max[2]-bounds.min[2]);
+    let length = (extent * 0.65).clamp(2.0, 16.0);
+    let project = |point: BVec3| -> Option<[f32; 2]> {
+        let (eye, target) = orbit_eye_target(cam);
+        let forward = (target-eye).normalize_or_zero();
+        let right = forward.cross(BVec3::Y).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let relative = point-eye;
+        let depth = relative.dot(forward);
+        if depth <= 0.01 { return None; }
+        let scale = (60.0_f32.to_radians()*0.5).tan();
+        Some([
+            0.5 + relative.dot(right) / (depth * scale * aspect) * 0.5,
+            0.5 - relative.dot(up) / (depth * scale) * 0.5,
+        ])
+    };
+    Some((project(center)?, [
+        project(center + BVec3::X * length)?,
+        project(center + BVec3::Y * length)?,
+        project(center + BVec3::Z * length)?,
+    ]))
+}

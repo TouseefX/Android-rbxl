@@ -246,6 +246,8 @@ pub struct EditorApp {
 
     // 3D viewport camera move speed (studs/step for Up/Down/pan).
     cam_move_speed: f32,
+    /// World axis currently captured by the transform gizmo (X/Y/Z = 0/1/2).
+    viewport_gizmo_axis: Option<usize>,
 
     // When Some, drain_events() will flip needs_3d_rebuild back on once this
     // deadline passes, so meshes/textures that finished downloading in the
@@ -395,6 +397,7 @@ impl Default for EditorApp {
             native_editor_initial_cursor: None,
             needs_3d_rebuild: false,
             cam_move_speed: 4.0,
+            viewport_gizmo_axis: None,
             pending_asset_refresh_at: None,
             command_input: String::new(),
             command_history: Vec::new(),
@@ -951,6 +954,32 @@ impl EditorApp {
         });
     }
 
+    fn move_selected_axis(&mut self, axis: usize, delta: f32) {
+        if !delta.is_finite() || delta.abs() < 1e-5 { return; }
+        let (Some(referent), Some(dom)) = (self.selected, self.dom.as_mut()) else { return; };
+        let Some(instance) = dom.get_by_ref(referent) else { return; };
+        let (property, value) = match instance.properties.get(&rbx_dom_weak::ustr("CFrame"))
+            .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("CoordinateFrame"))) {
+            Some(Variant::CFrame(frame)) => {
+                let mut position = frame.position;
+                match axis { 0 => position.x += delta, 1 => position.y += delta, _ => position.z += delta }
+                ("CFrame", Variant::CFrame(rbx_dom_weak::types::CFrame::new(position, frame.orientation)))
+            }
+            _ => {
+                let mut position = match instance.properties.get(&rbx_dom_weak::ustr("Position")) {
+                    Some(Variant::Vector3(position)) => *position,
+                    _ => Vector3::new(0.0, 0.0, 0.0),
+                };
+                match axis { 0 => position.x += delta, 1 => position.y += delta, _ => position.z += delta }
+                ("Position", Variant::Vector3(position))
+            }
+        };
+        if rbxl::set_property(dom, referent, property, value).is_ok() {
+            self.needs_3d_rebuild = true;
+            self.status = format!("Moved selected part on {} axis", ["X", "Y", "Z"][axis.min(2)]);
+        }
+    }
+
     /// Transparent drag area over the Bevy 3D scene: drag to orbit, scroll to
     /// zoom.
     fn show_viewport_drag(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam, viewport_scene: &crate::bevy_render::ViewportScene) {
@@ -958,7 +987,28 @@ impl EditorApp {
             ui.available_size().max(egui::vec2(220.0, 300.0)),
             egui::Sense::drag(),
         );
-        if response.clicked_by(egui::PointerButton::Primary) {
+        let aspect = rect.width() / rect.height().max(1.0);
+        let gizmo_projection = self.selected.and_then(|selected|
+            crate::bevy_render::gizmo_screen_axes(viewport_scene, selected, orbit, aspect));
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            if let (Some(pointer), Some((center, ends))) = (response.interact_pointer_pos(), gizmo_projection) {
+                let point = egui::pos2(
+                    (pointer.x - rect.left()) / rect.width(),
+                    (pointer.y - rect.top()) / rect.height(),
+                );
+                let center = egui::pos2(center[0], center[1]);
+                self.viewport_gizmo_axis = ends.iter().enumerate()
+                    .filter_map(|(axis, end)| {
+                        let end = egui::pos2(end[0], end[1]);
+                        let line = end - center;
+                        let t = ((point-center).dot(line) / line.length_sq().max(1e-8)).clamp(0.0, 1.0);
+                        let distance_px = (point - (center + line*t)).length() * rect.width();
+                        (distance_px <= 18.0).then_some((distance_px, axis))
+                    })
+                    .min_by(|a,b| a.0.total_cmp(&b.0)).map(|(_,axis)| axis);
+            }
+        }
+        if response.clicked_by(egui::PointerButton::Primary) && self.viewport_gizmo_axis.is_none() {
             if let Some(pointer) = response.interact_pointer_pos() {
                 let screen = [
                     ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
@@ -973,13 +1023,23 @@ impl EditorApp {
             }
         }
         if response.dragged_by(egui::PointerButton::Primary) {
-            let d = response.drag_delta();
-            orbit.yaw -= d.x * 0.008;
-            orbit.pitch = (orbit.pitch + d.y * 0.008).clamp(-1.5, 1.5);
+            let d = ui.input(|input| input.pointer.delta());
+            if let (Some(axis), Some((center, ends))) = (self.viewport_gizmo_axis, gizmo_projection) {
+                let screen_axis = egui::vec2(ends[axis][0]-center[0], ends[axis][1]-center[1]).normalized();
+                let pixels = egui::vec2(d.x / rect.width(), d.y / rect.height()).dot(screen_axis) * rect.width();
+                let studs_per_pixel = orbit.dist * (60.0_f32.to_radians()*0.5).tan() * 2.0 / rect.height();
+                self.move_selected_axis(axis, pixels * studs_per_pixel);
+            } else {
+                orbit.yaw -= d.x * 0.008;
+                orbit.pitch = (orbit.pitch + d.y * 0.008).clamp(-1.5, 1.5);
+            }
+        }
+        if !ui.input(|input| input.pointer.primary_down()) {
+            self.viewport_gizmo_axis = None;
         }
         // Studio-style secondary drag pans the target in the camera plane.
         if response.dragged_by(egui::PointerButton::Secondary) {
-            let d = response.drag_delta();
+            let d = ui.input(|input| input.pointer.delta());
             let scale = orbit.dist * 0.0015;
             let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
             orbit.target[0] += (-d.x * cos_yaw - d.y * sin_yaw) * scale;
