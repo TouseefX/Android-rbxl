@@ -33,6 +33,12 @@ struct GuiNode {
     text_stroke: Color32,
     image: Option<String>,
     image_color: Color32,
+    image_rect_offset: Vec2,
+    image_rect_size: Vec2,
+    image_scale_type: i32,
+    tile_size: Option<(f32, f32, f32, f32)>,
+    slice_center: Option<[f32; 4]>,
+    slice_scale: f32,
 }
 
 fn number(value: Option<&Variant>, fallback: f32) -> f32 {
@@ -76,6 +82,16 @@ fn enum_value(value: Option<&Variant>, fallback: i32) -> i32 {
 
 fn bool_value(value: Option<&Variant>, fallback: bool) -> bool {
     match value { Some(Variant::Bool(value)) => *value, _ => fallback }
+}
+
+fn udim2_tuple(value: Option<&Variant>) -> Option<(f32, f32, f32, f32)> {
+    match value {
+        Some(Variant::UDim2(value)) => Some((
+            value.x.scale, value.x.offset as f32,
+            value.y.scale, value.y.offset as f32,
+        )),
+        _ => None,
+    }
 }
 
 fn visible(instance: &rbx_dom_weak::Instance) -> bool {
@@ -332,6 +348,15 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 ((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("ImageTransparency")), 0.0).clamp(0.0,1.0))*255.0) as u8,
                 [255,255,255],
             ),
+            image_rect_offset: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectOffset")), Vec2::ZERO),
+            image_rect_size: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectSize")), Vec2::ZERO),
+            image_scale_type: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScaleType")), 0),
+            tile_size: udim2_tuple(instance.properties.get(&rbx_dom_weak::ustr("TileSize"))),
+            slice_center: match instance.properties.get(&rbx_dom_weak::ustr("SliceCenter")) {
+                Some(Variant::Rect(rect)) => Some([rect.min.x, rect.min.y, rect.max.x, rect.max.y]),
+                _ => None,
+            },
+            slice_scale: number(instance.properties.get(&rbx_dom_weak::ustr("SliceScale")), 1.0).max(0.0),
         });
     }
     let child_parent_rect = if instance.class == "ScrollingFrame" {
@@ -346,6 +371,112 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     for child in instance.children() {
         collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
             global_z, scale, &sort_path, sequence, nodes);
+    }
+}
+
+fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureHandle) {
+    let texture_size = texture.size_vec2().max(Vec2::splat(1.0));
+    let source_size = if node.image_rect_size.x > 0.0 && node.image_rect_size.y > 0.0 {
+        node.image_rect_size
+    } else {
+        texture_size
+    };
+    let uv_min = Pos2::new(node.image_rect_offset.x / texture_size.x, node.image_rect_offset.y / texture_size.y);
+    let uv_max = Pos2::new(
+        (node.image_rect_offset.x + source_size.x) / texture_size.x,
+        (node.image_rect_offset.y + source_size.y) / texture_size.y,
+    );
+    let uv = Rect::from_min_max(uv_min, uv_max);
+    let bounds = node.content_rect;
+    if bounds.width() <= 0.0 || bounds.height() <= 0.0 { return; }
+    match node.image_scale_type {
+        // Slice (nine-slice)
+        1 => {
+            let Some(slice) = node.slice_center else {
+                painter.image(texture.id(), bounds, uv, node.image_color);
+                return;
+            };
+            let mut left = (slice[0] - node.image_rect_offset.x).max(0.0) * node.slice_scale;
+            let mut top = (slice[1] - node.image_rect_offset.y).max(0.0) * node.slice_scale;
+            let mut right = (node.image_rect_offset.x + source_size.x - slice[2]).max(0.0) * node.slice_scale;
+            let mut bottom = (node.image_rect_offset.y + source_size.y - slice[3]).max(0.0) * node.slice_scale;
+            if left + right > bounds.width() {
+                let factor = bounds.width() / (left + right).max(1.0);
+                left *= factor; right *= factor;
+            }
+            if top + bottom > bounds.height() {
+                let factor = bounds.height() / (top + bottom).max(1.0);
+                top *= factor; bottom *= factor;
+            }
+            let dx = [bounds.left(), bounds.left() + left, bounds.right() - right, bounds.right()];
+            let dy = [bounds.top(), bounds.top() + top, bounds.bottom() - bottom, bounds.bottom()];
+            let ux = [uv.left(), slice[0] / texture_size.x, slice[2] / texture_size.x, uv.right()];
+            let uy = [uv.top(), slice[1] / texture_size.y, slice[3] / texture_size.y, uv.bottom()];
+            for y in 0..3 {
+                for x in 0..3 {
+                    if dx[x + 1] <= dx[x] || dy[y + 1] <= dy[y] { continue; }
+                    painter.image(texture.id(),
+                        Rect::from_min_max(Pos2::new(dx[x], dy[y]), Pos2::new(dx[x + 1], dy[y + 1])),
+                        Rect::from_min_max(Pos2::new(ux[x], uy[y]), Pos2::new(ux[x + 1], uy[y + 1])),
+                        node.image_color);
+                }
+            }
+        }
+        // Tile
+        2 => {
+            let (xs, xo, ys, yo) = node.tile_size.unwrap_or((0.0, 100.0, 0.0, 100.0));
+            let tile = Vec2::new(
+                (bounds.width() * xs + xo).max(1.0),
+                (bounds.height() * ys + yo).max(1.0),
+            );
+            let columns = (bounds.width() / tile.x).ceil().max(1.0) as usize;
+            let rows = (bounds.height() / tile.y).ceil().max(1.0) as usize;
+            // Protect malformed assets from creating millions of paint jobs.
+            if columns.saturating_mul(rows) > 4096 { return; }
+            for row in 0..rows {
+                for column in 0..columns {
+                    let min = bounds.min + Vec2::new(column as f32 * tile.x, row as f32 * tile.y);
+                    let max = (min + tile).min(bounds.max);
+                    let fraction = (max - min) / tile;
+                    let tile_uv = Rect::from_min_max(uv.min, Pos2::new(
+                        uv.min.x + uv.width() * fraction.x,
+                        uv.min.y + uv.height() * fraction.y,
+                    ));
+                    painter.image(texture.id(), Rect::from_min_max(min, max), tile_uv, node.image_color);
+                }
+            }
+        }
+        // Fit
+        3 => {
+            let image_aspect = source_size.x / source_size.y.max(1.0);
+            let bounds_aspect = bounds.width() / bounds.height().max(1.0);
+            let size = if bounds_aspect > image_aspect {
+                Vec2::new(bounds.height() * image_aspect, bounds.height())
+            } else {
+                Vec2::new(bounds.width(), bounds.width() / image_aspect)
+            };
+            painter.image(texture.id(), Rect::from_center_size(bounds.center(), size), uv, node.image_color);
+        }
+        // Crop
+        4 => {
+            let image_aspect = source_size.x / source_size.y.max(1.0);
+            let bounds_aspect = bounds.width() / bounds.height().max(1.0);
+            let mut crop_uv = uv;
+            if bounds_aspect > image_aspect {
+                let visible = image_aspect / bounds_aspect;
+                let margin = uv.height() * (1.0 - visible) * 0.5;
+                crop_uv.min.y += margin;
+                crop_uv.max.y -= margin;
+            } else {
+                let visible = bounds_aspect / image_aspect;
+                let margin = uv.width() * (1.0 - visible) * 0.5;
+                crop_uv.min.x += margin;
+                crop_uv.max.x -= margin;
+            }
+            painter.image(texture.id(), bounds, crop_uv, node.image_color);
+        }
+        // Stretch
+        _ => painter.image(texture.id(), bounds, uv, node.image_color),
     }
 }
 
@@ -412,8 +543,7 @@ pub fn draw_starter_gui(
                 }
             }
             if let Some(texture) = textures.get(uri) {
-                painter.image(texture.id(), node.content_rect,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), node.image_color);
+                paint_image(&painter, &node, texture);
             }
         }
         if !node.text.is_empty() {
