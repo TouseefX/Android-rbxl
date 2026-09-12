@@ -32,8 +32,10 @@ flate2 = "1.1.9"
 zstd = "0.13"
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "gzip", "brotli", "zstd"] }
+# Roblox CDN textures are not guaranteed to be PNG/JPEG; modern assets often
+# arrive as WebP and older uploaded images can be GIF/BMP.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 # Embedded Luau VM for the script runner / plugin host. Uses TouseefX/luaur — a
 # pure-Rust, full-accuracy Luau port with Android support. `default-features =
 # false` skips the CLI binary and static type checker; we only need the runtime.

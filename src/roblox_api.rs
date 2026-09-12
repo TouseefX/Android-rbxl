@@ -656,19 +656,37 @@ impl RobloxApiClient {
         let id_text = asset_downloader::extract_asset_id(asset_uri)
             .ok_or_else(|| format!("invalid {kind} asset id"))?;
         let id = id_text.parse::<u64>().map_err(|_| format!("invalid numeric {kind} id"))?;
-        let bytes = Self::fetch_asset_payload_sync(id, cookie)?;
+        let mut payload_id = id_text.clone();
+        let mut bytes = Self::fetch_asset_payload_sync(id, cookie)?;
+        let decoded_directly = if kind == "mesh" {
+            asset_downloader::parse_roblox_mesh(&bytes).is_some()
+        } else {
+            asset_downloader::decode_image_bytes(&bytes).is_some()
+        };
+        if !decoded_directly {
+            // Decal/catalog and some legacy mesh IDs resolve to an RBXM wrapper
+            // whose property points at the actual binary asset.
+            if let Some(target) = asset_downloader::wrapped_asset_target(&bytes, kind, &id_text) {
+                let target_id = target.parse::<u64>()
+                    .map_err(|_| format!("wrapper contained invalid asset id {target}"))?;
+                bytes = Self::fetch_asset_payload_sync(target_id, cookie)?;
+                payload_id = target;
+            }
+        }
         if kind == "mesh" {
-            asset_downloader::store_cached_raw(format!("rbxassetid://{id}"), bytes.clone());
+            asset_downloader::store_cached_raw(format!("rbxassetid://{payload_id}"), bytes.clone());
             let mesh = asset_downloader::parse_roblox_mesh(&bytes)
-                .ok_or_else(|| format!("asset {id} downloaded but its mesh format could not be decoded"))?;
+                .ok_or_else(|| format!("asset {id} and its target could not be decoded as a mesh"))?;
             asset_downloader::store_cached_mesh(asset_uri.to_string(), mesh.clone());
-            asset_downloader::store_cached_mesh(id_text, mesh);
+            asset_downloader::store_cached_mesh(id_text, mesh.clone());
+            asset_downloader::store_cached_mesh(payload_id, mesh);
         } else {
             let image = asset_downloader::decode_image_bytes(&bytes)
-                .ok_or_else(|| format!("asset {id} downloaded but was not a PNG/JPEG image"))?;
+                .ok_or_else(|| format!("asset {id} and its target are not a supported image"))?;
             let image = std::sync::Arc::new(image);
             asset_downloader::store_cached_image(asset_uri.to_string(), image.clone());
-            asset_downloader::store_cached_image(id_text, image);
+            asset_downloader::store_cached_image(id_text, image.clone());
+            asset_downloader::store_cached_image(payload_id, image);
         }
         Ok(())
     }
@@ -710,20 +728,9 @@ impl RobloxApiClient {
 
         std::thread::spawn(move || {
             let _permit = AssetDownloadPermit::acquire();
-            let result = (|| {
-                let id_text = asset_downloader::extract_asset_id(&mesh_id_str)
-                    .ok_or_else(|| "invalid mesh asset id".to_string())?;
-                let id = id_text.parse::<u64>().map_err(|_| "invalid numeric mesh id".to_string())?;
-                let bytes = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref())?;
-                asset_downloader::store_cached_raw(format!("rbxassetid://{id}"), bytes.clone());
-                let mesh = asset_downloader::parse_roblox_mesh(&bytes)
-                    .ok_or_else(|| format!("asset {id} downloaded but its mesh format could not be decoded"))?;
-                // Cache both URI and numeric aliases because compiled and XML
-                // places can refer to the same mesh in different forms.
-                asset_downloader::store_cached_mesh(mesh_id_str.clone(), mesh.clone());
-                asset_downloader::store_cached_mesh(id_text, mesh);
-                Ok(())
-            })();
+            let result = Self::fetch_viewport_asset_sync(
+                &mesh_id_str, "mesh", cookie_opt.as_deref(),
+            );
             let (tx, _) = viewport_asset_channel();
             let _ = tx.send(ViewportAssetReady { id: mesh_id_str, kind: "mesh", result });
         });
@@ -743,18 +750,9 @@ impl RobloxApiClient {
 
         std::thread::spawn(move || {
             let _permit = AssetDownloadPermit::acquire();
-            let result = (|| {
-                let id_text = asset_downloader::extract_asset_id(&image_id_str)
-                    .ok_or_else(|| "invalid texture asset id".to_string())?;
-                let id = id_text.parse::<u64>().map_err(|_| "invalid numeric texture id".to_string())?;
-                let bytes = Self::fetch_asset_payload_sync(id, cookie_opt.as_deref())?;
-                let image = asset_downloader::decode_image_bytes(&bytes)
-                    .ok_or_else(|| format!("asset {id} downloaded but was not a PNG/JPEG image"))?;
-                let image = std::sync::Arc::new(image);
-                asset_downloader::store_cached_image(image_id_str.clone(), image.clone());
-                asset_downloader::store_cached_image(id_text, image);
-                Ok(())
-            })();
+            let result = Self::fetch_viewport_asset_sync(
+                &image_id_str, "texture", cookie_opt.as_deref(),
+            );
             let (tx, _) = viewport_asset_channel();
             let _ = tx.send(ViewportAssetReady { id: image_id_str, kind: "texture", result });
         });

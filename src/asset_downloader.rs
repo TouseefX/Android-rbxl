@@ -709,7 +709,8 @@ pub fn parse_roblox_mesh(bytes: &[u8]) -> Option<MeshData> {
 
     if bytes.starts_with(b"version 1.00") || bytes.starts_with(b"version 1.01") {
         parse_ascii_mesh(bytes)
-    } else if bytes.starts_with(b"version 2.00") || bytes.starts_with(b"version 3.00") {
+    } else if bytes.starts_with(b"version 2.00") || bytes.starts_with(b"version 3.00")
+        || bytes.starts_with(b"version 3.01") {
         parse_binary_mesh_v2_v3(bytes)
     } else if bytes.starts_with(b"version 4.00") || bytes.starts_with(b"version 4.01")
         || bytes.starts_with(b"version 5.00") {
@@ -1025,4 +1026,42 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
     }
 
     out
+}
+
+/// AssetDelivery occasionally returns an RBXM/XML wrapper (Decal, MeshPart,
+/// CharacterMesh) instead of raw image/mesh bytes. Resolve the real content ID
+/// from that wrapper so the downloader can follow it once.
+pub fn wrapped_asset_target(bytes: &[u8], kind: &str, original_id: &str) -> Option<String> {
+    let dom = crate::rbxl::load_place(bytes.to_vec()).ok()?;
+    let wanted: &[&str] = if kind == "mesh" {
+        &["MeshId", "MeshID", "MeshContent"]
+    } else {
+        &["Texture", "TextureId", "TextureID", "TextureContent", "ColorMap",
+          "ColorMapContent", "BaseTextureId", "BaseTextureContent",
+          "OverlayTextureId", "OverlayTextureContent", "ShirtTemplate",
+          "PantsTemplate", "Graphic"]
+    };
+    let mut stack = dom.root().children().to_vec();
+    while let Some(referent) = stack.pop() {
+        let instance = dom.get_by_ref(referent)?;
+        stack.extend(instance.children());
+        for property in wanted {
+            let Some(value) = instance.properties.get(&rbx_dom_weak::ustr(property)) else { continue; };
+            let raw = match value {
+                Variant::String(value) => Some(value.clone()),
+                Variant::ContentId(value) => Some(value.as_str().to_string()),
+                Variant::Content(value) => match value.value() {
+                    ContentType::Uri(uri) => Some(uri.clone()),
+                    _ => None,
+                },
+                Variant::Int64(value) if *value > 0 => Some(value.to_string()),
+                Variant::Int32(value) if *value > 0 => Some(value.to_string()),
+                _ => None,
+            };
+            if let Some(id) = raw.as_deref().and_then(extract_asset_id) {
+                if id != original_id { return Some(id); }
+            }
+        }
+    }
+    None
 }
