@@ -760,7 +760,7 @@ impl EditorApp {
             // presets, distance/zoom, speed, up/down.
             egui::TopBottomPanel::top("viewport_controls")
                 .show(ctx, |ui| {
-                    self.show_viewport_controls(ui, orbit);
+                    self.show_viewport_controls(ui, orbit, viewport_scene);
                 });
             // Transparent central panel: the Bevy 3D scene shows through and
             // this region senses drag/scroll to orbit the camera.
@@ -774,7 +774,7 @@ impl EditorApp {
                 match self.active_tab {
                     ActiveTab::Explorer => self.show_explorer_ui(ui),
                     ActiveTab::Viewport3D => {
-                        self.show_viewport_controls(ui, orbit);
+                        self.show_viewport_controls(ui, orbit, viewport_scene);
                         self.show_viewport_drag(ui, orbit, viewport_scene);
                     }
                     ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
@@ -916,7 +916,7 @@ impl EditorApp {
 
     /// Camera control bar (always drawn on a solid panel so it's visible over
     /// the 3D). Steers the Bevy `OrbitCam`.
-    fn show_viewport_controls(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
+    fn show_viewport_controls(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam, viewport_scene: &crate::bevy_render::ViewportScene) {
         // Row 1 (scrollable): label, presets, focus, reset, distance, speed.
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
@@ -930,18 +930,13 @@ impl EditorApp {
             if ui.button("📐 Front").clicked() { orbit.yaw = 0.0; orbit.pitch = 0.15; }
             if ui.button("📐 Side").clicked() { orbit.yaw = std::f32::consts::PI * 0.5; orbit.pitch = 0.15; }
             if ui.button("🎯 Focus Sel").clicked() {
-                if let (Some(dom), Some(r)) = (&self.dom, self.selected) {
-                    if let Some(inst) = dom.get_by_ref(r) {
-                        match inst.properties.get(&rbx_dom_weak::ustr("CFrame"))
-                            .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("CoordinateFrame"))) {
-                            Some(Variant::CFrame(cf)) => {
-                                orbit.target = [cf.position.x, cf.position.y, cf.position.z];
-                            }
-                            _ => if let Some(Variant::Vector3(v)) = inst.properties.get(&rbx_dom_weak::ustr("Position")) {
-                                orbit.target = [v.x, v.y, v.z];
-                            },
-                        }
-                    }
+                if !viewport_scene.frame(orbit, self.selected) {
+                    self.status = "Select a visible part to focus it".into();
+                }
+            }
+            if ui.button("▣ Frame All").clicked() {
+                if !viewport_scene.frame(orbit, None) {
+                    self.status = "No visible Workspace parts to frame".into();
                 }
             }
             if ui.button("🔄 Reset").clicked() { *orbit = crate::bevy_render::OrbitCam::default(); }
@@ -949,8 +944,8 @@ impl EditorApp {
             ui.separator();
             ui.label("📏 Dist:");
             if ui.button("−").clicked() { orbit.dist = (orbit.dist * 0.85).max(2.0); }
-            ui.add(egui::Slider::new(&mut orbit.dist, 2.0..=2000.0).show_value(false));
-            if ui.button("+").clicked() { orbit.dist = (orbit.dist * 1.15).min(2000.0); }
+            ui.add(egui::Slider::new(&mut orbit.dist, 2.0..=50_000.0).show_value(false));
+            if ui.button("+").clicked() { orbit.dist = (orbit.dist * 1.15).min(50_000.0); }
 
             ui.separator();
             let mut speed = self.cam_move_speed;
@@ -1115,7 +1110,7 @@ impl EditorApp {
         }
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.0 {
-            orbit.dist = (orbit.dist - scroll * 0.1).clamp(2.0, 2000.0);
+            orbit.dist = (orbit.dist - scroll * 0.1).clamp(2.0, 50_000.0);
         }
         // Subtle border so the user can see the drag area.
         ui.painter().rect_stroke(rect, 0.0_f32, egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(120, 180, 255, 90)), egui::StrokeKind::Inside);

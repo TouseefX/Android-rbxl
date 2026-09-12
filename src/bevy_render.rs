@@ -411,6 +411,33 @@ pub struct ViewportScene {
     pub parts: Vec<SelectablePart>,
 }
 
+impl ViewportScene {
+    /// Aim the orbit camera so the requested object, or the entire place when
+    /// `selected` is None, fits in the 60-degree viewport.
+    pub fn frame(&self, camera: &mut OrbitCam, selected: Option<rbx_dom_weak::types::Ref>) -> bool {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        let mut found = false;
+        for part in self.parts.iter().filter(|part| selected.map_or(true, |id| part.referent == id)) {
+            found = true;
+            for axis in 0..3 {
+                min[axis] = min[axis].min(part.min[axis]);
+                max[axis] = max[axis].max(part.max[axis]);
+            }
+        }
+        if !found { return false; }
+        camera.target = [
+            (min[0] + max[0]) * 0.5,
+            (min[1] + max[1]) * 0.5,
+            (min[2] + max[2]) * 0.5,
+        ];
+        let diagonal = BVec3::new(max[0]-min[0], max[1]-min[1], max[2]-min[2]).length();
+        // A little margin leaves room for the selection outline and gizmo.
+        camera.dist = (diagonal * 1.15).clamp(2.0, 50_000.0);
+        true
+    }
+}
+
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     let n = [
         a[1] * b[2] - a[2] * b[1],
@@ -1331,13 +1358,11 @@ pub fn spawn_camera_and_light(commands: &mut Commands) {
         // see the whole place, and a small near plane means you can go right up
         // to / inside a part without the geometry vanishing.
         Projection::Perspective(PerspectiveProjection {
-            // near/far tuned for large maps: far enough to see the whole place
-            // (parts beyond the far plane pop in/out = flicker), while keeping
-            // the near/far ratio reasonable for depth precision. Far=20000 was
-            // too large (z-fighting); far=800 was too small (distant parts
-            // clipped). 2000 balances both.
+            // Bevy/wgpu uses reverse-Z depth, so a large far plane does not
+            // cause the precision collapse of a traditional projection. Keep
+            // large Roblox worlds visible when Frame All zooms beyond 2k studs.
             near: 0.1,
-            far: 2000.0,
+            far: 100_000.0,
             fov: 60f32.to_radians(),
             ..default()
         }),
