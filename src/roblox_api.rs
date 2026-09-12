@@ -105,14 +105,15 @@ pub fn try_recv_viewport_asset_ready() -> Option<ViewportAssetReady> {
 
 // AssetDelivery bursts can contain hundreds of meshes/textures. Letting every
 // request parse and upload concurrently saturated mobile CPUs and caused UI
-// stalls. Keep at most four network/decode jobs active.
+// stalls. Twelve concurrent requests keeps mobile bandwidth busy like Studio,
+// while still bounding CPU-side decoding.
 static ASSET_DOWNLOAD_LIMITER: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
 struct AssetDownloadPermit;
 impl AssetDownloadPermit {
     fn acquire() -> Self {
         let (count, wake) = ASSET_DOWNLOAD_LIMITER.get_or_init(|| (Mutex::new(0), Condvar::new()));
         let mut active = count.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *active >= 4 {
+        while *active >= 12 {
             active = wake.wait(active).unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         *active += 1;
@@ -628,6 +629,10 @@ impl RobloxApiClient {
     /// Fetches a 3D .mesh asset asynchronously in the background and stores it in mesh_cache
     pub fn fetch_and_cache_mesh_async(mesh_id_str: String, cookie_opt: Option<String>) {
         if asset_downloader::get_cached_mesh(&mesh_id_str).is_some() {
+            let (tx, _) = viewport_asset_channel();
+            let _ = tx.send(ViewportAssetReady {
+                id: mesh_id_str, kind: "mesh", result: Ok(()),
+            });
             return;
         }
 
@@ -657,6 +662,10 @@ impl RobloxApiClient {
     /// (and therefore `bevy_render::load_image_rgba`) reads from.
     pub fn fetch_and_cache_image_async(image_id_str: String, cookie_opt: Option<String>) {
         if asset_downloader::get_cached_image(&image_id_str).is_some() {
+            let (tx, _) = viewport_asset_channel();
+            let _ = tx.send(ViewportAssetReady {
+                id: image_id_str, kind: "texture", result: Ok(()),
+            });
             return;
         }
 

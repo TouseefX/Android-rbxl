@@ -263,6 +263,9 @@ pub struct EditorApp {
     // background (see auto_download_place_assets) actually get pulled into
     // the scene instead of only ever showing on the NEXT manual reopen.
     pending_asset_refresh_at: Option<std::time::Instant>,
+    /// Number of mesh/texture requests in the current automatic place batch.
+    /// The expensive full scene rebuild runs once when this reaches zero.
+    viewport_assets_pending: usize,
 
     // Command bar: a one-line Luau prompt that runs against the embedded
     // luaur VM with a tiny `game`/`workspace`/`script`-style surface so users
@@ -409,6 +412,7 @@ impl Default for EditorApp {
             viewport_gizmo_axis: None,
             viewport_gizmo_mode: ViewportGizmoMode::Move,
             pending_asset_refresh_at: None,
+            viewport_assets_pending: 0,
             command_input: String::new(),
             command_history: Vec::new(),
             command_history_idx: 0,
@@ -499,7 +503,13 @@ impl EditorApp {
             return;
         }
         let cookie = if self.roblosecurity_cookie.is_empty() { None } else { Some(self.roblosecurity_cookie.clone()) };
-        self.log_info(format!("Auto-downloading {} referenced assets in the background", assets.len()));
+        self.viewport_assets_pending = assets.iter()
+            .filter(|asset| matches!(asset.asset_type, "Mesh" | "Texture"))
+            .count();
+        self.log_info(format!(
+            "Loading {} viewport assets in the background",
+            self.viewport_assets_pending,
+        ));
         std::thread::spawn(move || {
             for asset in assets {
                 let id = format!("rbxassetid://{}", asset.asset_id);
@@ -3696,19 +3706,26 @@ ui.label("Place ID:");
         // Rebuild as each viewport asset actually completes. The previous
         // fixed four-second refresh missed slow/mobile downloads permanently.
         while let Some(ready) = roblox_api::try_recv_viewport_asset_ready() {
+            let in_place_batch = self.viewport_assets_pending > 0;
+            if in_place_batch {
+                self.viewport_assets_pending -= 1;
+            }
             match ready.result {
-                Ok(()) => {
-                    // Debounce GPU rebuilds: a character/place can finish
-                    // dozens of assets in quick succession. Rebuilding the
-                    // entire scene for every completion caused severe lag.
-                    self.pending_asset_refresh_at = Some(
-                        std::time::Instant::now() + std::time::Duration::from_millis(450),
-                    );
-                    self.log_info(format!("Viewport {} ready: {}", ready.kind, ready.id));
-                }
-                Err(error) => {
-                    self.log_error(format!("Viewport {} failed ({}): {}", ready.kind, ready.id, error));
-                }
+                Ok(()) => self.log_info(format!("Viewport {} ready: {}", ready.kind, ready.id)),
+                Err(error) => self.log_error(format!(
+                    "Viewport {} failed ({}): {}", ready.kind, ready.id, error,
+                )),
+            }
+            if in_place_batch && self.viewport_assets_pending == 0 {
+                // One GPU upload after the complete batch, rather than a full
+                // scene rebuild for each individual mesh.
+                self.needs_3d_rebuild = true;
+                self.status = "✅ All viewport meshes and textures loaded".into();
+            } else if !in_place_batch {
+                // Manual/single downloads still appear automatically.
+                self.pending_asset_refresh_at = Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(450),
+                );
             }
         }
 
