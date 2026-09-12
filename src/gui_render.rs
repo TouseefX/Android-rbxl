@@ -76,30 +76,59 @@ fn visible(instance: &rbx_dom_weak::Instance) -> bool {
     !matches!(instance.properties.get(&rbx_dom_weak::ustr("Visible")), Some(Variant::Bool(false)))
 }
 
-fn gui_rect(instance: &rbx_dom_weak::Instance, parent: Rect) -> Rect {
+fn vector2(value: Option<&Variant>, fallback: Vec2) -> Vec2 {
+    match value {
+        Some(Variant::Vector2(value)) => Vec2::new(value.x, value.y),
+        _ => fallback,
+    }
+}
+
+/// Resolve Roblox's absolute GuiObject rectangle, including inherited UIScale,
+/// UISizeConstraint and UIAspectRatioConstraint. Constraints are children of
+/// the object they affect, unlike CSS constraints.
+fn gui_rect(dom: &WeakDom, instance: &rbx_dom_weak::Instance, parent: Rect, scale: f32) -> Rect {
     let position = match instance.properties.get(&rbx_dom_weak::ustr("Position")) {
         Some(Variant::UDim2(v)) => Vec2::new(
-            parent.width() * v.x.scale + v.x.offset as f32,
-            parent.height() * v.y.scale + v.y.offset as f32),
+            parent.width() * v.x.scale + v.x.offset as f32 * scale,
+            parent.height() * v.y.scale + v.y.offset as f32 * scale),
         _ => Vec2::ZERO,
     };
-    let size = match instance.properties.get(&rbx_dom_weak::ustr("Size")) {
+    let mut size = match instance.properties.get(&rbx_dom_weak::ustr("Size")) {
         Some(Variant::UDim2(v)) => Vec2::new(
-            parent.width() * v.x.scale + v.x.offset as f32,
-            parent.height() * v.y.scale + v.y.offset as f32),
-        _ => Vec2::new(100.0, 100.0),
+            parent.width() * v.x.scale + v.x.offset as f32 * scale,
+            parent.height() * v.y.scale + v.y.offset as f32 * scale),
+        _ => Vec2::new(100.0 * scale, 100.0 * scale),
     }.max(Vec2::ZERO);
-    let anchor = match instance.properties.get(&rbx_dom_weak::ustr("AnchorPoint")) {
-        Some(Variant::Vector2(v)) => Vec2::new(v.x, v.y),
-        _ => Vec2::ZERO,
-    };
+
+    if let Some(constraint) = child_of_class(dom, instance, "UISizeConstraint") {
+        let min = vector2(constraint.properties.get(&rbx_dom_weak::ustr("MinSize")), Vec2::ZERO) * scale;
+        let max = vector2(constraint.properties.get(&rbx_dom_weak::ustr("MaxSize")), Vec2::splat(10_000.0)) * scale;
+        size.x = size.x.clamp(min.x.min(max.x), max.x.max(min.x));
+        size.y = size.y.clamp(min.y.min(max.y), max.y.max(min.y));
+    }
+    if let Some(constraint) = child_of_class(dom, instance, "UIAspectRatioConstraint") {
+        let ratio = number(constraint.properties.get(&rbx_dom_weak::ustr("AspectRatio")), 1.0).max(0.0001);
+        // DominantAxis: Width=0, Height=1. AspectType=ScaleWithParentSize
+        // uses the parent's dominant dimension before applying the ratio.
+        let dominant = enum_value(constraint.properties.get(&rbx_dom_weak::ustr("DominantAxis")), 0);
+        let aspect_type = enum_value(constraint.properties.get(&rbx_dom_weak::ustr("AspectType")), 0);
+        if aspect_type == 1 {
+            if dominant == 1 { size = Vec2::new(parent.height() * ratio, parent.height()); }
+            else { size = Vec2::new(parent.width(), parent.width() / ratio); }
+        } else if size.x / size.y.max(0.0001) > ratio {
+            size.x = size.y * ratio;
+        } else {
+            size.y = size.x / ratio;
+        }
+    }
+    let anchor = vector2(instance.properties.get(&rbx_dom_weak::ustr("AnchorPoint")), Vec2::ZERO);
     let min = parent.min + position - size * anchor;
     Rect::from_min_size(min, size)
 }
 
-fn udim_pixels(value: Option<&Variant>, extent: f32) -> f32 {
+fn udim_pixels(value: Option<&Variant>, extent: f32, scale: f32) -> f32 {
     match value {
-        Some(Variant::UDim(value)) => extent * value.scale + value.offset as f32,
+        Some(Variant::UDim(value)) => extent * value.scale + value.offset as f32 * scale,
         _ => 0.0,
     }
 }
@@ -113,12 +142,16 @@ fn child_of_class<'a>(dom: &'a WeakDom, instance: &rbx_dom_weak::Instance, class
 }
 
 fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
-           inherited_z: i32, display_order: i32, sequence: &mut usize,
-           nodes: &mut Vec<GuiNode>) {
+           inherited_z: i32, display_order: i32, inherited_scale: f32,
+           sequence: &mut usize, nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
+    let local_scale = child_of_class(dom, instance, "UIScale")
+        .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
+        .unwrap_or(1.0);
+    let scale = inherited_scale * local_scale;
     let is_screen = instance.class == "ScreenGui";
-    let rect = if is_screen { parent_rect } else { gui_rect(instance, parent_rect) };
+    let rect = if is_screen { parent_rect } else { gui_rect(dom, instance, parent_rect, scale) };
     let clips = matches!(instance.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), Some(Variant::Bool(true)));
     let child_clip = if clips { parent_clip.intersect(rect) } else { parent_clip };
     let z = inherited_z + match instance.properties.get(&rbx_dom_weak::ustr("ZIndex")) {
@@ -133,11 +166,11 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
         let alpha = ((1.0 - transparency) * 255.0).round() as u8;
         let text_transparency = number(instance.properties.get(&rbx_dom_weak::ustr("TextTransparency")), 0.0).clamp(0.0, 1.0);
         let corner_radius = child_of_class(dom, instance, "UICorner")
-            .map(|corner| udim_pixels(corner.properties.get(&rbx_dom_weak::ustr("CornerRadius")), rect.width().min(rect.height())))
+            .map(|corner| udim_pixels(corner.properties.get(&rbx_dom_weak::ustr("CornerRadius")), rect.width().min(rect.height()), scale))
             .unwrap_or(0.0)
             .clamp(0.0, rect.width().min(rect.height()) * 0.5);
         let ui_stroke = child_of_class(dom, instance, "UIStroke").and_then(|stroke| {
-            let thickness = number(stroke.properties.get(&rbx_dom_weak::ustr("Thickness")), 1.0).max(0.0);
+            let thickness = number(stroke.properties.get(&rbx_dom_weak::ustr("Thickness")), 1.0).max(0.0) * scale;
             let transparency = number(stroke.properties.get(&rbx_dom_weak::ustr("Transparency")), 0.0).clamp(0.0, 1.0);
             (thickness > 0.0 && transparency < 1.0).then(|| (thickness, color(
                 stroke.properties.get(&rbx_dom_weak::ustr("Color")),
@@ -155,12 +188,12 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
             order,
             background: color(instance.properties.get(&rbx_dom_weak::ustr("BackgroundColor3")), alpha, [255,255,255]),
             border: color(instance.properties.get(&rbx_dom_weak::ustr("BorderColor3")), 255, [27,42,53]),
-            border_size: number(instance.properties.get(&rbx_dom_weak::ustr("BorderSizePixel")), 1.0).max(0.0),
+            border_size: number(instance.properties.get(&rbx_dom_weak::ustr("BorderSizePixel")), 1.0).max(0.0) * scale,
             corner_radius,
             ui_stroke,
             text: match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() },
             text_color: color(instance.properties.get(&rbx_dom_weak::ustr("TextColor3")), ((1.0-text_transparency)*255.0) as u8, [0,0,0]),
-            text_size: number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0).clamp(1.0, 200.0),
+            text_size: (number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0) * scale).clamp(1.0, 400.0),
             text_x_alignment: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextXAlignment")), 1),
             text_y_alignment: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextYAlignment")), 1),
             text_wrapped: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false),
@@ -180,17 +213,17 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
         });
     }
     let content_rect = if let Some(padding) = child_of_class(dom, instance, "UIPadding") {
-        let left = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingLeft")), rect.width());
-        let right = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingRight")), rect.width());
-        let top = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingTop")), rect.height());
-        let bottom = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingBottom")), rect.height());
+        let left = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingLeft")), rect.width(), scale);
+        let right = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingRight")), rect.width(), scale);
+        let top = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingTop")), rect.height(), scale);
+        let bottom = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingBottom")), rect.height(), scale);
         Rect::from_min_max(
             Pos2::new(rect.left() + left, rect.top() + top),
             Pos2::new((rect.right() - right).max(rect.left() + left), (rect.bottom() - bottom).max(rect.top() + top)),
         )
     } else { rect };
     for child in instance.children() {
-        collect(dom, *child, content_rect, child_clip, z, display_order, sequence, nodes);
+        collect(dom, *child, content_rect, child_clip, z, display_order, scale, sequence, nodes);
     }
 }
 
@@ -213,7 +246,7 @@ pub fn draw_starter_gui(
             let Some(gui) = dom.get_by_ref(*child) else { continue; };
             if gui.class != "ScreenGui" || matches!(gui.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
             let display_order = enum_value(gui.properties.get(&rbx_dom_weak::ustr("DisplayOrder")), 0);
-            collect(dom, *child, viewport, viewport, 0, display_order, &mut sequence, &mut nodes);
+            collect(dom, *child, viewport, viewport, 0, display_order, 1.0, &mut sequence, &mut nodes);
         }
     }
     nodes.sort_by_key(|node| (node.z, node.order));
