@@ -1289,10 +1289,21 @@ pub fn draw_starter_gui(
             projected_points.push(Pos2::new(viewport.left()+point[0]*viewport.width(), viewport.top()+point[1]*viewport.height()));
         }
         if projected_points.len() != 4 { continue; }
-        let mut surface_rect = Rect::NOTHING;
-        for point in projected_points { surface_rect.extend_with(point); }
-        let surface_clip = surface_rect.intersect(viewport);
+        let projected_bounds = projected_points.iter().fold(Rect::NOTHING, |mut bounds, point| {
+            bounds.extend_with(*point); bounds
+        });
+        let surface_clip = projected_bounds.intersect(viewport);
         if surface_clip.width() <= 0.0 || surface_clip.height() <= 0.0 { continue; }
+        let edge = |a: Pos2, b: Pos2| (b-a).length();
+        let surface_width = (edge(projected_points[0], projected_points[1]) + edge(projected_points[3], projected_points[2])) * 0.5;
+        let surface_height = (edge(projected_points[0], projected_points[3]) + edge(projected_points[1], projected_points[2])) * 0.5;
+        let surface_center = Pos2::new(
+            projected_points.iter().map(|point| point.x).sum::<f32>() * 0.25,
+            projected_points.iter().map(|point| point.y).sum::<f32>() * 0.25,
+        );
+        let surface_rotation = (projected_points[1].y-projected_points[0].y)
+            .atan2(projected_points[1].x-projected_points[0].x);
+        let surface_rect = Rect::from_center_size(surface_center, Vec2::new(surface_width, surface_height));
         let always_on_top = bool_value(surface.properties.get(&rbx_dom_weak::ustr("AlwaysOnTop")), false);
         if !always_on_top {
             let center = transform(fixed);
@@ -1313,10 +1324,27 @@ pub fn draw_starter_gui(
         };
         let screen_scale = (surface_rect.width()/canvas.x.max(1.0)).min(surface_rect.height()/canvas.y.max(1.0));
         let path = vec![(-2, surface_order)];
+        let first_surface_node = nodes.len();
         for child in surface.children() {
-            collect(dom, &layout_painter, *child, surface_rect, surface_clip, -900_000,
+            collect(dom, &layout_painter, *child, surface_rect, viewport, -900_000,
                 true, screen_scale, 1.0, Color32::WHITE, &path, None, &mut overrides,
                 scroll_offsets, &mut sequence, &mut nodes);
+        }
+        // Rotate the complete hierarchy with its Part face. Child-local
+        // Rotation remains additive, just as it is for an oriented SurfaceGui.
+        for node in &mut nodes[first_surface_node..] {
+            let center = rotate_point(node.rect.center(), surface_center, surface_rotation);
+            let content_center = rotate_point(node.content_rect.center(), surface_center, surface_rotation);
+            let had_ancestor_clip = node.clip.width() < viewport.width()-0.5 || node.clip.height() < viewport.height()-0.5;
+            let transformed_clip = if had_ancestor_clip {
+                let clip_center = rotate_point(node.clip.center(), surface_center, surface_rotation);
+                rotated_bounds(Rect::from_center_size(clip_center, node.clip.size()), surface_rotation.to_degrees())
+                    .intersect(surface_clip)
+            } else { surface_clip };
+            node.rect = Rect::from_center_size(center, node.rect.size());
+            node.content_rect = Rect::from_center_size(content_center, node.content_rect.size());
+            node.rotation += surface_rotation.to_degrees();
+            node.clip = transformed_clip;
         }
     }
 
