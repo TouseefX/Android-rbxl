@@ -372,6 +372,10 @@ struct Tri {
     normal: [f32; 3],
     uv: [f32; 2],
     tex: Option<String>,
+    /// Per-surface opacity (Decal/Texture transparency), multiplied by the part opacity.
+    opacity: f32,
+    /// Procedural and mesh textures are tinted by the part Color; decals are not.
+    tint: bool,
 }
 
 #[derive(Clone)]
@@ -396,24 +400,29 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 }
 
 fn push_quad(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3, uv: [[f32; 2]; 4], tex: Option<String>) {
+    push_quad_surface(tris, cf, p, n, uv, tex.clone(), 1.0,
+        tex.as_deref().is_some_and(|key| key.starts_with("__")));
+}
+
+fn push_quad_surface(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3,
+                     uv: [[f32; 2]; 4], tex: Option<String>, opacity: f32, tint: bool) {
     let a = tp(cf, p[0]);
     let b = tp(cf, p[1]);
     let c = tp(cf, p[2]);
     let d = tp(cf, p[3]);
     let nrm = tn(cf, n);
-    tris.push(Tri { pos: a, normal: nrm, uv: uv[0], tex: tex.clone() });
-    tris.push(Tri { pos: b, normal: nrm, uv: uv[1], tex: tex.clone() });
-    tris.push(Tri { pos: c, normal: nrm, uv: uv[2], tex: tex.clone() });
-    tris.push(Tri { pos: a, normal: nrm, uv: uv[0], tex: tex.clone() });
-    tris.push(Tri { pos: c, normal: nrm, uv: uv[2], tex: tex.clone() });
-    tris.push(Tri { pos: d, normal: nrm, uv: uv[3], tex });
+    for (pos, uv) in [(a, uv[0]), (b, uv[1]), (c, uv[2]),
+                      (a, uv[0]), (c, uv[2]), (d, uv[3])] {
+        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint });
+    }
 }
 
 fn push_tri(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 3], n: Vec3, uv: [[f32; 2]; 3], tex: Option<String>) {
     let nrm = tn(cf, n);
-    tris.push(Tri { pos: tp(cf, p[0]), normal: nrm, uv: uv[0], tex: tex.clone() });
-    tris.push(Tri { pos: tp(cf, p[1]), normal: nrm, uv: uv[1], tex: tex.clone() });
-    tris.push(Tri { pos: tp(cf, p[2]), normal: nrm, uv: uv[2], tex });
+    let tint = tex.as_deref().is_some_and(|key| key.starts_with("__"));
+    for i in 0..3 {
+        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint });
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -523,6 +532,12 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
         _ => 0.0,
     };
     let alpha = (1.0 - transparency).clamp(0.0, 1.0);
+    // Roblox treats Transparency=1 as not rendered. Keeping invisible geometry
+    // in a blended mesh wastes substantial fill rate on mobile and can still
+    // interfere with transparent draw ordering.
+    if alpha <= 0.001 {
+        return None;
+    }
     // `Material` deserializes as `Variant::Enum` (a raw u32 index) from a
     // compiled .rbxl, NEVER as `Variant::String` — that arm only ever matched
     // hand-built XML doms. Every part was silently defaulting to "Plastic",
@@ -575,7 +590,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     }
 
     // Decals
-    let mut decals: HashMap<&'static str, String> = HashMap::new();
+    let mut decals: HashMap<&'static str, (String, f32)> = HashMap::new();
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
         if ch.class == "Decal" || ch.class == "Texture" {
@@ -595,7 +610,15 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
                 _ => "Front",
             };
             if let Some(t) = ch.properties.get(&rbx_dom_weak::ustr("Texture")).and_then(content_str) {
-                decals.insert(face, t);
+                let transparency = match ch.properties.get(&rbx_dom_weak::ustr("Transparency")) {
+                    Some(Variant::Float32(value)) => *value,
+                    Some(Variant::Float64(value)) => *value as f32,
+                    _ => 0.0,
+                };
+                let opacity = (1.0 - transparency).clamp(0.0, 1.0);
+                if opacity > 0.001 {
+                    decals.insert(face, (t, opacity));
+                }
             }
         }
     }
@@ -631,9 +654,10 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
                     let ub = md.uvs.get(f[1] as usize).copied().unwrap_or([1.0, 0.0]);
                     let uc = md.uvs.get(f[2] as usize).copied().unwrap_or([0.0, 1.0]);
                     let t = tex_key.clone();
-                    tris.push(Tri { pos: pa, normal: n, uv: ua, tex: t.clone() });
-                    tris.push(Tri { pos: pb, normal: n, uv: ub, tex: t.clone() });
-                    tris.push(Tri { pos: pc, normal: n, uv: uc, tex: t });
+                    // Roblox mesh textures are modulated by MeshPart.Color.
+                    tris.push(Tri { pos: pa, normal: n, uv: ua, tex: t.clone(), opacity: 1.0, tint: true });
+                    tris.push(Tri { pos: pb, normal: n, uv: ub, tex: t.clone(), opacity: 1.0, tint: true });
+                    tris.push(Tri { pos: pc, normal: n, uv: uc, tex: t, opacity: 1.0, tint: true });
                 }
             }
             if tris.is_empty() {
@@ -664,16 +688,22 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
             _ => {
                 if inst.name.to_lowercase().contains("ball") || inst.name.to_lowercase().contains("sphere") {
                     "Ball"
-                } else if let Some(Variant::String(s)) = inst.properties.get(&rbx_dom_weak::ustr("Shape")) {
-                    match s.as_str() {
-                        "Ball" => "Ball",
-                        "Cylinder" => "Cylinder",
-                        "Block" => "Block",
-                        "Wedge" => "Wedge",
+                } else {
+                    match inst.properties.get(&rbx_dom_weak::ustr("Shape")) {
+                        Some(Variant::Enum(value)) => match value.clone().to_u32() {
+                            0 => "Ball",
+                            2 => "Cylinder",
+                            3 => "Wedge",
+                            _ => "Block",
+                        },
+                        Some(Variant::String(value)) => match value.as_str() {
+                            "Ball" => "Ball",
+                            "Cylinder" => "Cylinder",
+                            "Wedge" => "Wedge",
+                            _ => "Block",
+                        },
                         _ => "Block",
                     }
-                } else {
-                    "Block"
                 }
             }
         },
@@ -758,7 +788,7 @@ fn normal_id_name(value: u32) -> &'static str {
 
 // --- primitive builders (same shapes as the Android app / OpenRBLX) ---
 
-fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, String>) {
+fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, (String, f32)>) {
     let h = half;
     let v = [
         Vec3::new(-h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, h.z), Vec3::new(-h.x, -h.y, h.z),
@@ -779,15 +809,20 @@ fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, dec
         ("Right", [2, 1, 5, 6], Vec3::new(1.0, 0.0, 0.0), false),
         ("Left", [0, 3, 7, 4], Vec3::new(-1.0, 0.0, 0.0), false),
     ];
-    for (face, idx, n, is_top) in faces {
-        let tex = if let Some(d) = decals.get(face) {
-            Some(d.clone())
-        } else if is_top {
-            mat_tex.clone()
-        } else {
-            mat_tex.clone()
-        };
-        push_quad(tris, cf, [v[idx[0]], v[idx[1]], v[idx[2]], v[idx[3]]], n, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], tex);
+    for (face, idx, n, _is_top) in faces {
+        let points = [v[idx[0]], v[idx[1]], v[idx[2]], v[idx[3]]];
+        let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        // A decal is a second surface over the part, not a replacement for the
+        // part face. Keeping the base face means transparent PNG pixels reveal
+        // the underlying BrickColor/material exactly as they do in Studio.
+        push_quad(tris, cf, points, n, uv, mat_tex.clone());
+        if let Some((texture, opacity)) = decals.get(face) {
+            // Offset the overlay a fraction of a stud to avoid coplanar
+            // z-fighting without relying on driver-specific polygon offsets.
+            let offset = n.mul(0.0015);
+            let overlay = points.map(|point| point.add(&offset));
+            push_quad_surface(tris, cf, overlay, n, uv, Some(texture.clone()), *opacity, false);
+        }
     }
 }
 
@@ -1081,9 +1116,9 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
             )
         } else {
             (
-                u32::from_le_bytes(bytes[o..o + 2].try_into().ok()?),
-                u32::from_le_bytes(bytes[o + 2..o + 4].try_into().ok()?),
-                u32::from_le_bytes(bytes[o + 4..o + 6].try_into().ok()?),
+                u16::from_le_bytes(bytes[o..o + 2].try_into().ok()?) as u32,
+                u16::from_le_bytes(bytes[o + 2..o + 4].try_into().ok()?) as u32,
+                u16::from_le_bytes(bytes[o + 4..o + 6].try_into().ok()?) as u32,
             )
         };
         // Skip faces referencing out-of-range vertices (would create spikes).
@@ -1206,6 +1241,10 @@ pub fn rebuild_scene(
     // decals, studs). Keys like "rbxassetid://123" are resolved to the local
     // asset/<id>.png file and uploaded as Bevy Images.
     let mut tex_cache: HashMap<String, Handle<Image>> = HashMap::new();
+    // Keep whether an image actually contains alpha. Texture alpha must select
+    // Bevy's transparent render phase even when BasePart.Transparency is zero;
+    // otherwise PNG cut-outs are incorrectly rendered as opaque rectangles.
+    let mut texture_has_alpha: HashMap<String, bool> = HashMap::new();
     let mut texture_ids: HashMap<String, (u32, u32, Vec<u8>)> = HashMap::new();
     for p in &parts {
         for t in &p.tris {
@@ -1221,6 +1260,7 @@ pub fn rebuild_scene(
         }
     }
     for (k, (w, h, rgba)) in &texture_ids {
+        texture_has_alpha.insert(k.clone(), rgba.chunks_exact(4).any(|pixel| pixel[3] < 255));
         let bevy_img = Image::new(
             Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
             TextureDimension::D2,
@@ -1245,7 +1285,7 @@ pub fn rebuild_scene(
     // Semi-transparent surfaces (glass, alpha decals) blend back-to-front
     // and were affected the same way. BTreeMap always iterates in sorted key
     // order, so the same file now produces the same draw order every time.
-    type Key = ([u8; 3], u8, Option<String>);
+    type Key = ([u8; 3], u8, Option<String>, bool);
     let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
     for p in &parts {
         let ck = [
@@ -1253,28 +1293,33 @@ pub fn rebuild_scene(
             (p.color[1] * 255.0).round() as u8,
             (p.color[2] * 255.0).round() as u8,
         ];
-        let ak = (p.alpha * 255.0).round() as u8;
         for t in &p.tris {
-            buckets.entry((ck, ak, t.tex.clone())).or_default().push(t.clone());
+            let ak = (p.alpha * t.opacity * 255.0).round() as u8;
+            if ak > 0 {
+                buckets.entry((ck, ak, t.tex.clone(), t.tint)).or_default().push(t.clone());
+            }
         }
     }
     let draw_call_count = buckets.len();
 
-    for ((ck, ak, tex_key), tris) in buckets {
+    for ((ck, ak, tex_key, tint), tris) in buckets {
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
-        let mut indices = Vec::new();
-        let mut idx = 0u32;
-        for t in &tris {
+        let mut indices = Vec::with_capacity(tris.len());
+        for (idx, t) in tris.iter().enumerate() {
             positions.push(t.pos);
             normals.push(t.normal);
             uvs.push(t.uv);
-            indices.push(idx);
-            indices.push(idx + 1);
-            indices.push(idx + 2);
-            idx += 3;
+            indices.push(idx as u32);
         }
+        // Geometry extraction stores one Tri record per vertex, in groups of
+        // three. The old code emitted *three indices for every one vertex*
+        // (0,1,2 then 3,4,5 while only vertices 0 and 1 existed), producing an
+        // out-of-bounds index buffer. Depending on the Android GPU/driver this
+        // dropped meshes, connected unrelated faces, or read arbitrary vertex
+        // data — the main reason the viewport appeared fundamentally broken.
+        debug_assert_eq!(indices.len() % 3, 0);
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
@@ -1311,17 +1356,15 @@ pub fn rebuild_scene(
         // get_cached_image — those should tint. Anything else (a real
         // rbxassetid/content-id key) is a downloaded Decal/MeshPart texture
         // and should render as-is.
-        let tint_texture: u32 = match &tex_key {
-            Some(k) if k.starts_with("__") => 1,
-            _ => 0,
-        };
+        let tint_texture: u32 = u32::from(tint);
         let mth = materials.add(FlatMaterial {
             color,
             light_dir: Vec4::new(60.0, 90.0, 40.0, 0.0),
             has_texture,
             texture,
             tint_texture,
-            transparent: alpha < 0.99,
+            transparent: alpha < 0.999
+                || tex_key.as_ref().and_then(|key| texture_has_alpha.get(key)).copied().unwrap_or(false),
             // Was a flat `1.0` for every material. That pushes ALL surfaces
             // toward the camera by the same amount, so two coincident/
             // overlapping parts (a decal-carrying part stacked directly on
