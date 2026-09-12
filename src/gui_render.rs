@@ -21,7 +21,8 @@ struct GuiNode {
     border_size: f32,
     corner_radius: f32,
     rotation: f32,
-    ui_stroke: Option<(f32, Color32)>,
+    ui_stroke: Option<(f32, Color32, f32, egui::StrokeKind)>,
+    text_ui_stroke: Option<(f32, Color32)>,
     gradient: Option<(f32, Vec2, Vec<Color32>)>,
     text: String,
     text_color: Color32,
@@ -480,14 +481,30 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             .map(|corner| udim_pixels(corner.properties.get(&rbx_dom_weak::ustr("CornerRadius")), rect.width().min(rect.height()), scale))
             .unwrap_or(0.0)
             .clamp(0.0, rect.width().min(rect.height()) * 0.5);
-        let ui_stroke = child_of_class(dom, instance, "UIStroke").and_then(|stroke| {
-            let thickness = number(stroke.properties.get(&rbx_dom_weak::ustr("Thickness")), 1.0).max(0.0) * scale;
-            let transparency = number(stroke.properties.get(&rbx_dom_weak::ustr("Transparency")), 0.0).clamp(0.0, 1.0);
-            (thickness > 0.0 && transparency < 1.0).then(|| (thickness, multiply_color(color(
-                stroke.properties.get(&rbx_dom_weak::ustr("Color")),
-                ((1.0 - transparency) * 255.0) as u8, [0, 0, 0],
-            ), modulation)))
-        });
+        let (ui_stroke, text_ui_stroke) = child_of_class(dom, instance, "UIStroke")
+            .and_then(|stroke| {
+                if !bool_value(stroke.properties.get(&rbx_dom_weak::ustr("Enabled")), true) { return None; }
+                let sizing_scale = if enum_value(stroke.properties.get(&rbx_dom_weak::ustr("StrokeSizingMode")), 0) == 1 { scale } else { 1.0 };
+                let thickness = number(stroke.properties.get(&rbx_dom_weak::ustr("Thickness")), 1.0).max(0.0) * sizing_scale;
+                let transparency = number(stroke.properties.get(&rbx_dom_weak::ustr("Transparency")), 0.0).clamp(0.0, 1.0);
+                if thickness <= 0.0 || transparency >= 1.0 { return None; }
+                let stroke_color = multiply_color(color(stroke.properties.get(&rbx_dom_weak::ustr("Color")),
+                    ((1.0-transparency)*255.0) as u8, [0,0,0]), modulation);
+                let contextual_text = enum_value(stroke.properties.get(&rbx_dom_weak::ustr("ApplyStrokeMode")), 0) == 0
+                    && matches!(instance.class.as_str(), "TextLabel" | "TextButton" | "TextBox");
+                if contextual_text {
+                    Some((None, Some((thickness, stroke_color))))
+                } else {
+                    let offset = udim_pixels(stroke.properties.get(&rbx_dom_weak::ustr("BorderOffset")),
+                        rect.width().min(rect.height()), scale);
+                    let position = match enum_value(stroke.properties.get(&rbx_dom_weak::ustr("BorderStrokePosition")), 0) {
+                        1 => egui::StrokeKind::Inside,
+                        2 => egui::StrokeKind::Outside,
+                        _ => egui::StrokeKind::Middle,
+                    };
+                    Some((Some((thickness, stroke_color, offset, position)), None))
+                }
+            }).unwrap_or((None, None));
         let (text_min_size, text_max_size) = child_of_class(dom, instance, "UITextSizeConstraint")
             .map(|constraint| (
                 number(constraint.properties.get(&rbx_dom_weak::ustr("MinTextSize")), 1.0).max(1.0) * scale,
@@ -535,6 +552,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             corner_radius,
             rotation: number(instance.properties.get(&rbx_dom_weak::ustr("Rotation")), 0.0),
             ui_stroke,
+            text_ui_stroke,
             gradient,
             text: match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() },
             text_color: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("TextColor3")), ((1.0-text_transparency)*255.0) as u8, [0,0,0]), modulation),
@@ -1443,16 +1461,21 @@ pub fn draw_starter_gui(
             if node.border_size > 0.0 {
                 painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(node.border_size, node.border), egui::StrokeKind::Inside);
             }
-            if let Some((thickness, color)) = node.ui_stroke {
-                painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(thickness, color), egui::StrokeKind::Middle);
+            if let Some((thickness, color, offset, position)) = node.ui_stroke {
+                painter.rect_stroke(node.rect.expand(offset), node.corner_radius + offset.max(0.0),
+                    Stroke::new(thickness, color), position);
             }
         } else {
             let radians = node.rotation.to_radians();
-            let mut corners: Vec<Pos2> = [node.rect.left_top(), node.rect.right_top(), node.rect.right_bottom(), node.rect.left_bottom()]
-                .into_iter().map(|point| rotate_point(point, node.rect.center(), radians)).collect();
-            corners.push(corners[0]);
-            if node.border_size > 0.0 { painter.line(corners.clone(), Stroke::new(node.border_size, node.border)); }
-            if let Some((thickness, color)) = node.ui_stroke { painter.line(corners, Stroke::new(thickness, color)); }
+            let outline = |rect: Rect| {
+                let mut corners: Vec<Pos2> = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()]
+                    .into_iter().map(|point| rotate_point(point, node.rect.center(), radians)).collect();
+                corners.push(corners[0]); corners
+            };
+            if node.border_size > 0.0 { painter.line(outline(node.rect), Stroke::new(node.border_size, node.border)); }
+            if let Some((thickness, color, offset, _)) = node.ui_stroke {
+                painter.line(outline(node.rect.expand(offset)), Stroke::new(thickness, color));
+            }
         }
         let displayed_image = if pressed {
             node.pressed_image.as_ref().or(node.hover_image.as_ref()).or(node.image.as_ref())
@@ -1524,6 +1547,13 @@ pub fn draw_starter_gui(
             if node.text_stroke.a() > 0 {
                 for offset in [Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, -1.0), Vec2::new(0.0, 1.0)] {
                     paint_galley(&painter, pos + offset, galley.clone(), node.text_stroke, true,
+                        node.rotation, node.rect.center());
+                }
+            }
+            if let Some((thickness, color)) = node.text_ui_stroke {
+                for direction in [Vec2::new(-1.0,0.0), Vec2::new(1.0,0.0), Vec2::new(0.0,-1.0), Vec2::new(0.0,1.0),
+                    Vec2::new(-0.707,-0.707), Vec2::new(0.707,-0.707), Vec2::new(-0.707,0.707), Vec2::new(0.707,0.707)] {
+                    paint_galley(&painter, pos + direction*thickness, galley.clone(), color, true,
                         node.rotation, node.rect.center());
                 }
             }
