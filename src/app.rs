@@ -1131,7 +1131,7 @@ impl EditorApp {
         // scene. Clicking a GUI object synchronizes selection with Explorer.
         let clicked_gui = if let Some(dom) = self.dom.as_ref() {
             crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures,
-                &mut self.gui_scroll_offsets, self.selected)
+                &mut self.gui_scroll_offsets, self.selected, orbit)
         } else {
             None
         };

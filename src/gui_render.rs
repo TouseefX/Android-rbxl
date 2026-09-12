@@ -937,8 +937,14 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
     }
 }
 
-/// Draw enabled ScreenGuis under StarterGui and return the topmost clicked
-/// Roblox referent, allowing the editor to synchronize viewport and Explorer.
+fn gather_class(dom: &WeakDom, referent: Ref, class: &str, output: &mut Vec<Ref>) {
+    let Some(instance) = dom.get_by_ref(referent) else { return; };
+    if instance.class == class { output.push(referent); }
+    for child in instance.children() { gather_class(dom, *child, class, output); }
+}
+
+/// Draw enabled ScreenGuis and world-projected BillboardGuis, returning the
+/// topmost clicked Roblox referent for Explorer synchronization.
 pub fn draw_starter_gui(
     ui: &mut egui::Ui,
     viewport: Rect,
@@ -946,15 +952,61 @@ pub fn draw_starter_gui(
     textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
     scroll_offsets: &mut std::collections::HashMap<Ref, Vec2>,
     selected: Option<Ref>,
+    orbit: &crate::bevy_render::OrbitCam,
 ) -> Option<Ref> {
-    let Some(starter) = dom.root().children().iter().find_map(|referent| {
+    let starter = dom.root().children().iter().find_map(|referent| {
         dom.get_by_ref(*referent).filter(|instance| instance.class == "StarterGui").map(|_| *referent)
-    }) else { return None; };
+    });
     let mut nodes = Vec::new();
     let mut sequence = 0;
     let mut overrides = std::collections::HashMap::new();
     let layout_painter = ui.painter().clone();
-    if let Some(starter) = dom.get_by_ref(starter) {
+
+    // BillboardGui uses the same 2D layout/render tree after projecting its
+    // Adornee (or parent Part) through the Bevy orbit camera.
+    let mut billboards = Vec::new();
+    gather_class(dom, dom.root_ref(), "BillboardGui", &mut billboards);
+    let aspect = viewport.width() / viewport.height().max(1.0);
+    for (billboard_order, referent) in billboards.into_iter().enumerate() {
+        let Some(billboard) = dom.get_by_ref(referent) else { continue; };
+        if matches!(billboard.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
+        let adornee = match billboard.properties.get(&rbx_dom_weak::ustr("Adornee")) {
+            Some(Variant::Ref(value)) if !value.is_none() => *value,
+            _ => billboard.parent(),
+        };
+        let Some(part) = dom.get_by_ref(adornee) else { continue; };
+        let Some(Variant::CFrame(cframe)) = part.properties.get(&rbx_dom_weak::ustr("CFrame")) else { continue; };
+        let mut point = [cframe.position.x, cframe.position.y, cframe.position.z];
+        for property in ["StudsOffset", "StudsOffsetWorldSpace", "ExtentsOffsetWorldSpace"] {
+            if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr(property)) {
+                point[0] += offset.x; point[1] += offset.y; point[2] += offset.z;
+            }
+        }
+        let Some(projected) = crate::bevy_render::project_world_point(orbit, point, aspect) else { continue; };
+        let max_distance = number(billboard.properties.get(&rbx_dom_weak::ustr("MaxDistance")), 0.0);
+        if max_distance > 0.0 && projected[2] > max_distance { continue; }
+        let pixels_per_stud = viewport.height() / (2.0 * (30.0_f32.to_radians().tan()) * projected[2].max(0.01));
+        let size = match billboard.properties.get(&rbx_dom_weak::ustr("Size")) {
+            Some(Variant::UDim2(value)) => Vec2::new(
+                value.x.scale*pixels_per_stud + value.x.offset as f32,
+                value.y.scale*pixels_per_stud + value.y.offset as f32,
+            ),
+            _ => Vec2::new(100.0, 100.0),
+        }.max(Vec2::ZERO);
+        if size.x <= 0.0 || size.y <= 0.0 { continue; }
+        let size_offset = vector2(billboard.properties.get(&rbx_dom_weak::ustr("SizeOffset")), Vec2::ZERO);
+        let center = Pos2::new(viewport.left()+projected[0]*viewport.width(), viewport.top()+projected[1]*viewport.height())
+            + Vec2::new(size_offset.x*size.x, -size_offset.y*size.y);
+        let billboard_rect = Rect::from_center_size(center, size);
+        let path = vec![(-1, billboard_order)];
+        for child in billboard.children() {
+            collect(dom, &layout_painter, *child, billboard_rect, viewport, -1_000_000,
+                true, 1.0, 1.0, Color32::WHITE, &path, None, &mut overrides,
+                scroll_offsets, &mut sequence, &mut nodes);
+        }
+    }
+
+    if let Some(starter) = starter.and_then(|referent| dom.get_by_ref(referent)) {
         for (screen_order, child) in starter.children().iter().enumerate() {
             let Some(gui) = dom.get_by_ref(*child) else { continue; };
             if gui.class != "ScreenGui" || matches!(gui.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }

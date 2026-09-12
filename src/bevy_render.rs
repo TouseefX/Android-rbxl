@@ -1815,6 +1815,25 @@ pub fn update_camera(mut q: Query<&mut Transform, With<RbxCamera>>, cam: Res<Orb
     }
 }
 
+/// Project a Roblox world point into normalized viewport coordinates. Returns
+/// `(x, y, camera_distance)` and rejects points behind the camera.
+pub fn project_world_point(cam: &OrbitCam, point_studs: [f32; 3], aspect: f32)
+    -> Option<[f32; 3]>
+{
+    let (eye, target) = orbit_eye_target(cam);
+    let point = BVec3::new(point_studs[0], point_studs[1], point_studs[2]) * STUD_TO_METER;
+    let forward = (target - eye).normalize_or_zero();
+    let right = forward.cross(BVec3::Y).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let relative = point - eye;
+    let depth = relative.dot(forward);
+    if depth <= 0.1 * STUD_TO_METER { return None; }
+    let tan_half_fov = (60.0_f32.to_radians() * 0.5).tan();
+    let ndc_x = relative.dot(right) / (depth * tan_half_fov * aspect.max(0.001));
+    let ndc_y = relative.dot(up) / (depth * tan_half_fov);
+    Some([(ndc_x + 1.0) * 0.5, (1.0 - ndc_y) * 0.5, depth / STUD_TO_METER])
+}
+
 /// Ray-cast a screen point against selectable part bounds. `screen` is in
 /// normalized viewport coordinates (0..1, top-left origin).
 pub fn pick_part(scene: &ViewportScene, cam: &OrbitCam, screen: [f32; 2], aspect: f32)
