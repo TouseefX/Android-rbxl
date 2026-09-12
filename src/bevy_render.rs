@@ -676,6 +676,29 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
         }
     }
 
+    // Legacy Roblox face surfaces. Studs and inlets are visible patterns and
+    // can be assigned independently to any of the six BasePart faces.
+    let mut surface_patterns: HashMap<&'static str, String> = HashMap::new();
+    for (face, property) in [
+        ("Top", "TopSurface"), ("Bottom", "BottomSurface"),
+        ("Front", "FrontSurface"), ("Back", "BackSurface"),
+        ("Left", "LeftSurface"), ("Right", "RightSurface"),
+    ] {
+        let pattern = match inst.properties.get(&rbx_dom_weak::ustr(property)) {
+            Some(Variant::Enum(value)) => match value.clone().to_u32() {
+                3 => Some("__studs"),
+                4 => Some("__inlets"),
+                _ => None,
+            },
+            Some(Variant::String(value)) if value == "Studs" => Some("__studs"),
+            Some(Variant::String(value)) if value == "Inlet" => Some("__inlets"),
+            _ => None,
+        };
+        if let Some(pattern) = pattern {
+            surface_patterns.insert(face, pattern.into());
+        }
+    }
+
     // Decals
     // Keep every overlay on a face. A HashMap<String> used previously meant
     // that the last Decal silently deleted all earlier decals/textures.
@@ -830,7 +853,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
         "Wedge" => build_wedge(&mut tris, &cf2, half),
         "CornerWedge" => build_corner_wedge(&mut tris, &cf2, half),
         "Truss" => build_truss(&mut tris, &cf2, half),
-        _ => build_block(&mut tris, &cf2, half, material_str.as_str(), &decals),
+        _ => build_block(&mut tris, &cf2, half, material_str.as_str(), &surface_patterns, &decals),
     }
 
     if tris.is_empty() {
@@ -923,7 +946,14 @@ struct FaceOverlay {
     color: [f32; 3],
 }
 
-fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, Vec<FaceOverlay>>) {
+fn build_block(
+    tris: &mut Vec<Tri>,
+    cf: &CFrame,
+    half: Vec3,
+    material: &str,
+    surface_patterns: &HashMap<&'static str, String>,
+    decals: &HashMap<&'static str, Vec<FaceOverlay>>,
+) {
     let h = half;
     let v = [
         Vec3::new(-h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, h.z), Vec3::new(-h.x, -h.y, h.z),
@@ -957,16 +987,19 @@ fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, dec
         // A decal is a second surface over the part, not a replacement for the
         // part face. Keeping the base face means transparent PNG pixels reveal
         // the underlying BrickColor/material exactly as they do in Studio.
-        let material_uv = if mat_tex.is_some() {
-            // Keep procedural material detail at a roughly Studio-like world
-            // scale instead of stretching one brick/grass sample over an
-            // entire baseplate or wall.
-            [[0.0, 0.0], [face_span.0 / 4.0, 0.0],
-             [face_span.0 / 4.0, face_span.1 / 4.0], [0.0, face_span.1 / 4.0]]
+        // A face SurfaceType takes visual priority over the broad material
+        // pattern, just like classic Roblox studs/inlets over Plastic/Wood.
+        let face_texture = surface_patterns.get(face).cloned().or_else(|| mat_tex.clone());
+        let tile_studs = if surface_patterns.contains_key(face) { 1.0 } else { 4.0 };
+        let material_uv = if face_texture.is_some() {
+            // Studs/inlets repeat once per stud; broader material patterns use
+            // a four-stud tile to avoid excessive high-frequency detail.
+            [[0.0, 0.0], [face_span.0 / tile_studs, 0.0],
+             [face_span.0 / tile_studs, face_span.1 / tile_studs], [0.0, face_span.1 / tile_studs]]
         } else {
             uv
         };
-        push_quad(tris, cf, points, n, material_uv, mat_tex.clone());
+        push_quad(tris, cf, points, n, material_uv, face_texture);
         if let Some(overlays) = decals.get(face) {
             for (layer, surface) in overlays.iter().enumerate() {
                 // Texture repeats according to studs-per-tile; Decal occupies
