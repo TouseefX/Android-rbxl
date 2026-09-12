@@ -400,6 +400,8 @@ struct Tri {
     /// Decal/Texture overlays must disappear while their image is unavailable;
     /// rendering their fallback material creates blank layered planes.
     hide_without_texture: bool,
+    /// Authored mesh vertex color (white for ordinary primitives).
+    vertex_color: [f32; 4],
 }
 
 #[derive(Clone)]
@@ -485,7 +487,7 @@ fn push_quad_surface(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3,
     let nrm = tn(cf, n);
     for (pos, uv) in [(a, uv[0]), (b, uv[1]), (c, uv[2]),
                       (a, uv[0]), (c, uv[2]), (d, uv[3])] {
-        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint, texture_mode: 0, color_override, hide_without_texture });
+        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint, texture_mode: 0, color_override, hide_without_texture, vertex_color: [1.0; 4] });
     }
 }
 
@@ -493,7 +495,7 @@ fn push_tri(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 3], n: Vec3, uv: [[f32; 
     let nrm = tn(cf, n);
     let tint = tex.as_deref().is_some_and(|key| key.starts_with("__"));
     for i in 0..3 {
-        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint, texture_mode: 0, color_override: None, hide_without_texture: false });
+        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint, texture_mode: 0, color_override: None, hide_without_texture: false, vertex_color: [1.0; 4] });
     }
 }
 
@@ -884,11 +886,15 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
                     let ua = md.uvs.get(f[0] as usize).copied().unwrap_or([0.0, 0.0]);
                     let ub = md.uvs.get(f[1] as usize).copied().unwrap_or([1.0, 0.0]);
                     let uc = md.uvs.get(f[2] as usize).copied().unwrap_or([0.0, 1.0]);
+                    let ca = md.colors.get(f[0] as usize).copied().unwrap_or([1.0; 4]);
+                    let cb = md.colors.get(f[1] as usize).copied().unwrap_or([1.0; 4]);
+                    let cc = md.colors.get(f[2] as usize).copied().unwrap_or([1.0; 4]);
                     let t = tex_key.clone();
-                    // Roblox mesh textures are modulated by MeshPart.Color.
-                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
-                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
-                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
+                    // Roblox mesh textures and vertex colors are both
+                    // modulated by MeshPart.Color.
+                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false, vertex_color: ca });
+                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false, vertex_color: cb });
+                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false, vertex_color: cc });
                 }
             }
             // CharacterMesh overlay textures and Shirt/Pants templates are a
@@ -1271,6 +1277,7 @@ fn build_truss(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
 struct MeshData {
     vertices: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
     uvs: Vec<[f32; 2]>,
     faces: Vec<[u32; 3]>,
     aabb_min: [f32; 3],
@@ -1356,6 +1363,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
         return Some(MeshData {
             vertices: cached.vertices,
             normals: cached.normals,
+            colors: cached.colors,
             uvs: cached.uvs,
             faces: cached.faces,
             aabb_min: cached.aabb_min,
@@ -1411,6 +1419,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
 
     let mut vertices = Vec::with_capacity(vertex_count);
     let mut normals = Vec::with_capacity(vertex_count);
+    let mut colors = Vec::with_capacity(vertex_count);
     let mut uvs = Vec::with_capacity(vertex_count);
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
@@ -1436,6 +1445,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
         max[2] = max[2].max(pz);
         vertices.push([px, py, pz]);
         normals.push([nx, ny, nz]);
+        colors.push([1.0; 4]);
         uvs.push([u, 1.0 - v]);
     }
     cursor += vertex_count * VERTEX_STRIDE;
@@ -1476,7 +1486,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     if faces.is_empty() {
         return None;
     }
-    Some(MeshData { vertices, normals, uvs, faces, aabb_min: min, aabb_max: max })
+    Some(MeshData { vertices, normals, colors, uvs, faces, aabb_min: min, aabb_max: max })
 }
 
 // ----------------------------------------------------------------------------
@@ -1701,6 +1711,7 @@ pub fn rebuild_scene(
         };
         let mut positions = Vec::new();
         let mut normals = Vec::new();
+        let mut colors = Vec::new();
         let mut uvs = Vec::new();
         let mut indices = Vec::with_capacity(tris.len());
         for (idx, t) in tris.iter().enumerate() {
@@ -1710,6 +1721,7 @@ pub fn rebuild_scene(
                 t.pos[2] - center[2],
             ]);
             normals.push(t.normal);
+            colors.push(t.vertex_color);
             uvs.push(t.uv);
             indices.push(idx as u32);
         }
@@ -1723,6 +1735,7 @@ pub fn rebuild_scene(
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
         mesh.insert_indices(Indices::U32(indices));
         let mh = meshes.add(mesh);

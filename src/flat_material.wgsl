@@ -56,6 +56,14 @@ fn fragment(
         }
     }
 
+    // Modern Roblox meshes can author color directly per vertex without any
+    // texture. Bevy exposes ATTRIBUTE_COLOR through the default mesh vertex
+    // stage when VERTEX_COLORS is specialized for this mesh.
+#ifdef VERTEX_COLORS
+    out_rgb = out_rgb * mesh.color.rgb;
+    out_alpha = out_alpha * mesh.color.a;
+#endif
+
     // Deliberately unlit. This is the viewport's mobile-safe "Flat" mode:
     // Color3 and texture pixels reach the framebuffer without directional
     // lighting darkening them by as much as 45%. That lighting multiplication

@@ -22,6 +22,7 @@ pub struct MeshData {
     pub face_count: usize,
     pub vertices: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
+    pub colors: Vec<[f32; 4]>,
     pub uvs: Vec<[f32; 2]>,
     pub faces: Vec<[u32; 3]>,
     pub aabb_min: [f32; 3],
@@ -738,6 +739,7 @@ fn parse_modern_mesh(bytes: &[u8]) -> Option<MeshData> {
     let mut max = [f32::NEG_INFINITY; 3];
     let mut vertices = Vec::with_capacity(source_vertices.len());
     let mut normals = Vec::with_capacity(source_vertices.len());
+    let mut colors = Vec::with_capacity(source_vertices.len());
     let mut uvs = Vec::with_capacity(source_vertices.len());
     for vertex in source_vertices {
         if !vertex.pos.iter().chain(vertex.norm.iter()).all(|value| value.is_finite()) {
@@ -749,6 +751,7 @@ fn parse_modern_mesh(bytes: &[u8]) -> Option<MeshData> {
         }
         vertices.push(vertex.pos);
         normals.push(vertex.norm);
+        colors.push(vertex.color.map(|channel| channel as f32 / 255.0));
         uvs.push([vertex.tex[0], 1.0 - vertex.tex[1]]);
     }
 
@@ -771,6 +774,7 @@ fn parse_modern_mesh(bytes: &[u8]) -> Option<MeshData> {
         face_count: faces.len(),
         vertices,
         normals,
+        colors,
         uvs,
         faces,
         aabb_min: min,
@@ -789,6 +793,7 @@ fn parse_ascii_mesh(bytes: &[u8]) -> Option<MeshData> {
 
     let mut vertices = Vec::new();
     let mut normals = Vec::new();
+    let mut colors = Vec::new();
     let mut uvs = Vec::new();
     let mut faces = Vec::new();
 
@@ -824,6 +829,7 @@ fn parse_ascii_mesh(bytes: &[u8]) -> Option<MeshData> {
 
                 vertices.push([px, py, pz]);
                 normals.push([nums[off + 3], nums[off + 4], nums[off + 5]]);
+                colors.push([1.0; 4]);
                 uvs.push([nums[off + 6], 1.0 - nums[off + 7]]);
             }
             faces.push([vert_idx, vert_idx + 1, vert_idx + 2]);
@@ -837,6 +843,7 @@ fn parse_ascii_mesh(bytes: &[u8]) -> Option<MeshData> {
         face_count: faces.len().max(num_faces),
         vertices,
         normals,
+        colors,
         uvs,
         faces,
         aabb_min: min,
@@ -877,6 +884,7 @@ fn parse_binary_mesh_v2_v3(bytes: &[u8]) -> Option<MeshData> {
 
     let mut vertices = Vec::with_capacity(num_verts);
     let mut normals = Vec::with_capacity(num_verts);
+    let mut colors = Vec::with_capacity(num_verts);
     let mut uvs = Vec::with_capacity(num_verts);
 
     let mut min = [f32::INFINITY, f32::INFINITY, f32::INFINITY];
@@ -908,6 +916,10 @@ fn parse_binary_mesh_v2_v3(bytes: &[u8]) -> Option<MeshData> {
 
         vertices.push([px, py, pz]);
         normals.push([nx, ny, nz]);
+        colors.push(if sizeof_vertex >= 40 {
+            [bytes[cursor + 36] as f32 / 255.0, bytes[cursor + 37] as f32 / 255.0,
+             bytes[cursor + 38] as f32 / 255.0, bytes[cursor + 39] as f32 / 255.0]
+        } else { [1.0; 4] });
         uvs.push([u, 1.0 - v]);
 
         cursor += sizeof_vertex;
@@ -938,6 +950,7 @@ fn parse_binary_mesh_v2_v3(bytes: &[u8]) -> Option<MeshData> {
         face_count: faces.len(),
         vertices,
         normals,
+        colors,
         uvs,
         faces,
         aabb_min: min,
