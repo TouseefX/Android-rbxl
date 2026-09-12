@@ -181,7 +181,28 @@ fn gui_rect(
             required.x = required.x.max((child_rect.right() - provisional_content.left()).max(0.0));
             required.y = required.y.max((child_rect.bottom() - provisional_content.top()).max(0.0));
         }
-        if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
+        if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
+            let (cxs, cxo, cys, cyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellSize")))
+                .unwrap_or((0.0, 100.0, 0.0, 100.0));
+            let (pxs, pxo, pys, pyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellPadding")))
+                .unwrap_or((0.0, 5.0, 0.0, 5.0));
+            let cell = Vec2::new(provisional_content.width()*cxs+cxo*scale, provisional_content.height()*cys+cyo*scale).max(Vec2::ZERO);
+            let gap = Vec2::new(provisional_content.width()*pxs+pxo*scale, provisional_content.height()*pys+pyo*scale).max(Vec2::ZERO);
+            let count = instance.children().iter().filter(|child| dom.get_by_ref(**child)
+                .map(|child| is_gui_object(&child.class) && visible(child)).unwrap_or(false)).count();
+            let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 0) == 0;
+            let maximum = number(layout.properties.get(&rbx_dom_weak::ustr("FillDirectionMaxCells")), 0.0).max(0.0) as usize;
+            let fit_columns = ((provisional_content.width()+gap.x)/(cell.x+gap.x).max(1.0)).floor().max(1.0) as usize;
+            let fit_rows = ((provisional_content.height()+gap.y)/(cell.y+gap.y).max(1.0)).floor().max(1.0) as usize;
+            let vertical_capacity = if maximum > 0 { maximum } else { fit_rows }.max(1);
+            let columns = if horizontal { if maximum > 0 { maximum } else { fit_columns } }
+                else { ((count + vertical_capacity - 1) / vertical_capacity).max(1) };
+            let rows = if horizontal { ((count + columns - 1) / columns).max(1) } else { vertical_capacity };
+            required = Vec2::new(
+                cell.x*columns.min(count.max(1)) as f32 + gap.x*columns.min(count.max(1)).saturating_sub(1) as f32,
+                cell.y*rows.min(count.max(1)) as f32 + gap.y*rows.min(count.max(1)).saturating_sub(1) as f32,
+            );
+        } else if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
             let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 1) == 0;
             let gap = udim_pixels(layout.properties.get(&rbx_dom_weak::ustr("Padding")),
                 if horizontal { provisional_content.width() } else { provisional_content.height() }, scale);
@@ -443,7 +464,68 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     } else {
         content_rect
     };
-    if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
+    if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
+        let (cxs, cxo, cys, cyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellSize")))
+            .unwrap_or((0.0, 100.0, 0.0, 100.0));
+        let (pxs, pxo, pys, pyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellPadding")))
+            .unwrap_or((0.0, 5.0, 0.0, 5.0));
+        let cell = Vec2::new(
+            (child_parent_rect.width() * cxs + cxo * scale).max(0.0),
+            (child_parent_rect.height() * cys + cyo * scale).max(0.0),
+        );
+        let gap = Vec2::new(
+            (child_parent_rect.width() * pxs + pxo * scale).max(0.0),
+            (child_parent_rect.height() * pys + pyo * scale).max(0.0),
+        );
+        let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 0) == 0;
+        let maximum = number(layout.properties.get(&rbx_dom_weak::ustr("FillDirectionMaxCells")), 0.0).max(0.0) as usize;
+        let start_corner = enum_value(layout.properties.get(&rbx_dom_weak::ustr("StartCorner")), 0);
+        let horizontal_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("HorizontalAlignment")), 0);
+        let vertical_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("VerticalAlignment")), 0);
+        let sort_order = enum_value(layout.properties.get(&rbx_dom_weak::ustr("SortOrder")), 0);
+        let mut children: Vec<(usize, Ref, i32, String)> = instance.children().iter().enumerate()
+            .filter_map(|(index, referent)| {
+                let child = dom.get_by_ref(*referent)?;
+                if !is_gui_object(&child.class) || !visible(child) { return None; }
+                let order = match child.properties.get(&rbx_dom_weak::ustr("LayoutOrder")) {
+                    Some(Variant::Int32(value)) => *value,
+                    Some(Variant::Int64(value)) => *value as i32,
+                    _ => 0,
+                };
+                Some((index, *referent, order, child.name.to_string()))
+            }).collect();
+        children.sort_by(|left, right| {
+            if sort_order == 1 { left.2.cmp(&right.2).then(left.0.cmp(&right.0)) }
+            else { left.3.cmp(&right.3).then(left.0.cmp(&right.0)) }
+        });
+        let fit_columns = ((child_parent_rect.width() + gap.x) / (cell.x + gap.x).max(1.0)).floor().max(1.0) as usize;
+        let fit_rows = ((child_parent_rect.height() + gap.y) / (cell.y + gap.y).max(1.0)).floor().max(1.0) as usize;
+        let count = children.len();
+        let vertical_capacity = if maximum > 0 { maximum } else { fit_rows }.max(1);
+        let columns = if horizontal { if maximum > 0 { maximum } else { fit_columns } }
+            else { ((count + vertical_capacity - 1) / vertical_capacity).max(1) };
+        let rows = if horizontal { ((count + columns - 1) / columns).max(1) }
+            else { vertical_capacity };
+        let effective_columns = columns.min(count.max(1));
+        let effective_rows = rows.min(count.max(1));
+        let occupied = Vec2::new(
+            cell.x * effective_columns as f32 + gap.x * effective_columns.saturating_sub(1) as f32,
+            cell.y * effective_rows as f32 + gap.y * effective_rows.saturating_sub(1) as f32,
+        );
+        let origin = child_parent_rect.min + Vec2::new(
+            match horizontal_alignment { 1 => (child_parent_rect.width()-occupied.x)*0.5, 2 => child_parent_rect.width()-occupied.x, _ => 0.0 }.max(0.0),
+            match vertical_alignment { 1 => (child_parent_rect.height()-occupied.y)*0.5, 2 => child_parent_rect.height()-occupied.y, _ => 0.0 }.max(0.0),
+        );
+        for (slot, (_, child, _, _)) in children.into_iter().enumerate() {
+            let (mut column, mut row) = if horizontal { (slot % effective_columns, slot / effective_columns) }
+                else { (slot / effective_rows, slot % effective_rows) };
+            if start_corner == 1 || start_corner == 3 { column = effective_columns.saturating_sub(1).saturating_sub(column); }
+            if start_corner == 2 || start_corner == 3 { row = effective_rows.saturating_sub(1).saturating_sub(row); }
+            let min = origin + Vec2::new(column as f32 * (cell.x + gap.x), row as f32 * (cell.y + gap.y));
+            collect(dom, painter, child, child_parent_rect, child_clip, display_order,
+                global_z, scale, &sort_path, Some(Rect::from_min_size(min, cell)), sequence, nodes);
+        }
+    } else if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
         let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 1) == 0;
         let horizontal_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("HorizontalAlignment")), 0);
         let vertical_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("VerticalAlignment")), 0);
