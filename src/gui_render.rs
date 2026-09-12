@@ -49,6 +49,7 @@ struct GuiNode {
     pressed_image: Option<String>,
     image_color: Color32,
     auto_button_color: bool,
+    interactable: bool,
     image_rect_offset: Vec2,
     image_rect_size: Vec2,
     image_scale_type: i32,
@@ -60,6 +61,7 @@ struct GuiNode {
     scroll_bar_thickness: f32,
     scroll_bar_color: Color32,
     scrolling_direction: i32,
+    scrolling_enabled: bool,
 }
 
 fn number(value: Option<&Variant>, fallback: f32) -> f32 {
@@ -610,6 +612,8 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 [255,255,255],
             ), modulation),
             auto_button_color: bool_value(instance.properties.get(&rbx_dom_weak::ustr("AutoButtonColor")), true),
+            interactable: bool_value(instance.properties.get(&rbx_dom_weak::ustr("Active")), true)
+                && bool_value(instance.properties.get(&rbx_dom_weak::ustr("Interactable")), true),
             image_rect_offset: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectOffset")), Vec2::ZERO),
             image_rect_size: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectSize")), Vec2::ZERO),
             image_scale_type: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScaleType")), 0),
@@ -625,6 +629,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             scroll_bar_color: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarImageColor3")),
                 ((1.0-scroll_bar_transparency)*255.0) as u8, [255,255,255]), modulation),
             scrolling_direction: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScrollingDirection")), 4),
+            scrolling_enabled: bool_value(instance.properties.get(&rbx_dom_weak::ustr("ScrollingEnabled")), true),
         });
     }
     let child_parent_rect = if instance.class == "ScrollingFrame" {
@@ -1464,7 +1469,7 @@ pub fn draw_starter_gui(
     });
     let mut clicked = None;
     // rect, color, owner, horizontal, canvas maximum, thumb travel
-    let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32)> = Vec::new();
+    let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool)> = Vec::new();
     for node in nodes {
         if node.clip.width() <= 0.0 || node.clip.height() <= 0.0 { continue; }
         let hit_rect = rotated_bounds(node.rect, node.rotation).intersect(node.clip);
@@ -1478,7 +1483,7 @@ pub fn draw_starter_gui(
             let allow_y = node.scrolling_direction != 1;
             let raw_maximum = (node.canvas_size - node.content_rect.size()).max(Vec2::ZERO);
             let maximum = Vec2::new(if allow_x { raw_maximum.x } else { 0.0 }, if allow_y { raw_maximum.y } else { 0.0 });
-            if response.hovered() && pointer_inside && (maximum.x > 0.0 || maximum.y > 0.0) {
+            if node.scrolling_enabled && response.hovered() && pointer_inside && (maximum.x > 0.0 || maximum.y > 0.0) {
                 let delta = ui.input(|input| input.smooth_scroll_delta);
                 if delta != Vec2::ZERO {
                     let entry = scroll_offsets.entry(node.referent).or_insert(Vec2::ZERO);
@@ -1503,7 +1508,7 @@ pub fn draw_starter_gui(
                 let travel = (track.height()-thumb_height).max(0.0);
                 let top = track.top() + travel * effective.y/maximum.y.max(1.0);
                 scroll_bars.push((Rect::from_min_size(Pos2::new(track.left(), top), Vec2::new(thickness, thumb_height)),
-                    node.scroll_bar_color, node.referent, false, maximum.y, travel, node.canvas_position.y));
+                    node.scroll_bar_color, node.referent, false, maximum.y, travel, node.canvas_position.y, node.scrolling_enabled));
             }
             if thickness > 0.0 && maximum.x > 0.0 {
                 let track_right = node.rect.right() - if maximum.y > 0.0 { thickness } else { 0.0 };
@@ -1512,13 +1517,13 @@ pub fn draw_starter_gui(
                 let travel = (track.width()-thumb_width).max(0.0);
                 let left = track.left() + travel * effective.x/maximum.x.max(1.0);
                 scroll_bars.push((Rect::from_min_size(Pos2::new(left, track.top()), Vec2::new(thumb_width, thickness)),
-                    node.scroll_bar_color, node.referent, true, maximum.x, travel, node.canvas_position.x));
+                    node.scroll_bar_color, node.referent, true, maximum.x, travel, node.canvas_position.x, node.scrolling_enabled));
             }
         }
         let painter = ui.painter().with_clip_rect(node.clip);
         let is_button = matches!(node.class.as_str(), "TextButton" | "ImageButton");
-        let pressed = is_button && response.is_pointer_button_down_on();
-        let hovered = is_button && response.hovered() && pointer_inside;
+        let pressed = is_button && node.interactable && response.is_pointer_button_down_on();
+        let hovered = is_button && node.interactable && response.hovered() && pointer_inside;
         let button_factor = if node.auto_button_color && pressed { 0.72 }
             else if node.auto_button_color && hovered { 0.88 } else { 1.0 };
         if node.rotation.abs() < 0.001 {
@@ -1657,8 +1662,9 @@ pub fn draw_starter_gui(
         if response.clicked() && pointer_inside { clicked = Some(node.referent); }
     }
     let overlay_painter = ui.painter().with_clip_rect(viewport);
-    for (rect, color, owner, horizontal, maximum, travel, authored) in scroll_bars {
-        let response = ui.interact(rect, ui.make_persistent_id(("scroll_thumb", format!("{:?}", owner), horizontal)), egui::Sense::drag());
+    for (rect, color, owner, horizontal, maximum, travel, authored, enabled) in scroll_bars {
+        let sense = if enabled { egui::Sense::drag() } else { egui::Sense::hover() };
+        let response = ui.interact(rect, ui.make_persistent_id(("scroll_thumb", format!("{:?}", owner), horizontal)), sense);
         let shown_color = if response.dragged() { shade_color(color, 0.72) }
             else if response.hovered() { shade_color(color, 0.88) } else { color };
         overlay_painter.rect_filled(rect, 2.0, shown_color);
