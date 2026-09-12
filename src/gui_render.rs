@@ -24,6 +24,8 @@ struct GuiNode {
     text_y_alignment: i32,
     text_wrapped: bool,
     text_scaled: bool,
+    text_min_size: f32,
+    text_max_size: f32,
     text_stroke: Color32,
     image: Option<String>,
     image_color: Color32,
@@ -86,7 +88,13 @@ fn vector2(value: Option<&Variant>, fallback: Vec2) -> Vec2 {
 /// Resolve Roblox's absolute GuiObject rectangle, including inherited UIScale,
 /// UISizeConstraint and UIAspectRatioConstraint. Constraints are children of
 /// the object they affect, unlike CSS constraints.
-fn gui_rect(dom: &WeakDom, instance: &rbx_dom_weak::Instance, parent: Rect, scale: f32) -> Rect {
+fn gui_rect(
+    dom: &WeakDom,
+    painter: &egui::Painter,
+    instance: &rbx_dom_weak::Instance,
+    parent: Rect,
+    scale: f32,
+) -> Rect {
     let position = match instance.properties.get(&rbx_dom_weak::ustr("Position")) {
         Some(Variant::UDim2(v)) => Vec2::new(
             parent.width() * v.x.scale + v.x.offset as f32 * scale,
@@ -99,6 +107,24 @@ fn gui_rect(dom: &WeakDom, instance: &rbx_dom_weak::Instance, parent: Rect, scal
             parent.height() * v.y.scale + v.y.offset as f32 * scale),
         _ => Vec2::new(100.0 * scale, 100.0 * scale),
     }.max(Vec2::ZERO);
+
+    // AutomaticSize uses authored Size as a minimum. Text is measured with the
+    // same egui font engine used for painting so layout and display agree.
+    let automatic = enum_value(instance.properties.get(&rbx_dom_weak::ustr("AutomaticSize")), 0);
+    if automatic != 0 && matches!(instance.class.as_str(), "TextLabel" | "TextButton" | "TextBox") {
+        let text = match instance.properties.get(&rbx_dom_weak::ustr("Text")) {
+            Some(Variant::String(text)) => text.clone(),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            let font_size = number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0).max(1.0) * scale;
+            let wrapped = bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false);
+            let wrap_width = if wrapped && size.x > 0.0 { size.x } else { f32::INFINITY };
+            let galley = painter.layout(text, FontId::proportional(font_size), Color32::WHITE, wrap_width);
+            if automatic == 1 || automatic == 3 { size.x = size.x.max(galley.size().x); }
+            if automatic == 2 || automatic == 3 { size.y = size.y.max(galley.size().y); }
+        }
+    }
 
     if let Some(constraint) = child_of_class(dom, instance, "UISizeConstraint") {
         let min = vector2(constraint.properties.get(&rbx_dom_weak::ustr("MinSize")), Vec2::ZERO) * scale;
@@ -141,9 +167,10 @@ fn child_of_class<'a>(dom: &'a WeakDom, instance: &rbx_dom_weak::Instance, class
     })
 }
 
-fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
-           inherited_z: i32, display_order: i32, inherited_scale: f32,
-           sequence: &mut usize, nodes: &mut Vec<GuiNode>) {
+fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
+           parent_rect: Rect, parent_clip: Rect, inherited_z: i32,
+           display_order: i32, inherited_scale: f32, sequence: &mut usize,
+           nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
     let local_scale = child_of_class(dom, instance, "UIScale")
@@ -151,7 +178,7 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
         .unwrap_or(1.0);
     let scale = inherited_scale * local_scale;
     let is_screen = instance.class == "ScreenGui";
-    let rect = if is_screen { parent_rect } else { gui_rect(dom, instance, parent_rect, scale) };
+    let rect = if is_screen { parent_rect } else { gui_rect(dom, painter, instance, parent_rect, scale) };
     let clips = matches!(instance.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), Some(Variant::Bool(true)));
     let child_clip = if clips { parent_clip.intersect(rect) } else { parent_clip };
     let z = inherited_z + match instance.properties.get(&rbx_dom_weak::ustr("ZIndex")) {
@@ -177,6 +204,13 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
                 ((1.0 - transparency) * 255.0) as u8, [0, 0, 0],
             )))
         });
+        let (text_min_size, text_max_size) = child_of_class(dom, instance, "UITextSizeConstraint")
+            .map(|constraint| (
+                number(constraint.properties.get(&rbx_dom_weak::ustr("MinTextSize")), 1.0).max(1.0) * scale,
+                number(constraint.properties.get(&rbx_dom_weak::ustr("MaxTextSize")), 100.0).max(1.0) * scale,
+            ))
+            .map(|(min, max)| (min.min(max), max.max(min)))
+            .unwrap_or((1.0, 400.0));
         let order = *sequence;
         *sequence += 1;
         nodes.push(GuiNode {
@@ -198,6 +232,8 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
             text_y_alignment: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextYAlignment")), 1),
             text_wrapped: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false),
             text_scaled: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextScaled")), false),
+            text_min_size,
+            text_max_size,
             text_stroke: color(
                 instance.properties.get(&rbx_dom_weak::ustr("TextStrokeColor3")),
                 ((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("TextStrokeTransparency")), 1.0).clamp(0.0,1.0))*255.0) as u8,
@@ -223,7 +259,7 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
         )
     } else { rect };
     for child in instance.children() {
-        collect(dom, *child, content_rect, child_clip, z, display_order, scale, sequence, nodes);
+        collect(dom, painter, *child, content_rect, child_clip, z, display_order, scale, sequence, nodes);
     }
 }
 
@@ -241,12 +277,13 @@ pub fn draw_starter_gui(
     }) else { return None; };
     let mut nodes = Vec::new();
     let mut sequence = 0;
+    let layout_painter = ui.painter().clone();
     if let Some(starter) = dom.get_by_ref(starter) {
         for child in starter.children() {
             let Some(gui) = dom.get_by_ref(*child) else { continue; };
             if gui.class != "ScreenGui" || matches!(gui.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
             let display_order = enum_value(gui.properties.get(&rbx_dom_weak::ustr("DisplayOrder")), 0);
-            collect(dom, *child, viewport, viewport, 0, display_order, 1.0, &mut sequence, &mut nodes);
+            collect(dom, &layout_painter, *child, viewport, viewport, 0, display_order, 1.0, &mut sequence, &mut nodes);
         }
     }
     nodes.sort_by_key(|node| (node.z, node.order));
@@ -285,11 +322,12 @@ pub fn draw_starter_gui(
         if !node.text.is_empty() {
             let wrap_width = if node.text_wrapped { node.rect.width() } else { f32::INFINITY };
             let mut font_size = if node.text_scaled { node.rect.height().max(1.0) } else { node.text_size };
+            font_size = font_size.clamp(node.text_min_size, node.text_max_size);
             let mut galley = painter.layout(node.text.clone(), FontId::proportional(font_size), node.text_color, wrap_width);
             if node.text_scaled && (galley.size().x > node.rect.width() || galley.size().y > node.rect.height()) {
                 let scale = (node.rect.width() / galley.size().x.max(1.0))
                     .min(node.rect.height() / galley.size().y.max(1.0));
-                font_size = (font_size * scale).max(1.0);
+                font_size = (font_size * scale).clamp(node.text_min_size, node.text_max_size);
                 galley = painter.layout(node.text.clone(), FontId::proportional(font_size), node.text_color, wrap_width);
             }
             let x = match node.text_x_alignment {
