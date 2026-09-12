@@ -196,6 +196,8 @@ pub struct EditorApp {
     editor_word_wrap: bool,
     editor_focus_mode: bool,
     show_stats: bool,
+    /// GPU textures retained by the StarterGui preview.
+    gui_textures: HashMap<String, egui::TextureHandle>,
     rename_buffer: String,
     project_name: String,
     show_quick_open: bool,
@@ -370,6 +372,7 @@ impl Default for EditorApp {
             editor_word_wrap: saved_settings.editor_word_wrap,
             editor_focus_mode: false,
             show_stats: false,
+            gui_textures: HashMap::new(),
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
             show_quick_open: false,
@@ -475,6 +478,7 @@ impl EditorApp {
             Ok(dom) => {
                 self.dom = Some(dom);
                 self.selected = None;
+                self.gui_textures.clear();
                 self.needs_3d_rebuild = true;
                 self.status = format!("Loaded ({})", self.place_format.label());
                 // New document → fresh undo history.
@@ -1118,6 +1122,18 @@ impl EditorApp {
         }
         // Subtle border so the user can see the drag area.
         ui.painter().rect_stroke(rect, 0.0_f32, egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(120, 180, 255, 90)), egui::StrokeKind::Inside);
+
+        // StarterGui is previewed as a real screen-space hierarchy over the 3D
+        // scene. Clicking a GUI object synchronizes selection with Explorer.
+        let clicked_gui = if let Some(dom) = self.dom.as_ref() {
+            crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures)
+        } else {
+            None
+        };
+        if let Some(clicked) = clicked_gui {
+            self.selected = Some(clicked);
+            self.status = "Selected GUI object from viewport".into();
+        }
 
         if self.dom.is_none() {
             ui.centered_and_justified(|ui| {

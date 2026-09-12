@@ -976,7 +976,8 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
                     | "ColorMap" | "ColorMapContent" | "BaseTextureId"
                     | "BaseTextureContent" | "OverlayTextureId"
                     | "OverlayTextureContent" | "ShirtTemplate"
-                    | "PantsTemplate" | "Graphic" => Some("Texture"),
+                    | "PantsTemplate" | "Graphic" | "Image" | "ImageContent"
+                    | "HoverImage" | "PressedImage" => Some("Texture"),
                     "SoundId" | "SoundID" => Some("Sound"),
                     "AnimationId" => Some("Animation"),
                     _ => None,

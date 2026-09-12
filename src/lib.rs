@@ -24,6 +24,7 @@ mod asset_downloader;
 mod audio;
 mod bevy_render;
 mod explorer;
+mod gui_render;
 mod jni_bridge;
 mod lua_syntax;
 mod luau_intelligence;
