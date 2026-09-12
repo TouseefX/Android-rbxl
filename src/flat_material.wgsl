@@ -20,7 +20,9 @@ fn fragment(
     var out_alpha = material_color.a;
 
     if (has_texture == 1u) {
-        var tex_col = textureSample(tex, tex_sampler, mesh.uv);
+        // Roblox Texture and mesh UVs wrap outside 0..1. `fract` provides
+        // repeat sampling even when a mobile backend creates a clamp sampler.
+        var tex_col = textureSample(tex, tex_sampler, fract(mesh.uv));
         // Procedural material patterns (studs/brick/grass/etc., generated in
         // asset_downloader.rs) are deliberately greyscale/neutral and MEANT
         // to be multiplied by the part's BrickColor — that's how a red brick

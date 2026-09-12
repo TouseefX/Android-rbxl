@@ -590,7 +590,9 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     }
 
     // Decals
-    let mut decals: HashMap<&'static str, (String, f32)> = HashMap::new();
+    // Face overlay: asset URI, opacity, and optional Texture tile size in studs.
+    // `None` is a Decal (one image stretched across the face).
+    let mut decals: HashMap<&'static str, (String, f32, Option<(f32, f32)>)> = HashMap::new();
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
         if ch.class == "Decal" || ch.class == "Texture" {
@@ -617,7 +619,18 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
                 };
                 let opacity = (1.0 - transparency).clamp(0.0, 1.0);
                 if opacity > 0.001 {
-                    decals.insert(face, (t, opacity));
+                    let tile = if ch.class == "Texture" {
+                        let number = |name: &str, fallback: f32| match ch.properties.get(&rbx_dom_weak::ustr(name)) {
+                            Some(Variant::Float32(value)) => *value,
+                            Some(Variant::Float64(value)) => *value as f32,
+                            _ => fallback,
+                        };
+                        Some((number("StudsPerTileU", 2.0).max(0.01),
+                              number("StudsPerTileV", 2.0).max(0.01)))
+                    } else {
+                        None
+                    };
+                    decals.insert(face, (t, opacity, tile));
                 }
             }
         }
@@ -788,7 +801,7 @@ fn normal_id_name(value: u32) -> &'static str {
 
 // --- primitive builders (same shapes as the Android app / OpenRBLX) ---
 
-fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, (String, f32)>) {
+fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, (String, f32, Option<(f32, f32)>)>) {
     let h = half;
     let v = [
         Vec3::new(-h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, h.z), Vec3::new(-h.x, -h.y, h.z),
@@ -801,59 +814,90 @@ fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, dec
         "Grass" => Some("__grass".into()),
         _ => None,
     };
-    let faces: [(&str, [usize; 4], Vec3, bool); 6] = [
-        ("Top", [4, 5, 6, 7], Vec3::new(0.0, 1.0, 0.0), true),
-        ("Bottom", [0, 3, 2, 1], Vec3::new(0.0, -1.0, 0.0), false),
-        ("Front", [3, 2, 6, 7], Vec3::new(0.0, 0.0, 1.0), false),
-        ("Back", [1, 0, 4, 5], Vec3::new(0.0, 0.0, -1.0), false),
-        ("Right", [2, 1, 5, 6], Vec3::new(1.0, 0.0, 0.0), false),
-        ("Left", [0, 3, 7, 4], Vec3::new(-1.0, 0.0, 0.0), false),
+    // Last pair is the physical U/V span of the face in studs, used by
+    // Texture. Decal ignores it and always covers the face once.
+    let faces: [(&str, [usize; 4], Vec3, (f32, f32)); 6] = [
+        ("Top", [4, 5, 6, 7], Vec3::new(0.0, 1.0, 0.0), (h.x * 2.0, h.z * 2.0)),
+        ("Bottom", [0, 3, 2, 1], Vec3::new(0.0, -1.0, 0.0), (h.x * 2.0, h.z * 2.0)),
+        ("Front", [3, 2, 6, 7], Vec3::new(0.0, 0.0, 1.0), (h.x * 2.0, h.y * 2.0)),
+        ("Back", [1, 0, 4, 5], Vec3::new(0.0, 0.0, -1.0), (h.x * 2.0, h.y * 2.0)),
+        ("Right", [2, 1, 5, 6], Vec3::new(1.0, 0.0, 0.0), (h.z * 2.0, h.y * 2.0)),
+        ("Left", [0, 3, 7, 4], Vec3::new(-1.0, 0.0, 0.0), (h.z * 2.0, h.y * 2.0)),
     ];
-    for (face, idx, n, _is_top) in faces {
+    for (face, idx, n, face_span) in faces {
         let points = [v[idx[0]], v[idx[1]], v[idx[2]], v[idx[3]]];
         let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         // A decal is a second surface over the part, not a replacement for the
         // part face. Keeping the base face means transparent PNG pixels reveal
         // the underlying BrickColor/material exactly as they do in Studio.
         push_quad(tris, cf, points, n, uv, mat_tex.clone());
-        if let Some((texture, opacity)) = decals.get(face) {
+        if let Some((texture, opacity, tile)) = decals.get(face) {
+            // Texture repeats according to studs-per-tile; Decal occupies the
+            // face once. The image sampler uses repeat addressing below.
+            let overlay_uv = tile.map(|(u, v)| [
+                [0.0, 0.0], [face_span.0 / u, 0.0],
+                [face_span.0 / u, face_span.1 / v], [0.0, face_span.1 / v],
+            ]).unwrap_or(uv);
             // Offset the overlay a fraction of a stud to avoid coplanar
             // z-fighting without relying on driver-specific polygon offsets.
             let offset = n.mul(0.0015);
             let overlay = points.map(|point| point.add(&offset));
-            push_quad_surface(tris, cf, overlay, n, uv, Some(texture.clone()), *opacity, false);
+            push_quad_surface(tris, cf, overlay, n, overlay_uv, Some(texture.clone()), *opacity, false);
         }
     }
 }
 
 fn build_ball(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
-    let lats = 8;
-    let lons = 12;
-    let r = half.x.min(half.y).min(half.z);
+    // Roblox Ball parts fill Size on every axis: a non-uniform Size is an
+    // ellipsoid, not a sphere using the smallest dimension. Use enough rings
+    // to remain round on tablets while keeping the mobile vertex count modest.
+    let lats = 12;
+    let lons = 20;
+    let point = |latitude: f32, longitude: f32| {
+        let ring = latitude.cos();
+        Vec3::new(
+            longitude.cos() * ring * half.x,
+            latitude.sin() * half.y,
+            longitude.sin() * ring * half.z,
+        )
+    };
+    let normal = |latitude: f32, longitude: f32| {
+        // The normal of a scaled sphere uses inverse scale. Computing it this
+        // way prevents stretched balls from having visibly incorrect shading
+        // if a lit viewport mode is added later.
+        Vec3::new(
+            longitude.cos() * latitude.cos() / half.x.max(0.001),
+            latitude.sin() / half.y.max(0.001),
+            longitude.sin() * latitude.cos() / half.z.max(0.001),
+        ).normalize()
+    };
     for i in 0..lats {
-        let la0 = std::f32::consts::PI * (-0.5 + i as f32 / lats as f32);
-        let la1 = std::f32::consts::PI * (-0.5 + (i + 1) as f32 / lats as f32);
-        let z0 = la0.sin() * r;
-        let z1 = la1.sin() * r;
-        let r0 = la0.cos() * r;
-        let r1 = la1.cos() * r;
+        let lat0 = std::f32::consts::PI * (-0.5 + i as f32 / lats as f32);
+        let lat1 = std::f32::consts::PI * (-0.5 + (i + 1) as f32 / lats as f32);
         for j in 0..lons {
-            let a0 = 2.0 * std::f32::consts::PI * j as f32 / lons as f32;
-            let a1 = 2.0 * std::f32::consts::PI * (j + 1) as f32 / lons as f32;
-            let x0 = a0.cos();
-            let y0 = a0.sin();
-            let x1 = a1.cos();
-            let y1 = a1.sin();
-            let n = Vec3::new((x0 + x1) * 0.5 * (r0 + r1) * 0.5, (y0 + y1) * 0.5 * (r0 + r1) * 0.5, (z0 + z1) * 0.5).normalize();
-            push_tri(tris, cf, [Vec3::new(x0 * r0, y0 * r0, z0), Vec3::new(x1 * r0, y1 * r0, z0), Vec3::new(x1 * r1, y1 * r1, z1)], n, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], None);
-            push_tri(tris, cf, [Vec3::new(x0 * r0, y0 * r0, z0), Vec3::new(x1 * r1, y1 * r1, z1), Vec3::new(x0 * r1, y0 * r1, z1)], n, [[0.0, 0.0], [1.0, 1.0], [0.0, 1.0]], None);
+            let lon0 = 2.0 * std::f32::consts::PI * j as f32 / lons as f32;
+            let lon1 = 2.0 * std::f32::consts::PI * (j + 1) as f32 / lons as f32;
+            let p00 = point(lat0, lon0);
+            let p01 = point(lat0, lon1);
+            let p11 = point(lat1, lon1);
+            let p10 = point(lat1, lon0);
+            let n = normal((lat0 + lat1) * 0.5, (lon0 + lon1) * 0.5);
+            push_tri(tris, cf, [p00, p01, p11], n,
+                [[j as f32 / lons as f32, i as f32 / lats as f32],
+                 [(j + 1) as f32 / lons as f32, i as f32 / lats as f32],
+                 [(j + 1) as f32 / lons as f32, (i + 1) as f32 / lats as f32]], None);
+            push_tri(tris, cf, [p00, p11, p10], n,
+                [[j as f32 / lons as f32, i as f32 / lats as f32],
+                 [(j + 1) as f32 / lons as f32, (i + 1) as f32 / lats as f32],
+                 [j as f32 / lons as f32, (i + 1) as f32 / lats as f32]], None);
         }
     }
 }
 
 fn build_cylinder(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
-    let segments = 12;
-    let r = half.y.min(half.z);
+    // Roblox cylinders run along local X. Y and Z can differ, producing an
+    // elliptical cross-section that must still occupy the full declared Size.
+    let segments = 20;
     let mut front = Vec::new();
     let mut back = Vec::new();
     for i in 0..segments {
@@ -861,10 +905,19 @@ fn build_cylinder(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
         let t2 = (i + 1) as f32 / segments as f32 * 2.0 * std::f32::consts::PI;
         let (sy1, sz1) = t.sin_cos();
         let (sy2, sz2) = t2.sin_cos();
-        let n = Vec3::new(0.0, (sy1 + sy2) * 0.5, (sz1 + sz2) * 0.5).normalize();
-        push_quad(tris, cf, [Vec3::new(-half.x, sy1 * r, sz1 * r), Vec3::new(half.x, sy1 * r, sz1 * r), Vec3::new(half.x, sy2 * r, sz2 * r), Vec3::new(-half.x, sy2 * r, sz2 * r)], n, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], None);
-        front.push(Vec3::new(half.x, sy1 * r, sz1 * r));
-        back.push(Vec3::new(-half.x, sy1 * r, sz1 * r));
+        let n = Vec3::new(
+            0.0,
+            (sy1 + sy2) * 0.5 / half.y.max(0.001),
+            (sz1 + sz2) * 0.5 / half.z.max(0.001),
+        ).normalize();
+        push_quad(tris, cf, [
+            Vec3::new(-half.x, sy1 * half.y, sz1 * half.z),
+            Vec3::new(half.x, sy1 * half.y, sz1 * half.z),
+            Vec3::new(half.x, sy2 * half.y, sz2 * half.z),
+            Vec3::new(-half.x, sy2 * half.y, sz2 * half.z),
+        ], n, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], None);
+        front.push(Vec3::new(half.x, sy1 * half.y, sz1 * half.z));
+        back.push(Vec3::new(-half.x, sy1 * half.y, sz1 * half.z));
     }
     let fc = Vec3::new(half.x, 0.0, 0.0);
     let bc = Vec3::new(-half.x, 0.0, 0.0);
