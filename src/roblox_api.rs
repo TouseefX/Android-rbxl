@@ -6,7 +6,7 @@ use rbx_dom_weak::{
     InstanceBuilder, WeakDom,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 #[derive(Debug, Clone)]
 pub struct LiveCatalogItem {
@@ -101,6 +101,31 @@ fn viewport_asset_channel() -> &'static (
 pub fn try_recv_viewport_asset_ready() -> Option<ViewportAssetReady> {
     let (_, rx) = viewport_asset_channel();
     rx.lock().ok().and_then(|receiver| receiver.try_recv().ok())
+}
+
+// AssetDelivery bursts can contain hundreds of meshes/textures. Letting every
+// request parse and upload concurrently saturated mobile CPUs and caused UI
+// stalls. Keep at most four network/decode jobs active.
+static ASSET_DOWNLOAD_LIMITER: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+struct AssetDownloadPermit;
+impl AssetDownloadPermit {
+    fn acquire() -> Self {
+        let (count, wake) = ASSET_DOWNLOAD_LIMITER.get_or_init(|| (Mutex::new(0), Condvar::new()));
+        let mut active = count.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *active >= 4 {
+            active = wake.wait(active).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *active += 1;
+        Self
+    }
+}
+impl Drop for AssetDownloadPermit {
+    fn drop(&mut self) {
+        let Some((count, wake)) = ASSET_DOWNLOAD_LIMITER.get() else { return; };
+        let mut active = count.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active.saturating_sub(1);
+        wake.notify_one();
+    }
 }
 
 pub fn fetch_and_cache_mesh_async(mesh_id_str: String, cookie_opt: Option<String>) {
@@ -607,6 +632,7 @@ impl RobloxApiClient {
         }
 
         std::thread::spawn(move || {
+            let _permit = AssetDownloadPermit::acquire();
             let result = (|| {
                 let id_text = asset_downloader::extract_asset_id(&mesh_id_str)
                     .ok_or_else(|| "invalid mesh asset id".to_string())?;
@@ -635,6 +661,7 @@ impl RobloxApiClient {
         }
 
         std::thread::spawn(move || {
+            let _permit = AssetDownloadPermit::acquire();
             let result = (|| {
                 let id_text = asset_downloader::extract_asset_id(&image_id_str)
                     .ok_or_else(|| "invalid texture asset id".to_string())?;

@@ -514,12 +514,8 @@ impl EditorApp {
                 }
             }
         });
-        // fetch_and_cache_*_async are fire-and-forget background threads with
-        // no completion signal, so we can't know exactly when they're done.
-        // 4s is a rough guess generous enough for a city-sized place over
-        // typical mobile data; bump this (or add a real completion channel,
-        // like the existing search_channel pattern) if your assets are bigger.
-        self.pending_asset_refresh_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        // Completion events debounce scene rebuilds in drain_events; no fixed
+        // timer is needed (and a timer cannot predict mobile download speed).
     }
 
     fn log_info(&mut self, msg: impl Into<String>) {
@@ -3702,7 +3698,12 @@ ui.label("Place ID:");
         while let Some(ready) = roblox_api::try_recv_viewport_asset_ready() {
             match ready.result {
                 Ok(()) => {
-                    self.needs_3d_rebuild = true;
+                    // Debounce GPU rebuilds: a character/place can finish
+                    // dozens of assets in quick succession. Rebuilding the
+                    // entire scene for every completion caused severe lag.
+                    self.pending_asset_refresh_at = Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(450),
+                    );
                     self.log_info(format!("Viewport {} ready: {}", ready.kind, ready.id));
                 }
                 Err(error) => {
@@ -3782,10 +3783,9 @@ ui.label("Place ID:");
             }
         }
 
-        // If a background asset download was started, flip needs_3d_rebuild
-        // back on once its rough deadline passes so downloaded meshes/textures
-        // actually appear in the viewport without the user having to reopen
-        // the file.
+        // Rebuild once after a burst of completed viewport downloads. Every
+        // new completion pushes this deadline out, coalescing many assets into
+        // one GPU upload rather than one full rebuild per asset.
         if let Some(at) = self.pending_asset_refresh_at {
             if std::time::Instant::now() >= at {
                 self.needs_3d_rebuild = true;

@@ -622,6 +622,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
     // Legacy mesh textures use their alpha as transparency. SurfaceAppearance
     // can explicitly select a different alpha interpretation.
     let mut mesh_texture_mode = 0u32;
+    let mut mesh_texture_tint = true;
     let mut mesh_type: Option<String> = None;
     let mut scale = Vec3::new(1.0, 1.0, 1.0);
     let mut offset = Vec3::new(0.0, 0.0, 0.0);
@@ -686,6 +687,39 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
             if let Some(Variant::Vector3(o)) = ch.properties.get(&rbx_dom_weak::ustr("Offset")) {
                 offset = Vec3::new(o.x, o.y, o.z);
             }
+        }
+    }
+
+    // Classic Shirt/Pants instances live beside body parts under the character
+    // Model, not inside each MeshPart. Roblox body meshes have clothing-atlas
+    // UVs, so route the appropriate template onto each body segment.
+    if let Some(parent) = dom.get_by_ref(inst.parent()) {
+        let body_name = inst.name.to_ascii_lowercase().replace(' ', "");
+        let shirt_body = body_name.contains("torso") || body_name.contains("arm")
+            || body_name.contains("hand");
+        let pants_body = body_name.contains("leg") || body_name.contains("foot")
+            || body_name.contains("lowertorso");
+        let graphic_body = body_name == "torso" || body_name == "uppertorso";
+        let mut clothing_texture = None;
+        for child_ref in parent.children() {
+            let Some(clothing) = dom.get_by_ref(*child_ref) else { continue; };
+            let property = match clothing.class.as_str() {
+                "Shirt" if shirt_body => Some("ShirtTemplate"),
+                "Pants" if pants_body => Some("PantsTemplate"),
+                "ShirtGraphic" if graphic_body => Some("Graphic"),
+                _ => None,
+            };
+            if let Some(texture) = property
+                .and_then(|name| clothing.properties.get(&rbx_dom_weak::ustr(name)))
+                .and_then(content_str)
+            {
+                clothing_texture = Some(texture);
+            }
+        }
+        if clothing_texture.is_some() {
+            mesh_tex = clothing_texture;
+            mesh_texture_mode = 1; // overlay garment alpha over body Color
+            mesh_texture_tint = false; // clothing keeps its authored colors
         }
     }
 
@@ -812,9 +846,9 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
                     let uc = md.uvs.get(f[2] as usize).copied().unwrap_or([0.0, 1.0]);
                     let t = tex_key.clone();
                     // Roblox mesh textures are modulated by MeshPart.Color.
-                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: true, texture_mode: mesh_texture_mode, color_override: None });
-                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: true, texture_mode: mesh_texture_mode, color_override: None });
-                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: true, texture_mode: mesh_texture_mode, color_override: None });
+                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None });
+                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None });
+                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None });
                 }
             }
             if tris.is_empty() {

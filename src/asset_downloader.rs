@@ -959,7 +959,8 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
                 let asset_type = match key_str {
                     "MeshId" | "MeshID" | "MeshContent" => Some("Mesh"),
                     "TextureId" | "TextureID" | "Texture" | "TextureContent"
-                    | "ColorMap" | "ColorMapContent" => Some("Texture"),
+                    | "ColorMap" | "ColorMapContent" | "ShirtTemplate"
+                    | "PantsTemplate" | "Graphic" => Some("Texture"),
                     "SoundId" | "SoundID" => Some("Sound"),
                     "AnimationId" => Some("Animation"),
                     _ => None,
