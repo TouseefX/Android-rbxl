@@ -33,6 +33,10 @@ struct GuiNode {
     text_min_size: f32,
     text_max_size: f32,
     text_stroke: Color32,
+    multiline: bool,
+    clear_text_on_focus: bool,
+    placeholder_text: String,
+    placeholder_color: Color32,
     image: Option<String>,
     hover_image: Option<String>,
     pressed_image: Option<String>,
@@ -530,6 +534,14 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 ((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("TextStrokeTransparency")), 1.0).clamp(0.0,1.0))*255.0) as u8,
                 [0,0,0],
             ), modulation),
+            multiline: bool_value(instance.properties.get(&rbx_dom_weak::ustr("MultiLine")), false),
+            clear_text_on_focus: bool_value(instance.properties.get(&rbx_dom_weak::ustr("ClearTextOnFocus")), true),
+            placeholder_text: match instance.properties.get(&rbx_dom_weak::ustr("PlaceholderText")) {
+                Some(Variant::String(value)) => value.clone(), _ => String::new(),
+            },
+            placeholder_color: multiply_color(color(
+                instance.properties.get(&rbx_dom_weak::ustr("PlaceholderColor3")), 255, [178,178,178],
+            ), modulation),
             image: content(instance.properties.get(&rbx_dom_weak::ustr("Image"))
                 .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("ImageContent")))),
             hover_image: content(instance.properties.get(&rbx_dom_weak::ustr("HoverImage"))),
@@ -999,6 +1011,7 @@ pub fn draw_starter_gui(
     dom: &WeakDom,
     textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
     scroll_offsets: &mut std::collections::HashMap<Ref, Vec2>,
+    text_inputs: &mut std::collections::HashMap<Ref, String>,
     selected: Option<Ref>,
     orbit: &crate::bevy_render::OrbitCam,
     viewport_scene: &crate::bevy_render::ViewportScene,
@@ -1227,7 +1240,24 @@ pub fn draw_starter_gui(
                 paint_image(&painter, &node, texture, shade_color(node.image_color, button_factor));
             }
         }
-        if !node.text.is_empty() {
+        let editable_textbox = node.class == "TextBox" && node.rotation.abs() < 0.001;
+        if editable_textbox {
+            let value = text_inputs.entry(node.referent).or_insert_with(|| node.text.clone());
+            let hint = egui::RichText::new(node.placeholder_text.clone()).color(node.placeholder_color);
+            let widget = if node.multiline {
+                egui::TextEdit::multiline(value)
+                    .desired_width(node.content_rect.width()).font(FontId::proportional(node.text_size))
+                    .text_color(node.text_color).hint_text(hint).frame(false)
+            } else {
+                egui::TextEdit::singleline(value)
+                    .desired_width(node.content_rect.width()).font(FontId::proportional(node.text_size))
+                    .text_color(node.text_color).hint_text(hint).frame(false)
+            };
+            let text_response = ui.put(node.content_rect, widget);
+            if text_response.gained_focus() && node.clear_text_on_focus { value.clear(); }
+            if text_response.clicked() { clicked = Some(node.referent); }
+        }
+        if !node.text.is_empty() && !editable_textbox {
             let text_color = shade_color(node.text_color, button_factor);
             let text_rect = node.content_rect;
             let wrap_width = if node.text_wrapped { text_rect.width() } else { f32::INFINITY };

@@ -200,6 +200,8 @@ pub struct EditorApp {
     gui_textures: HashMap<String, egui::TextureHandle>,
     /// Editor-preview scroll positions, keyed by ScrollingFrame referent.
     gui_scroll_offsets: HashMap<Ref, egui::Vec2>,
+    /// Editable preview state for Roblox TextBox controls.
+    gui_text_inputs: HashMap<Ref, String>,
     rename_buffer: String,
     project_name: String,
     show_quick_open: bool,
@@ -376,6 +378,7 @@ impl Default for EditorApp {
             show_stats: false,
             gui_textures: HashMap::new(),
             gui_scroll_offsets: HashMap::new(),
+            gui_text_inputs: HashMap::new(),
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
             show_quick_open: false,
@@ -483,6 +486,7 @@ impl EditorApp {
                 self.selected = None;
                 self.gui_textures.clear();
                 self.gui_scroll_offsets.clear();
+                self.gui_text_inputs.clear();
                 self.needs_3d_rebuild = true;
                 self.status = format!("Loaded ({})", self.place_format.label());
                 // New document → fresh undo history.
@@ -1131,7 +1135,8 @@ impl EditorApp {
         // scene. Clicking a GUI object synchronizes selection with Explorer.
         let clicked_gui = if let Some(dom) = self.dom.as_ref() {
             crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures,
-                &mut self.gui_scroll_offsets, self.selected, orbit, viewport_scene)
+                &mut self.gui_scroll_offsets, &mut self.gui_text_inputs,
+                self.selected, orbit, viewport_scene)
         } else {
             None
         };
