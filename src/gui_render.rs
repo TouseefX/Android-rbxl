@@ -1241,6 +1241,85 @@ pub fn draw_starter_gui(
         }
     }
 
+    // SurfaceGui shares the layout engine. Its part face is projected to a
+    // screen rectangle; Bevy depth picking provides normal occlusion.
+    let mut surfaces = Vec::new();
+    gather_class(dom, dom.root_ref(), "SurfaceGui", &mut surfaces);
+    for (surface_order, referent) in surfaces.into_iter().enumerate() {
+        let Some(surface) = dom.get_by_ref(referent) else { continue; };
+        if matches!(surface.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
+        let adornee = match surface.properties.get(&rbx_dom_weak::ustr("Adornee")) {
+            Some(Variant::Ref(value)) if !value.is_none() => *value,
+            _ => surface.parent(),
+        };
+        let Some(part) = dom.get_by_ref(adornee) else { continue; };
+        let Some(Variant::CFrame(cframe)) = part.properties.get(&rbx_dom_weak::ustr("CFrame")) else { continue; };
+        let size = match part.properties.get(&rbx_dom_weak::ustr("Size")) {
+            Some(Variant::Vector3(size)) => [size.x, size.y, size.z], _ => continue,
+        };
+        let face = enum_value(surface.properties.get(&rbx_dom_weak::ustr("Face")), 5);
+        let (u, v, fixed) = match face {
+            0 => ([0.0, 0.0, size[2]*0.5], [0.0, size[1]*0.5, 0.0], [size[0]*0.5, 0.0, 0.0]),
+            1 => ([size[0]*0.5, 0.0, 0.0], [0.0, 0.0, size[2]*0.5], [0.0, size[1]*0.5, 0.0]),
+            2 => ([-size[0]*0.5, 0.0, 0.0], [0.0, size[1]*0.5, 0.0], [0.0, 0.0, size[2]*0.5]),
+            3 => ([0.0, 0.0, -size[2]*0.5], [0.0, size[1]*0.5, 0.0], [-size[0]*0.5, 0.0, 0.0]),
+            4 => ([size[0]*0.5, 0.0, 0.0], [0.0, 0.0, -size[2]*0.5], [0.0, -size[1]*0.5, 0.0]),
+            _ => ([size[0]*0.5, 0.0, 0.0], [0.0, size[1]*0.5, 0.0], [0.0, 0.0, -size[2]*0.5]),
+        };
+        let transform = |local: [f32; 3]| [
+            cframe.position.x + cframe.orientation.x.x*local[0] + cframe.orientation.x.y*local[1] + cframe.orientation.x.z*local[2],
+            cframe.position.y + cframe.orientation.y.x*local[0] + cframe.orientation.y.y*local[1] + cframe.orientation.y.z*local[2],
+            cframe.position.z + cframe.orientation.z.x*local[0] + cframe.orientation.z.y*local[1] + cframe.orientation.z.z*local[2],
+        ];
+        let local_normal = match face { 0 => [1.0,0.0,0.0], 1 => [0.0,1.0,0.0], 2 => [0.0,0.0,1.0],
+            3 => [-1.0,0.0,0.0], 4 => [0.0,-1.0,0.0], _ => [0.0,0.0,-1.0] };
+        let world_normal_point = transform(local_normal);
+        let center_world = transform([0.0, 0.0, 0.0]);
+        let normal = [world_normal_point[0]-center_world[0], world_normal_point[1]-center_world[1], world_normal_point[2]-center_world[2]];
+        let (sin_pitch, cos_pitch) = orbit.pitch.sin_cos();
+        let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
+        let camera = [orbit.target[0]+orbit.dist*cos_pitch*sin_yaw, orbit.target[1]+orbit.dist*sin_pitch,
+            orbit.target[2]+orbit.dist*cos_pitch*cos_yaw];
+        let to_camera = [camera[0]-center_world[0], camera[1]-center_world[1], camera[2]-center_world[2]];
+        if normal[0]*to_camera[0] + normal[1]*to_camera[1] + normal[2]*to_camera[2] <= 0.0 { continue; }
+        let mut projected_points = Vec::new();
+        for (su, sv) in [(-1.0,-1.0), (1.0,-1.0), (1.0,1.0), (-1.0,1.0)] {
+            let local = [fixed[0]+u[0]*su+v[0]*sv, fixed[1]+u[1]*su+v[1]*sv, fixed[2]+u[2]*su+v[2]*sv];
+            let Some(point) = crate::bevy_render::project_world_point(orbit, transform(local), aspect) else { projected_points.clear(); break; };
+            projected_points.push(Pos2::new(viewport.left()+point[0]*viewport.width(), viewport.top()+point[1]*viewport.height()));
+        }
+        if projected_points.len() != 4 { continue; }
+        let mut surface_rect = Rect::NOTHING;
+        for point in projected_points { surface_rect.extend_with(point); }
+        let surface_clip = surface_rect.intersect(viewport);
+        if surface_clip.width() <= 0.0 || surface_clip.height() <= 0.0 { continue; }
+        let always_on_top = bool_value(surface.properties.get(&rbx_dom_weak::ustr("AlwaysOnTop")), false);
+        if !always_on_top {
+            let center = transform(fixed);
+            if let Some(projected) = crate::bevy_render::project_world_point(orbit, center, aspect) {
+                if let Some(hit) = crate::bevy_render::pick_part(viewport_scene, orbit, [projected[0], projected[1]], aspect) {
+                    if hit != adornee { continue; }
+                }
+            }
+        }
+        let sizing_mode = enum_value(surface.properties.get(&rbx_dom_weak::ustr("SizingMode")), 0);
+        let canvas = if sizing_mode == 1 {
+            let pixels_per_stud = number(surface.properties.get(&rbx_dom_weak::ustr("PixelsPerStud")), 50.0).max(1.0);
+            let u_length = (u[0]*u[0] + u[1]*u[1] + u[2]*u[2]).sqrt()*2.0;
+            let v_length = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt()*2.0;
+            Vec2::new(u_length*pixels_per_stud, v_length*pixels_per_stud)
+        } else {
+            vector2(surface.properties.get(&rbx_dom_weak::ustr("CanvasSize")), Vec2::new(800.0, 600.0))
+        };
+        let screen_scale = (surface_rect.width()/canvas.x.max(1.0)).min(surface_rect.height()/canvas.y.max(1.0));
+        let path = vec![(-2, surface_order)];
+        for child in surface.children() {
+            collect(dom, &layout_painter, *child, surface_rect, surface_clip, -900_000,
+                true, screen_scale, 1.0, Color32::WHITE, &path, None, &mut overrides,
+                scroll_offsets, &mut sequence, &mut nodes);
+        }
+    }
+
     if let Some(starter) = starter.and_then(|referent| dom.get_by_ref(referent)) {
         for (screen_order, child) in starter.children().iter().enumerate() {
             let Some(gui) = dom.get_by_ref(*child) else { continue; };
