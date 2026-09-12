@@ -11,7 +11,10 @@ struct GuiNode {
     rect: Rect,
     content_rect: Rect,
     clip: Rect,
+    display_order: i32,
     z: i32,
+    global_z: bool,
+    sort_path: Vec<(i32, usize)>,
     order: usize,
     background: Color32,
     border: Color32,
@@ -244,9 +247,9 @@ fn padded_rect(dom: &WeakDom, instance: &rbx_dom_weak::Instance, rect: Rect, sca
 }
 
 fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
-           parent_rect: Rect, parent_clip: Rect, inherited_z: i32,
-           display_order: i32, inherited_scale: f32, sequence: &mut usize,
-           nodes: &mut Vec<GuiNode>) {
+           parent_rect: Rect, parent_clip: Rect, display_order: i32,
+           global_z: bool, inherited_scale: f32, parent_path: &[(i32, usize)],
+           sequence: &mut usize, nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
     let local_scale = child_of_class(dom, instance, "UIScale")
@@ -257,11 +260,14 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     let rect = if is_screen { parent_rect } else { gui_rect(dom, painter, instance, parent_rect, scale) };
     let clips = matches!(instance.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), Some(Variant::Bool(true)));
     let child_clip = if clips { parent_clip.intersect(rect) } else { parent_clip };
-    let z = inherited_z + match instance.properties.get(&rbx_dom_weak::ustr("ZIndex")) {
+    let z = match instance.properties.get(&rbx_dom_weak::ustr("ZIndex")) {
         Some(Variant::Int32(v)) => *v,
         Some(Variant::Int64(v)) => *v as i32,
         _ => 1,
     };
+    let current_order = *sequence;
+    let mut sort_path = parent_path.to_vec();
+    sort_path.push((z, current_order));
     let content_rect = padded_rect(dom, instance, rect, scale);
 
     if is_gui_object(&instance.class) {
@@ -295,7 +301,10 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             rect,
             content_rect,
             clip: parent_clip.intersect(rect),
-            z: display_order.saturating_mul(1_000_000).saturating_add(z),
+            display_order,
+            z,
+            global_z,
+            sort_path: sort_path.clone(),
             order,
             background: color(instance.properties.get(&rbx_dom_weak::ustr("BackgroundColor3")), alpha, [255,255,255]),
             border: color(instance.properties.get(&rbx_dom_weak::ustr("BorderColor3")), 255, [27,42,53]),
@@ -335,7 +344,8 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         content_rect
     };
     for child in instance.children() {
-        collect(dom, painter, *child, child_parent_rect, child_clip, z, display_order, scale, sequence, nodes);
+        collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
+            global_z, scale, &sort_path, sequence, nodes);
     }
 }
 
@@ -355,14 +365,25 @@ pub fn draw_starter_gui(
     let mut sequence = 0;
     let layout_painter = ui.painter().clone();
     if let Some(starter) = dom.get_by_ref(starter) {
-        for child in starter.children() {
+        for (screen_order, child) in starter.children().iter().enumerate() {
             let Some(gui) = dom.get_by_ref(*child) else { continue; };
             if gui.class != "ScreenGui" || matches!(gui.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
             let display_order = enum_value(gui.properties.get(&rbx_dom_weak::ustr("DisplayOrder")), 0);
-            collect(dom, &layout_painter, *child, viewport, viewport, 0, display_order, 1.0, &mut sequence, &mut nodes);
+            let global_z = enum_value(gui.properties.get(&rbx_dom_weak::ustr("ZIndexBehavior")), 1) == 0;
+            let root_path = vec![(0, screen_order)];
+            collect(dom, &layout_painter, *child, viewport, viewport, display_order,
+                global_z, 1.0, &root_path, &mut sequence, &mut nodes);
         }
     }
-    nodes.sort_by_key(|node| (node.z, node.order));
+    nodes.sort_by(|left, right| {
+        left.display_order.cmp(&right.display_order).then_with(|| {
+            if left.global_z && right.global_z {
+                left.z.cmp(&right.z).then(left.order.cmp(&right.order))
+            } else {
+                left.sort_path.cmp(&right.sort_path).then(left.order.cmp(&right.order))
+            }
+        })
+    });
     let mut clicked = None;
     for node in nodes {
         if node.clip.width() <= 0.0 || node.clip.height() <= 0.0 { continue; }
