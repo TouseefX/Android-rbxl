@@ -1126,7 +1126,7 @@ impl EditorApp {
         // StarterGui is previewed as a real screen-space hierarchy over the 3D
         // scene. Clicking a GUI object synchronizes selection with Explorer.
         let clicked_gui = if let Some(dom) = self.dom.as_ref() {
-            crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures)
+            crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures, self.selected)
         } else {
             None
         };
