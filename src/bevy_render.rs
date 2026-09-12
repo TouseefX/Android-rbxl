@@ -387,11 +387,14 @@ struct PartGeo {
 }
 
 /// Lightweight picking data retained independently from render batching.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SelectablePart {
     pub referent: rbx_dom_weak::types::Ref,
     pub min: [f32; 3],
     pub max: [f32; 3],
+    /// Exact rendered triangles used after the inexpensive AABB broad phase.
+    /// This prevents selecting empty corners of rotated and wedge-shaped parts.
+    triangles: Vec<[[f32; 3]; 3]>,
 }
 
 #[derive(Resource, Default)]
@@ -692,15 +695,26 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
                     let pa = tp(&cf2, Vec3::new(a[0] * sx, a[1] * sy, a[2] * sz));
                     let pb = tp(&cf2, Vec3::new(b[0] * sx, b[1] * sy, b[2] * sz));
                     let pc = tp(&cf2, Vec3::new(c[0] * sx, c[1] * sy, c[2] * sz));
-                    let n = cross(sub3(pb, pa), sub3(pc, pa));
+                    let face_normal = cross(sub3(pb, pa), sub3(pc, pa));
+                    let vertex_normal = |index: u32| {
+                        md.normals.get(index as usize).and_then(|normal| {
+                            let local = Vec3::new(normal[0] / sx, normal[1] / sy, normal[2] / sz);
+                            let valid = local.x.is_finite() && local.y.is_finite() && local.z.is_finite()
+                                && local.length() > 1e-5;
+                            valid.then(|| tn(&cf2, local))
+                        }).unwrap_or(face_normal)
+                    };
+                    let na = vertex_normal(f[0]);
+                    let nb = vertex_normal(f[1]);
+                    let nc = vertex_normal(f[2]);
                     let ua = md.uvs.get(f[0] as usize).copied().unwrap_or([0.0, 0.0]);
                     let ub = md.uvs.get(f[1] as usize).copied().unwrap_or([1.0, 0.0]);
                     let uc = md.uvs.get(f[2] as usize).copied().unwrap_or([0.0, 1.0]);
                     let t = tex_key.clone();
                     // Roblox mesh textures are modulated by MeshPart.Color.
-                    tris.push(Tri { pos: pa, normal: n, uv: ua, tex: t.clone(), opacity: 1.0, tint: true });
-                    tris.push(Tri { pos: pb, normal: n, uv: ub, tex: t.clone(), opacity: 1.0, tint: true });
-                    tris.push(Tri { pos: pc, normal: n, uv: uc, tex: t, opacity: 1.0, tint: true });
+                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: true });
+                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: true });
+                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: true });
                 }
             }
             if tris.is_empty() {
@@ -1009,6 +1023,7 @@ fn build_truss(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
 
 struct MeshData {
     vertices: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
     faces: Vec<[u32; 3]>,
     aabb_min: [f32; 3],
@@ -1093,6 +1108,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     if let Some(cached) = crate::asset_downloader::get_cached_mesh(id_or_path) {
         return Some(MeshData {
             vertices: cached.vertices,
+            normals: cached.normals,
             uvs: cached.uvs,
             faces: cached.faces,
             aabb_min: cached.aabb_min,
@@ -1147,6 +1163,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     }
 
     let mut vertices = Vec::with_capacity(vertex_count);
+    let mut normals = Vec::with_capacity(vertex_count);
     let mut uvs = Vec::with_capacity(vertex_count);
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
@@ -1155,6 +1172,9 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
         let px = f32::from_le_bytes(bytes[o..o + 4].try_into().ok()?);
         let py = f32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?);
         let pz = f32::from_le_bytes(bytes[o + 8..o + 12].try_into().ok()?);
+        let nx = f32::from_le_bytes(bytes[o + 12..o + 16].try_into().ok()?);
+        let ny = f32::from_le_bytes(bytes[o + 16..o + 20].try_into().ok()?);
+        let nz = f32::from_le_bytes(bytes[o + 20..o + 24].try_into().ok()?);
         let u = f32::from_le_bytes(bytes[o + 24..o + 28].try_into().ok()?);
         let v = f32::from_le_bytes(bytes[o + 28..o + 32].try_into().ok()?);
         // Skip NaN/inf vertices (would create spikes).
@@ -1168,6 +1188,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
         max[1] = max[1].max(py);
         max[2] = max[2].max(pz);
         vertices.push([px, py, pz]);
+        normals.push([nx, ny, nz]);
         uvs.push([u, 1.0 - v]);
     }
     cursor += vertex_count * VERTEX_STRIDE;
@@ -1208,7 +1229,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     if faces.is_empty() {
         return None;
     }
-    Some(MeshData { vertices, uvs, faces, aabb_min: min, aabb_max: max })
+    Some(MeshData { vertices, normals, uvs, faces, aabb_min: min, aabb_max: max })
 }
 
 // ----------------------------------------------------------------------------
@@ -1321,7 +1342,12 @@ pub fn rebuild_scene(
                 max[axis] = max[axis].max(vertex.pos[axis]);
             }
         }
-        min[0].is_finite().then_some(SelectablePart { referent: part.referent, min, max })
+        let triangles = part.tris.chunks_exact(3)
+            .map(|vertices| [vertices[0].pos, vertices[1].pos, vertices[2].pos])
+            .collect();
+        min[0].is_finite().then_some(SelectablePart {
+            referent: part.referent, min, max, triangles,
+        })
     }).collect();
     commands.insert_resource(ViewportScene { parts: selectable });
 
@@ -1531,10 +1557,39 @@ pub fn pick_part(scene: &ViewportScene, cam: &OrbitCam, screen: [f32; 2], aspect
     let y = (1.0 - screen[1] * 2.0) * tan_half_fov;
     let direction = (forward + right * x + up * y).normalize_or_zero();
 
+    let origin = eye.to_array();
+    let direction = direction.to_array();
     scene.parts.iter().filter_map(|part| {
-        ray_aabb(eye.to_array(), direction.to_array(), part.min, part.max)
-            .map(|distance| (distance, part.referent))
+        // Broad phase rejects almost every part without touching its triangles.
+        ray_aabb(origin, direction, part.min, part.max)?;
+        let distance = part.triangles.iter()
+            .filter_map(|triangle| ray_triangle(origin, direction, *triangle))
+            .min_by(f32::total_cmp)?;
+        Some((distance, part.referent))
     }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, referent)| referent)
+}
+
+/// Two-sided Möller–Trumbore ray/triangle intersection. Roblox parts and
+/// imported meshes can contain reversed winding, so backface culling would
+/// make visible surfaces impossible to select.
+fn ray_triangle(origin: [f32; 3], direction: [f32; 3], triangle: [[f32; 3]; 3]) -> Option<f32> {
+    let o = BVec3::from_array(origin);
+    let d = BVec3::from_array(direction);
+    let a = BVec3::from_array(triangle[0]);
+    let edge_1 = BVec3::from_array(triangle[1]) - a;
+    let edge_2 = BVec3::from_array(triangle[2]) - a;
+    let p = d.cross(edge_2);
+    let determinant = edge_1.dot(p);
+    if determinant.abs() < 1e-7 { return None; }
+    let inverse = 1.0 / determinant;
+    let t = o - a;
+    let u = t.dot(p) * inverse;
+    if !(0.0..=1.0).contains(&u) { return None; }
+    let q = t.cross(edge_1);
+    let v = d.dot(q) * inverse;
+    if v < 0.0 || u + v > 1.0 { return None; }
+    let distance = edge_2.dot(q) * inverse;
+    (distance >= 0.0).then_some(distance)
 }
 
 fn ray_aabb(origin: [f32; 3], direction: [f32; 3], min: [f32; 3], max: [f32; 3]) -> Option<f32> {
