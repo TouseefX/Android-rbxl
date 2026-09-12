@@ -198,6 +198,8 @@ pub struct EditorApp {
     show_stats: bool,
     /// GPU textures retained by the StarterGui preview.
     gui_textures: HashMap<String, egui::TextureHandle>,
+    /// Editor-preview scroll positions, keyed by ScrollingFrame referent.
+    gui_scroll_offsets: HashMap<Ref, egui::Vec2>,
     rename_buffer: String,
     project_name: String,
     show_quick_open: bool,
@@ -373,6 +375,7 @@ impl Default for EditorApp {
             editor_focus_mode: false,
             show_stats: false,
             gui_textures: HashMap::new(),
+            gui_scroll_offsets: HashMap::new(),
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
             show_quick_open: false,
@@ -479,6 +482,7 @@ impl EditorApp {
                 self.dom = Some(dom);
                 self.selected = None;
                 self.gui_textures.clear();
+                self.gui_scroll_offsets.clear();
                 self.needs_3d_rebuild = true;
                 self.status = format!("Loaded ({})", self.place_format.label());
                 // New document → fresh undo history.
@@ -1126,7 +1130,8 @@ impl EditorApp {
         // StarterGui is previewed as a real screen-space hierarchy over the 3D
         // scene. Clicking a GUI object synchronizes selection with Explorer.
         let clicked_gui = if let Some(dom) = self.dom.as_ref() {
-            crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures, self.selected)
+            crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures,
+                &mut self.gui_scroll_offsets, self.selected)
         } else {
             None
         };

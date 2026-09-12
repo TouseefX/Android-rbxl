@@ -40,6 +40,10 @@ struct GuiNode {
     tile_size: Option<(f32, f32, f32, f32)>,
     slice_center: Option<[f32; 4]>,
     slice_scale: f32,
+    canvas_size: Vec2,
+    canvas_position: Vec2,
+    scroll_bar_thickness: f32,
+    scroll_bar_color: Color32,
 }
 
 fn number(value: Option<&Variant>, fallback: f32) -> f32 {
@@ -393,7 +397,8 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
            parent_rect: Rect, parent_clip: Rect, display_order: i32,
            global_z: bool, inherited_scale: f32, parent_path: &[(i32, usize)],
            forced_rect: Option<Rect>, overrides: &mut std::collections::HashMap<Ref, Rect>,
-           sequence: &mut usize, nodes: &mut Vec<GuiNode>) {
+           scroll_offsets: &std::collections::HashMap<Ref, Vec2>, sequence: &mut usize,
+           nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
     let local_scale = child_of_class(dom, instance, "UIScale")
@@ -443,6 +448,27 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             ))
             .map(|(min, max)| (min.min(max), max.max(min)))
             .unwrap_or((1.0, 400.0));
+        let mut canvas_size = match instance.properties.get(&rbx_dom_weak::ustr("CanvasSize")) {
+            Some(Variant::UDim2(value)) if instance.class == "ScrollingFrame" => Vec2::new(
+                rect.width() * value.x.scale + value.x.offset as f32 * scale,
+                rect.height() * value.y.scale + value.y.offset as f32 * scale,
+            ).max(rect.size()),
+            _ => rect.size(),
+        };
+        let automatic_canvas = enum_value(instance.properties.get(&rbx_dom_weak::ustr("AutomaticCanvasSize")), 0);
+        if instance.class == "ScrollingFrame" && automatic_canvas != 0 {
+            let mut required = Vec2::ZERO;
+            for child_ref in instance.children() {
+                let Some(child) = dom.get_by_ref(*child_ref) else { continue; };
+                if !is_gui_object(&child.class) || !visible(child) { continue; }
+                let child_rect = gui_rect(dom, painter, child, content_rect, scale);
+                required.x = required.x.max((child_rect.right()-content_rect.left()).max(0.0));
+                required.y = required.y.max((child_rect.bottom()-content_rect.top()).max(0.0));
+            }
+            if automatic_canvas == 1 || automatic_canvas == 3 { canvas_size.x = canvas_size.x.max(required.x); }
+            if automatic_canvas == 2 || automatic_canvas == 3 { canvas_size.y = canvas_size.y.max(required.y); }
+        }
+        let scroll_bar_transparency = number(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarImageTransparency")), 0.0).clamp(0.0, 1.0);
         let order = *sequence;
         *sequence += 1;
         nodes.push(GuiNode {
@@ -492,14 +518,20 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 _ => None,
             },
             slice_scale: number(instance.properties.get(&rbx_dom_weak::ustr("SliceScale")), 1.0).max(0.0),
+            canvas_size,
+            canvas_position: vector2(instance.properties.get(&rbx_dom_weak::ustr("CanvasPosition")), Vec2::ZERO) * scale,
+            scroll_bar_thickness: number(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarThickness")), 12.0).max(0.0) * scale,
+            scroll_bar_color: color(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarImageColor3")),
+                ((1.0-scroll_bar_transparency)*255.0) as u8, [255,255,255]),
         });
     }
     let child_parent_rect = if instance.class == "ScrollingFrame" {
-        let canvas_position = vector2(
+        let authored_position = vector2(
             instance.properties.get(&rbx_dom_weak::ustr("CanvasPosition")),
             Vec2::ZERO,
         ) * scale;
-        content_rect.translate(-canvas_position)
+        let preview_position = scroll_offsets.get(&referent).copied().unwrap_or(Vec2::ZERO);
+        content_rect.translate(-(authored_position + preview_position))
     } else {
         content_rect
     };
@@ -575,7 +607,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         }
         for child in instance.children() {
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, None, overrides, sequence, nodes);
+                global_z, scale, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIPageLayout") {
         let sort_order = enum_value(layout.properties.get(&rbx_dom_weak::ustr("SortOrder")), 0);
@@ -620,7 +652,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 _ => child_parent_rect.center().y - natural.height() * 0.5,
             };
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(Rect::from_min_size(Pos2::new(x, y), natural.size())), overrides, sequence, nodes);
+                global_z, scale, &sort_path, Some(Rect::from_min_size(Pos2::new(x, y), natural.size())), overrides, scroll_offsets, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
         let (cxs, cxo, cys, cyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellSize")))
@@ -681,7 +713,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             if start_corner == 2 || start_corner == 3 { row = effective_rows.saturating_sub(1).saturating_sub(row); }
             let min = origin + Vec2::new(column as f32 * (cell.x + gap.x), row as f32 * (cell.y + gap.y));
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(Rect::from_min_size(min, cell)), overrides, sequence, nodes);
+                global_z, scale, &sort_path, Some(Rect::from_min_size(min, cell)), overrides, scroll_offsets, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
         let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 1) == 0;
@@ -736,13 +768,13 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             };
             let arranged = Rect::from_min_size(min, natural.size());
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(arranged), overrides, sequence, nodes);
+                global_z, scale, &sort_path, Some(arranged), overrides, scroll_offsets, sequence, nodes);
             cursor += if horizontal { natural.width() } else { natural.height() } + padding;
         }
     } else {
         for child in instance.children() {
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, None, overrides, sequence, nodes);
+                global_z, scale, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
         }
     }
 }
@@ -884,6 +916,7 @@ pub fn draw_starter_gui(
     viewport: Rect,
     dom: &WeakDom,
     textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
+    scroll_offsets: &mut std::collections::HashMap<Ref, Vec2>,
     selected: Option<Ref>,
 ) -> Option<Ref> {
     let Some(starter) = dom.root().children().iter().find_map(|referent| {
@@ -901,7 +934,7 @@ pub fn draw_starter_gui(
             let global_z = enum_value(gui.properties.get(&rbx_dom_weak::ustr("ZIndexBehavior")), 1) == 0;
             let root_path = vec![(0, screen_order)];
             collect(dom, &layout_painter, *child, viewport, viewport, display_order,
-                global_z, 1.0, &root_path, None, &mut overrides, &mut sequence, &mut nodes);
+                global_z, 1.0, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
         }
     }
     nodes.sort_by(|left, right| {
@@ -914,9 +947,41 @@ pub fn draw_starter_gui(
         })
     });
     let mut clicked = None;
+    let mut scroll_bars: Vec<(Rect, Color32)> = Vec::new();
     for node in nodes {
         if node.clip.width() <= 0.0 || node.clip.height() <= 0.0 { continue; }
         let response = ui.interact(node.clip, ui.make_persistent_id(("roblox_gui", format!("{:?}", node.referent))), egui::Sense::click());
+        if node.class == "ScrollingFrame" {
+            let maximum = (node.canvas_size - node.content_rect.size()).max(Vec2::ZERO);
+            if response.hovered() && (maximum.x > 0.0 || maximum.y > 0.0) {
+                let delta = ui.input(|input| input.smooth_scroll_delta);
+                if delta != Vec2::ZERO {
+                    let entry = scroll_offsets.entry(node.referent).or_insert(Vec2::ZERO);
+                    let horizontal_wheel = if maximum.y <= 0.0 { delta.y } else { 0.0 };
+                    entry.x = (entry.x - delta.x - horizontal_wheel)
+                        .clamp(-node.canvas_position.x, maximum.x-node.canvas_position.x);
+                    entry.y = (entry.y - delta.y)
+                        .clamp(-node.canvas_position.y, maximum.y-node.canvas_position.y);
+                    ui.ctx().request_repaint();
+                }
+            }
+            let effective = (node.canvas_position + scroll_offsets.get(&node.referent).copied().unwrap_or(Vec2::ZERO)).clamp(Vec2::ZERO, maximum);
+            let thickness = node.scroll_bar_thickness;
+            if thickness > 0.0 && maximum.y > 0.0 {
+                let track = Rect::from_min_max(Pos2::new(node.rect.right()-thickness, node.rect.top()), node.rect.right_bottom());
+                let thumb_height = (track.height() * node.content_rect.height()/node.canvas_size.y.max(1.0)).max(thickness);
+                let travel = (track.height()-thumb_height).max(0.0);
+                let top = track.top() + travel * effective.y/maximum.y.max(1.0);
+                scroll_bars.push((Rect::from_min_size(Pos2::new(track.left(), top), Vec2::new(thickness, thumb_height)), node.scroll_bar_color));
+            }
+            if thickness > 0.0 && maximum.x > 0.0 {
+                let track = Rect::from_min_max(Pos2::new(node.rect.left(), node.rect.bottom()-thickness), node.rect.right_bottom());
+                let thumb_width = (track.width() * node.content_rect.width()/node.canvas_size.x.max(1.0)).max(thickness);
+                let travel = (track.width()-thumb_width).max(0.0);
+                let left = track.left() + travel * effective.x/maximum.x.max(1.0);
+                scroll_bars.push((Rect::from_min_size(Pos2::new(left, track.top()), Vec2::new(thumb_width, thickness)), node.scroll_bar_color));
+            }
+        }
         let painter = ui.painter().with_clip_rect(node.clip);
         painter.rect_filled(node.rect, node.corner_radius, node.background);
         if let Some(gradient) = &node.gradient {
@@ -986,6 +1051,10 @@ pub fn draw_starter_gui(
             }
         }
         if response.clicked() { clicked = Some(node.referent); }
+    }
+    let overlay_painter = ui.painter().with_clip_rect(viewport);
+    for (rect, color) in scroll_bars {
+        overlay_painter.rect_filled(rect, 2.0, color);
     }
     clicked
 }
