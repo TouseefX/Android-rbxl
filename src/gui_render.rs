@@ -395,12 +395,22 @@ fn padded_rect(dom: &WeakDom, instance: &rbx_dom_weak::Instance, rect: Rect, sca
 
 fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
            parent_rect: Rect, parent_clip: Rect, display_order: i32,
-           global_z: bool, inherited_scale: f32, parent_path: &[(i32, usize)],
-           forced_rect: Option<Rect>, overrides: &mut std::collections::HashMap<Ref, Rect>,
+           global_z: bool, inherited_scale: f32, inherited_opacity: f32,
+           inherited_tint: Color32, parent_path: &[(i32, usize)], forced_rect: Option<Rect>,
+           overrides: &mut std::collections::HashMap<Ref, Rect>,
            scroll_offsets: &std::collections::HashMap<Ref, Vec2>, sequence: &mut usize,
            nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
+    let group_transparency = if instance.class == "CanvasGroup" {
+        number(instance.properties.get(&rbx_dom_weak::ustr("GroupTransparency")), 0.0).clamp(0.0, 1.0)
+    } else { 0.0 };
+    let opacity = inherited_opacity * (1.0 - group_transparency);
+    let local_tint = if instance.class == "CanvasGroup" {
+        color(instance.properties.get(&rbx_dom_weak::ustr("GroupColor3")), 255, [255, 255, 255])
+    } else { Color32::WHITE };
+    let tint = multiply_color(inherited_tint, local_tint);
+    let modulation = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), (opacity * 255.0) as u8);
     let local_scale = child_of_class(dom, instance, "UIScale")
         .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
         .unwrap_or(1.0);
@@ -424,7 +434,10 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     if is_gui_object(&instance.class) {
         let transparency = number(instance.properties.get(&rbx_dom_weak::ustr("BackgroundTransparency")), 0.0).clamp(0.0, 1.0);
         let alpha = ((1.0 - transparency) * 255.0).round() as u8;
-        let background = color(instance.properties.get(&rbx_dom_weak::ustr("BackgroundColor3")), alpha, [255,255,255]);
+        let background = multiply_color(
+            color(instance.properties.get(&rbx_dom_weak::ustr("BackgroundColor3")), alpha, [255,255,255]),
+            modulation,
+        );
         let gradient = child_of_class(dom, instance, "UIGradient")
             .and_then(|modifier| bool_value(modifier.properties.get(&rbx_dom_weak::ustr("Enabled")), true)
                 .then(|| gradient_samples(modifier, background)).flatten());
@@ -436,10 +449,10 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         let ui_stroke = child_of_class(dom, instance, "UIStroke").and_then(|stroke| {
             let thickness = number(stroke.properties.get(&rbx_dom_weak::ustr("Thickness")), 1.0).max(0.0) * scale;
             let transparency = number(stroke.properties.get(&rbx_dom_weak::ustr("Transparency")), 0.0).clamp(0.0, 1.0);
-            (thickness > 0.0 && transparency < 1.0).then(|| (thickness, color(
+            (thickness > 0.0 && transparency < 1.0).then(|| (thickness, multiply_color(color(
                 stroke.properties.get(&rbx_dom_weak::ustr("Color")),
                 ((1.0 - transparency) * 255.0) as u8, [0, 0, 0],
-            )))
+            ), modulation)))
         });
         let (text_min_size, text_max_size) = child_of_class(dom, instance, "UITextSizeConstraint")
             .map(|constraint| (
@@ -483,13 +496,13 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             sort_path: sort_path.clone(),
             order,
             background,
-            border: color(instance.properties.get(&rbx_dom_weak::ustr("BorderColor3")), 255, [27,42,53]),
+            border: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("BorderColor3")), 255, [27,42,53]), modulation),
             border_size: number(instance.properties.get(&rbx_dom_weak::ustr("BorderSizePixel")), 1.0).max(0.0) * scale,
             corner_radius,
             ui_stroke,
             gradient,
             text: match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() },
-            text_color: color(instance.properties.get(&rbx_dom_weak::ustr("TextColor3")), ((1.0-text_transparency)*255.0) as u8, [0,0,0]),
+            text_color: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("TextColor3")), ((1.0-text_transparency)*255.0) as u8, [0,0,0]), modulation),
             text_size: (number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0) * scale).clamp(1.0, 400.0),
             text_x_alignment: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextXAlignment")), 1),
             text_y_alignment: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextYAlignment")), 1),
@@ -497,18 +510,18 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             text_scaled: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextScaled")), false),
             text_min_size,
             text_max_size,
-            text_stroke: color(
+            text_stroke: multiply_color(color(
                 instance.properties.get(&rbx_dom_weak::ustr("TextStrokeColor3")),
                 ((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("TextStrokeTransparency")), 1.0).clamp(0.0,1.0))*255.0) as u8,
                 [0,0,0],
-            ),
+            ), modulation),
             image: content(instance.properties.get(&rbx_dom_weak::ustr("Image"))
                 .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("ImageContent")))),
-            image_color: color(
+            image_color: multiply_color(color(
                 instance.properties.get(&rbx_dom_weak::ustr("ImageColor3")),
                 ((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("ImageTransparency")), 0.0).clamp(0.0,1.0))*255.0) as u8,
                 [255,255,255],
-            ),
+            ), modulation),
             image_rect_offset: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectOffset")), Vec2::ZERO),
             image_rect_size: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectSize")), Vec2::ZERO),
             image_scale_type: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScaleType")), 0),
@@ -521,8 +534,8 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             canvas_size,
             canvas_position: vector2(instance.properties.get(&rbx_dom_weak::ustr("CanvasPosition")), Vec2::ZERO) * scale,
             scroll_bar_thickness: number(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarThickness")), 12.0).max(0.0) * scale,
-            scroll_bar_color: color(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarImageColor3")),
-                ((1.0-scroll_bar_transparency)*255.0) as u8, [255,255,255]),
+            scroll_bar_color: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarImageColor3")),
+                ((1.0-scroll_bar_transparency)*255.0) as u8, [255,255,255]), modulation),
         });
     }
     let child_parent_rect = if instance.class == "ScrollingFrame" {
@@ -607,7 +620,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         }
         for child in instance.children() {
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
+                global_z, scale, opacity, tint, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIPageLayout") {
         let sort_order = enum_value(layout.properties.get(&rbx_dom_weak::ustr("SortOrder")), 0);
@@ -652,7 +665,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 _ => child_parent_rect.center().y - natural.height() * 0.5,
             };
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(Rect::from_min_size(Pos2::new(x, y), natural.size())), overrides, scroll_offsets, sequence, nodes);
+                global_z, scale, opacity, tint, &sort_path, Some(Rect::from_min_size(Pos2::new(x, y), natural.size())), overrides, scroll_offsets, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
         let (cxs, cxo, cys, cyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellSize")))
@@ -713,7 +726,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             if start_corner == 2 || start_corner == 3 { row = effective_rows.saturating_sub(1).saturating_sub(row); }
             let min = origin + Vec2::new(column as f32 * (cell.x + gap.x), row as f32 * (cell.y + gap.y));
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(Rect::from_min_size(min, cell)), overrides, scroll_offsets, sequence, nodes);
+                global_z, scale, opacity, tint, &sort_path, Some(Rect::from_min_size(min, cell)), overrides, scroll_offsets, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
         let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 1) == 0;
@@ -768,13 +781,13 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             };
             let arranged = Rect::from_min_size(min, natural.size());
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, Some(arranged), overrides, scroll_offsets, sequence, nodes);
+                global_z, scale, opacity, tint, &sort_path, Some(arranged), overrides, scroll_offsets, sequence, nodes);
             cursor += if horizontal { natural.width() } else { natural.height() } + padding;
         }
     } else {
         for child in instance.children() {
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-                global_z, scale, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
+                global_z, scale, opacity, tint, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
         }
     }
 }
@@ -934,7 +947,7 @@ pub fn draw_starter_gui(
             let global_z = enum_value(gui.properties.get(&rbx_dom_weak::ustr("ZIndexBehavior")), 1) == 0;
             let root_path = vec![(0, screen_order)];
             collect(dom, &layout_painter, *child, viewport, viewport, display_order,
-                global_z, 1.0, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
+                global_z, 1.0, 1.0, Color32::WHITE, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
         }
     }
     nodes.sort_by(|left, right| {
