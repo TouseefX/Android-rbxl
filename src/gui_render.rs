@@ -21,6 +21,7 @@ struct GuiNode {
     border_size: f32,
     corner_radius: f32,
     ui_stroke: Option<(f32, Color32)>,
+    gradient: Option<(f32, Vec2, Vec<Color32>)>,
     text: String,
     text_color: Color32,
     text_size: f32,
@@ -241,6 +242,52 @@ fn udim_pixels(value: Option<&Variant>, extent: f32, scale: f32) -> f32 {
     }
 }
 
+fn multiply_color(a: Color32, b: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (a.r() as u16 * b.r() as u16 / 255) as u8,
+        (a.g() as u16 * b.g() as u16 / 255) as u8,
+        (a.b() as u16 * b.b() as u16 / 255) as u8,
+        (a.a() as u16 * b.a() as u16 / 255) as u8,
+    )
+}
+
+fn gradient_samples(instance: &rbx_dom_weak::Instance, base: Color32) -> Option<(f32, Vec2, Vec<Color32>)> {
+    let rotation = number(instance.properties.get(&rbx_dom_weak::ustr("Rotation")), 0.0);
+    let offset = vector2(instance.properties.get(&rbx_dom_weak::ustr("Offset")), Vec2::ZERO);
+    let colors = match instance.properties.get(&rbx_dom_weak::ustr("Color")) {
+        Some(Variant::ColorSequence(sequence)) => &sequence.keypoints,
+        _ => return None,
+    };
+    if colors.is_empty() { return None; }
+    let transparencies = match instance.properties.get(&rbx_dom_weak::ustr("Transparency")) {
+        Some(Variant::NumberSequence(sequence)) => Some(&sequence.keypoints),
+        _ => None,
+    };
+    let sample_color = |time: f32| {
+        let upper = colors.iter().position(|point| point.time >= time).unwrap_or(colors.len().saturating_sub(1));
+        let lower = upper.saturating_sub(1);
+        let a = &colors[lower];
+        let b = &colors[upper];
+        let mix = if b.time > a.time { (time - a.time) / (b.time - a.time) } else { 0.0 };
+        let rgb = Color32::from_rgb(
+            ((a.value.r + (b.value.r - a.value.r) * mix) * 255.0) as u8,
+            ((a.value.g + (b.value.g - a.value.g) * mix) * 255.0) as u8,
+            ((a.value.b + (b.value.b - a.value.b) * mix) * 255.0) as u8,
+        );
+        let transparency = transparencies.and_then(|points| {
+            if points.is_empty() { return None; }
+            let upper = points.iter().position(|point| point.time >= time).unwrap_or(points.len() - 1);
+            let lower = upper.saturating_sub(1);
+            let a = &points[lower];
+            let b = &points[upper];
+            let mix = if b.time > a.time { (time - a.time) / (b.time - a.time) } else { 0.0 };
+            Some(a.value + (b.value - a.value) * mix)
+        }).unwrap_or(0.0).clamp(0.0, 1.0);
+        multiply_color(base, Color32::from_rgba_unmultiplied(rgb.r(), rgb.g(), rgb.b(), ((1.0-transparency)*255.0) as u8))
+    };
+    Some((rotation, offset, (0..=32).map(|index| sample_color(index as f32 / 32.0)).collect()))
+}
+
 fn child_of_class<'a>(dom: &'a WeakDom, instance: &rbx_dom_weak::Instance, class: &str)
     -> Option<&'a rbx_dom_weak::Instance>
 {
@@ -289,6 +336,10 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     if is_gui_object(&instance.class) {
         let transparency = number(instance.properties.get(&rbx_dom_weak::ustr("BackgroundTransparency")), 0.0).clamp(0.0, 1.0);
         let alpha = ((1.0 - transparency) * 255.0).round() as u8;
+        let background = color(instance.properties.get(&rbx_dom_weak::ustr("BackgroundColor3")), alpha, [255,255,255]);
+        let gradient = child_of_class(dom, instance, "UIGradient")
+            .and_then(|modifier| bool_value(modifier.properties.get(&rbx_dom_weak::ustr("Enabled")), true)
+                .then(|| gradient_samples(modifier, background)).flatten());
         let text_transparency = number(instance.properties.get(&rbx_dom_weak::ustr("TextTransparency")), 0.0).clamp(0.0, 1.0);
         let corner_radius = child_of_class(dom, instance, "UICorner")
             .map(|corner| udim_pixels(corner.properties.get(&rbx_dom_weak::ustr("CornerRadius")), rect.width().min(rect.height()), scale))
@@ -322,11 +373,12 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             global_z,
             sort_path: sort_path.clone(),
             order,
-            background: color(instance.properties.get(&rbx_dom_weak::ustr("BackgroundColor3")), alpha, [255,255,255]),
+            background,
             border: color(instance.properties.get(&rbx_dom_weak::ustr("BorderColor3")), 255, [27,42,53]),
             border_size: number(instance.properties.get(&rbx_dom_weak::ustr("BorderSizePixel")), 1.0).max(0.0) * scale,
             corner_radius,
             ui_stroke,
+            gradient,
             text: match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() },
             text_color: color(instance.properties.get(&rbx_dom_weak::ustr("TextColor3")), ((1.0-text_transparency)*255.0) as u8, [0,0,0]),
             text_size: (number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0) * scale).clamp(1.0, 400.0),
@@ -371,6 +423,30 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     for child in instance.children() {
         collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
             global_z, scale, &sort_path, sequence, nodes);
+    }
+}
+
+fn paint_gradient(painter: &egui::Painter, rect: Rect, gradient: &(f32, Vec2, Vec<Color32>)) {
+    let (rotation, offset, samples) = gradient;
+    if samples.len() < 2 { return; }
+    let radians = rotation.to_radians();
+    let direction = Vec2::new(radians.cos(), radians.sin());
+    let perpendicular = Vec2::new(-direction.y, direction.x);
+    let along = direction.x.abs() * rect.width() * 0.5 + direction.y.abs() * rect.height() * 0.5;
+    let across = perpendicular.x.abs() * rect.width() * 0.5 + perpendicular.y.abs() * rect.height() * 0.5 + 2.0;
+    let center = rect.center() + Vec2::new(offset.x * rect.width(), offset.y * rect.height());
+    for index in 0..samples.len() - 1 {
+        let t0 = index as f32 / (samples.len() - 1) as f32;
+        let t1 = (index + 1) as f32 / (samples.len() - 1) as f32;
+        let a = -along + along * 2.0 * t0;
+        let b = -along + along * 2.0 * t1;
+        let points = vec![
+            center + direction * a - perpendicular * across,
+            center + direction * b - perpendicular * across,
+            center + direction * b + perpendicular * across,
+            center + direction * a + perpendicular * across,
+        ];
+        painter.add(egui::Shape::convex_polygon(points, samples[index], Stroke::NONE));
     }
 }
 
@@ -521,6 +597,9 @@ pub fn draw_starter_gui(
         let response = ui.interact(node.clip, ui.make_persistent_id(("roblox_gui", format!("{:?}", node.referent))), egui::Sense::click());
         let painter = ui.painter().with_clip_rect(node.clip);
         painter.rect_filled(node.rect, node.corner_radius, node.background);
+        if let Some(gradient) = &node.gradient {
+            paint_gradient(&painter.with_clip_rect(node.rect.intersect(node.clip)), node.rect, gradient);
+        }
         if node.border_size > 0.0 {
             painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(node.border_size, node.border), egui::StrokeKind::Inside);
         }
