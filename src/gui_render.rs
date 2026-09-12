@@ -20,6 +20,7 @@ struct GuiNode {
     border: Color32,
     border_size: f32,
     corner_radius: f32,
+    rotation: f32,
     ui_stroke: Option<(f32, Color32)>,
     gradient: Option<(f32, Vec2, Vec<Color32>)>,
     text: String,
@@ -511,6 +512,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             border: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("BorderColor3")), 255, [27,42,53]), modulation),
             border_size: number(instance.properties.get(&rbx_dom_weak::ustr("BorderSizePixel")), 1.0).max(0.0) * scale,
             corner_radius,
+            rotation: number(instance.properties.get(&rbx_dom_weak::ustr("Rotation")), 0.0),
             ui_stroke,
             gradient,
             text: match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() },
@@ -831,6 +833,48 @@ fn paint_gradient(painter: &egui::Painter, rect: Rect, gradient: &(f32, Vec2, Ve
     }
 }
 
+fn rotated_bounds(rect: Rect, rotation: f32) -> Rect {
+    if rotation.abs() < 0.001 { return rect; }
+    let radians = rotation.to_radians();
+    let points = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()]
+        .map(|point| rotate_point(point, rect.center(), radians));
+    let mut bounds = Rect::NOTHING;
+    for point in points { bounds.extend_with(point); }
+    bounds
+}
+
+fn paint_galley(painter: &egui::Painter, pos: Pos2, galley: std::sync::Arc<egui::Galley>,
+                color: Color32, rotation: f32, pivot: Pos2) {
+    if rotation.abs() < 0.001 {
+        painter.galley(pos, galley, color);
+    } else {
+        let radians = rotation.to_radians();
+        let rotated_pos = rotate_point(pos, pivot, radians);
+        painter.add(egui::epaint::TextShape::new(rotated_pos, galley, color).with_angle(radians));
+    }
+}
+
+fn rotate_point(point: Pos2, pivot: Pos2, radians: f32) -> Pos2 {
+    let offset = point - pivot;
+    let (sin, cos) = radians.sin_cos();
+    pivot + Vec2::new(offset.x*cos - offset.y*sin, offset.x*sin + offset.y*cos)
+}
+
+fn paint_texture_quad(painter: &egui::Painter, texture: egui::TextureId, destination: Rect,
+                      uv: Rect, tint: Color32, rotation: f32, pivot: Pos2) {
+    if rotation.abs() < 0.001 {
+        painter.image(texture, destination, uv, tint);
+        return;
+    }
+    let mut mesh = egui::Mesh::with_texture(texture);
+    mesh.add_rect_with_uv(destination, uv, tint);
+    let radians = rotation.to_radians();
+    for vertex in &mut mesh.vertices {
+        vertex.pos = rotate_point(vertex.pos, pivot, radians);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureHandle, tint: Color32) {
     let texture_size = texture.size_vec2().max(Vec2::splat(1.0));
     let source_size = if node.image_rect_size.x > 0.0 && node.image_rect_size.y > 0.0 {
@@ -850,7 +894,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
         // Slice (nine-slice)
         1 => {
             let Some(slice) = node.slice_center else {
-                painter.image(texture.id(), bounds, uv, tint);
+                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center());
                 return;
             };
             let mut left = (slice[0] - node.image_rect_offset.x).max(0.0) * node.slice_scale;
@@ -872,10 +916,10 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
             for y in 0..3 {
                 for x in 0..3 {
                     if dx[x + 1] <= dx[x] || dy[y + 1] <= dy[y] { continue; }
-                    painter.image(texture.id(),
+                    paint_texture_quad(painter, texture.id(),
                         Rect::from_min_max(Pos2::new(dx[x], dy[y]), Pos2::new(dx[x + 1], dy[y + 1])),
                         Rect::from_min_max(Pos2::new(ux[x], uy[y]), Pos2::new(ux[x + 1], uy[y + 1])),
-                        tint);
+                        tint, node.rotation, node.rect.center());
                 }
             }
         }
@@ -899,7 +943,8 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                         uv.min.x + uv.width() * fraction.x,
                         uv.min.y + uv.height() * fraction.y,
                     ));
-                    painter.image(texture.id(), Rect::from_min_max(min, max), tile_uv, tint);
+                    paint_texture_quad(painter, texture.id(), Rect::from_min_max(min, max), tile_uv,
+                        tint, node.rotation, node.rect.center());
                 }
             }
         }
@@ -912,7 +957,8 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
             } else {
                 Vec2::new(bounds.width(), bounds.width() / image_aspect)
             };
-            painter.image(texture.id(), Rect::from_center_size(bounds.center(), size), uv, tint);
+            paint_texture_quad(painter, texture.id(), Rect::from_center_size(bounds.center(), size), uv,
+                tint, node.rotation, node.rect.center());
         }
         // Crop
         4 => {
@@ -930,10 +976,10 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 crop_uv.min.x += margin;
                 crop_uv.max.x -= margin;
             }
-            painter.image(texture.id(), bounds, crop_uv, tint);
+            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center());
         }
         // Stretch
-        _ => painter.image(texture.id(), bounds, uv, tint),
+        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center()),
     }
 }
 
@@ -1071,10 +1117,15 @@ pub fn draw_starter_gui(
     let mut scroll_bars: Vec<(Rect, Color32)> = Vec::new();
     for node in nodes {
         if node.clip.width() <= 0.0 || node.clip.height() <= 0.0 { continue; }
-        let response = ui.interact(node.clip, ui.make_persistent_id(("roblox_gui", format!("{:?}", node.referent))), egui::Sense::click());
+        let hit_rect = rotated_bounds(node.rect, node.rotation).intersect(node.clip);
+        let response = ui.interact(hit_rect, ui.make_persistent_id(("roblox_gui", format!("{:?}", node.referent))), egui::Sense::click());
+        let pointer_inside = ui.input(|input| input.pointer.hover_pos()).map(|point| {
+            let local = rotate_point(point, node.rect.center(), -node.rotation.to_radians());
+            node.rect.contains(local) && node.clip.contains(point)
+        }).unwrap_or(false);
         if node.class == "ScrollingFrame" {
             let maximum = (node.canvas_size - node.content_rect.size()).max(Vec2::ZERO);
-            if response.hovered() && (maximum.x > 0.0 || maximum.y > 0.0) {
+            if response.hovered() && pointer_inside && (maximum.x > 0.0 || maximum.y > 0.0) {
                 let delta = ui.input(|input| input.smooth_scroll_delta);
                 if delta != Vec2::ZERO {
                     let entry = scroll_offsets.entry(node.referent).or_insert(Vec2::ZERO);
@@ -1106,18 +1157,35 @@ pub fn draw_starter_gui(
         let painter = ui.painter().with_clip_rect(node.clip);
         let is_button = matches!(node.class.as_str(), "TextButton" | "ImageButton");
         let pressed = is_button && response.is_pointer_button_down_on();
-        let hovered = is_button && response.hovered();
+        let hovered = is_button && response.hovered() && pointer_inside;
         let button_factor = if node.auto_button_color && pressed { 0.72 }
             else if node.auto_button_color && hovered { 0.88 } else { 1.0 };
-        painter.rect_filled(node.rect, node.corner_radius, shade_color(node.background, button_factor));
+        if node.rotation.abs() < 0.001 {
+            painter.rect_filled(node.rect, node.corner_radius, shade_color(node.background, button_factor));
+        } else {
+            let radians = node.rotation.to_radians();
+            let corners = [node.rect.left_top(), node.rect.right_top(), node.rect.right_bottom(), node.rect.left_bottom()]
+                .into_iter().map(|point| rotate_point(point, node.rect.center(), radians)).collect();
+            painter.add(egui::Shape::convex_polygon(corners,
+                shade_color(node.background, button_factor), Stroke::NONE));
+        }
         if let Some(gradient) = &node.gradient {
             paint_gradient(&painter.with_clip_rect(node.rect.intersect(node.clip)), node.rect, gradient);
         }
-        if node.border_size > 0.0 {
-            painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(node.border_size, node.border), egui::StrokeKind::Inside);
-        }
-        if let Some((thickness, color)) = node.ui_stroke {
-            painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(thickness, color), egui::StrokeKind::Middle);
+        if node.rotation.abs() < 0.001 {
+            if node.border_size > 0.0 {
+                painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(node.border_size, node.border), egui::StrokeKind::Inside);
+            }
+            if let Some((thickness, color)) = node.ui_stroke {
+                painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(thickness, color), egui::StrokeKind::Middle);
+            }
+        } else {
+            let radians = node.rotation.to_radians();
+            let mut corners: Vec<Pos2> = [node.rect.left_top(), node.rect.right_top(), node.rect.right_bottom(), node.rect.left_bottom()]
+                .into_iter().map(|point| rotate_point(point, node.rect.center(), radians)).collect();
+            corners.push(corners[0]);
+            if node.border_size > 0.0 { painter.line(corners.clone(), Stroke::new(node.border_size, node.border)); }
+            if let Some((thickness, color)) = node.ui_stroke { painter.line(corners, Stroke::new(thickness, color)); }
         }
         let displayed_image = if pressed {
             node.pressed_image.as_ref().or(node.hover_image.as_ref()).or(node.image.as_ref())
@@ -1171,10 +1239,11 @@ pub fn draw_starter_gui(
             let pos = Pos2::new(x, y);
             if node.text_stroke.a() > 0 {
                 for offset in [Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, -1.0), Vec2::new(0.0, 1.0)] {
-                    painter.galley(pos + offset, galley.clone(), node.text_stroke);
+                    paint_galley(&painter, pos + offset, galley.clone(), node.text_stroke,
+                        node.rotation, node.rect.center());
                 }
             }
-            painter.galley(pos, galley, text_color);
+            paint_galley(&painter, pos, galley, text_color, node.rotation, node.rect.center());
         }
         if selected == Some(node.referent) {
             painter.rect_stroke(node.rect, 0.0, Stroke::new(2.0, Color32::from_rgb(0, 162, 255)), egui::StrokeKind::Outside);
@@ -1184,7 +1253,7 @@ pub fn draw_starter_gui(
                     Stroke::new(1.0, Color32::from_rgb(0, 110, 220)), egui::StrokeKind::Inside);
             }
         }
-        if response.clicked() { clicked = Some(node.referent); }
+        if response.clicked() && pointer_inside { clicked = Some(node.referent); }
     }
     let overlay_painter = ui.painter().with_clip_rect(viewport);
     for (rect, color) in scroll_bars {
