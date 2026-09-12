@@ -33,7 +33,10 @@ struct GuiNode {
     text_max_size: f32,
     text_stroke: Color32,
     image: Option<String>,
+    hover_image: Option<String>,
+    pressed_image: Option<String>,
     image_color: Color32,
+    auto_button_color: bool,
     image_rect_offset: Vec2,
     image_rect_size: Vec2,
     image_scale_type: i32,
@@ -326,6 +329,15 @@ fn udim_pixels(value: Option<&Variant>, extent: f32, scale: f32) -> f32 {
     }
 }
 
+fn shade_color(color: Color32, factor: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (color.r() as f32 * factor).round() as u8,
+        (color.g() as f32 * factor).round() as u8,
+        (color.b() as f32 * factor).round() as u8,
+        color.a(),
+    )
+}
+
 fn multiply_color(a: Color32, b: Color32) -> Color32 {
     Color32::from_rgba_unmultiplied(
         (a.r() as u16 * b.r() as u16 / 255) as u8,
@@ -517,11 +529,14 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             ), modulation),
             image: content(instance.properties.get(&rbx_dom_weak::ustr("Image"))
                 .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("ImageContent")))),
+            hover_image: content(instance.properties.get(&rbx_dom_weak::ustr("HoverImage"))),
+            pressed_image: content(instance.properties.get(&rbx_dom_weak::ustr("PressedImage"))),
             image_color: multiply_color(color(
                 instance.properties.get(&rbx_dom_weak::ustr("ImageColor3")),
                 ((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("ImageTransparency")), 0.0).clamp(0.0,1.0))*255.0) as u8,
                 [255,255,255],
             ), modulation),
+            auto_button_color: bool_value(instance.properties.get(&rbx_dom_weak::ustr("AutoButtonColor")), true),
             image_rect_offset: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectOffset")), Vec2::ZERO),
             image_rect_size: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectSize")), Vec2::ZERO),
             image_scale_type: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScaleType")), 0),
@@ -816,7 +831,7 @@ fn paint_gradient(painter: &egui::Painter, rect: Rect, gradient: &(f32, Vec2, Ve
     }
 }
 
-fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureHandle) {
+fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureHandle, tint: Color32) {
     let texture_size = texture.size_vec2().max(Vec2::splat(1.0));
     let source_size = if node.image_rect_size.x > 0.0 && node.image_rect_size.y > 0.0 {
         node.image_rect_size
@@ -835,7 +850,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
         // Slice (nine-slice)
         1 => {
             let Some(slice) = node.slice_center else {
-                painter.image(texture.id(), bounds, uv, node.image_color);
+                painter.image(texture.id(), bounds, uv, tint);
                 return;
             };
             let mut left = (slice[0] - node.image_rect_offset.x).max(0.0) * node.slice_scale;
@@ -860,7 +875,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                     painter.image(texture.id(),
                         Rect::from_min_max(Pos2::new(dx[x], dy[y]), Pos2::new(dx[x + 1], dy[y + 1])),
                         Rect::from_min_max(Pos2::new(ux[x], uy[y]), Pos2::new(ux[x + 1], uy[y + 1])),
-                        node.image_color);
+                        tint);
                 }
             }
         }
@@ -884,7 +899,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                         uv.min.x + uv.width() * fraction.x,
                         uv.min.y + uv.height() * fraction.y,
                     ));
-                    painter.image(texture.id(), Rect::from_min_max(min, max), tile_uv, node.image_color);
+                    painter.image(texture.id(), Rect::from_min_max(min, max), tile_uv, tint);
                 }
             }
         }
@@ -897,7 +912,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
             } else {
                 Vec2::new(bounds.width(), bounds.width() / image_aspect)
             };
-            painter.image(texture.id(), Rect::from_center_size(bounds.center(), size), uv, node.image_color);
+            painter.image(texture.id(), Rect::from_center_size(bounds.center(), size), uv, tint);
         }
         // Crop
         4 => {
@@ -915,10 +930,10 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 crop_uv.min.x += margin;
                 crop_uv.max.x -= margin;
             }
-            painter.image(texture.id(), bounds, crop_uv, node.image_color);
+            painter.image(texture.id(), bounds, crop_uv, tint);
         }
         // Stretch
-        _ => painter.image(texture.id(), bounds, uv, node.image_color),
+        _ => painter.image(texture.id(), bounds, uv, tint),
     }
 }
 
@@ -996,7 +1011,12 @@ pub fn draw_starter_gui(
             }
         }
         let painter = ui.painter().with_clip_rect(node.clip);
-        painter.rect_filled(node.rect, node.corner_radius, node.background);
+        let is_button = matches!(node.class.as_str(), "TextButton" | "ImageButton");
+        let pressed = is_button && response.is_pointer_button_down_on();
+        let hovered = is_button && response.hovered();
+        let button_factor = if node.auto_button_color && pressed { 0.72 }
+            else if node.auto_button_color && hovered { 0.88 } else { 1.0 };
+        painter.rect_filled(node.rect, node.corner_radius, shade_color(node.background, button_factor));
         if let Some(gradient) = &node.gradient {
             paint_gradient(&painter.with_clip_rect(node.rect.intersect(node.clip)), node.rect, gradient);
         }
@@ -1006,7 +1026,14 @@ pub fn draw_starter_gui(
         if let Some((thickness, color)) = node.ui_stroke {
             painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(thickness, color), egui::StrokeKind::Middle);
         }
-        if let Some(uri) = &node.image {
+        let displayed_image = if pressed {
+            node.pressed_image.as_ref().or(node.hover_image.as_ref()).or(node.image.as_ref())
+        } else if hovered {
+            node.hover_image.as_ref().or(node.image.as_ref())
+        } else {
+            node.image.as_ref()
+        };
+        if let Some(uri) = displayed_image {
             if !textures.contains_key(uri) {
                 let decoded = crate::asset_downloader::get_cached_image(uri).or_else(|| {
                     crate::asset_downloader::extract_asset_id(uri)
@@ -1022,20 +1049,21 @@ pub fn draw_starter_gui(
                 }
             }
             if let Some(texture) = textures.get(uri) {
-                paint_image(&painter, &node, texture);
+                paint_image(&painter, &node, texture, shade_color(node.image_color, button_factor));
             }
         }
         if !node.text.is_empty() {
+            let text_color = shade_color(node.text_color, button_factor);
             let text_rect = node.content_rect;
             let wrap_width = if node.text_wrapped { text_rect.width() } else { f32::INFINITY };
             let mut font_size = if node.text_scaled { text_rect.height().max(1.0) } else { node.text_size };
             font_size = font_size.clamp(node.text_min_size, node.text_max_size);
-            let mut galley = painter.layout(node.text.clone(), FontId::proportional(font_size), node.text_color, wrap_width);
+            let mut galley = painter.layout(node.text.clone(), FontId::proportional(font_size), text_color, wrap_width);
             if node.text_scaled && (galley.size().x > text_rect.width() || galley.size().y > text_rect.height()) {
                 let scale = (text_rect.width() / galley.size().x.max(1.0))
                     .min(text_rect.height() / galley.size().y.max(1.0));
                 font_size = (font_size * scale).clamp(node.text_min_size, node.text_max_size);
-                galley = painter.layout(node.text.clone(), FontId::proportional(font_size), node.text_color, wrap_width);
+                galley = painter.layout(node.text.clone(), FontId::proportional(font_size), text_color, wrap_width);
             }
             let x = match node.text_x_alignment {
                 0 => text_rect.left(),
@@ -1053,7 +1081,7 @@ pub fn draw_starter_gui(
                     painter.galley(pos + offset, galley.clone(), node.text_stroke);
                 }
             }
-            painter.galley(pos, galley, node.text_color);
+            painter.galley(pos, galley, text_color);
         }
         if selected == Some(node.referent) {
             painter.rect_stroke(node.rect, 0.0, Stroke::new(2.0, Color32::from_rgb(0, 162, 255)), egui::StrokeKind::Outside);
