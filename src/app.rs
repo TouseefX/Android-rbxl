@@ -912,8 +912,14 @@ impl EditorApp {
             if ui.button("🎯 Focus Sel").clicked() {
                 if let (Some(dom), Some(r)) = (&self.dom, self.selected) {
                     if let Some(inst) = dom.get_by_ref(r) {
-                        if let Some(Variant::Vector3(v)) = inst.properties.get(&rbx_dom_weak::ustr("Position")) {
-                            orbit.target = [v.x, v.y, v.z];
+                        match inst.properties.get(&rbx_dom_weak::ustr("CFrame"))
+                            .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("CoordinateFrame"))) {
+                            Some(Variant::CFrame(cf)) => {
+                                orbit.target = [cf.position.x, cf.position.y, cf.position.z];
+                            }
+                            _ => if let Some(Variant::Vector3(v)) = inst.properties.get(&rbx_dom_weak::ustr("Position")) {
+                                orbit.target = [v.x, v.y, v.z];
+                            },
                         }
                     }
                 }
@@ -948,10 +954,32 @@ impl EditorApp {
             ui.available_size().max(egui::vec2(220.0, 300.0)),
             egui::Sense::drag(),
         );
-        if response.dragged() {
+        if response.dragged_by(egui::PointerButton::Primary) {
             let d = response.drag_delta();
             orbit.yaw -= d.x * 0.008;
             orbit.pitch = (orbit.pitch + d.y * 0.008).clamp(-1.5, 1.5);
+        }
+        // Studio-style secondary drag pans the target in the camera plane.
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            let d = response.drag_delta();
+            let scale = orbit.dist * 0.0015;
+            let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
+            orbit.target[0] += (-d.x * cos_yaw - d.y * sin_yaw) * scale;
+            orbit.target[2] += (d.x * sin_yaw - d.y * cos_yaw) * scale;
+        }
+        // Keyboard navigation only applies while the viewport is hovered, so
+        // WASD remains available when editing scripts and property text.
+        if response.hovered() {
+            let step = self.cam_move_speed * 0.12;
+            let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
+            ui.input(|input| {
+                let held = |key| if input.key_down(key) { 1.0_f32 } else { 0.0_f32 };
+                let forward = held(egui::Key::W) - held(egui::Key::S);
+                let right = held(egui::Key::D) - held(egui::Key::A);
+                orbit.target[0] += (forward * sin_yaw + right * cos_yaw) * step;
+                orbit.target[2] += (forward * cos_yaw - right * sin_yaw) * step;
+                orbit.target[1] += (held(egui::Key::E) - held(egui::Key::Q)) * step;
+            });
         }
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.0 {

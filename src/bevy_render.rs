@@ -520,7 +520,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
         Some(Variant::Color3(c)) => [c.r as f32, c.g as f32, c.b as f32],
         Some(Variant::Color3uint8(c)) => [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0],
         _ => match inst.properties.get(&rbx_dom_weak::ustr("BrickColor")) {
-            Some(Variant::BrickColor(bc)) => brick_color_rgb(*bc as u32),
+            Some(Variant::BrickColor(bc)) => brick_color_value_rgb(*bc),
             Some(Variant::Int32(bc)) => brick_color_rgb(*bc as u32),
             Some(Variant::Int64(bc)) => brick_color_rgb(*bc as u32),
             _ => brick_color_rgb(194), // Roblox default "Medium stone grey"
@@ -606,7 +606,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     // Decals
     // Face overlay: asset URI, opacity, and optional Texture tile size in studs.
     // `None` is a Decal (one image stretched across the face).
-    let mut decals: HashMap<&'static str, (String, f32, Option<(f32, f32)>)> = HashMap::new();
+    let mut decals: HashMap<&'static str, (String, f32, Option<(f32, f32, f32, f32)>)> = HashMap::new();
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
         if ch.class == "Decal" || ch.class == "Texture" {
@@ -640,7 +640,9 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
                             _ => fallback,
                         };
                         Some((number("StudsPerTileU", 2.0).max(0.01),
-                              number("StudsPerTileV", 2.0).max(0.01)))
+                              number("StudsPerTileV", 2.0).max(0.01),
+                              number("OffsetStudsU", 0.0),
+                              number("OffsetStudsV", 0.0)))
                     } else {
                         None
                     };
@@ -749,27 +751,23 @@ fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-/// Map a Roblox BrickColor number to RGB (0..1). Covers the common colors plus
-/// a default grey; used when a part stores its color as a BrickColor.
+/// Convert the palette value using rbx_types' canonical 208-color table.
+/// This avoids a hand-maintained subset silently turning uncommon colors grey.
+fn brick_color_value_rgb(color: rbx_dom_weak::types::BrickColor) -> [f32; 3] {
+    let value = color.to_color3uint8();
+    [value.r as f32 / 255.0, value.g as f32 / 255.0, value.b as f32 / 255.0]
+}
+
+/// Legacy/synthetic DOMs can encode BrickColor as an integer instead of the
+/// typed variant. Resolve those through the same complete canonical palette.
 fn brick_color_rgb(code: u32) -> [f32; 3] {
-    let c = match code {
-        21 => [196.0, 40.0, 28.0],   // Bright red
-        24 => [98.0, 71.0, 50.0],    // Medium brown
-        26 => [75.0, 105.0, 47.0],   // Dark green
-        28 => [194.0, 218.0, 184.0], // Dark green (light)
-        45 => [200.0, 190.0, 170.0], // Pastel brown
-        100 => [252.0, 251.0, 247.0], // White
-        102 => [251.0, 249.0, 240.0], // White
-        104 => [248.0, 244.0, 225.0], // Pastel yellow
-        107 => [214.0, 199.0, 128.0], // Gold
-        119 => [196.0, 140.0, 40.0],  // Bright orange
-        135 => [255.0, 34.0, 14.0],   // Bright red-orange
-        194 => [163.0, 162.0, 165.0], // Medium stone grey
-        199 => [184.0, 184.0, 0.0],   // Dark yellow
-        208 => [53.0, 53.0, 53.0],    // Dark stone grey
-        _ => [163.0, 162.0, 165.0],
-    };
-    [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]
+    rbx_dom_weak::types::BrickColor::from_number(code as u16)
+        .map(brick_color_value_rgb)
+        .unwrap_or_else(|| {
+            let fallback = rbx_dom_weak::types::BrickColor::from_number(194)
+                .expect("Roblox BrickColor 194 must exist");
+            brick_color_value_rgb(fallback)
+        })
 }
 
 /// Map the numeric value of a Roblox `Material` EnumItem to its name.
@@ -809,7 +807,7 @@ fn normal_id_name(value: u32) -> &'static str {
 
 // --- primitive builders (same shapes as the Android app / OpenRBLX) ---
 
-fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, (String, f32, Option<(f32, f32)>)>) {
+fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, (String, f32, Option<(f32, f32, f32, f32)>)>) {
     let h = half;
     let v = [
         Vec3::new(-h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, h.z), Vec3::new(-h.x, -h.y, h.z),
@@ -842,10 +840,15 @@ fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, dec
         if let Some((texture, opacity, tile)) = decals.get(face) {
             // Texture repeats according to studs-per-tile; Decal occupies the
             // face once. The image sampler uses repeat addressing below.
-            let overlay_uv = tile.map(|(u, v)| [
-                [0.0, 0.0], [face_span.0 / u, 0.0],
-                [face_span.0 / u, face_span.1 / v], [0.0, face_span.1 / v],
-            ]).unwrap_or(uv);
+            let overlay_uv = tile.map(|(u, v, offset_u, offset_v)| {
+                let start_u = -offset_u / u;
+                let start_v = -offset_v / v;
+                [
+                    [start_u, start_v], [start_u + face_span.0 / u, start_v],
+                    [start_u + face_span.0 / u, start_v + face_span.1 / v],
+                    [start_u, start_v + face_span.1 / v],
+                ]
+            }).unwrap_or(uv);
             // Offset the overlay a fraction of a stud to avoid coplanar
             // z-fighting without relying on driver-specific polygon offsets.
             let offset = n.mul(0.0015);
