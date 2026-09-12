@@ -65,6 +65,9 @@ pub struct FlatMaterial {
     /// textures — Roblox doesn't tint these by the part's Color).
     #[uniform(5)]
     pub tint_texture: u32,
+    /// Texture alpha interpretation. See `Tri::texture_mode`.
+    #[uniform(6)]
+    pub texture_mode: u32,
     /// Whether to use alpha blending (transparent parts).
     pub transparent: bool,
     /// Small depth bias to separate coincident/overlapping faces and stop
@@ -376,6 +379,9 @@ struct Tri {
     opacity: f32,
     /// Procedural and mesh textures are tinted by the part Color; decals are not.
     tint: bool,
+    /// SurfaceAppearance alpha behavior: 0=transparency, 1=overlay,
+    /// 2=tint-mask, 3=opaque.
+    texture_mode: u32,
 }
 
 #[derive(Clone)]
@@ -430,7 +436,7 @@ fn push_quad_surface(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3,
     let nrm = tn(cf, n);
     for (pos, uv) in [(a, uv[0]), (b, uv[1]), (c, uv[2]),
                       (a, uv[0]), (c, uv[2]), (d, uv[3])] {
-        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint });
+        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint, texture_mode: 0 });
     }
 }
 
@@ -438,7 +444,7 @@ fn push_tri(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 3], n: Vec3, uv: [[f32; 
     let nrm = tn(cf, n);
     let tint = tex.as_deref().is_some_and(|key| key.starts_with("__"));
     for i in 0..3 {
-        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint });
+        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint, texture_mode: 0 });
     }
 }
 
@@ -569,6 +575,9 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
     // MeshPart / SpecialMesh
     let mut mesh_id: Option<String> = None;
     let mut mesh_tex: Option<String> = None;
+    // Legacy mesh textures use their alpha as transparency. SurfaceAppearance
+    // can explicitly select a different alpha interpretation.
+    let mut mesh_texture_mode = 0u32;
     let mut mesh_type: Option<String> = None;
     let mut scale = Vec3::new(1.0, 1.0, 1.0);
     let mut offset = Vec3::new(0.0, 0.0, 0.0);
@@ -599,6 +608,22 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
             {
                 mesh_tex = Some(texture);
             }
+            mesh_texture_mode = match ch.properties.get(&rbx_dom_weak::ustr("AlphaMode")) {
+                Some(Variant::Enum(value)) => match value.clone().to_u32() {
+                    0 => 1, // Overlay
+                    1 => 0, // Transparency
+                    2 => 2, // TintMask
+                    3 => 3, // Opaque
+                    _ => 1,
+                },
+                Some(Variant::String(value)) => match value.as_str() {
+                    "Transparency" => 0,
+                    "TintMask" => 2,
+                    "Opaque" => 3,
+                    _ => 1,
+                },
+                _ => 1, // Roblox SurfaceAppearance default: Overlay
+            };
         } else if ch.class == "SpecialMesh" || ch.class == "BlockMesh" {
             if let Some(m) = ch.properties.get(&rbx_dom_weak::ustr("MeshId")).and_then(content_str) {
                 mesh_id = Some(m);
@@ -712,9 +737,9 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
                     let uc = md.uvs.get(f[2] as usize).copied().unwrap_or([0.0, 1.0]);
                     let t = tex_key.clone();
                     // Roblox mesh textures are modulated by MeshPart.Color.
-                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: true });
-                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: true });
-                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: true });
+                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: true, texture_mode: mesh_texture_mode });
+                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: true, texture_mode: mesh_texture_mode });
+                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: true, texture_mode: mesh_texture_mode });
                 }
             }
             if tris.is_empty() {
@@ -1405,7 +1430,7 @@ pub fn rebuild_scene(
     // transparent *entities*, not triangles inside a merged mesh; merging all
     // glass with the same color made distant panes draw over nearby panes.
     // Opaque surfaces remain aggressively batched for Android performance.
-    type Key = ([u8; 3], u8, Option<String>, bool, Option<usize>);
+    type Key = ([u8; 3], u8, Option<String>, bool, u32, Option<usize>);
     let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
     for (part_index, p) in parts.iter().enumerate() {
         let ck = [
@@ -1419,14 +1444,15 @@ pub fn rebuild_scene(
                 let image_alpha = t.tex.as_ref()
                     .and_then(|key| texture_has_alpha.get(key))
                     .copied().unwrap_or(false);
-                let sort_part = (ak < 255 || image_alpha).then_some(part_index);
-                buckets.entry((ck, ak, t.tex.clone(), t.tint, sort_part)).or_default().push(t.clone());
+                let uses_texture_alpha = t.texture_mode == 0;
+                let sort_part = (ak < 255 || (image_alpha && uses_texture_alpha)).then_some(part_index);
+                buckets.entry((ck, ak, t.tex.clone(), t.tint, t.texture_mode, sort_part)).or_default().push(t.clone());
             }
         }
     }
     let draw_call_count = buckets.len();
 
-    for ((ck, ak, tex_key, tint, sort_part), tris) in buckets {
+    for ((ck, ak, tex_key, tint, texture_mode, sort_part), tris) in buckets {
         // Put each transparent entity's origin at its geometric center so
         // Bevy's back-to-front phase has a meaningful distance to sort. Opaque
         // merged buckets stay in world space at the origin.
@@ -1506,8 +1532,10 @@ pub fn rebuild_scene(
             has_texture,
             texture,
             tint_texture,
+            texture_mode,
             transparent: alpha < 0.999
-                || tex_key.as_ref().and_then(|key| texture_has_alpha.get(key)).copied().unwrap_or(false),
+                || (texture_mode == 0
+                    && tex_key.as_ref().and_then(|key| texture_has_alpha.get(key)).copied().unwrap_or(false)),
             // Was a flat `1.0` for every material. That pushes ALL surfaces
             // toward the camera by the same amount, so two coincident/
             // overlapping parts (a decal-carrying part stacked directly on
@@ -1673,7 +1701,7 @@ fn spawn_lines(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &m
     let material = materials.add(FlatMaterial {
         color: Color::srgba(rgb[0], rgb[1], rgb[2], 1.0).to_linear(),
         light_dir: Vec4::ZERO, has_texture: 0, texture: None, tint_texture: 0,
-        transparent: false, depth_bias: 8.0,
+        texture_mode: 0, transparent: false, depth_bias: 8.0,
     });
     commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), Transform::IDENTITY, SelectionVisual));
 }

@@ -11,6 +11,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var tex_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var<uniform> tint_texture: u32;
+@group(#{MATERIAL_BIND_GROUP}) @binding(6) var<uniform> texture_mode: u32;
 
 @fragment
 fn fragment(
@@ -34,12 +35,25 @@ fn fragment(
         // had — invisible before the texture finished downloading (nothing
         // to multiply against yet), then a visible muddy/grey tint the
         // moment it landed a few seconds later.
-        if (tint_texture == 1u) {
-            out_rgb = out_rgb * tex_col.rgb;
+        if (texture_mode == 1u) {
+            // SurfaceAppearance Overlay: image alpha reveals the underlying
+            // MeshPart color; it does not make the object itself transparent.
+            let textured = select(tex_col.rgb, out_rgb * tex_col.rgb, tint_texture == 1u);
+            out_rgb = mix(out_rgb, textured, tex_col.a);
+            out_alpha = material_color.a;
+        } else if (texture_mode == 2u) {
+            // TintMask: alpha chooses where MeshPart.Color tints the ColorMap.
+            out_rgb = tex_col.rgb * mix(vec3<f32>(1.0), out_rgb, tex_col.a);
+            out_alpha = material_color.a;
         } else {
-            out_rgb = tex_col.rgb;
+            if (tint_texture == 1u) {
+                out_rgb = out_rgb * tex_col.rgb;
+            } else {
+                out_rgb = tex_col.rgb;
+            }
+            // Opaque ignores image alpha; mode 0 is regular transparency.
+            out_alpha = select(tex_col.a * material_color.a, material_color.a, texture_mode == 3u);
         }
-        out_alpha = tex_col.a * material_color.a;
     }
 
     // Deliberately unlit. This is the viewport's mobile-safe "Flat" mode:
