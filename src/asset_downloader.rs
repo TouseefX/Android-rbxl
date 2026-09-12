@@ -959,7 +959,9 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
                 let asset_type = match key_str {
                     "MeshId" | "MeshID" | "MeshContent" => Some("Mesh"),
                     "TextureId" | "TextureID" | "Texture" | "TextureContent"
-                    | "ColorMap" | "ColorMapContent" | "ShirtTemplate"
+                    | "ColorMap" | "ColorMapContent" | "BaseTextureId"
+                    | "BaseTextureContent" | "OverlayTextureId"
+                    | "OverlayTextureContent" | "ShirtTemplate"
                     | "PantsTemplate" | "Graphic" => Some("Texture"),
                     "SoundId" | "SoundID" => Some("Sound"),
                     "AnimationId" => Some("Animation"),
@@ -981,6 +983,9 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
                             ContentType::Uri(s) if !s.is_empty() => Some(s.clone()),
                             _ => None,
                         },
+                        // CharacterMesh's legacy IDs are integer properties.
+                        Variant::Int64(id) if *id > 0 => Some(id.to_string()),
+                        Variant::Int32(id) if *id > 0 => Some(id.to_string()),
                         _ => None,
                     };
                     if let Some(s) = found {

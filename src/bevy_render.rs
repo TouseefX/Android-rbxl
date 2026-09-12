@@ -169,6 +169,9 @@ fn content_str(v: &Variant) -> Option<String> {
             rbx_dom_weak::types::ContentType::Uri(s) if !s.is_empty() => Some(s.clone()),
             _ => None,
         },
+        // CharacterMesh stores legacy asset references as int64 IDs.
+        Variant::Int64(id) if *id > 0 => Some(format!("rbxassetid://{id}")),
+        Variant::Int32(id) if *id > 0 => Some(format!("rbxassetid://{id}")),
         _ => None,
     }
 }
@@ -622,6 +625,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
     // MeshPart / SpecialMesh
     let mut mesh_id: Option<String> = None;
     let mut mesh_tex: Option<String> = None;
+    let mut mesh_overlay_tex: Option<String> = None;
     // Legacy mesh textures use their alpha as transparency. SurfaceAppearance
     // can explicitly select a different alpha interpretation.
     let mut mesh_texture_mode = 0u32;
@@ -693,6 +697,41 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
         }
     }
 
+    // R6 packages commonly replace body geometry through CharacterMesh
+    // siblings. The body Part itself has no MeshId, which previously made
+    // these characters render as blocks/eggs even after all assets downloaded.
+    if let Some(parent) = dom.get_by_ref(inst.parent()) {
+        let body_name = inst.name.to_ascii_lowercase().replace(' ', "");
+        let body_part_index = match body_name.as_str() {
+            "head" => Some(0), "torso" => Some(1), "leftarm" => Some(2),
+            "rightarm" => Some(3), "leftleg" => Some(4), "rightleg" => Some(5),
+            _ => None,
+        };
+        if let Some(expected) = body_part_index {
+            for child_ref in parent.children() {
+                let Some(character_mesh) = dom.get_by_ref(*child_ref) else { continue; };
+                if character_mesh.class != "CharacterMesh" { continue; }
+                let actual = match character_mesh.properties.get(&rbx_dom_weak::ustr("BodyPart")) {
+                    Some(Variant::Enum(value)) => value.clone().to_u32(),
+                    Some(Variant::Int32(value)) => *value as u32,
+                    Some(Variant::Int64(value)) => *value as u32,
+                    _ => u32::MAX,
+                };
+                if actual != expected { continue; }
+                mesh_id = character_mesh.properties.get(&rbx_dom_weak::ustr("MeshContent"))
+                    .or_else(|| character_mesh.properties.get(&rbx_dom_weak::ustr("MeshId")))
+                    .and_then(content_str).or(mesh_id);
+                mesh_tex = character_mesh.properties.get(&rbx_dom_weak::ustr("BaseTextureContent"))
+                    .or_else(|| character_mesh.properties.get(&rbx_dom_weak::ustr("BaseTextureId")))
+                    .and_then(content_str).or(mesh_tex);
+                mesh_overlay_tex = character_mesh.properties.get(&rbx_dom_weak::ustr("OverlayTextureContent"))
+                    .or_else(|| character_mesh.properties.get(&rbx_dom_weak::ustr("OverlayTextureId")))
+                    .and_then(content_str);
+                break;
+            }
+        }
+    }
+
     // Classic Shirt/Pants instances live beside body parts under the character
     // Model, not inside each MeshPart. Roblox body meshes have clothing-atlas
     // UVs, so route the appropriate template onto each body segment.
@@ -720,9 +759,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
             }
         }
         if clothing_texture.is_some() {
-            mesh_tex = clothing_texture;
-            mesh_texture_mode = 1; // overlay garment alpha over body Color
-            mesh_texture_tint = false; // clothing keeps its authored colors
+            mesh_overlay_tex = clothing_texture;
         }
     }
 
@@ -852,6 +889,23 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
                     tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
                     tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
                     tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
+                }
+            }
+            // CharacterMesh overlay textures and Shirt/Pants templates are a
+            // second skin over the base body mesh. Keep both passes so alpha
+            // holes reveal the base texture instead of the sky/body fallback.
+            if let Some(overlay) = mesh_overlay_tex {
+                let base_vertices = tris.len();
+                for index in 0..base_vertices {
+                    let mut vertex = tris[index].clone();
+                    for axis in 0..3 {
+                        vertex.pos[axis] += vertex.normal[axis] * 0.0004 * STUD_TO_METER;
+                    }
+                    vertex.tex = Some(overlay.clone());
+                    vertex.tint = false;
+                    vertex.texture_mode = 0;
+                    vertex.hide_without_texture = true;
+                    tris.push(vertex);
                 }
             }
             if tris.is_empty() {
