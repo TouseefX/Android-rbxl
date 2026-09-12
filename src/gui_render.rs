@@ -181,6 +181,27 @@ fn gui_rect(
             required.x = required.x.max((child_rect.right() - provisional_content.left()).max(0.0));
             required.y = required.y.max((child_rect.bottom() - provisional_content.top()).max(0.0));
         }
+        if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
+            let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 1) == 0;
+            let gap = udim_pixels(layout.properties.get(&rbx_dom_weak::ustr("Padding")),
+                if horizontal { provisional_content.width() } else { provisional_content.height() }, scale);
+            let mut count = 0usize;
+            let mut main = 0.0f32;
+            let mut cross = 0.0f32;
+            for child_ref in instance.children() {
+                let Some(child) = dom.get_by_ref(*child_ref) else { continue; };
+                if !is_gui_object(&child.class) || !visible(child) { continue; }
+                let child_scale = child_of_class(dom, child, "UIScale")
+                    .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
+                    .unwrap_or(1.0);
+                let rect = gui_rect(dom, painter, child, provisional_content, scale * child_scale);
+                main += if horizontal { rect.width() } else { rect.height() };
+                cross = cross.max(if horizontal { rect.height() } else { rect.width() });
+                count += 1;
+            }
+            main += gap * count.saturating_sub(1) as f32;
+            required = if horizontal { Vec2::new(main, cross) } else { Vec2::new(cross, main) };
+        }
         let padding = size - provisional_content.size();
         if automatic == 1 || automatic == 3 { size.x = size.x.max(required.x + padding.x); }
         if automatic == 2 || automatic == 3 { size.y = size.y.max(required.y + padding.y); }
@@ -312,7 +333,7 @@ fn padded_rect(dom: &WeakDom, instance: &rbx_dom_weak::Instance, rect: Rect, sca
 fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
            parent_rect: Rect, parent_clip: Rect, display_order: i32,
            global_z: bool, inherited_scale: f32, parent_path: &[(i32, usize)],
-           sequence: &mut usize, nodes: &mut Vec<GuiNode>) {
+           forced_rect: Option<Rect>, sequence: &mut usize, nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
     let local_scale = child_of_class(dom, instance, "UIScale")
@@ -320,7 +341,9 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         .unwrap_or(1.0);
     let scale = inherited_scale * local_scale;
     let is_screen = instance.class == "ScreenGui";
-    let rect = if is_screen { parent_rect } else { gui_rect(dom, painter, instance, parent_rect, scale) };
+    let rect = forced_rect.unwrap_or_else(|| {
+        if is_screen { parent_rect } else { gui_rect(dom, painter, instance, parent_rect, scale) }
+    });
     let clips = matches!(instance.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), Some(Variant::Bool(true)));
     let child_clip = if clips { parent_clip.intersect(rect) } else { parent_clip };
     let z = match instance.properties.get(&rbx_dom_weak::ustr("ZIndex")) {
@@ -420,9 +443,67 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     } else {
         content_rect
     };
-    for child in instance.children() {
-        collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
-            global_z, scale, &sort_path, sequence, nodes);
+    if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
+        let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 1) == 0;
+        let horizontal_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("HorizontalAlignment")), 0);
+        let vertical_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("VerticalAlignment")), 0);
+        let padding = udim_pixels(
+            layout.properties.get(&rbx_dom_weak::ustr("Padding")),
+            if horizontal { child_parent_rect.width() } else { child_parent_rect.height() }, scale,
+        );
+        let sort_order = enum_value(layout.properties.get(&rbx_dom_weak::ustr("SortOrder")), 0);
+        let mut children: Vec<(usize, Ref, i32, String, f32, Rect)> = instance.children().iter().enumerate()
+            .filter_map(|(index, referent)| {
+                let child = dom.get_by_ref(*referent)?;
+                if !is_gui_object(&child.class) || !visible(child) { return None; }
+                let child_scale = child_of_class(dom, child, "UIScale")
+                    .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
+                    .unwrap_or(1.0);
+                let child_rect = gui_rect(dom, painter, child, child_parent_rect, scale * child_scale);
+                let order = match child.properties.get(&rbx_dom_weak::ustr("LayoutOrder")) {
+                    Some(Variant::Int32(value)) => *value,
+                    Some(Variant::Int64(value)) => *value as i32,
+                    _ => 0,
+                };
+                Some((index, *referent, order, child.name.to_string(), child_scale, child_rect))
+            }).collect();
+        children.sort_by(|left, right| {
+            if sort_order == 1 { left.2.cmp(&right.2).then(left.0.cmp(&right.0)) }
+            else { left.3.cmp(&right.3).then(left.0.cmp(&right.0)) }
+        });
+        let total = children.iter().map(|(_, _, _, _, _, rect)| if horizontal { rect.width() } else { rect.height() }).sum::<f32>()
+            + padding * children.len().saturating_sub(1) as f32;
+        let available = if horizontal { child_parent_rect.width() } else { child_parent_rect.height() };
+        let main_alignment = if horizontal { horizontal_alignment } else { vertical_alignment };
+        let mut cursor = match main_alignment {
+            1 => (available - total) * 0.5,
+            2 => available - total,
+            _ => 0.0,
+        }.max(0.0);
+        for (_, child, _, _, _child_scale, natural) in children {
+            let cross_available = if horizontal { child_parent_rect.height() } else { child_parent_rect.width() };
+            let cross_size = if horizontal { natural.height() } else { natural.width() };
+            let cross_alignment = if horizontal { vertical_alignment } else { horizontal_alignment };
+            let cross = match cross_alignment {
+                1 => (cross_available - cross_size) * 0.5,
+                2 => cross_available - cross_size,
+                _ => 0.0,
+            }.max(0.0);
+            let min = if horizontal {
+                child_parent_rect.min + Vec2::new(cursor, cross)
+            } else {
+                child_parent_rect.min + Vec2::new(cross, cursor)
+            };
+            let arranged = Rect::from_min_size(min, natural.size());
+            collect(dom, painter, child, child_parent_rect, child_clip, display_order,
+                global_z, scale, &sort_path, Some(arranged), sequence, nodes);
+            cursor += if horizontal { natural.width() } else { natural.height() } + padding;
+        }
+    } else {
+        for child in instance.children() {
+            collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
+                global_z, scale, &sort_path, None, sequence, nodes);
+        }
     }
 }
 
@@ -579,7 +660,7 @@ pub fn draw_starter_gui(
             let global_z = enum_value(gui.properties.get(&rbx_dom_weak::ustr("ZIndexBehavior")), 1) == 0;
             let root_path = vec![(0, screen_order)];
             collect(dom, &layout_painter, *child, viewport, viewport, display_order,
-                global_z, 1.0, &root_path, &mut sequence, &mut nodes);
+                global_z, 1.0, &root_path, None, &mut sequence, &mut nodes);
         }
     }
     nodes.sort_by(|left, right| {
