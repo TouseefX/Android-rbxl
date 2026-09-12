@@ -15,6 +15,8 @@ struct GuiNode {
     background: Color32,
     border: Color32,
     border_size: f32,
+    corner_radius: f32,
+    ui_stroke: Option<(f32, Color32)>,
     text: String,
     text_color: Color32,
     text_size: f32,
@@ -95,6 +97,21 @@ fn gui_rect(instance: &rbx_dom_weak::Instance, parent: Rect) -> Rect {
     Rect::from_min_size(min, size)
 }
 
+fn udim_pixels(value: Option<&Variant>, extent: f32) -> f32 {
+    match value {
+        Some(Variant::UDim(value)) => extent * value.scale + value.offset as f32,
+        _ => 0.0,
+    }
+}
+
+fn child_of_class<'a>(dom: &'a WeakDom, instance: &rbx_dom_weak::Instance, class: &str)
+    -> Option<&'a rbx_dom_weak::Instance>
+{
+    instance.children().iter().find_map(|child| {
+        dom.get_by_ref(*child).filter(|candidate| candidate.class == class)
+    })
+}
+
 fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
            inherited_z: i32, display_order: i32, sequence: &mut usize,
            nodes: &mut Vec<GuiNode>) {
@@ -115,6 +132,18 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
         let transparency = number(instance.properties.get(&rbx_dom_weak::ustr("BackgroundTransparency")), 0.0).clamp(0.0, 1.0);
         let alpha = ((1.0 - transparency) * 255.0).round() as u8;
         let text_transparency = number(instance.properties.get(&rbx_dom_weak::ustr("TextTransparency")), 0.0).clamp(0.0, 1.0);
+        let corner_radius = child_of_class(dom, instance, "UICorner")
+            .map(|corner| udim_pixels(corner.properties.get(&rbx_dom_weak::ustr("CornerRadius")), rect.width().min(rect.height())))
+            .unwrap_or(0.0)
+            .clamp(0.0, rect.width().min(rect.height()) * 0.5);
+        let ui_stroke = child_of_class(dom, instance, "UIStroke").and_then(|stroke| {
+            let thickness = number(stroke.properties.get(&rbx_dom_weak::ustr("Thickness")), 1.0).max(0.0);
+            let transparency = number(stroke.properties.get(&rbx_dom_weak::ustr("Transparency")), 0.0).clamp(0.0, 1.0);
+            (thickness > 0.0 && transparency < 1.0).then(|| (thickness, color(
+                stroke.properties.get(&rbx_dom_weak::ustr("Color")),
+                ((1.0 - transparency) * 255.0) as u8, [0, 0, 0],
+            )))
+        });
         let order = *sequence;
         *sequence += 1;
         nodes.push(GuiNode {
@@ -127,6 +156,8 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
             background: color(instance.properties.get(&rbx_dom_weak::ustr("BackgroundColor3")), alpha, [255,255,255]),
             border: color(instance.properties.get(&rbx_dom_weak::ustr("BorderColor3")), 255, [27,42,53]),
             border_size: number(instance.properties.get(&rbx_dom_weak::ustr("BorderSizePixel")), 1.0).max(0.0),
+            corner_radius,
+            ui_stroke,
             text: match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() },
             text_color: color(instance.properties.get(&rbx_dom_weak::ustr("TextColor3")), ((1.0-text_transparency)*255.0) as u8, [0,0,0]),
             text_size: number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0).clamp(1.0, 200.0),
@@ -148,8 +179,18 @@ fn collect(dom: &WeakDom, referent: Ref, parent_rect: Rect, parent_clip: Rect,
             ),
         });
     }
+    let content_rect = if let Some(padding) = child_of_class(dom, instance, "UIPadding") {
+        let left = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingLeft")), rect.width());
+        let right = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingRight")), rect.width());
+        let top = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingTop")), rect.height());
+        let bottom = udim_pixels(padding.properties.get(&rbx_dom_weak::ustr("PaddingBottom")), rect.height());
+        Rect::from_min_max(
+            Pos2::new(rect.left() + left, rect.top() + top),
+            Pos2::new((rect.right() - right).max(rect.left() + left), (rect.bottom() - bottom).max(rect.top() + top)),
+        )
+    } else { rect };
     for child in instance.children() {
-        collect(dom, *child, rect, child_clip, z, display_order, sequence, nodes);
+        collect(dom, *child, content_rect, child_clip, z, display_order, sequence, nodes);
     }
 }
 
@@ -181,9 +222,12 @@ pub fn draw_starter_gui(
         if node.clip.width() <= 0.0 || node.clip.height() <= 0.0 { continue; }
         let response = ui.interact(node.clip, ui.make_persistent_id(("roblox_gui", format!("{:?}", node.referent))), egui::Sense::click());
         let painter = ui.painter().with_clip_rect(node.clip);
-        painter.rect_filled(node.rect, 0.0, node.background);
+        painter.rect_filled(node.rect, node.corner_radius, node.background);
         if node.border_size > 0.0 {
-            painter.rect_stroke(node.rect, 0.0, Stroke::new(node.border_size, node.border), egui::StrokeKind::Inside);
+            painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(node.border_size, node.border), egui::StrokeKind::Inside);
+        }
+        if let Some((thickness, color)) = node.ui_stroke {
+            painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(thickness, color), egui::StrokeKind::Middle);
         }
         if let Some(uri) = &node.image {
             if !textures.contains_key(uri) {
