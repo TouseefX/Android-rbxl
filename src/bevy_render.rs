@@ -394,6 +394,9 @@ struct Tri {
     /// Decal/Texture Color3 override. Mesh and procedural surfaces use the
     /// owning part color instead.
     color_override: Option<[f32; 3]>,
+    /// Decal/Texture overlays must disappear while their image is unavailable;
+    /// rendering their fallback material creates blank layered planes.
+    hide_without_texture: bool,
 }
 
 #[derive(Clone)]
@@ -466,12 +469,12 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn push_quad(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3, uv: [[f32; 2]; 4], tex: Option<String>) {
     push_quad_surface(tris, cf, p, n, uv, tex.clone(), 1.0,
-        tex.as_deref().is_some_and(|key| key.starts_with("__")), None);
+        tex.as_deref().is_some_and(|key| key.starts_with("__")), None, false);
 }
 
 fn push_quad_surface(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3,
                      uv: [[f32; 2]; 4], tex: Option<String>, opacity: f32, tint: bool,
-                     color_override: Option<[f32; 3]>) {
+                     color_override: Option<[f32; 3]>, hide_without_texture: bool) {
     let a = tp(cf, p[0]);
     let b = tp(cf, p[1]);
     let c = tp(cf, p[2]);
@@ -479,7 +482,7 @@ fn push_quad_surface(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3,
     let nrm = tn(cf, n);
     for (pos, uv) in [(a, uv[0]), (b, uv[1]), (c, uv[2]),
                       (a, uv[0]), (c, uv[2]), (d, uv[3])] {
-        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint, texture_mode: 0, color_override });
+        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint, texture_mode: 0, color_override, hide_without_texture });
     }
 }
 
@@ -487,7 +490,7 @@ fn push_tri(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 3], n: Vec3, uv: [[f32; 
     let nrm = tn(cf, n);
     let tint = tex.as_deref().is_some_and(|key| key.starts_with("__"));
     for i in 0..3 {
-        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint, texture_mode: 0, color_override: None });
+        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint, texture_mode: 0, color_override: None, hide_without_texture: false });
     }
 }
 
@@ -846,9 +849,9 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
                     let uc = md.uvs.get(f[2] as usize).copied().unwrap_or([0.0, 1.0]);
                     let t = tex_key.clone();
                     // Roblox mesh textures are modulated by MeshPart.Color.
-                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None });
-                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None });
-                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None });
+                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
+                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
+                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false });
                 }
             }
             if tris.is_empty() {
@@ -869,7 +872,12 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
     }
 
     let shape = match mesh_type.as_deref() {
-        Some("Sphere") | Some("Head") => "Ball",
+        Some("Sphere") => "Ball",
+        // MeshType.Head with no file mesh is Roblox's classic bevelled block
+        // head. Treating the 2x1x1 Head part as an ellipsoid produced the
+        // sideways-egg appearance. Explicit/custom head MeshIds still take
+        // the real mesh path above.
+        Some("Head") => "Block",
         Some("Cylinder") => "Cylinder",
         Some("Wedge") => "Wedge",
         _ => match inst.class.as_str() {
@@ -1065,7 +1073,7 @@ fn build_block(
                 let overlay = points.map(|point| point.add(&offset));
                 push_quad_surface(tris, cf, overlay, n, overlay_uv,
                     Some(surface.texture.clone()), surface.opacity, true,
-                    Some(surface.color));
+                    Some(surface.color), true);
             }
         }
     }
@@ -1597,6 +1605,11 @@ pub fn rebuild_scene(
     let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
     for (part_index, p) in parts.iter().enumerate() {
         for t in &p.tris {
+            if t.hide_without_texture
+                && t.tex.as_ref().map_or(true, |key| !tex_cache.contains_key(key))
+            {
+                continue;
+            }
             let surface_color = t.color_override.unwrap_or(p.color);
             let ck = [
                 (surface_color[0] * 255.0).round() as u8,
