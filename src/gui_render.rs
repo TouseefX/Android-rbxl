@@ -181,7 +181,22 @@ fn gui_rect(
             required.x = required.x.max((child_rect.right() - provisional_content.left()).max(0.0));
             required.y = required.y.max((child_rect.bottom() - provisional_content.top()).max(0.0));
         }
-        if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
+        if let Some(layout) = child_of_class(dom, instance, "UIPageLayout") {
+            let requested = match layout.properties.get(&rbx_dom_weak::ustr("CurrentPage")) {
+                Some(Variant::Ref(referent)) => Some(*referent),
+                _ => None,
+            };
+            let active = requested.and_then(|referent| dom.get_by_ref(referent)
+                .filter(|child| is_gui_object(&child.class) && visible(child)))
+                .or_else(|| instance.children().iter().find_map(|referent| dom.get_by_ref(*referent)
+                    .filter(|child| is_gui_object(&child.class) && visible(child))));
+            required = active.map(|child| {
+                let child_scale = child_of_class(dom, child, "UIScale")
+                    .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
+                    .unwrap_or(1.0);
+                gui_rect(dom, painter, child, provisional_content, scale * child_scale).size()
+            }).unwrap_or(Vec2::ZERO);
+        } else if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
             let (cxs, cxo, cys, cyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellSize")))
                 .unwrap_or((0.0, 100.0, 0.0, 100.0));
             let (pxs, pxo, pys, pyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellPadding")))
@@ -464,7 +479,52 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     } else {
         content_rect
     };
-    if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
+    if let Some(layout) = child_of_class(dom, instance, "UIPageLayout") {
+        let sort_order = enum_value(layout.properties.get(&rbx_dom_weak::ustr("SortOrder")), 0);
+        let mut pages: Vec<(usize, Ref, i32, String)> = instance.children().iter().enumerate()
+            .filter_map(|(index, referent)| {
+                let child = dom.get_by_ref(*referent)?;
+                if !is_gui_object(&child.class) || !visible(child) { return None; }
+                let order = match child.properties.get(&rbx_dom_weak::ustr("LayoutOrder")) {
+                    Some(Variant::Int32(value)) => *value,
+                    Some(Variant::Int64(value)) => *value as i32,
+                    _ => 0,
+                };
+                Some((index, *referent, order, child.name.to_string()))
+            }).collect();
+        pages.sort_by(|left, right| {
+            if sort_order == 1 { left.2.cmp(&right.2).then(left.0.cmp(&right.0)) }
+            else { left.3.cmp(&right.3).then(left.0.cmp(&right.0)) }
+        });
+        let requested_page = match layout.properties.get(&rbx_dom_weak::ustr("CurrentPage")) {
+            Some(Variant::Ref(referent)) => Some(*referent),
+            _ => None,
+        };
+        let active = requested_page
+            .and_then(|requested| pages.iter().find(|(_, referent, _, _)| *referent == requested))
+            .or_else(|| pages.first());
+        if let Some((_, child, _, _)) = active {
+            let child_instance = dom.get_by_ref(*child).expect("page disappeared during layout");
+            let child_scale = child_of_class(dom, child_instance, "UIScale")
+                .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
+                .unwrap_or(1.0);
+            let natural = gui_rect(dom, painter, child_instance, child_parent_rect, scale * child_scale);
+            let horizontal_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("HorizontalAlignment")), 1);
+            let vertical_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("VerticalAlignment")), 1);
+            let x = match horizontal_alignment {
+                0 => child_parent_rect.left(),
+                2 => child_parent_rect.right() - natural.width(),
+                _ => child_parent_rect.center().x - natural.width() * 0.5,
+            };
+            let y = match vertical_alignment {
+                0 => child_parent_rect.top(),
+                2 => child_parent_rect.bottom() - natural.height(),
+                _ => child_parent_rect.center().y - natural.height() * 0.5,
+            };
+            collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
+                global_z, scale, &sort_path, Some(Rect::from_min_size(Pos2::new(x, y), natural.size())), sequence, nodes);
+        }
+    } else if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
         let (cxs, cxo, cys, cyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellSize")))
             .unwrap_or((0.0, 100.0, 0.0, 100.0));
         let (pxs, pxo, pys, pyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellPadding")))
