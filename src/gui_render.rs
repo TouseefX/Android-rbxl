@@ -34,6 +34,9 @@ struct GuiNode {
     text_truncate: i32,
     rich_text: bool,
     line_height: f32,
+    font_monospace: bool,
+    font_italic: bool,
+    font_bold: bool,
     text_min_size: f32,
     text_max_size: f32,
     text_stroke: Color32,
@@ -183,7 +186,11 @@ fn gui_rect(
             let wrapped = bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false);
             let wrap_width = if wrapped && size.x > 0.0 { size.x } else { f32::INFINITY };
             let line_height = number(instance.properties.get(&rbx_dom_weak::ustr("LineHeight")), 1.0).max(0.1);
-            let mut job = egui::text::LayoutJob::simple(text, FontId::proportional(font_size), Color32::WHITE, wrap_width);
+            let legacy_font = enum_value(instance.properties.get(&rbx_dom_weak::ustr("Font")), 3);
+            let face_mono = matches!(instance.properties.get(&rbx_dom_weak::ustr("FontFace")),
+                Some(Variant::Font(font)) if font.family.to_ascii_lowercase().contains("mono") || font.family.to_ascii_lowercase().contains("code"));
+            let family = if legacy_font == 10 || face_mono { egui::FontFamily::Monospace } else { egui::FontFamily::Proportional };
+            let mut job = egui::text::LayoutJob::simple(text, FontId::new(font_size, family), Color32::WHITE, wrap_width);
             if let Some(section) = job.sections.first_mut() { section.format.line_height = Some(font_size * line_height); }
             let galley = painter.layout_job(job);
             let provisional = Rect::from_min_size(Pos2::ZERO, size);
@@ -505,6 +512,17 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                     Some((Some((thickness, stroke_color, offset, position)), None))
                 }
             }).unwrap_or((None, None));
+        let legacy_font = enum_value(instance.properties.get(&rbx_dom_weak::ustr("Font")), 3);
+        let font_face = match instance.properties.get(&rbx_dom_weak::ustr("FontFace")) {
+            Some(Variant::Font(font)) => Some(font), _ => None,
+        };
+        let face_family = font_face.map(|font| font.family.to_ascii_lowercase()).unwrap_or_default();
+        let face_style = font_face.map(|font| format!("{:?}", font.style).to_ascii_lowercase()).unwrap_or_default();
+        let face_weight = font_face.map(|font| format!("{:?}", font.weight).to_ascii_lowercase()).unwrap_or_default();
+        let font_monospace = legacy_font == 10 || face_family.contains("mono") || face_family.contains("code");
+        let font_italic = legacy_font == 6 || face_style.contains("italic");
+        let font_bold = matches!(legacy_font, 2 | 4) || face_weight.contains("bold")
+            || face_weight.contains("600") || face_weight.contains("700") || face_weight.contains("800") || face_weight.contains("900");
         let (text_min_size, text_max_size) = child_of_class(dom, instance, "UITextSizeConstraint")
             .map(|constraint| (
                 number(constraint.properties.get(&rbx_dom_weak::ustr("MinTextSize")), 1.0).max(1.0) * scale,
@@ -564,6 +582,9 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             text_truncate: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextTruncate")), 0),
             rich_text: bool_value(instance.properties.get(&rbx_dom_weak::ustr("RichText")), false),
             line_height: number(instance.properties.get(&rbx_dom_weak::ustr("LineHeight")), 1.0).max(0.1),
+            font_monospace,
+            font_italic,
+            font_bold,
             text_min_size,
             text_max_size,
             text_stroke: multiply_color(color(
@@ -933,9 +954,11 @@ fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
     let mut stack = vec![egui::TextFormat {
-        font_id: FontId::proportional(font_size),
+        font_id: FontId::new(font_size, if node.font_monospace { egui::FontFamily::Monospace } else { egui::FontFamily::Proportional }),
         line_height: Some(font_size * node.line_height),
         color: base_color,
+        italics: node.font_italic,
+        extra_letter_spacing: if node.font_bold { font_size*0.015 } else { 0.0 },
         ..Default::default()
     }];
     let text = node.text.as_str();
@@ -997,11 +1020,14 @@ fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
     let mut job = if node.rich_text {
         rich_layout_job(node, font_size, color, wrap_width)
     } else {
+        let family = if node.font_monospace { egui::FontFamily::Monospace } else { egui::FontFamily::Proportional };
         let mut job = egui::text::LayoutJob::simple(
-            node.text.clone(), FontId::proportional(font_size), color, wrap_width,
+            node.text.clone(), FontId::new(font_size, family), color, wrap_width,
         );
         if let Some(section) = job.sections.first_mut() {
             section.format.line_height = Some(font_size * node.line_height);
+            section.format.italics = node.font_italic;
+            if node.font_bold { section.format.extra_letter_spacing = font_size*0.015; }
         }
         job
     };
@@ -1558,13 +1584,16 @@ pub fn draw_starter_gui(
         if editable_textbox {
             let value = text_inputs.entry(node.referent).or_insert_with(|| node.text.clone());
             let hint = egui::RichText::new(node.placeholder_text.clone()).color(node.placeholder_color);
+            let textbox_font = FontId::new(node.text_size, if node.font_monospace {
+                egui::FontFamily::Monospace
+            } else { egui::FontFamily::Proportional });
             let widget = if node.multiline {
                 egui::TextEdit::multiline(value)
-                    .desired_width(node.content_rect.width()).font(FontId::proportional(node.text_size))
+                    .desired_width(node.content_rect.width()).font(textbox_font.clone())
                     .text_color(node.text_color).hint_text(hint).frame(false)
             } else {
                 egui::TextEdit::singleline(value)
-                    .desired_width(node.content_rect.width()).font(FontId::proportional(node.text_size))
+                    .desired_width(node.content_rect.width()).font(textbox_font)
                     .text_color(node.text_color).hint_text(hint).frame(false)
             };
             let text_response = ui.put(node.content_rect, widget);
@@ -1611,6 +1640,10 @@ pub fn draw_starter_gui(
             let final_galley = node.gradient.as_ref()
                 .map(|gradient| gradient_galley(galley.clone(), pos, gradient, node.rect))
                 .unwrap_or(galley);
+            if node.font_bold {
+                paint_galley(&painter, pos + Vec2::new(0.35, 0.0), final_galley.clone(), text_color,
+                    false, node.rotation, node.rect.center());
+            }
             paint_galley(&painter, pos, final_galley, text_color, false, node.rotation, node.rect.center());
         }
         if selected == Some(node.referent) {
