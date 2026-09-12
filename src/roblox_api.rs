@@ -105,15 +105,15 @@ pub fn try_recv_viewport_asset_ready() -> Option<ViewportAssetReady> {
 
 // AssetDelivery bursts can contain hundreds of meshes/textures. Letting every
 // request parse and upload concurrently saturated mobile CPUs and caused UI
-// stalls. Twelve concurrent requests keeps mobile bandwidth busy like Studio,
-// while still bounding CPU-side decoding.
+// stalls. Thirty-two pooled requests keep mobile bandwidth busy like Studio,
+// while still placing a hard bound on network and decode work.
 static ASSET_DOWNLOAD_LIMITER: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
 struct AssetDownloadPermit;
 impl AssetDownloadPermit {
     fn acquire() -> Self {
         let (count, wake) = ASSET_DOWNLOAD_LIMITER.get_or_init(|| (Mutex::new(0), Condvar::new()));
         let mut active = count.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *active >= 12 {
+        while *active >= 32 {
             active = wake.wait(active).unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         *active += 1;
@@ -141,6 +141,16 @@ pub fn fetch_and_cache_mesh_async(mesh_id_str: String, cookie_opt: Option<String
 /// `fetch_and_cache_mesh_async` for images.
 pub fn fetch_and_cache_image_async(image_id_str: String, cookie_opt: Option<String>) {
     RobloxApiClient::fetch_and_cache_image_async(image_id_str, cookie_opt);
+}
+
+/// Download a complete place's viewport assets through a fixed worker pool.
+/// This avoids creating one OS thread for every asset (2,000 assets previously
+/// meant 2,000 threads and large scheduler/memory overhead on Android).
+pub fn fetch_viewport_asset_batch_async(
+    assets: Vec<(String, &'static str)>,
+    cookie: Option<String>,
+) {
+    RobloxApiClient::fetch_viewport_asset_batch_async(assets, cookie);
 }
 
 /// Fetches a Sound/audio asset (ogg/mp3) on a background thread and
@@ -549,15 +559,21 @@ impl RobloxApiClient {
     }
 
     /// Fetches the raw asset payload bytes directly from Roblox Asset Delivery API
-    /// using in-process native Rust HTTP client (reqwest + rustls) - no curl process needed.
+    /// using one shared connection-pooled client. Constructing a Client per
+    /// asset forced a new DNS/TLS setup for thousands of files and was the main
+    /// reason place assets took minutes instead of seconds.
     pub fn fetch_asset_payload_sync(asset_id: u64, cookie_opt: Option<&str>) -> Result<Vec<u8>, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("RobloxStudio/WinInet")
-            // Roblox CDNs redirect (302) to c<N>.rbxcdn.com; follow them.
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .map_err(|e| format!("HTTP client build error: {e}"))?;
+        static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+        let client = CLIENT.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .pool_max_idle_per_host(64)
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .user_agent("RobloxStudio/WinInet")
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .map_err(|e| format!("HTTP client build error: {e}"))
+        }).as_ref().map_err(Clone::clone)?;
 
         let cookie = cookie_opt
             .map(str::trim)
@@ -624,6 +640,62 @@ impl RobloxApiClient {
         }
 
         Err(format!("Asset {asset_id} could not be fetched (offline, moderated, or requires auth)"))
+    }
+
+    fn fetch_viewport_asset_sync(
+        asset_uri: &str,
+        kind: &'static str,
+        cookie: Option<&str>,
+    ) -> Result<(), String> {
+        if kind == "mesh" && asset_downloader::get_cached_mesh(asset_uri).is_some() {
+            return Ok(());
+        }
+        if kind == "texture" && asset_downloader::get_cached_image(asset_uri).is_some() {
+            return Ok(());
+        }
+        let id_text = asset_downloader::extract_asset_id(asset_uri)
+            .ok_or_else(|| format!("invalid {kind} asset id"))?;
+        let id = id_text.parse::<u64>().map_err(|_| format!("invalid numeric {kind} id"))?;
+        let bytes = Self::fetch_asset_payload_sync(id, cookie)?;
+        if kind == "mesh" {
+            asset_downloader::store_cached_raw(format!("rbxassetid://{id}"), bytes.clone());
+            let mesh = asset_downloader::parse_roblox_mesh(&bytes)
+                .ok_or_else(|| format!("asset {id} downloaded but its mesh format could not be decoded"))?;
+            asset_downloader::store_cached_mesh(asset_uri.to_string(), mesh.clone());
+            asset_downloader::store_cached_mesh(id_text, mesh);
+        } else {
+            let image = asset_downloader::decode_image_bytes(&bytes)
+                .ok_or_else(|| format!("asset {id} downloaded but was not a PNG/JPEG image"))?;
+            let image = std::sync::Arc::new(image);
+            asset_downloader::store_cached_image(asset_uri.to_string(), image.clone());
+            asset_downloader::store_cached_image(id_text, image);
+        }
+        Ok(())
+    }
+
+    pub fn fetch_viewport_asset_batch_async(
+        assets: Vec<(String, &'static str)>,
+        cookie: Option<String>,
+    ) {
+        std::thread::spawn(move || {
+            let queue = std::sync::Arc::new(Mutex::new(
+                std::collections::VecDeque::from(assets),
+            ));
+            let workers = queue.lock().map(|q| q.len().min(32)).unwrap_or(0);
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let queue = queue.clone();
+                let cookie = cookie.clone();
+                handles.push(std::thread::spawn(move || loop {
+                    let job = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                    let Some((uri, kind)) = job else { break; };
+                    let result = Self::fetch_viewport_asset_sync(&uri, kind, cookie.as_deref());
+                    let (tx, _) = viewport_asset_channel();
+                    let _ = tx.send(ViewportAssetReady { id: uri, kind, result });
+                }));
+            }
+            for handle in handles { let _ = handle.join(); }
+        });
     }
 
     /// Fetches a 3D .mesh asset asynchronously in the background and stores it in mesh_cache

@@ -510,20 +510,18 @@ impl EditorApp {
             "Loading {} viewport assets in the background",
             self.viewport_assets_pending,
         ));
-        std::thread::spawn(move || {
-            for asset in assets {
-                let id = format!("rbxassetid://{}", asset.asset_id);
-                match asset.asset_type {
-                    "Mesh" => roblox_api::fetch_and_cache_mesh_async(id, cookie.clone()),
-                    "Texture" => roblox_api::fetch_and_cache_image_async(id, cookie.clone()),
-                    "Sound" => roblox_api::fetch_and_cache_audio_async(id, cookie.clone()),
-                    // Animations are rbxm model files, not raw binaries;
-                    // they'll be fetched on demand when inserted.
-                    "Animation" => {}
-                    _ => {}
-                }
+        let mut viewport_assets = Vec::with_capacity(self.viewport_assets_pending);
+        for asset in assets {
+            let id = format!("rbxassetid://{}", asset.asset_id);
+            match asset.asset_type {
+                "Mesh" => viewport_assets.push((id, "mesh")),
+                "Texture" => viewport_assets.push((id, "texture")),
+                "Sound" => roblox_api::fetch_and_cache_audio_async(id, cookie.clone()),
+                // Animations are model assets and are fetched on demand.
+                _ => {}
             }
-        });
+        }
+        roblox_api::fetch_viewport_asset_batch_async(viewport_assets, cookie);
         // Completion events debounce scene rebuilds in drain_events; no fixed
         // timer is needed (and a timer cannot predict mobile download speed).
     }
