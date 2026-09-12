@@ -556,11 +556,15 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     let mut scale = Vec3::new(1.0, 1.0, 1.0);
     let mut offset = Vec3::new(0.0, 0.0, 0.0);
     if inst.class == "MeshPart" {
-        if let Some(m) = inst.properties.get(&rbx_dom_weak::ustr("MeshId")).and_then(content_str) {
+        if let Some(m) = inst.properties.get(&rbx_dom_weak::ustr("MeshId"))
+            .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("MeshContent")))
+            .and_then(content_str)
+        {
             mesh_id = Some(m);
         }
         if let Some(t) = inst.properties.get(&rbx_dom_weak::ustr("TextureID"))
             .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("TextureId")))
+            .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("TextureContent")))
             .and_then(content_str)
         {
             mesh_tex = Some(t);
@@ -568,7 +572,17 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     }
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
-        if ch.class == "SpecialMesh" || ch.class == "BlockMesh" {
+        if ch.class == "SurfaceAppearance" {
+            // Flat mode intentionally ignores normal/roughness/metalness maps,
+            // but ColorMap is the visible albedo and must override the legacy
+            // MeshPart.TextureID just as it does in Studio.
+            if let Some(texture) = ch.properties.get(&rbx_dom_weak::ustr("ColorMap"))
+                .or_else(|| ch.properties.get(&rbx_dom_weak::ustr("ColorMapContent")))
+                .and_then(content_str)
+            {
+                mesh_tex = Some(texture);
+            }
+        } else if ch.class == "SpecialMesh" || ch.class == "BlockMesh" {
             if let Some(m) = ch.properties.get(&rbx_dom_weak::ustr("MeshId")).and_then(content_str) {
                 mesh_id = Some(m);
             }
@@ -698,26 +712,20 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
             "WedgePart" => "Wedge",
             "CornerWedgePart" => "CornerWedge",
             "TrussPart" => "Truss",
-            _ => {
-                if inst.name.to_lowercase().contains("ball") || inst.name.to_lowercase().contains("sphere") {
-                    "Ball"
-                } else {
-                    match inst.properties.get(&rbx_dom_weak::ustr("Shape")) {
-                        Some(Variant::Enum(value)) => match value.clone().to_u32() {
-                            0 => "Ball",
-                            2 => "Cylinder",
-                            3 => "Wedge",
-                            _ => "Block",
-                        },
-                        Some(Variant::String(value)) => match value.as_str() {
-                            "Ball" => "Ball",
-                            "Cylinder" => "Cylinder",
-                            "Wedge" => "Wedge",
-                            _ => "Block",
-                        },
-                        _ => "Block",
-                    }
-                }
+            _ => match inst.properties.get(&rbx_dom_weak::ustr("Shape")) {
+                Some(Variant::Enum(value)) => match value.clone().to_u32() {
+                    0 => "Ball",
+                    2 => "Cylinder",
+                    3 => "Wedge",
+                    _ => "Block",
+                },
+                Some(Variant::String(value)) => match value.as_str() {
+                    "Ball" => "Ball",
+                    "Cylinder" => "Cylinder",
+                    "Wedge" => "Wedge",
+                    _ => "Block",
+                },
+                _ => "Block",
             }
         },
     };
@@ -1338,9 +1346,13 @@ pub fn rebuild_scene(
     // Semi-transparent surfaces (glass, alpha decals) blend back-to-front
     // and were affected the same way. BTreeMap always iterates in sorted key
     // order, so the same file now produces the same draw order every time.
-    type Key = ([u8; 3], u8, Option<String>, bool);
+    // Transparent geometry gets one bucket per source part. Bevy sorts
+    // transparent *entities*, not triangles inside a merged mesh; merging all
+    // glass with the same color made distant panes draw over nearby panes.
+    // Opaque surfaces remain aggressively batched for Android performance.
+    type Key = ([u8; 3], u8, Option<String>, bool, Option<usize>);
     let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
-    for p in &parts {
+    for (part_index, p) in parts.iter().enumerate() {
         let ck = [
             (p.color[0] * 255.0).round() as u8,
             (p.color[1] * 255.0).round() as u8,
@@ -1349,19 +1361,42 @@ pub fn rebuild_scene(
         for t in &p.tris {
             let ak = (p.alpha * t.opacity * 255.0).round() as u8;
             if ak > 0 {
-                buckets.entry((ck, ak, t.tex.clone(), t.tint)).or_default().push(t.clone());
+                let image_alpha = t.tex.as_ref()
+                    .and_then(|key| texture_has_alpha.get(key))
+                    .copied().unwrap_or(false);
+                let sort_part = (ak < 255 || image_alpha).then_some(part_index);
+                buckets.entry((ck, ak, t.tex.clone(), t.tint, sort_part)).or_default().push(t.clone());
             }
         }
     }
     let draw_call_count = buckets.len();
 
-    for ((ck, ak, tex_key, tint), tris) in buckets {
+    for ((ck, ak, tex_key, tint, sort_part), tris) in buckets {
+        // Put each transparent entity's origin at its geometric center so
+        // Bevy's back-to-front phase has a meaningful distance to sort. Opaque
+        // merged buckets stay in world space at the origin.
+        let center = if sort_part.is_some() && !tris.is_empty() {
+            let sum = tris.iter().fold([0.0; 3], |mut sum, vertex| {
+                sum[0] += vertex.pos[0];
+                sum[1] += vertex.pos[1];
+                sum[2] += vertex.pos[2];
+                sum
+            });
+            let count = tris.len() as f32;
+            [sum[0] / count, sum[1] / count, sum[2] / count]
+        } else {
+            [0.0; 3]
+        };
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
         let mut indices = Vec::with_capacity(tris.len());
         for (idx, t) in tris.iter().enumerate() {
-            positions.push(t.pos);
+            positions.push([
+                t.pos[0] - center[0],
+                t.pos[1] - center[1],
+                t.pos[2] - center[2],
+            ]);
             normals.push(t.normal);
             uvs.push(t.uv);
             indices.push(idx as u32);
@@ -1434,7 +1469,11 @@ pub fn rebuild_scene(
         });
 
         commands.entity(root).with_children(|parent| {
-            parent.spawn((Mesh3d(mh), MeshMaterial3d(mth), Transform::IDENTITY));
+            parent.spawn((
+                Mesh3d(mh),
+                MeshMaterial3d(mth),
+                Transform::from_xyz(center[0], center[1], center[2]),
+            ));
         });
     }
 
