@@ -30,6 +30,8 @@ struct GuiNode {
     text_y_alignment: i32,
     text_wrapped: bool,
     text_scaled: bool,
+    text_truncate: i32,
+    line_height: f32,
     text_min_size: f32,
     text_max_size: f32,
     text_stroke: Color32,
@@ -168,7 +170,10 @@ fn gui_rect(
             let font_size = number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0).max(1.0) * scale;
             let wrapped = bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false);
             let wrap_width = if wrapped && size.x > 0.0 { size.x } else { f32::INFINITY };
-            let galley = painter.layout(text, FontId::proportional(font_size), Color32::WHITE, wrap_width);
+            let line_height = number(instance.properties.get(&rbx_dom_weak::ustr("LineHeight")), 1.0).max(0.1);
+            let mut job = egui::text::LayoutJob::simple(text, FontId::proportional(font_size), Color32::WHITE, wrap_width);
+            if let Some(section) = job.sections.first_mut() { section.format.line_height = Some(font_size * line_height); }
+            let galley = painter.layout_job(job);
             let provisional = Rect::from_min_size(Pos2::ZERO, size);
             let content = padded_rect(dom, instance, provisional, scale);
             let padding = size - content.size();
@@ -527,6 +532,8 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             text_y_alignment: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextYAlignment")), 1),
             text_wrapped: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false),
             text_scaled: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextScaled")), false),
+            text_truncate: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextTruncate")), 0),
+            line_height: number(instance.properties.get(&rbx_dom_weak::ustr("LineHeight")), 1.0).max(0.1),
             text_min_size,
             text_max_size,
             text_stroke: multiply_color(color(
@@ -855,6 +862,23 @@ fn rotated_bounds(rect: Rect, rotation: f32) -> Rect {
     let mut bounds = Rect::NOTHING;
     for point in points { bounds.extend_with(point); }
     bounds
+}
+
+fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
+               color: Color32, wrap_width: f32, available_height: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple(
+        node.text.clone(), FontId::proportional(font_size), color, wrap_width,
+    );
+    if let Some(section) = job.sections.first_mut() {
+        section.format.line_height = Some(font_size * node.line_height);
+    }
+    if node.text_truncate != 0 {
+        job.wrap.max_width = wrap_width;
+        job.wrap.max_rows = ((available_height / (font_size * node.line_height).max(1.0)).floor() as usize).max(1);
+        job.wrap.break_anywhere = node.text_truncate == 1;
+        job.wrap.overflow_character = Some('…');
+    }
+    painter.layout_job(job)
 }
 
 fn paint_galley(painter: &egui::Painter, pos: Pos2, galley: std::sync::Arc<egui::Galley>,
@@ -1260,15 +1284,15 @@ pub fn draw_starter_gui(
         if !node.text.is_empty() && !editable_textbox {
             let text_color = shade_color(node.text_color, button_factor);
             let text_rect = node.content_rect;
-            let wrap_width = if node.text_wrapped { text_rect.width() } else { f32::INFINITY };
+            let wrap_width = if node.text_wrapped || node.text_truncate != 0 { text_rect.width() } else { f32::INFINITY };
             let mut font_size = if node.text_scaled { text_rect.height().max(1.0) } else { node.text_size };
             font_size = font_size.clamp(node.text_min_size, node.text_max_size);
-            let mut galley = painter.layout(node.text.clone(), FontId::proportional(font_size), text_color, wrap_width);
+            let mut galley = layout_text(&painter, &node, font_size, text_color, wrap_width, text_rect.height());
             if node.text_scaled && (galley.size().x > text_rect.width() || galley.size().y > text_rect.height()) {
                 let scale = (text_rect.width() / galley.size().x.max(1.0))
                     .min(text_rect.height() / galley.size().y.max(1.0));
                 font_size = (font_size * scale).clamp(node.text_min_size, node.text_max_size);
-                galley = painter.layout(node.text.clone(), FontId::proportional(font_size), text_color, wrap_width);
+                galley = layout_text(&painter, &node, font_size, text_color, wrap_width, text_rect.height());
             }
             let x = match node.text_x_alignment {
                 0 => text_rect.left(),
