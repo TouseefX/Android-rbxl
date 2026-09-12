@@ -25,6 +25,9 @@ anyhow       = "1"
 log          = "0.4"
 android_logger = "0.14"
 rbx_xml = "2"
+# Complete Roblox mesh v2-v5 decoder. Only the mesh feature is enabled, so no
+# union/zstd native dependencies are added to the Android build.
+rbx_mesh = { version = "0.7", default-features = false, features = ["mesh"] }
 flate2 = "1.1.9"
 zstd = "0.13"
 serde_json = "1.0.151"

@@ -710,9 +710,72 @@ pub fn parse_roblox_mesh(bytes: &[u8]) -> Option<MeshData> {
         parse_ascii_mesh(bytes)
     } else if bytes.starts_with(b"version 2.00") || bytes.starts_with(b"version 3.00") {
         parse_binary_mesh_v2_v3(bytes)
+    } else if bytes.starts_with(b"version 4.00") || bytes.starts_with(b"version 4.01")
+        || bytes.starts_with(b"version 5.00") {
+        parse_modern_mesh(bytes)
     } else {
         None
     }
+}
+
+/// Decode current Roblox v4/v5 meshes. These formats add LODs, bones and FACS
+/// data around the familiar vertex/face streams. Flat viewport rendering uses
+/// the highest-detail static bind-pose geometry; animation data remains cached
+/// in the source asset for future skinned rendering.
+fn parse_modern_mesh(bytes: &[u8]) -> Option<MeshData> {
+    use rbx_mesh::mesh::Mesh;
+    let parsed = rbx_mesh::read_mesh_versioned(std::io::Cursor::new(bytes)).ok()?;
+    let (version, source_vertices, source_faces, lods) = match parsed {
+        Mesh::V4(mesh) => ("version 4.x".to_string(), mesh.vertices, mesh.faces, mesh.lods),
+        Mesh::V5(mesh) => ("version 5.00".to_string(), mesh.vertices, mesh.faces, mesh.lods),
+        _ => return None,
+    };
+    if source_vertices.is_empty() || source_vertices.len() > 2_000_000 {
+        return None;
+    }
+
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut vertices = Vec::with_capacity(source_vertices.len());
+    let mut normals = Vec::with_capacity(source_vertices.len());
+    let mut uvs = Vec::with_capacity(source_vertices.len());
+    for vertex in source_vertices {
+        if !vertex.pos.iter().chain(vertex.norm.iter()).all(|value| value.is_finite()) {
+            return None;
+        }
+        for axis in 0..3 {
+            min[axis] = min[axis].min(vertex.pos[axis]);
+            max[axis] = max[axis].max(vertex.pos[axis]);
+        }
+        vertices.push(vertex.pos);
+        normals.push(vertex.norm);
+        uvs.push([vertex.tex[0], 1.0 - vertex.tex[1]]);
+    }
+
+    // LOD offsets delimit independent face ranges. The first range is the
+    // highest-detail mesh; rendering every range at once creates overlapping
+    // duplicate geometry and severe z-fighting.
+    let start = lods.first().map(|lod| lod.0 as usize).unwrap_or(0);
+    let end = lods.get(1).map(|lod| lod.0 as usize).unwrap_or(source_faces.len());
+    let mut faces = Vec::with_capacity(end.saturating_sub(start));
+    for face in source_faces.get(start..end.min(source_faces.len()))? {
+        let indices = [face.0[0].0, face.0[1].0, face.0[2].0];
+        if indices.iter().all(|index| (*index as usize) < vertices.len()) {
+            faces.push(indices);
+        }
+    }
+    if faces.is_empty() { return None; }
+    Some(MeshData {
+        version,
+        vertex_count: vertices.len(),
+        face_count: faces.len(),
+        vertices,
+        normals,
+        uvs,
+        faces,
+        aabb_min: min,
+        aabb_max: max,
+    })
 }
 
 fn parse_ascii_mesh(bytes: &[u8]) -> Option<MeshData> {
