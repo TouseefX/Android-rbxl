@@ -942,7 +942,7 @@ impl EditorApp {
             if ui.button("🔄 Reset").clicked() { *orbit = crate::bevy_render::OrbitCam::default(); }
 
             ui.separator();
-            ui.label("📏 Dist:");
+            ui.label("📏 Dist (studs):");
             if ui.button("−").clicked() { orbit.dist = (orbit.dist * 0.85).max(2.0); }
             ui.add(egui::Slider::new(&mut orbit.dist, 2.0..=50_000.0).show_value(false));
             if ui.button("+").clicked() { orbit.dist = (orbit.dist * 1.15).min(50_000.0); }

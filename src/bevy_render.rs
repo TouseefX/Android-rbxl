@@ -21,6 +21,11 @@ use rbx_dom_weak::{types::Variant, WeakDom};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+/// Roblox Studio's physical scale: one stud represents 0.28 metres. Bevy world
+/// coordinates are metres throughout the render and picking pipelines; editor
+/// camera controls remain expressed in familiar studs.
+pub const STUD_TO_METER: f32 = 0.28;
+
 // ----------------------------------------------------------------------------
 // FlatMaterial — a custom material with a trivial shader.
 //
@@ -194,7 +199,11 @@ pub fn spawn_sky_dome(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<SkyMaterial>,
 ) {
-    let dome = Mesh::from(bevy::math::primitives::Sphere::new(500.0).mesh().ico(8).unwrap());
+    // Keep the dome just inside the far plane. A 500-metre dome occluded large
+    // Roblox maps after adopting the real 0.28 m/stud scale.
+    let dome = Mesh::from(
+        bevy::math::primitives::Sphere::new(25_000.0).mesh().ico(8).unwrap(),
+    );
     let mesh_handle = meshes.add(dome);
     // Same sRGB-as-linear bug as FlatMaterial's color, applied to the sky
     // dome: these authored 0..1 numbers are sRGB, and were being passed to
@@ -351,10 +360,10 @@ fn extract_cframe(inst: &rbx_dom_weak::Instance) -> CFrame {
 
 // S -> Bevy world (Z flip).
 fn s2b(p: Vec3) -> [f32; 3] {
-    // Render in Roblox's native coordinate space. Negating Z here was a mirror
-    // reflection that flipped parts left-right (the "reversed colors"). Bevy
-    // camera + geometry are kept in the same space, so no flip is needed.
-    [p.x, p.y, p.z]
+    // Preserve Roblox axis orientation, but convert authored studs to Bevy's
+    // metre-scale world. Applying this once at the world boundary keeps mesh
+    // decoding, CFrames and property editing in native Roblox units.
+    [p.x * STUD_TO_METER, p.y * STUD_TO_METER, p.z * STUD_TO_METER]
 }
 fn tp(cf: &CFrame, p: Vec3) -> [f32; 3] {
     let w = cf.transform_point(p);
@@ -427,13 +436,16 @@ impl ViewportScene {
         }
         if !found { return false; }
         camera.target = [
-            (min[0] + max[0]) * 0.5,
-            (min[1] + max[1]) * 0.5,
-            (min[2] + max[2]) * 0.5,
+            (min[0] + max[0]) * 0.5 / STUD_TO_METER,
+            (min[1] + max[1]) * 0.5 / STUD_TO_METER,
+            (min[2] + max[2]) * 0.5 / STUD_TO_METER,
         ];
-        let diagonal = BVec3::new(max[0]-min[0], max[1]-min[1], max[2]-min[2]).length();
-        // A little margin leaves room for the selection outline and gizmo.
-        camera.dist = (diagonal * 1.15).clamp(2.0, 50_000.0);
+        let diagonal_metres = BVec3::new(
+            max[0]-min[0], max[1]-min[1], max[2]-min[2],
+        ).length();
+        // Orbit distance is stored in studs even though bounds are GPU metres.
+        let diagonal_studs = diagonal_metres / STUD_TO_METER;
+        camera.dist = (diagonal_studs * 1.15).clamp(2.0, 50_000.0);
         true
     }
 }
@@ -551,7 +563,8 @@ fn extract_geometry(dom: &WeakDom) -> Vec<PartGeo> {
                     std::hash::Hash::hash(&c.to_bits(), &mut hasher);
                 }
                 let hv = std::hash::Hasher::finish(&hasher);
-                let eps = 0.0003 + (hv % 997) as f32 / 997.0 * 0.0007; // ~0.0003..0.001 studs
+                let eps = (0.0003 + (hv % 997) as f32 / 997.0 * 0.0007)
+                    * STUD_TO_METER; // ~0.0003..0.001 studs, converted to metres
                 for t in &mut g.tris {
                     t.pos[0] += t.normal[0] * eps;
                     t.pos[1] += t.normal[1] * eps;
@@ -1424,8 +1437,8 @@ pub fn spawn_camera_and_light(commands: &mut Commands) {
             // Bevy/wgpu uses reverse-Z depth, so a large far plane does not
             // cause the precision collapse of a traditional projection. Keep
             // large Roblox worlds visible when Frame All zooms beyond 2k studs.
-            near: 0.1,
-            far: 100_000.0,
+            near: 0.1 * STUD_TO_METER,
+            far: 100_000.0 * STUD_TO_METER,
             fov: 60f32.to_radians(),
             ..default()
         }),
@@ -1453,9 +1466,9 @@ pub fn orbit_eye_target(cam: &OrbitCam) -> (BVec3, BVec3) {
         cam.target[1] + cam.dist * sp,
         cam.target[2] + cam.dist * cp * cy,
     ];
-    // No Z-flip (consistent with geometry rendered in Roblox space).
-    let eye = BVec3::new(eye_s[0], eye_s[1], eye_s[2]);
-    let target = BVec3::new(cam.target[0], cam.target[1], cam.target[2]);
+    // Orbit state is presented to the editor in studs; the GPU world is metres.
+    let eye = BVec3::new(eye_s[0], eye_s[1], eye_s[2]) * STUD_TO_METER;
+    let target = BVec3::new(cam.target[0], cam.target[1], cam.target[2]) * STUD_TO_METER;
     (eye, target)
 }
 
@@ -1789,7 +1802,7 @@ pub fn update_selection_visual(
 
     let center = [(min[0]+max[0])*0.5, (min[1]+max[1])*0.5, (min[2]+max[2])*0.5];
     let extent = (max[0]-min[0]).max(max[1]-min[1]).max(max[2]-min[2]);
-    let length = (extent * 0.65).clamp(2.0, 16.0);
+    let length = (extent * 0.65).clamp(2.0 * STUD_TO_METER, 16.0 * STUD_TO_METER);
     for (axis_index, axis, color) in [
         (0, [length,0.0,0.0], [1.0,0.15,0.15]),
         (1, [0.0,length,0.0], [0.15,1.0,0.25]),
@@ -1835,7 +1848,7 @@ pub fn gizmo_screen_axes(scene: &ViewportScene, selected: rbx_dom_weak::types::R
         (bounds.min[2] + bounds.max[2]) * 0.5,
     );
     let extent = (bounds.max[0]-bounds.min[0]).max(bounds.max[1]-bounds.min[1]).max(bounds.max[2]-bounds.min[2]);
-    let length = (extent * 0.65).clamp(2.0, 16.0);
+    let length = (extent * 0.65).clamp(2.0 * STUD_TO_METER, 16.0 * STUD_TO_METER);
     let project = |point: BVec3| -> Option<[f32; 2]> {
         let (eye, target) = orbit_eye_target(cam);
         let forward = (target-eye).normalize_or_zero();
