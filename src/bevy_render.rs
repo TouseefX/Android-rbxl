@@ -382,6 +382,9 @@ struct Tri {
     /// SurfaceAppearance alpha behavior: 0=transparency, 1=overlay,
     /// 2=tint-mask, 3=opaque.
     texture_mode: u32,
+    /// Decal/Texture Color3 override. Mesh and procedural surfaces use the
+    /// owning part color instead.
+    color_override: Option<[f32; 3]>,
 }
 
 #[derive(Clone)]
@@ -424,11 +427,12 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn push_quad(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3, uv: [[f32; 2]; 4], tex: Option<String>) {
     push_quad_surface(tris, cf, p, n, uv, tex.clone(), 1.0,
-        tex.as_deref().is_some_and(|key| key.starts_with("__")));
+        tex.as_deref().is_some_and(|key| key.starts_with("__")), None);
 }
 
 fn push_quad_surface(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3,
-                     uv: [[f32; 2]; 4], tex: Option<String>, opacity: f32, tint: bool) {
+                     uv: [[f32; 2]; 4], tex: Option<String>, opacity: f32, tint: bool,
+                     color_override: Option<[f32; 3]>) {
     let a = tp(cf, p[0]);
     let b = tp(cf, p[1]);
     let c = tp(cf, p[2]);
@@ -436,7 +440,7 @@ fn push_quad_surface(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3,
     let nrm = tn(cf, n);
     for (pos, uv) in [(a, uv[0]), (b, uv[1]), (c, uv[2]),
                       (a, uv[0]), (c, uv[2]), (d, uv[3])] {
-        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint, texture_mode: 0 });
+        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint, texture_mode: 0, color_override });
     }
 }
 
@@ -444,7 +448,7 @@ fn push_tri(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 3], n: Vec3, uv: [[f32; 
     let nrm = tn(cf, n);
     let tint = tex.as_deref().is_some_and(|key| key.starts_with("__"));
     for i in 0..3 {
-        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint, texture_mode: 0 });
+        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint, texture_mode: 0, color_override: None });
     }
 }
 
@@ -646,9 +650,9 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
     }
 
     // Decals
-    // Face overlay: asset URI, opacity, and optional Texture tile size in studs.
-    // `None` is a Decal (one image stretched across the face).
-    let mut decals: HashMap<&'static str, (String, f32, Option<(f32, f32, f32, f32)>)> = HashMap::new();
+    // Keep every overlay on a face. A HashMap<String> used previously meant
+    // that the last Decal silently deleted all earlier decals/textures.
+    let mut decals: HashMap<&'static str, Vec<FaceOverlay>> = HashMap::new();
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
         if ch.class == "Decal" || ch.class == "Texture" {
@@ -688,7 +692,15 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
                     } else {
                         None
                     };
-                    decals.insert(face, (t, opacity, tile));
+                    let color = match ch.properties.get(&rbx_dom_weak::ustr("Color3"))
+                        .or_else(|| ch.properties.get(&rbx_dom_weak::ustr("Color"))) {
+                        Some(Variant::Color3(value)) => [value.r as f32, value.g as f32, value.b as f32],
+                        Some(Variant::Color3uint8(value)) => [value.r as f32 / 255.0, value.g as f32 / 255.0, value.b as f32 / 255.0],
+                        _ => [1.0, 1.0, 1.0],
+                    };
+                    decals.entry(face).or_default().push(FaceOverlay {
+                        texture: t, opacity, tile, color,
+                    });
                 }
             }
         }
@@ -737,9 +749,9 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
                     let uc = md.uvs.get(f[2] as usize).copied().unwrap_or([0.0, 1.0]);
                     let t = tex_key.clone();
                     // Roblox mesh textures are modulated by MeshPart.Color.
-                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: true, texture_mode: mesh_texture_mode });
-                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: true, texture_mode: mesh_texture_mode });
-                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: true, texture_mode: mesh_texture_mode });
+                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: true, texture_mode: mesh_texture_mode, color_override: None });
+                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: true, texture_mode: mesh_texture_mode, color_override: None });
+                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: true, texture_mode: mesh_texture_mode, color_override: None });
                 }
             }
             if tris.is_empty() {
@@ -860,7 +872,15 @@ fn normal_id_name(value: u32) -> &'static str {
 
 // --- primitive builders (same shapes as the Android app / OpenRBLX) ---
 
-fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, (String, f32, Option<(f32, f32, f32, f32)>)>) {
+struct FaceOverlay {
+    texture: String,
+    opacity: f32,
+    /// Texture tile U/V and offset U/V. None means a face-filling Decal.
+    tile: Option<(f32, f32, f32, f32)>,
+    color: [f32; 3],
+}
+
+fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, Vec<FaceOverlay>>) {
     let h = half;
     let v = [
         Vec3::new(-h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, h.z), Vec3::new(-h.x, -h.y, h.z),
@@ -890,23 +910,26 @@ fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, dec
         // part face. Keeping the base face means transparent PNG pixels reveal
         // the underlying BrickColor/material exactly as they do in Studio.
         push_quad(tris, cf, points, n, uv, mat_tex.clone());
-        if let Some((texture, opacity, tile)) = decals.get(face) {
-            // Texture repeats according to studs-per-tile; Decal occupies the
-            // face once. The image sampler uses repeat addressing below.
-            let overlay_uv = tile.map(|(u, v, offset_u, offset_v)| {
-                let start_u = -offset_u / u;
-                let start_v = -offset_v / v;
-                [
-                    [start_u, start_v], [start_u + face_span.0 / u, start_v],
-                    [start_u + face_span.0 / u, start_v + face_span.1 / v],
-                    [start_u, start_v + face_span.1 / v],
-                ]
-            }).unwrap_or(uv);
-            // Offset the overlay a fraction of a stud to avoid coplanar
-            // z-fighting without relying on driver-specific polygon offsets.
-            let offset = n.mul(0.0015);
-            let overlay = points.map(|point| point.add(&offset));
-            push_quad_surface(tris, cf, overlay, n, overlay_uv, Some(texture.clone()), *opacity, false);
+        if let Some(overlays) = decals.get(face) {
+            for (layer, surface) in overlays.iter().enumerate() {
+                // Texture repeats according to studs-per-tile; Decal occupies
+                // the face once. UV wrapping is handled in the shader.
+                let overlay_uv = surface.tile.map(|(u, v, offset_u, offset_v)| {
+                    let start_u = -offset_u / u;
+                    let start_v = -offset_v / v;
+                    [
+                        [start_u, start_v], [start_u + face_span.0 / u, start_v],
+                        [start_u + face_span.0 / u, start_v + face_span.1 / v],
+                        [start_u, start_v + face_span.1 / v],
+                    ]
+                }).unwrap_or(uv);
+                // Give every overlay layer a deterministic separation.
+                let offset = n.mul(0.0015 * (layer + 1) as f32);
+                let overlay = points.map(|point| point.add(&offset));
+                push_quad_surface(tris, cf, overlay, n, overlay_uv,
+                    Some(surface.texture.clone()), surface.opacity, true,
+                    Some(surface.color));
+            }
         }
     }
 }
@@ -1433,12 +1456,13 @@ pub fn rebuild_scene(
     type Key = ([u8; 3], u8, Option<String>, bool, u32, Option<usize>);
     let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
     for (part_index, p) in parts.iter().enumerate() {
-        let ck = [
-            (p.color[0] * 255.0).round() as u8,
-            (p.color[1] * 255.0).round() as u8,
-            (p.color[2] * 255.0).round() as u8,
-        ];
         for t in &p.tris {
+            let surface_color = t.color_override.unwrap_or(p.color);
+            let ck = [
+                (surface_color[0] * 255.0).round() as u8,
+                (surface_color[1] * 255.0).round() as u8,
+                (surface_color[2] * 255.0).round() as u8,
+            ];
             let ak = (p.alpha * t.opacity * 255.0).round() as u8;
             if ak > 0 {
                 let image_alpha = t.tex.as_ref()
