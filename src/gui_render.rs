@@ -396,9 +396,9 @@ fn gradient_samples(instance: &rbx_dom_weak::Instance) -> Option<(f32, Vec2, Vec
         let b = &colors[upper];
         let mix = if b.time > a.time { (time - a.time) / (b.time - a.time) } else { 0.0 };
         let rgb = Color32::from_rgb(
-            ((a.value.r + (b.value.r - a.value.r) * mix) * 255.0) as u8,
-            ((a.value.g + (b.value.g - a.value.g) * mix) * 255.0) as u8,
-            ((a.value.b + (b.value.b - a.value.b) * mix) * 255.0) as u8,
+            ((a.color.r + (b.color.r - a.color.r) * mix) * 255.0) as u8,
+            ((a.color.g + (b.color.g - a.color.g) * mix) * 255.0) as u8,
+            ((a.color.b + (b.color.b - a.color.b) * mix) * 255.0) as u8,
         );
         let transparency = transparencies.and_then(|points| {
             if points.is_empty() { return None; }
