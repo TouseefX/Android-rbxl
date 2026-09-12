@@ -1815,6 +1815,17 @@ pub fn update_camera(mut q: Query<&mut Transform, With<RbxCamera>>, cam: Res<Orb
     }
 }
 
+/// Convert a camera-relative Roblox offset (right, up, camera-back) into a
+/// world-space stud vector for BillboardGui StudsOffset/ExtentsOffset.
+pub fn camera_relative_offset(cam: &OrbitCam, offset: [f32; 3]) -> [f32; 3] {
+    let (eye, target) = orbit_eye_target(cam);
+    let forward = (target - eye).normalize_or_zero();
+    let right = forward.cross(BVec3::Y).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let world = right * offset[0] + up * offset[1] - forward * offset[2];
+    world.to_array()
+}
+
 /// Project a Roblox world point into normalized viewport coordinates. Returns
 /// `(x, y, camera_distance)` and rejects points behind the camera.
 pub fn project_world_point(cam: &OrbitCam, point_studs: [f32; 3], aspect: f32)

@@ -953,6 +953,7 @@ pub fn draw_starter_gui(
     scroll_offsets: &mut std::collections::HashMap<Ref, Vec2>,
     selected: Option<Ref>,
     orbit: &crate::bevy_render::OrbitCam,
+    viewport_scene: &crate::bevy_render::ViewportScene,
 ) -> Option<Ref> {
     let starter = dom.root().children().iter().find_map(|referent| {
         dom.get_by_ref(*referent).filter(|instance| instance.class == "StarterGui").map(|_| *referent)
@@ -975,17 +976,57 @@ pub fn draw_starter_gui(
             _ => billboard.parent(),
         };
         let Some(part) = dom.get_by_ref(adornee) else { continue; };
-        let Some(Variant::CFrame(cframe)) = part.properties.get(&rbx_dom_weak::ustr("CFrame")) else { continue; };
-        let mut point = [cframe.position.x, cframe.position.y, cframe.position.z];
-        for property in ["StudsOffset", "StudsOffsetWorldSpace", "ExtentsOffsetWorldSpace"] {
-            if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr(property)) {
-                point[0] += offset.x; point[1] += offset.y; point[2] += offset.z;
-            }
+        let mut point = match part.properties.get(&rbx_dom_weak::ustr("WorldPosition"))
+            .or_else(|| part.properties.get(&rbx_dom_weak::ustr("Position")))
+        {
+            Some(Variant::Vector3(position)) => [position.x, position.y, position.z],
+            _ => match part.properties.get(&rbx_dom_weak::ustr("CFrame")) {
+                Some(Variant::CFrame(cframe)) => [cframe.position.x, cframe.position.y, cframe.position.z],
+                _ => continue,
+            },
+        };
+        let part_size = match part.properties.get(&rbx_dom_weak::ustr("Size")) {
+            Some(Variant::Vector3(size)) => [size.x, size.y, size.z],
+            _ => [0.0, 0.0, 0.0],
+        };
+        let mut camera_offset = [0.0; 3];
+        let mut world_offset = [0.0; 3];
+        if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr("StudsOffset")) {
+            camera_offset[0] += offset.x; camera_offset[1] += offset.y; camera_offset[2] += offset.z;
         }
+        if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr("StudsOffsetWorldSpace")) {
+            world_offset[0] += offset.x; world_offset[1] += offset.y; world_offset[2] += offset.z;
+        }
+        if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr("ExtentsOffset")) {
+            camera_offset[0] += offset.x*part_size[0]*0.5;
+            camera_offset[1] += offset.y*part_size[1]*0.5;
+            camera_offset[2] += offset.z*part_size[2]*0.5;
+        }
+        if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr("ExtentsOffsetWorldSpace")) {
+            world_offset[0] += offset.x*part_size[0]*0.5;
+            world_offset[1] += offset.y*part_size[1]*0.5;
+            world_offset[2] += offset.z*part_size[2]*0.5;
+        }
+        let camera_world = crate::bevy_render::camera_relative_offset(orbit, camera_offset);
+        for axis in 0..3 { point[axis] += camera_world[axis] + world_offset[axis]; }
         let Some(projected) = crate::bevy_render::project_world_point(orbit, point, aspect) else { continue; };
         let max_distance = number(billboard.properties.get(&rbx_dom_weak::ustr("MaxDistance")), 0.0);
         if max_distance > 0.0 && projected[2] > max_distance { continue; }
-        let pixels_per_stud = viewport.height() / (2.0 * (30.0_f32.to_radians().tan()) * projected[2].max(0.01));
+        let always_on_top = bool_value(billboard.properties.get(&rbx_dom_weak::ustr("AlwaysOnTop")), false);
+        if !always_on_top {
+            if let Some(hit) = crate::bevy_render::pick_part(viewport_scene, orbit, [projected[0], projected[1]], aspect) {
+                let occlusion_target = if part.class == "Attachment" { part.parent() } else { adornee };
+                if hit != occlusion_target { continue; }
+            }
+        }
+        let lower_limit = number(billboard.properties.get(&rbx_dom_weak::ustr("DistanceLowerLimit")), 0.0).max(0.0);
+        let upper_limit = number(billboard.properties.get(&rbx_dom_weak::ustr("DistanceUpperLimit")), -1.0);
+        let scale_distance = if upper_limit >= 0.0 {
+            projected[2].clamp(lower_limit.min(upper_limit), upper_limit.max(lower_limit))
+        } else {
+            projected[2].max(lower_limit)
+        };
+        let pixels_per_stud = viewport.height() / (2.0 * (30.0_f32.to_radians().tan()) * scale_distance.max(0.01));
         let size = match billboard.properties.get(&rbx_dom_weak::ustr("Size")) {
             Some(Variant::UDim2(value)) => Vec2::new(
                 value.x.scale*pixels_per_stud + value.x.offset as f32,
