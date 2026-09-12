@@ -872,12 +872,28 @@ fn material_name_from_enum(value: u32) -> String {
     match value {
         512 => "Wood",
         528 => "WoodPlanks",
+        784 => "Marble",
         800 => "Slate",
         816 => "Concrete",
+        832 => "Granite",
         848 => "Brick",
+        864 => "Pebble",
+        880 => "Cobblestone",
+        1040 => "CorrodedMetal",
+        1056 => "DiamondPlate",
+        1072 => "Foil",
+        1088 => "Metal",
         1280 => "Grass",
         1284 => "LeafyGrass",
+        1296 => "Sand",
+        1312 => "Fabric",
+        1328 => "Snow",
+        1344 => "Mud",
+        1360 => "Ground",
         1376 => "Asphalt",
+        1384 => "Salt",
+        1392 => "Limestone",
+        1408 => "Pavement",
         _ => "Plastic",
     }
     .into()
@@ -916,8 +932,13 @@ fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, dec
     let mat_tex = match material {
         "Brick" => Some("__brick".into()),
         "Wood" | "WoodPlanks" => Some("__wood_planks".into()),
-        "Concrete" | "Slate" => Some("__concrete".into()),
-        "Grass" => Some("__grass".into()),
+        "Cobblestone" => Some("__cobblestone".into()),
+        "DiamondPlate" => Some("__diamond_plate".into()),
+        "Grass" | "LeafyGrass" => Some("__grass".into()),
+        "Concrete" | "Slate" | "Marble" | "Granite" | "Pebble"
+        | "CorrodedMetal" | "Foil" | "Metal" | "Sand" | "Fabric"
+        | "Snow" | "Mud" | "Ground" | "Asphalt" | "Salt"
+        | "Limestone" | "Pavement" => Some("__concrete".into()),
         _ => None,
     };
     // Last pair is the physical U/V span of the face in studs, used by
@@ -936,7 +957,16 @@ fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, dec
         // A decal is a second surface over the part, not a replacement for the
         // part face. Keeping the base face means transparent PNG pixels reveal
         // the underlying BrickColor/material exactly as they do in Studio.
-        push_quad(tris, cf, points, n, uv, mat_tex.clone());
+        let material_uv = if mat_tex.is_some() {
+            // Keep procedural material detail at a roughly Studio-like world
+            // scale instead of stretching one brick/grass sample over an
+            // entire baseplate or wall.
+            [[0.0, 0.0], [face_span.0 / 4.0, 0.0],
+             [face_span.0 / 4.0, face_span.1 / 4.0], [0.0, face_span.1 / 4.0]]
+        } else {
+            uv
+        };
+        push_quad(tris, cf, points, n, material_uv, mat_tex.clone());
         if let Some(overlays) = decals.get(face) {
             for (layer, surface) in overlays.iter().enumerate() {
                 // Texture repeats according to studs-per-tile; Decal occupies
@@ -1437,12 +1467,17 @@ pub fn rebuild_scene(
     let mut texture_ids: HashMap<String, (u32, u32, Vec<u8>)> = HashMap::new();
     for p in &parts {
         for t in &p.tris {
-            if let Some(ref k) = t.tex {
-                if let Some(id) = extract_asset_id(k) {
-                    if !texture_ids.contains_key(k) {
-                        if let Some(img) = load_image_rgba(&id) {
-                            texture_ids.insert(k.clone(), img);
-                        }
+            if let Some(ref key) = t.tex {
+                if !texture_ids.contains_key(key) {
+                    // Procedural material keys (`__brick`, `__grass`, …) are
+                    // intentionally not Roblox asset IDs. The old asset-ID
+                    // gate rejected them before `get_cached_image` could
+                    // generate their pixels, so every material stayed flat.
+                    // Real content URIs are normalized to their numeric ID;
+                    // procedural keys pass through unchanged.
+                    let lookup = extract_asset_id(key).unwrap_or_else(|| key.clone());
+                    if let Some(img) = load_image_rgba(&lookup) {
+                        texture_ids.insert(key.clone(), img);
                     }
                 }
             }
