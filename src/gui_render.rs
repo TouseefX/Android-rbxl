@@ -1476,7 +1476,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
 }
 
 struct ViewportBox { corners: [[f32; 3]; 8], color: Color32 }
-struct ViewportMesh { vertices: Vec<[f32;3]>, faces: Vec<[u32;3]>, color: Color32 }
+struct ViewportMesh { vertices: Vec<[f32;3]>, faces: Vec<[u32;3]>, colors: Vec<[f32;4]>, color: Color32 }
 
 fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<ViewportBox>, meshes: &mut Vec<ViewportMesh>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
@@ -1497,7 +1497,8 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
                 cf.position.z + cf.orientation.z.x*local[0] + cf.orientation.z.y*local[1] + cf.orientation.z.z*local[2],
             ];
         }
-        let part_color=color(instance.properties.get(&rbx_dom_weak::ustr("Color")),255,[163,162,165]);
+        let part_alpha=((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("Transparency")),0.0).clamp(0.0,1.0))*255.0) as u8;
+        let part_color=color(instance.properties.get(&rbx_dom_weak::ustr("Color")),part_alpha,[163,162,165]);
         let mesh=if instance.class == "MeshPart" { content(instance.properties.get(&rbx_dom_weak::ustr("MeshId"))).and_then(|id|crate::asset_downloader::get_cached_mesh(&id)) } else { None };
         if let Some(mesh)=mesh {
             let range=[(mesh.aabb_max[0]-mesh.aabb_min[0]).max(0.001),(mesh.aabb_max[1]-mesh.aabb_min[1]).max(0.001),(mesh.aabb_max[2]-mesh.aabb_min[2]).max(0.001)];
@@ -1506,7 +1507,7 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
                 let local=[(vertex[0]-midpoint[0])*size.x/range[0],(vertex[1]-midpoint[1])*size.y/range[1],(vertex[2]-midpoint[2])*size.z/range[2]];
                 [cf.position.x+cf.orientation.x.x*local[0]+cf.orientation.x.y*local[1]+cf.orientation.x.z*local[2],cf.position.y+cf.orientation.y.x*local[0]+cf.orientation.y.y*local[1]+cf.orientation.y.z*local[2],cf.position.z+cf.orientation.z.x*local[0]+cf.orientation.z.y*local[1]+cf.orientation.z.z*local[2]]
             }).collect();
-            meshes.push(ViewportMesh{vertices,faces:mesh.faces,color:part_color});
+            meshes.push(ViewportMesh{vertices,faces:mesh.faces,colors:mesh.colors,color:part_color});
         } else { output.push(ViewportBox { corners, color: part_color }); }
     }
     for child in instance.children() { gather_viewport_parts(dom, *child, output, meshes); }
@@ -1578,7 +1579,7 @@ fn paint_viewport_frame(painter: &egui::Painter, node: &GuiNode, dom: &WeakDom) 
                 ((part.color.r() as f32)*(ambient.r() as f32+light_color.r() as f32*illumination).min(255.0)*image_tint.r() as f32/(255.0*255.0)) as u8,
                 ((part.color.g() as f32)*(ambient.g() as f32+light_color.g() as f32*illumination).min(255.0)*image_tint.g() as f32/(255.0*255.0)) as u8,
                 ((part.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32/(255.0*255.0)) as u8,
-                image_alpha);
+                ((part.color.a() as u16*image_alpha as u16)/255) as u8);
             let depth=face.iter().map(|index|projected[*index].1).sum::<f32>()*0.25;
             polygons.push((depth,face.map(|index|projected[index].0).to_vec(),lit));
         } }
@@ -1594,10 +1595,14 @@ fn paint_viewport_frame(painter: &egui::Painter, node: &GuiNode, dom: &WeakDom) 
             let length=(normal[0]*normal[0]+normal[1]*normal[1]+normal[2]*normal[2]).sqrt().max(0.001);let normal=[normal[0]/length,normal[1]/length,normal[2]/length];
             let view=[camera[0]-a[0],camera[1]-a[1],camera[2]-a[2]];if normal[0]*view[0]+normal[1]*view[1]+normal[2]*view[2]<=0.0{continue;}
             let illumination=(normal[0]*light[0]+normal[1]*light[1]+normal[2]*light[2]).max(0.0);
+            let vertex_color=if indices.iter().all(|index|*index<mesh.colors.len()) {
+                let mut average=[0.0;4]; for index in indices { for channel in 0..4 { average[channel]+=mesh.colors[index][channel]/3.0; } } average
+            } else {[1.0;4]};
             let lit=Color32::from_rgba_unmultiplied(
-                ((mesh.color.r() as f32)*(ambient.r() as f32+light_color.r() as f32*illumination).min(255.0)*image_tint.r() as f32/(255.0*255.0)) as u8,
-                ((mesh.color.g() as f32)*(ambient.g() as f32+light_color.g() as f32*illumination).min(255.0)*image_tint.g() as f32/(255.0*255.0)) as u8,
-                ((mesh.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32/(255.0*255.0)) as u8,image_alpha);
+                ((mesh.color.r() as f32)*(ambient.r() as f32+light_color.r() as f32*illumination).min(255.0)*image_tint.r() as f32*vertex_color[0]/(255.0*255.0)) as u8,
+                ((mesh.color.g() as f32)*(ambient.g() as f32+light_color.g() as f32*illumination).min(255.0)*image_tint.g() as f32*vertex_color[1]/(255.0*255.0)) as u8,
+                ((mesh.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32*vertex_color[2]/(255.0*255.0)) as u8,
+                ((mesh.color.a() as f32*image_alpha as f32*vertex_color[3])/255.0) as u8);
             polygons.push(((pa.1+pb.1+pc.1)/3.0,vec![pa.0,pb.0,pc.0],lit));
         }
     }
