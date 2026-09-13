@@ -1475,6 +1475,77 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
     }
 }
 
+struct ViewportBox { corners: [[f32; 3]; 8], color: Color32 }
+
+fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<ViewportBox>) {
+    let Some(instance) = dom.get_by_ref(referent) else { return; };
+    if let (Some(Variant::CFrame(cf)), Some(Variant::Vector3(size))) = (
+        instance.properties.get(&rbx_dom_weak::ustr("CFrame")),
+        instance.properties.get(&rbx_dom_weak::ustr("Size")),
+    ) {
+        let mut corners = [[0.0; 3]; 8];
+        for (index, corner) in corners.iter_mut().enumerate() {
+            let local = [
+                if index & 1 == 0 { -size.x * 0.5 } else { size.x * 0.5 },
+                if index & 2 == 0 { -size.y * 0.5 } else { size.y * 0.5 },
+                if index & 4 == 0 { -size.z * 0.5 } else { size.z * 0.5 },
+            ];
+            *corner = [
+                cf.position.x + cf.orientation.x.x*local[0] + cf.orientation.x.y*local[1] + cf.orientation.x.z*local[2],
+                cf.position.y + cf.orientation.y.x*local[0] + cf.orientation.y.y*local[1] + cf.orientation.y.z*local[2],
+                cf.position.z + cf.orientation.z.x*local[0] + cf.orientation.z.y*local[1] + cf.orientation.z.z*local[2],
+            ];
+        }
+        output.push(ViewportBox { corners, color: color(instance.properties.get(&rbx_dom_weak::ustr("Color")), 255, [163,162,165]) });
+    }
+    for child in instance.children() { gather_viewport_parts(dom, *child, output); }
+}
+
+fn paint_viewport_frame(painter: &egui::Painter, node: &GuiNode, dom: &WeakDom) {
+    let mut parts = Vec::new();
+    gather_viewport_parts(dom, node.referent, &mut parts);
+    if parts.is_empty() { return; }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for part in &parts { for corner in part.corners { for axis in 0..3 { min[axis]=min[axis].min(corner[axis]); max[axis]=max[axis].max(corner[axis]); } } }
+    let center = [(min[0]+max[0])*0.5, (min[1]+max[1])*0.5, (min[2]+max[2])*0.5];
+    let extent = (max[0]-min[0]).max(max[1]-min[1]).max(max[2]-min[2]).max(1.0);
+    let supplied_camera = dom.get_by_ref(node.referent).and_then(|frame| match frame.properties.get(&rbx_dom_weak::ustr("CurrentCamera")) {
+        Some(Variant::Ref(referent)) => dom.get_by_ref(*referent), _ => None,
+    }).and_then(|camera| match camera.properties.get(&rbx_dom_weak::ustr("CFrame")) {
+        Some(Variant::CFrame(cf)) => Some((
+            [cf.position.x,cf.position.y,cf.position.z],
+            [-cf.orientation.x.z,-cf.orientation.y.z,-cf.orientation.z.z],
+            [cf.orientation.x.x,cf.orientation.y.x,cf.orientation.z.x],
+            [cf.orientation.x.y,cf.orientation.y.y,cf.orientation.z.y],
+        )), _ => None,
+    });
+    let (camera,forward,right,up) = supplied_camera.unwrap_or_else(|| {
+        let camera=[center[0]+extent*1.5,center[1]+extent*1.2,center[2]+extent*1.5];
+        let forward={let v=[center[0]-camera[0],center[1]-camera[1],center[2]-camera[2]];let l=(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt();[v[0]/l,v[1]/l,v[2]/l]};
+        let right={let v=[forward[2],0.0,-forward[0]];let l=(v[0]*v[0]+v[2]*v[2]).sqrt().max(0.001);[v[0]/l,0.0,v[2]/l]};
+        let up=[right[1]*forward[2]-right[2]*forward[1],right[2]*forward[0]-right[0]*forward[2],right[0]*forward[1]-right[1]*forward[0]];
+        (camera,forward,right,up)
+    });
+    let project = |point: [f32;3]| -> Option<(Pos2,f32)> {
+        let relative=[point[0]-camera[0],point[1]-camera[1],point[2]-camera[2]];
+        let depth=relative[0]*forward[0]+relative[1]*forward[1]+relative[2]*forward[2];
+        if depth <= 0.01 { return None; }
+        let x=(relative[0]*right[0]+relative[1]*right[1]+relative[2]*right[2])/depth;
+        let y=(relative[0]*up[0]+relative[1]*up[1]+relative[2]*up[2])/depth;
+        Some((node.content_rect.center()+Vec2::new(x,-y)*node.content_rect.height()*0.8, depth))
+    };
+    let faces = [[0,1,3,2],[4,6,7,5],[0,4,5,1],[2,3,7,6],[0,2,6,4],[1,5,7,3]];
+    let mut polygons = Vec::new();
+    for part in parts {
+        let mut projected=[(Pos2::ZERO,0.0);8]; let mut valid=true;
+        for index in 0..8 { if let Some(value)=project(part.corners[index]) { projected[index]=value; } else { valid=false; break; } }
+        if valid { for face in faces { let depth=face.iter().map(|index|projected[*index].1).sum::<f32>()*0.25; polygons.push((depth,face.map(|index|projected[index].0),part.color)); } }
+    }
+    polygons.sort_by(|a,b| b.0.total_cmp(&a.0));
+    for (_,points,color) in polygons { painter.add(egui::Shape::convex_polygon(points.to_vec(),color,Stroke::new(0.5,shade_color(color,0.65)))); }
+}
+
 fn ensure_gui_texture(ui: &egui::Ui, textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
                       uri: &str) -> Option<egui::TextureId> {
     if !textures.contains_key(uri) {
@@ -1860,6 +1931,9 @@ pub fn draw_starter_gui(
             if let Some((thickness, color, offset, _)) = node.ui_stroke {
                 painter.line(outline(node.rect.expand(offset)), Stroke::new(thickness, color));
             }
+        }
+        if node.class == "ViewportFrame" {
+            paint_viewport_frame(&painter, &node, dom);
         }
         let displayed_image = if pressed {
             node.pressed_image.as_ref().or(node.hover_image.as_ref()).or(node.image.as_ref())
