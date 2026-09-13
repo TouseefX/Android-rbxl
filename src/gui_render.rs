@@ -835,7 +835,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             if horizontal { child_parent_rect.width() } else { child_parent_rect.height() }, scale,
         );
         let sort_order = enum_value(layout.properties.get(&rbx_dom_weak::ustr("SortOrder")), 0);
-        let mut children: Vec<(usize, Ref, i32, String, f32, Rect)> = instance.children().iter().enumerate()
+        let mut children: Vec<(usize, Ref, i32, String, f32, Rect, f32, f32)> = instance.children().iter().enumerate()
             .filter_map(|(index, referent)| {
                 let child = dom.get_by_ref(*referent)?;
                 if !is_gui_object(&child.class) || !visible(child) { return None; }
@@ -848,35 +848,56 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                     Some(Variant::Int64(value)) => *value as i32,
                     _ => 0,
                 };
-                Some((index, *referent, order, child.name.to_string(), child_scale, child_rect))
+                let (grow, shrink) = child_of_class(dom, child, "UIFlexItem").map(|item| {
+                    match enum_value(item.properties.get(&rbx_dom_weak::ustr("FlexMode")), 0) {
+                        1 => (1.0, 0.0),
+                        2 => (0.0, 1.0),
+                        3 => (1.0, 1.0),
+                        4 => (
+                            number(item.properties.get(&rbx_dom_weak::ustr("GrowRatio")), 0.0).max(0.0),
+                            number(item.properties.get(&rbx_dom_weak::ustr("ShrinkRatio")), 0.0).max(0.0),
+                        ),
+                        _ => (0.0, 0.0),
+                    }
+                }).unwrap_or((f32::NAN, f32::NAN));
+                Some((index, *referent, order, child.name.to_string(), child_scale, child_rect, grow, shrink))
             }).collect();
         children.sort_by(|left, right| {
             if sort_order == 1 { left.2.cmp(&right.2).then(left.0.cmp(&right.0)) }
             else { left.3.cmp(&right.3).then(left.0.cmp(&right.0)) }
         });
-        let mut total = children.iter().map(|(_, _, _, _, _, rect)| if horizontal { rect.width() } else { rect.height() }).sum::<f32>()
+        let mut total = children.iter().map(|(_, _, _, _, _, rect, _, _)| if horizontal { rect.width() } else { rect.height() }).sum::<f32>()
             + padding * children.len().saturating_sub(1) as f32;
         let available = if horizontal { child_parent_rect.width() } else { child_parent_rect.height() };
         let flex = enum_value(layout.properties.get(&rbx_dom_weak::ustr(
             if horizontal { "HorizontalFlex" } else { "VerticalFlex" })), 0);
-        let extra = (available-total).max(0.0);
+        let remaining = available-total;
+        let extra = remaining.max(0.0);
         let mut effective_padding = padding;
         let mut flex_inset = 0.0;
         if !children.is_empty() {
-            match flex {
-                1 => {
-                    let growth = extra/children.len() as f32;
-                    for (_, _, _, _, _, rect) in &mut children {
-                        let size = if horizontal { Vec2::new(rect.width()+growth, rect.height()) }
-                            else { Vec2::new(rect.width(), rect.height()+growth) };
-                        *rect = Rect::from_min_size(rect.min, size);
-                    }
-                    total = available;
+            let ratios: Vec<f32> = children.iter().map(|item| {
+                let explicit = if remaining >= 0.0 { item.6 } else { item.7 };
+                if explicit.is_nan() { if flex == 1 { 1.0 } else { 0.0 } } else { explicit }
+            }).collect();
+            let ratio_total: f32 = ratios.iter().sum();
+            if ratio_total > 0.0 && remaining != 0.0 {
+                for (item, ratio) in children.iter_mut().zip(ratios) {
+                    let basis = if horizontal { item.5.width() } else { item.5.height() };
+                    let adjusted = (basis + remaining*ratio/ratio_total).max(0.0);
+                    let size = if horizontal { Vec2::new(adjusted, item.5.height()) }
+                        else { Vec2::new(item.5.width(), adjusted) };
+                    item.5 = Rect::from_min_size(item.5.min, size);
                 }
-                2 => { effective_padding += extra/children.len() as f32; flex_inset = extra/(children.len() as f32*2.0); total=available; }
-                3 if children.len()>1 => { effective_padding += extra/(children.len()-1) as f32; total=available; }
-                4 => { effective_padding += extra/(children.len()+1) as f32; flex_inset=extra/(children.len()+1) as f32; total=available; }
-                _ => {}
+                total = children.iter().map(|item| if horizontal { item.5.width() } else { item.5.height() }).sum::<f32>()
+                    + padding*children.len().saturating_sub(1) as f32;
+            } else if remaining > 0.0 {
+                match flex {
+                    2 => { effective_padding += extra/children.len() as f32; flex_inset = extra/(children.len() as f32*2.0); total=available; }
+                    3 if children.len()>1 => { effective_padding += extra/(children.len()-1) as f32; total=available; }
+                    4 => { effective_padding += extra/(children.len()+1) as f32; flex_inset=extra/(children.len()+1) as f32; total=available; }
+                    _ => {}
+                }
             }
         }
         let main_alignment = if horizontal { horizontal_alignment } else { vertical_alignment };
@@ -885,7 +906,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             2 => available - total,
             _ => 0.0,
         }.max(0.0);
-        for (_, child, _, _, _child_scale, natural) in children {
+        for (_, child, _, _, _child_scale, natural, _, _) in children {
             let cross_available = if horizontal { child_parent_rect.height() } else { child_parent_rect.width() };
             let cross_size = if horizontal { natural.height() } else { natural.width() };
             let cross_alignment = if horizontal { vertical_alignment } else { horizontal_alignment };
