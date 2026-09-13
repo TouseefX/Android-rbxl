@@ -1506,15 +1506,27 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
         }
         let part_alpha=((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("Transparency")),0.0).clamp(0.0,1.0))*255.0) as u8;
         let part_color=color(instance.properties.get(&rbx_dom_weak::ustr("Color")),part_alpha,[163,162,165]);
-        let mesh=if instance.class == "MeshPart" { content(instance.properties.get(&rbx_dom_weak::ustr("MeshId"))).and_then(|id|crate::asset_downloader::get_cached_mesh(&id)) } else { None };
+        let mut mesh_id = if instance.class == "MeshPart" { content(instance.properties.get(&rbx_dom_weak::ustr("MeshId"))) } else { None };
+        let mut texture = if instance.class == "MeshPart" { content(instance.properties.get(&rbx_dom_weak::ustr("TextureID"))) } else { None };
+        let mut mesh_scale = [1.0,1.0,1.0];
+        let mut mesh_offset = [0.0,0.0,0.0];
+        if instance.class != "MeshPart" {
+            for child in instance.children().filter_map(|child|dom.get_by_ref(*child)) {
+                if child.class != "SpecialMesh" && child.class != "BlockMesh" { continue; }
+                mesh_id=content(child.properties.get(&rbx_dom_weak::ustr("MeshId"))).or(mesh_id);
+                texture=content(child.properties.get(&rbx_dom_weak::ustr("TextureId"))).or(texture);
+                if let Some(Variant::Vector3(value))=child.properties.get(&rbx_dom_weak::ustr("Scale")){mesh_scale=[value.x,value.y,value.z];}
+                if let Some(Variant::Vector3(value))=child.properties.get(&rbx_dom_weak::ustr("Offset")){mesh_offset=[value.x,value.y,value.z];}
+            }
+        }
+        let mesh=mesh_id.and_then(|id|crate::asset_downloader::get_cached_mesh(&id));
         if let Some(mesh)=mesh {
             let range=[(mesh.aabb_max[0]-mesh.aabb_min[0]).max(0.001),(mesh.aabb_max[1]-mesh.aabb_min[1]).max(0.001),(mesh.aabb_max[2]-mesh.aabb_min[2]).max(0.001)];
             let midpoint=[(mesh.aabb_max[0]+mesh.aabb_min[0])*0.5,(mesh.aabb_max[1]+mesh.aabb_min[1])*0.5,(mesh.aabb_max[2]+mesh.aabb_min[2])*0.5];
             let vertices=mesh.vertices.iter().map(|vertex| {
-                let local=[(vertex[0]-midpoint[0])*size.x/range[0],(vertex[1]-midpoint[1])*size.y/range[1],(vertex[2]-midpoint[2])*size.z/range[2]];
+                let local=[(vertex[0]-midpoint[0])*size.x*mesh_scale[0]/range[0]+mesh_offset[0],(vertex[1]-midpoint[1])*size.y*mesh_scale[1]/range[1]+mesh_offset[1],(vertex[2]-midpoint[2])*size.z*mesh_scale[2]/range[2]+mesh_offset[2]];
                 [cf.position.x+cf.orientation.x.x*local[0]+cf.orientation.x.y*local[1]+cf.orientation.x.z*local[2],cf.position.y+cf.orientation.y.x*local[0]+cf.orientation.y.y*local[1]+cf.orientation.y.z*local[2],cf.position.z+cf.orientation.z.x*local[0]+cf.orientation.z.y*local[1]+cf.orientation.z.z*local[2]]
             }).collect();
-            let texture=content(instance.properties.get(&rbx_dom_weak::ustr("TextureID")));
             meshes.push(ViewportMesh{vertices,faces:mesh.faces,colors:mesh.colors,uvs:mesh.uvs,color:part_color,texture});
         } else {
             let (vertices,faces)=if instance.class == "WedgePart" {
