@@ -854,11 +854,33 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             if sort_order == 1 { left.2.cmp(&right.2).then(left.0.cmp(&right.0)) }
             else { left.3.cmp(&right.3).then(left.0.cmp(&right.0)) }
         });
-        let total = children.iter().map(|(_, _, _, _, _, rect)| if horizontal { rect.width() } else { rect.height() }).sum::<f32>()
+        let mut total = children.iter().map(|(_, _, _, _, _, rect)| if horizontal { rect.width() } else { rect.height() }).sum::<f32>()
             + padding * children.len().saturating_sub(1) as f32;
         let available = if horizontal { child_parent_rect.width() } else { child_parent_rect.height() };
+        let flex = enum_value(layout.properties.get(&rbx_dom_weak::ustr(
+            if horizontal { "HorizontalFlex" } else { "VerticalFlex" })), 0);
+        let extra = (available-total).max(0.0);
+        let mut effective_padding = padding;
+        let mut flex_inset = 0.0;
+        if !children.is_empty() {
+            match flex {
+                1 => {
+                    let growth = extra/children.len() as f32;
+                    for (_, _, _, _, _, rect) in &mut children {
+                        let size = if horizontal { Vec2::new(rect.width()+growth, rect.height()) }
+                            else { Vec2::new(rect.width(), rect.height()+growth) };
+                        *rect = Rect::from_min_size(rect.min, size);
+                    }
+                    total = available;
+                }
+                2 => { effective_padding += extra/children.len() as f32; flex_inset = extra/(children.len() as f32*2.0); total=available; }
+                3 if children.len()>1 => { effective_padding += extra/(children.len()-1) as f32; total=available; }
+                4 => { effective_padding += extra/(children.len()+1) as f32; flex_inset=extra/(children.len()+1) as f32; total=available; }
+                _ => {}
+            }
+        }
         let main_alignment = if horizontal { horizontal_alignment } else { vertical_alignment };
-        let mut cursor = match main_alignment {
+        let mut cursor = flex_inset + match main_alignment {
             1 => (available - total) * 0.5,
             2 => available - total,
             _ => 0.0,
@@ -880,7 +902,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             let arranged = Rect::from_min_size(min, natural.size());
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
                 global_z, scale, opacity, tint, &sort_path, Some(arranged), overrides, scroll_offsets, sequence, nodes);
-            cursor += if horizontal { natural.width() } else { natural.height() } + padding;
+            cursor += (if horizontal { natural.width() } else { natural.height() }) + effective_padding;
         }
     } else {
         for child in instance.children() {
