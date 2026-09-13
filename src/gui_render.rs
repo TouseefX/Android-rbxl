@@ -288,6 +288,7 @@ fn gui_rect(
             let mut count = 0usize;
             let mut main = 0.0f32;
             let mut cross = 0.0f32;
+            let mut child_sizes = Vec::new();
             for child_ref in instance.children() {
                 let Some(child) = dom.get_by_ref(*child_ref) else { continue; };
                 if !is_gui_object(&child.class) || !visible(child) { continue; }
@@ -297,10 +298,28 @@ fn gui_rect(
                 let rect = gui_rect(dom, painter, child, provisional_content, scale * child_scale);
                 main += if horizontal { rect.width() } else { rect.height() };
                 cross = cross.max(if horizontal { rect.height() } else { rect.width() });
+                child_sizes.push(rect.size());
                 count += 1;
             }
             main += gap * count.saturating_sub(1) as f32;
-            required = if horizontal { Vec2::new(main, cross) } else { Vec2::new(cross, main) };
+            if bool_value(layout.properties.get(&rbx_dom_weak::ustr("Wraps")), false) {
+                let available = if horizontal { provisional_content.width() } else { provisional_content.height() };
+                let mut line_main=0.0f32; let mut line_cross=0.0f32; let mut total_cross=0.0f32; let mut widest=0.0f32; let mut lines=0usize;
+                for child in child_sizes {
+                    let child_main=if horizontal { child.x } else { child.y };
+                    let child_cross=if horizontal { child.y } else { child.x };
+                    if line_main>0.0 && line_main+gap+child_main>available {
+                        widest=widest.max(line_main); total_cross+=line_cross; lines+=1; line_main=0.0; line_cross=0.0;
+                    }
+                    if line_main>0.0 { line_main+=gap; }
+                    line_main+=child_main; line_cross=line_cross.max(child_cross);
+                }
+                if line_main>0.0 { widest=widest.max(line_main); total_cross+=line_cross; lines+=1; }
+                total_cross+=gap*lines.saturating_sub(1) as f32;
+                required=if horizontal { Vec2::new(widest,total_cross) } else { Vec2::new(total_cross,widest) };
+            } else {
+                required = if horizontal { Vec2::new(main, cross) } else { Vec2::new(cross, main) };
+            }
         }
         let padding = size - provisional_content.size();
         if automatic == 1 || automatic == 3 { size.x = size.x.max(required.x + padding.x); }
@@ -866,6 +885,67 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             if sort_order == 1 { left.2.cmp(&right.2).then(left.0.cmp(&right.0)) }
             else { left.3.cmp(&right.3).then(left.0.cmp(&right.0)) }
         });
+        let wraps = bool_value(layout.properties.get(&rbx_dom_weak::ustr("Wraps")), false);
+        if wraps {
+            let available_main = if horizontal { child_parent_rect.width() } else { child_parent_rect.height() };
+            let mut lines: Vec<Vec<(usize, Ref, i32, String, f32, Rect, f32, f32)>> = Vec::new();
+            for item in children {
+                let item_main = if horizontal { item.5.width() } else { item.5.height() };
+                let occupied = lines.last().map(|line| line.iter().map(|item| if horizontal { item.5.width() } else { item.5.height() }).sum::<f32>()
+                    + padding*line.len().saturating_sub(1) as f32).unwrap_or(0.0);
+                if !lines.is_empty() && !lines.last().unwrap().is_empty() && occupied+padding+item_main > available_main {
+                    lines.push(Vec::new());
+                }
+                if lines.is_empty() { lines.push(Vec::new()); }
+                lines.last_mut().unwrap().push(item);
+            }
+            let line_cross: Vec<f32> = lines.iter().map(|line| line.iter()
+                .map(|item| if horizontal { item.5.height() } else { item.5.width() }).fold(0.0, f32::max)).collect();
+            let total_cross = line_cross.iter().sum::<f32>() + padding*lines.len().saturating_sub(1) as f32;
+            let available_cross = if horizontal { child_parent_rect.height() } else { child_parent_rect.width() };
+            let overall_cross_alignment = if horizontal { vertical_alignment } else { horizontal_alignment };
+            let mut cross_cursor = match overall_cross_alignment { 1 => (available_cross-total_cross)*0.5, 2 => available_cross-total_cross, _ => 0.0 }.max(0.0);
+            let layout_line_alignment = enum_value(layout.properties.get(&rbx_dom_weak::ustr("ItemLineAlignment")), 0);
+            for (line_index, mut line) in lines.into_iter().enumerate() {
+                let mut line_main = line.iter().map(|item| if horizontal { item.5.width() } else { item.5.height() }).sum::<f32>()
+                    + padding*line.len().saturating_sub(1) as f32;
+                let remaining = (available_main-line_main).max(0.0);
+                let flex = enum_value(layout.properties.get(&rbx_dom_weak::ustr(
+                    if horizontal { "HorizontalFlex" } else { "VerticalFlex" })), 0);
+                let ratios: Vec<f32> = line.iter().map(|item| {
+                    if item.6.is_nan() { if flex == 1 { 1.0 } else { 0.0 } } else { item.6 }
+                }).collect();
+                let ratio_total: f32 = ratios.iter().sum();
+                if ratio_total > 0.0 && remaining > 0.0 {
+                    for (item, ratio) in line.iter_mut().zip(ratios) {
+                        let basis = if horizontal { item.5.width() } else { item.5.height() };
+                        let adjusted = basis+remaining*ratio/ratio_total;
+                        let size = if horizontal { Vec2::new(adjusted,item.5.height()) } else { Vec2::new(item.5.width(),adjusted) };
+                        item.5=Rect::from_min_size(item.5.min,size);
+                    }
+                    line_main=available_main;
+                }
+                let main_alignment = if horizontal { horizontal_alignment } else { vertical_alignment };
+                let mut main_cursor = match main_alignment { 1 => (available_main-line_main)*0.5, 2 => available_main-line_main, _ => 0.0 }.max(0.0);
+                for (_, child, _, _, _, natural, _, _) in line {
+                    let cross_size = if horizontal { natural.height() } else { natural.width() };
+                    let item_alignment = dom.get_by_ref(child).and_then(|instance| child_of_class(dom, instance, "UIFlexItem"))
+                        .map(|item| enum_value(item.properties.get(&rbx_dom_weak::ustr("ItemLineAlignment")), 0)).unwrap_or(0);
+                    let alignment = if item_alignment != 0 { item_alignment } else { layout_line_alignment };
+                    let cross_offset = match alignment { 2 => (line_cross[line_index]-cross_size)*0.5, 3 => line_cross[line_index]-cross_size, _ => 0.0 }.max(0.0);
+                    let mut arranged_size = natural.size();
+                    if alignment == 4 {
+                        if horizontal { arranged_size.y = line_cross[line_index]; } else { arranged_size.x = line_cross[line_index]; }
+                    }
+                    let min = if horizontal { child_parent_rect.min+Vec2::new(main_cursor, cross_cursor+cross_offset) }
+                        else { child_parent_rect.min+Vec2::new(cross_cursor+cross_offset, main_cursor) };
+                    collect(dom, painter, child, child_parent_rect, child_clip, display_order,
+                        global_z, scale, opacity, tint, &sort_path, Some(Rect::from_min_size(min, arranged_size)), overrides, scroll_offsets, sequence, nodes);
+                    main_cursor += (if horizontal { arranged_size.x } else { arranged_size.y }) + padding;
+                }
+                cross_cursor += line_cross[line_index]+padding;
+            }
+        } else {
         let mut total = children.iter().map(|(_, _, _, _, _, rect, _, _)| if horizontal { rect.width() } else { rect.height() }).sum::<f32>()
             + padding * children.len().saturating_sub(1) as f32;
         let available = if horizontal { child_parent_rect.width() } else { child_parent_rect.height() };
@@ -924,6 +1004,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
                 global_z, scale, opacity, tint, &sort_path, Some(arranged), overrides, scroll_offsets, sequence, nodes);
             cursor += (if horizontal { natural.width() } else { natural.height() }) + effective_padding;
+        }
         }
     } else {
         for child in instance.children() {
