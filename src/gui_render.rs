@@ -66,6 +66,9 @@ struct GuiNode {
     scrolling_enabled: bool,
     scroll_rate: f32,
     vertical_scroll_bar_left: bool,
+    scroll_top_image: Option<String>,
+    scroll_mid_image: Option<String>,
+    scroll_bottom_image: Option<String>,
 }
 
 fn number(value: Option<&Variant>, fallback: f32) -> f32 {
@@ -657,6 +660,12 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             scrolling_enabled: bool_value(instance.properties.get(&rbx_dom_weak::ustr("ScrollingEnabled")), true),
             scroll_rate: number(instance.properties.get(&rbx_dom_weak::ustr("ScrollRate")), 1.0).max(0.0),
             vertical_scroll_bar_left: enum_value(instance.properties.get(&rbx_dom_weak::ustr("VerticalScrollBarPosition")), 0) == 1,
+            scroll_top_image: content(instance.properties.get(&rbx_dom_weak::ustr("TopImage"))
+                .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("TopImageContent")))),
+            scroll_mid_image: content(instance.properties.get(&rbx_dom_weak::ustr("MidImage"))
+                .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("MidImageContent")))),
+            scroll_bottom_image: content(instance.properties.get(&rbx_dom_weak::ustr("BottomImage"))
+                .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("BottomImageContent")))),
         });
     }
     let child_parent_rect = if instance.class == "ScrollingFrame" {
@@ -1370,6 +1379,19 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
     }
 }
 
+fn ensure_gui_texture(ui: &egui::Ui, textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
+                      uri: &str) -> Option<egui::TextureId> {
+    if !textures.contains_key(uri) {
+        let decoded = crate::asset_downloader::get_cached_image(uri).or_else(|| {
+            crate::asset_downloader::extract_asset_id(uri)
+                .and_then(|id| crate::asset_downloader::get_cached_image(&id))
+        })?;
+        let image = egui::ColorImage::from_rgba_unmultiplied([decoded.width, decoded.height], &decoded.rgba);
+        textures.insert(uri.to_string(), ui.ctx().load_texture(uri, image, egui::TextureOptions::LINEAR));
+    }
+    textures.get(uri).map(egui::TextureHandle::id)
+}
+
 fn gather_class(dom: &WeakDom, referent: Ref, class: &str, output: &mut Vec<Ref>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if instance.class == class { output.push(referent); }
@@ -1610,7 +1632,7 @@ pub fn draw_starter_gui(
     });
     let mut clicked = None;
     // rect, color, owner, horizontal, canvas maximum, thumb travel
-    let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool)> = Vec::new();
+    let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool, [Option<String>; 3])> = Vec::new();
     for node in nodes {
         if node.clip.width() <= 0.0 || node.clip.height() <= 0.0 { continue; }
         let hit_rect = rotated_bounds(node.rect, node.rotation).intersect(node.clip);
@@ -1655,7 +1677,8 @@ pub fn draw_starter_gui(
                 let travel = (track.height()-thumb_height).max(0.0);
                 let top = track.top() + travel * effective.y/maximum.y.max(1.0);
                 scroll_bars.push((Rect::from_min_size(Pos2::new(track.left(), top), Vec2::new(thickness, thumb_height)),
-                    node.scroll_bar_color, node.referent, false, maximum.y, travel, node.canvas_position.y, node.scrolling_enabled));
+                    node.scroll_bar_color, node.referent, false, maximum.y, travel, node.canvas_position.y, node.scrolling_enabled,
+                    [node.scroll_top_image.clone(), node.scroll_mid_image.clone(), node.scroll_bottom_image.clone()]));
             }
             if thickness > 0.0 && maximum.x > 0.0 {
                 let has_vertical = maximum.y > 0.0;
@@ -1666,7 +1689,8 @@ pub fn draw_starter_gui(
                 let travel = (track.width()-thumb_width).max(0.0);
                 let left = track.left() + travel * effective.x/maximum.x.max(1.0);
                 scroll_bars.push((Rect::from_min_size(Pos2::new(left, track.top()), Vec2::new(thumb_width, thickness)),
-                    node.scroll_bar_color, node.referent, true, maximum.x, travel, node.canvas_position.x, node.scrolling_enabled));
+                    node.scroll_bar_color, node.referent, true, maximum.x, travel, node.canvas_position.x, node.scrolling_enabled,
+                    [node.scroll_top_image.clone(), node.scroll_mid_image.clone(), node.scroll_bottom_image.clone()]));
             }
         }
         let painter = ui.painter().with_clip_rect(node.clip);
@@ -1817,12 +1841,33 @@ pub fn draw_starter_gui(
         if response.clicked() && pointer_inside { clicked = Some(node.referent); }
     }
     let overlay_painter = ui.painter().with_clip_rect(viewport);
-    for (rect, color, owner, horizontal, maximum, travel, authored, enabled) in scroll_bars {
+    for (rect, color, owner, horizontal, maximum, travel, authored, enabled, images) in scroll_bars {
         let sense = if enabled { egui::Sense::drag() } else { egui::Sense::hover() };
         let response = ui.interact(rect, ui.make_persistent_id(("scroll_thumb", format!("{:?}", owner), horizontal)), sense);
         let shown_color = if response.dragged() { shade_color(color, 0.72) }
             else if response.hovered() { shade_color(color, 0.88) } else { color };
-        overlay_painter.rect_filled(rect, 2.0, shown_color);
+        let main_length = if horizontal { rect.width() } else { rect.height() };
+        let cap = (if horizontal { rect.height() } else { rect.width() }).min(main_length*0.5);
+        let segments = if horizontal {
+            [Rect::from_min_max(rect.min, Pos2::new(rect.left()+cap,rect.bottom())),
+             Rect::from_min_max(Pos2::new(rect.left()+cap,rect.top()),Pos2::new(rect.right()-cap,rect.bottom())),
+             Rect::from_min_max(Pos2::new(rect.right()-cap,rect.top()),rect.max)]
+        } else {
+            [Rect::from_min_max(rect.min,Pos2::new(rect.right(),rect.top()+cap)),
+             Rect::from_min_max(Pos2::new(rect.left(),rect.top()+cap),Pos2::new(rect.right(),rect.bottom()-cap)),
+             Rect::from_min_max(Pos2::new(rect.left(),rect.bottom()-cap),rect.max)]
+        };
+        let mut used_texture = false;
+        for (segment, image) in segments.into_iter().zip(images.iter()) {
+            if segment.width() <= 0.0 || segment.height() <= 0.0 { continue; }
+            if let Some(texture) = image.as_deref().and_then(|uri| ensure_gui_texture(ui,textures,uri)) {
+                overlay_painter.image(texture,segment,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),shown_color);
+                used_texture=true;
+            } else if images.iter().any(Option::is_some) {
+                overlay_painter.rect_filled(segment,0.0,shown_color);
+            }
+        }
+        if !used_texture && images.iter().all(Option::is_none) { overlay_painter.rect_filled(rect,2.0,shown_color); }
         if response.dragged() && travel > 0.0 {
             let pointer_delta = ui.input(|input| input.pointer.delta());
             let delta = if horizontal { pointer_delta.x } else { pointer_delta.y } * maximum / travel;
