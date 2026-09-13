@@ -8,6 +8,9 @@ use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 #[derive(Clone, Copy)]
 struct RoundedMask { rect: Rect, radius: f32, rotation: f32 }
 
+#[derive(Clone, Copy)]
+struct SurfaceWarp { source: Rect, rotation: f32, quad: [Pos2; 4] }
+
 struct GuiNode {
     referent: Ref,
     class: String,
@@ -16,6 +19,7 @@ struct GuiNode {
     gui_scale: f32,
     clip: Rect,
     rounded_clip: Option<RoundedMask>,
+    surface_warp: Option<SurfaceWarp>,
     display_order: i32,
     z: i32,
     global_z: bool,
@@ -608,6 +612,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             gui_scale: scale,
             clip: parent_clip.intersect(rect),
             rounded_clip: None,
+            surface_warp: None,
             display_order,
             z,
             global_z,
@@ -1049,7 +1054,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
 
 fn paint_gradient(painter: &egui::Painter, rect: Rect, base: Color32,
                   gradient: &(f32, Vec2, Vec<Color32>), object_rotation: f32,
-                  corner_radius: f32, rounded_clip: Option<RoundedMask>) {
+                  corner_radius: f32, rounded_clip: Option<RoundedMask>, surface_warp: Option<SurfaceWarp>) {
     if gradient.2.len() < 2 || rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
     // A regular mesh gives smooth interpolation at arbitrary angles and lets
     // UICorner alpha-mask the same gradient without leaking through corners.
@@ -1061,7 +1066,8 @@ fn paint_gradient(painter: &egui::Painter, rect: Rect, base: Color32,
             let unrotated=Pos2::new(rect.left()+rect.width()*fx, rect.top()+rect.height()*fy);
             let mut color=multiply_color(base,sample_gradient(gradient,unrotated,rect));
             let mut coverage=rounded_coverage(unrotated,rect,corner_radius);
-            let pos=if object_rotation.abs()>=0.001 { rotate_point(unrotated,rect.center(),object_rotation.to_radians()) } else { unrotated };
+            let mut pos=if object_rotation.abs()>=0.001 { rotate_point(unrotated,rect.center(),object_rotation.to_radians()) } else { unrotated };
+            if let Some(warp)=surface_warp { pos=warp_surface_point(pos,warp); }
             if let Some(mask)=rounded_clip {
                 let mask_local=rotate_point(pos,mask.rect.center(),-mask.rotation.to_radians());
                 coverage*=rounded_coverage(mask_local,mask.rect,mask.radius);
@@ -1076,6 +1082,33 @@ fn paint_gradient(painter: &egui::Painter, rect: Rect, base: Color32,
         mesh.add_triangle(a,b,d); mesh.add_triangle(a,d,c);
     }}
     painter.add(egui::Shape::mesh(mesh));
+}
+
+fn warp_surface_point(point: Pos2, warp: SurfaceWarp) -> Pos2 {
+    let local = rotate_point(point, warp.source.center(), -warp.rotation);
+    let u = ((local.x-warp.source.left())/warp.source.width().max(0.001)).clamp(0.0,1.0);
+    let v = ((local.y-warp.source.top())/warp.source.height().max(0.001)).clamp(0.0,1.0);
+    let top = warp.quad[0]+(warp.quad[1]-warp.quad[0])*u;
+    let bottom = warp.quad[3]+(warp.quad[2]-warp.quad[3])*u;
+    top+(bottom-top)*v
+}
+
+fn inverse_surface_point(point: Pos2, warp: SurfaceWarp) -> Pos2 {
+    let mut u=0.5f32; let mut v=0.5f32;
+    for _ in 0..6 {
+        let top=warp.quad[0]+(warp.quad[1]-warp.quad[0])*u;
+        let bottom=warp.quad[3]+(warp.quad[2]-warp.quad[3])*u;
+        let current=top+(bottom-top)*v;
+        let du=(warp.quad[1]-warp.quad[0])*(1.0-v)+(warp.quad[2]-warp.quad[3])*v;
+        let dv=bottom-top;
+        let error=current-point;
+        let determinant=du.x*dv.y-du.y*dv.x;
+        if determinant.abs()<1e-5 { break; }
+        u-=(error.x*dv.y-error.y*dv.x)/determinant;
+        v-=(du.x*error.y-du.y*error.x)/determinant;
+    }
+    let local=Pos2::new(warp.source.left()+warp.source.width()*u,warp.source.top()+warp.source.height()*v);
+    rotate_point(local,warp.source.center(),warp.rotation)
 }
 
 fn rotated_bounds(rect: Rect, rotation: f32) -> Rect {
@@ -1210,7 +1243,7 @@ fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
 
 fn mask_galley(mut galley: std::sync::Arc<egui::Galley>, origin: Pos2,
                gradient: Option<&(f32, Vec2, Vec<Color32>)>, rounded_clip: Option<RoundedMask>,
-               rect: Rect, object_rotation: f32) -> std::sync::Arc<egui::Galley> {
+               rect: Rect, object_rotation: f32, surface_warp: Option<SurfaceWarp>) -> std::sync::Arc<egui::Galley> {
     let mutable = std::sync::Arc::make_mut(&mut galley);
     for placed_row in &mut mutable.rows {
         let row_origin = origin + placed_row.pos.to_vec2();
@@ -1218,8 +1251,12 @@ fn mask_galley(mut galley: std::sync::Arc<egui::Galley>, origin: Pos2,
         for vertex in &mut row.visuals.mesh.vertices {
             let point=row_origin+vertex.pos.to_vec2();
             if let Some(gradient)=gradient { vertex.color=multiply_color(vertex.color,sample_gradient(gradient,point,rect)); }
+            let mut screen_point=if object_rotation.abs()>=0.001 { rotate_point(point,rect.center(),object_rotation.to_radians()) } else { point };
+            if let Some(warp)=surface_warp {
+                screen_point=warp_surface_point(screen_point,warp);
+                vertex.pos=screen_point-origin.to_vec2()-placed_row.pos.to_vec2();
+            }
             if let Some(mask)=rounded_clip {
-                let screen_point=if object_rotation.abs()>=0.001 { rotate_point(point,rect.center(),object_rotation.to_radians()) } else { point };
                 let local=rotate_point(screen_point,mask.rect.center(),-mask.rotation.to_radians());
                 let coverage=rounded_coverage(local,mask.rect,mask.radius);
                 vertex.color=Color32::from_rgba_unmultiplied(vertex.color.r(),vertex.color.g(),vertex.color.b(),(vertex.color.a() as f32*coverage) as u8);
@@ -1266,13 +1303,14 @@ fn sample_gradient(gradient: &(f32, Vec2, Vec<Color32>), point: Pos2, rect: Rect
 }
 
 fn paint_masked_solid(painter: &egui::Painter, rect: Rect, color: Color32, radius: f32,
-                      rotation: f32, rounded_clip: Option<RoundedMask>) {
+                      rotation: f32, rounded_clip: Option<RoundedMask>, surface_warp: Option<SurfaceWarp>) {
     let divisions=16usize; let mut mesh=egui::Mesh::default();
     for y in 0..=divisions { for x in 0..=divisions {
         let fx=x as f32/divisions as f32; let fy=y as f32/divisions as f32;
         let local=Pos2::new(rect.left()+rect.width()*fx,rect.top()+rect.height()*fy);
         let mut coverage=rounded_coverage(local,rect,radius);
-        let pos=if rotation.abs()>=0.001 { rotate_point(local,rect.center(),rotation.to_radians()) } else { local };
+        let mut pos=if rotation.abs()>=0.001 { rotate_point(local,rect.center(),rotation.to_radians()) } else { local };
+        if let Some(warp)=surface_warp { pos=warp_surface_point(pos,warp); }
         if let Some(mask)=rounded_clip {
             let mask_local=rotate_point(pos,mask.rect.center(),-mask.rotation.to_radians());
             coverage*=rounded_coverage(mask_local,mask.rect,mask.radius);
@@ -1297,8 +1335,8 @@ fn rounded_coverage(point: Pos2, rect: Rect, radius: f32) -> f32 {
 fn paint_texture_quad(painter: &egui::Painter, texture: egui::TextureId, destination: Rect,
                       uv: Rect, tint: Color32, rotation: f32, pivot: Pos2,
                       gradient: Option<&(f32, Vec2, Vec<Color32>)>, gradient_rect: Rect,
-                      corner_radius: f32, rounded_clip: Option<RoundedMask>) {
-    if gradient.is_none() && rotation.abs() < 0.001 && corner_radius <= 0.0 && rounded_clip.is_none() {
+                      corner_radius: f32, rounded_clip: Option<RoundedMask>, surface_warp: Option<SurfaceWarp>) {
+    if gradient.is_none() && rotation.abs() < 0.001 && corner_radius <= 0.0 && rounded_clip.is_none() && surface_warp.is_none() {
         painter.image(texture, destination, uv, tint);
         return;
     }
@@ -1312,6 +1350,7 @@ fn paint_texture_quad(painter: &egui::Painter, texture: egui::TextureId, destina
             let mut color=gradient.map(|value| multiply_color(tint, sample_gradient(value,pos,gradient_rect))).unwrap_or(tint);
             let mut coverage=rounded_coverage(pos,gradient_rect,corner_radius);
             if rotation.abs() >= 0.001 { pos=rotate_point(pos,pivot,rotation.to_radians()); }
+            if let Some(warp)=surface_warp { pos=warp_surface_point(pos,warp); }
             if let Some(mask)=rounded_clip {
                 let local=rotate_point(pos,mask.rect.center(),-mask.rotation.to_radians());
                 coverage*=rounded_coverage(local,mask.rect,mask.radius);
@@ -1347,7 +1386,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
         // Slice (nine-slice)
         1 => {
             let Some(slice) = node.slice_center else {
-                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
+                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip, node.surface_warp);
                 return;
             };
             let mut left = (slice[0] - node.image_rect_offset.x).max(0.0) * node.slice_scale;
@@ -1372,7 +1411,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                     paint_texture_quad(painter, texture.id(),
                         Rect::from_min_max(Pos2::new(dx[x], dy[y]), Pos2::new(dx[x + 1], dy[y + 1])),
                         Rect::from_min_max(Pos2::new(ux[x], uy[y]), Pos2::new(ux[x + 1], uy[y + 1])),
-                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
+                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip, node.surface_warp);
                 }
             }
         }
@@ -1397,7 +1436,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                         uv.min.y + uv.height() * fraction.y,
                     ));
                     paint_texture_quad(painter, texture.id(), Rect::from_min_max(min, max), tile_uv,
-                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
+                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip, node.surface_warp);
                 }
             }
         }
@@ -1411,7 +1450,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 Vec2::new(bounds.width(), bounds.width() / image_aspect)
             };
             paint_texture_quad(painter, texture.id(), Rect::from_center_size(bounds.center(), size), uv,
-                tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
+                tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip, node.surface_warp);
         }
         // Crop
         4 => {
@@ -1429,10 +1468,10 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 crop_uv.min.x += margin;
                 crop_uv.max.x -= margin;
             }
-            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
+            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip, node.surface_warp);
         }
         // Stretch
-        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip),
+        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip, node.surface_warp),
     }
 }
 
@@ -1651,6 +1690,8 @@ pub fn draw_starter_gui(
         }
         // Rotate the complete hierarchy with its Part face. Child-local
         // Rotation remains additive, just as it is for an oriented SurfaceGui.
+        let perspective_warp = SurfaceWarp { source: surface_rect, rotation: surface_rotation,
+            quad: [projected_points[0],projected_points[1],projected_points[2],projected_points[3]] };
         for node in &mut nodes[first_surface_node..] {
             let center = rotate_point(node.rect.center(), surface_center, surface_rotation);
             let content_center = rotate_point(node.content_rect.center(), surface_center, surface_rotation);
@@ -1664,6 +1705,7 @@ pub fn draw_starter_gui(
             node.content_rect = Rect::from_center_size(content_center, node.content_rect.size());
             node.rotation += surface_rotation.to_degrees();
             node.clip = transformed_clip;
+            node.surface_warp = Some(perspective_warp);
         }
     }
 
@@ -1710,10 +1752,17 @@ pub fn draw_starter_gui(
     let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool, [Option<String>; 3])> = Vec::new();
     for node in nodes {
         if node.clip.width() <= 0.0 || node.clip.height() <= 0.0 { continue; }
-        let hit_rect = rotated_bounds(node.rect, node.rotation).intersect(node.clip);
+        let hit_rect = if let Some(warp)=node.surface_warp {
+            let mut bounds=Rect::NOTHING;
+            for point in [node.rect.left_top(),node.rect.right_top(),node.rect.right_bottom(),node.rect.left_bottom()] {
+                bounds.extend_with(warp_surface_point(rotate_point(point,node.rect.center(),node.rotation.to_radians()),warp));
+            }
+            bounds.intersect(node.clip)
+        } else { rotated_bounds(node.rect, node.rotation).intersect(node.clip) };
         let response = ui.interact(hit_rect, ui.make_persistent_id(("roblox_gui", format!("{:?}", node.referent))), egui::Sense::click());
         let pointer_inside = ui.input(|input| input.pointer.hover_pos()).map(|point| {
-            let local = rotate_point(point, node.rect.center(), -node.rotation.to_radians());
+            let affine_point=node.surface_warp.map(|warp| inverse_surface_point(point,warp)).unwrap_or(point);
+            let local = rotate_point(affine_point, node.rect.center(), -node.rotation.to_radians());
             node.rect.contains(local) && node.clip.contains(point)
         }).unwrap_or(false);
         if node.class == "ScrollingFrame" {
@@ -1774,8 +1823,8 @@ pub fn draw_starter_gui(
         let hovered = is_button && node.interactable && response.hovered() && pointer_inside;
         let button_factor = if node.auto_button_color && pressed { 0.72 }
             else if node.auto_button_color && hovered { 0.88 } else { 1.0 };
-        if node.rounded_clip.is_some() {
-            paint_masked_solid(&painter,node.rect,shade_color(node.background,button_factor),node.corner_radius,node.rotation,node.rounded_clip);
+        if node.rounded_clip.is_some() || node.surface_warp.is_some() {
+            paint_masked_solid(&painter,node.rect,shade_color(node.background,button_factor),node.corner_radius,node.rotation,node.rounded_clip,node.surface_warp);
         } else if node.rotation.abs() < 0.001 {
             painter.rect_filled(node.rect, node.corner_radius, shade_color(node.background, button_factor));
         } else {
@@ -1787,7 +1836,7 @@ pub fn draw_starter_gui(
         }
         if let Some(gradient) = &node.gradient {
             paint_gradient(&painter.with_clip_rect(rotated_bounds(node.rect, node.rotation).intersect(node.clip)), node.rect,
-                shade_color(node.background, button_factor), gradient, node.rotation, node.corner_radius, node.rounded_clip);
+                shade_color(node.background, button_factor), gradient, node.rotation, node.corner_radius, node.rounded_clip, node.surface_warp);
         }
         if node.rotation.abs() < 0.001 {
             if node.border_size > 0.0 {
@@ -1801,7 +1850,10 @@ pub fn draw_starter_gui(
             let radians = node.rotation.to_radians();
             let outline = |rect: Rect| {
                 let mut corners: Vec<Pos2> = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()]
-                    .into_iter().map(|point| rotate_point(point, node.rect.center(), radians)).collect();
+                    .into_iter().map(|point| {
+                        let rotated=rotate_point(point,node.rect.center(),radians);
+                        node.surface_warp.map(|warp| warp_surface_point(rotated,warp)).unwrap_or(rotated)
+                    }).collect();
                 corners.push(corners[0]); corners
             };
             if node.border_size > 0.0 { painter.line(outline(node.rect), Stroke::new(node.border_size, node.border)); }
@@ -1898,14 +1950,15 @@ pub fn draw_starter_gui(
                         node.rotation, node.rect.center());
                 }
             }
-            let final_galley = if node.gradient.is_some() || node.rounded_clip.is_some() {
-                mask_galley(galley.clone(),pos,node.gradient.as_ref(),node.rounded_clip,node.rect,node.rotation)
+            let final_galley = if node.gradient.is_some() || node.rounded_clip.is_some() || node.surface_warp.is_some() {
+                mask_galley(galley.clone(),pos,node.gradient.as_ref(),node.rounded_clip,node.rect,node.rotation,node.surface_warp)
             } else { galley };
+            let render_rotation=if node.surface_warp.is_some() { 0.0 } else { node.rotation };
             if node.font_bold {
                 paint_galley(&painter, pos + Vec2::new(0.35, 0.0), final_galley.clone(), text_color,
-                    false, node.rotation, node.rect.center());
+                    false, render_rotation, node.rect.center());
             }
-            paint_galley(&painter, pos, final_galley, text_color, false, node.rotation, node.rect.center());
+            paint_galley(&painter, pos, final_galley, text_color, false, render_rotation, node.rect.center());
         }
         if selected == Some(node.referent) {
             painter.rect_stroke(node.rect, 0.0, Stroke::new(2.0, Color32::from_rgb(0, 162, 255)), egui::StrokeKind::Outside);
