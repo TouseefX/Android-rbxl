@@ -1222,21 +1222,32 @@ fn sample_gradient(gradient: &(f32, Vec2, Vec<Color32>), point: Pos2, rect: Rect
         (a.a() as f32+(b.a() as f32-a.a() as f32)*mix) as u8)
 }
 
+fn rounded_coverage(point: Pos2, rect: Rect, radius: f32) -> f32 {
+    if radius <= 0.0 { return 1.0; }
+    let radius = radius.min(rect.width().min(rect.height())*0.5);
+    let inner = Rect::from_min_max(rect.min+Vec2::splat(radius), rect.max-Vec2::splat(radius));
+    let nearest = Pos2::new(point.x.clamp(inner.left(),inner.right()), point.y.clamp(inner.top(),inner.bottom()));
+    (radius-(point-nearest).length()+0.75).clamp(0.0,1.0)
+}
+
 fn paint_texture_quad(painter: &egui::Painter, texture: egui::TextureId, destination: Rect,
                       uv: Rect, tint: Color32, rotation: f32, pivot: Pos2,
-                      gradient: Option<&(f32, Vec2, Vec<Color32>)>, gradient_rect: Rect) {
-    if gradient.is_none() && rotation.abs() < 0.001 {
+                      gradient: Option<&(f32, Vec2, Vec<Color32>)>, gradient_rect: Rect,
+                      corner_radius: f32) {
+    if gradient.is_none() && rotation.abs() < 0.001 && corner_radius <= 0.0 {
         painter.image(texture, destination, uv, tint);
         return;
     }
-    let divisions = if gradient.is_some() { 8usize } else { 1usize };
+    let divisions = if corner_radius > 0.0 { 16usize } else if gradient.is_some() { 8usize } else { 1usize };
     let mut mesh = egui::Mesh::with_texture(texture);
     for y in 0..=divisions {
         for x in 0..=divisions {
             let fx=x as f32/divisions as f32; let fy=y as f32/divisions as f32;
             let mut pos=Pos2::new(destination.left()+destination.width()*fx, destination.top()+destination.height()*fy);
             let uv_pos=Pos2::new(uv.left()+uv.width()*fx, uv.top()+uv.height()*fy);
-            let color=gradient.map(|value| multiply_color(tint, sample_gradient(value,pos,gradient_rect))).unwrap_or(tint);
+            let mut color=gradient.map(|value| multiply_color(tint, sample_gradient(value,pos,gradient_rect))).unwrap_or(tint);
+            let coverage=rounded_coverage(pos,gradient_rect,corner_radius);
+            color=Color32::from_rgba_unmultiplied(color.r(),color.g(),color.b(),(color.a() as f32*coverage) as u8);
             if rotation.abs() >= 0.001 { pos=rotate_point(pos,pivot,rotation.to_radians()); }
             mesh.vertices.push(egui::epaint::Vertex { pos, uv: uv_pos, color });
         }
@@ -1268,7 +1279,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
         // Slice (nine-slice)
         1 => {
             let Some(slice) = node.slice_center else {
-                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect);
+                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
                 return;
             };
             let mut left = (slice[0] - node.image_rect_offset.x).max(0.0) * node.slice_scale;
@@ -1293,7 +1304,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                     paint_texture_quad(painter, texture.id(),
                         Rect::from_min_max(Pos2::new(dx[x], dy[y]), Pos2::new(dx[x + 1], dy[y + 1])),
                         Rect::from_min_max(Pos2::new(ux[x], uy[y]), Pos2::new(ux[x + 1], uy[y + 1])),
-                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect);
+                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
                 }
             }
         }
@@ -1318,7 +1329,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                         uv.min.y + uv.height() * fraction.y,
                     ));
                     paint_texture_quad(painter, texture.id(), Rect::from_min_max(min, max), tile_uv,
-                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect);
+                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
                 }
             }
         }
@@ -1332,7 +1343,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 Vec2::new(bounds.width(), bounds.width() / image_aspect)
             };
             paint_texture_quad(painter, texture.id(), Rect::from_center_size(bounds.center(), size), uv,
-                tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect);
+                tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
         }
         // Crop
         4 => {
@@ -1350,10 +1361,10 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 crop_uv.min.x += margin;
                 crop_uv.max.x -= margin;
             }
-            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect);
+            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
         }
         // Stretch
-        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect),
+        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius),
     }
 }
 
