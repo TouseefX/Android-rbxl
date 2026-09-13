@@ -64,6 +64,8 @@ struct GuiNode {
     scroll_bar_color: Color32,
     scrolling_direction: i32,
     scrolling_enabled: bool,
+    scroll_rate: f32,
+    vertical_scroll_bar_left: bool,
 }
 
 fn number(value: Option<&Variant>, fallback: f32) -> f32 {
@@ -653,6 +655,8 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 ((1.0-scroll_bar_transparency)*255.0) as u8, [255,255,255]), modulation),
             scrolling_direction: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScrollingDirection")), 4),
             scrolling_enabled: bool_value(instance.properties.get(&rbx_dom_weak::ustr("ScrollingEnabled")), true),
+            scroll_rate: number(instance.properties.get(&rbx_dom_weak::ustr("ScrollRate")), 1.0).max(0.0),
+            vertical_scroll_bar_left: enum_value(instance.properties.get(&rbx_dom_weak::ustr("VerticalScrollBarPosition")), 0) == 1,
         });
     }
     let child_parent_rect = if instance.class == "ScrollingFrame" {
@@ -1624,6 +1628,7 @@ pub fn draw_starter_gui(
                 let delta = ui.input(|input| input.smooth_scroll_delta);
                 if delta != Vec2::ZERO {
                     let entry = scroll_offsets.entry(node.referent).or_insert(Vec2::ZERO);
+                    let delta = delta*node.scroll_rate;
                     let horizontal_wheel = if maximum.y <= 0.0 { delta.y } else { 0.0 };
                     if allow_x {
                         entry.x = (entry.x - delta.x - horizontal_wheel)
@@ -1640,7 +1645,12 @@ pub fn draw_starter_gui(
             let thickness = node.scroll_bar_thickness;
             if thickness > 0.0 && maximum.y > 0.0 {
                 let track_bottom = node.rect.bottom() - if maximum.x > 0.0 { thickness } else { 0.0 };
-                let track = Rect::from_min_max(Pos2::new(node.rect.right()-thickness, node.rect.top()), Pos2::new(node.rect.right(), track_bottom));
+                let (track_left, track_right) = if node.vertical_scroll_bar_left {
+                    (node.rect.left(), node.rect.left()+thickness)
+                } else {
+                    (node.rect.right()-thickness, node.rect.right())
+                };
+                let track = Rect::from_min_max(Pos2::new(track_left, node.rect.top()), Pos2::new(track_right, track_bottom));
                 let thumb_height = (track.height() * node.content_rect.height()/node.canvas_size.y.max(1.0)).max(thickness);
                 let travel = (track.height()-thumb_height).max(0.0);
                 let top = track.top() + travel * effective.y/maximum.y.max(1.0);
@@ -1648,8 +1658,10 @@ pub fn draw_starter_gui(
                     node.scroll_bar_color, node.referent, false, maximum.y, travel, node.canvas_position.y, node.scrolling_enabled));
             }
             if thickness > 0.0 && maximum.x > 0.0 {
-                let track_right = node.rect.right() - if maximum.y > 0.0 { thickness } else { 0.0 };
-                let track = Rect::from_min_max(Pos2::new(node.rect.left(), node.rect.bottom()-thickness), Pos2::new(track_right, node.rect.bottom()));
+                let has_vertical = maximum.y > 0.0;
+                let track_left = node.rect.left() + if has_vertical && node.vertical_scroll_bar_left { thickness } else { 0.0 };
+                let track_right = node.rect.right() - if has_vertical && !node.vertical_scroll_bar_left { thickness } else { 0.0 };
+                let track = Rect::from_min_max(Pos2::new(track_left, node.rect.bottom()-thickness), Pos2::new(track_right, node.rect.bottom()));
                 let thumb_width = (track.width() * node.content_rect.width()/node.canvas_size.x.max(1.0)).max(thickness);
                 let travel = (track.width()-thumb_width).max(0.0);
                 let left = track.left() + travel * effective.x/maximum.x.max(1.0);
