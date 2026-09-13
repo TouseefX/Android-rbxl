@@ -1510,6 +1510,7 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
         let mut texture = if instance.class == "MeshPart" { content(instance.properties.get(&rbx_dom_weak::ustr("TextureID"))) } else { None };
         let mut mesh_scale = [1.0,1.0,1.0];
         let mut mesh_offset = [0.0,0.0,0.0];
+        let mut mesh_type = None;
         if instance.class != "MeshPart" {
             for child in instance.children().filter_map(|child|dom.get_by_ref(*child)) {
                 if child.class != "SpecialMesh" && child.class != "BlockMesh" { continue; }
@@ -1517,6 +1518,11 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
                 texture=content(child.properties.get(&rbx_dom_weak::ustr("TextureId"))).or(texture);
                 if let Some(Variant::Vector3(value))=child.properties.get(&rbx_dom_weak::ustr("Scale")){mesh_scale=[value.x,value.y,value.z];}
                 if let Some(Variant::Vector3(value))=child.properties.get(&rbx_dom_weak::ustr("Offset")){mesh_offset=[value.x,value.y,value.z];}
+                mesh_type=match child.properties.get(&rbx_dom_weak::ustr("MeshType")) {
+                    Some(Variant::Enum(value))=>Some(value.clone().to_u32()),
+                    Some(Variant::String(value))=>Some(match value.as_str(){"Sphere"=>3,"Cylinder"=>4,"Wedge"=>2,"FileMesh"=>5,"Brick"=>6,_=>0}),
+                    _=>mesh_type,
+                };
             }
         }
         let mesh=mesh_id.and_then(|id|crate::asset_downloader::get_cached_mesh(&id));
@@ -1529,14 +1535,31 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
             }).collect();
             meshes.push(ViewportMesh{vertices,faces:mesh.faces,colors:mesh.colors,uvs:mesh.uvs,color:part_color,texture});
         } else {
-            let (vertices,faces)=if instance.class == "WedgePart" {
-                (vec![corners[0],corners[1],corners[4],corners[5],corners[6],corners[7]],vec![
+            let mut primitive_corners=corners;
+            if mesh_type.is_some() {
+                for (index,corner) in primitive_corners.iter_mut().enumerate(){let local=[if index&1==0{-size.x*mesh_scale[0]*0.5}else{size.x*mesh_scale[0]*0.5},if index&2==0{-size.y*mesh_scale[1]*0.5}else{size.y*mesh_scale[1]*0.5},if index&4==0{-size.z*mesh_scale[2]*0.5}else{size.z*mesh_scale[2]*0.5}];let local=[local[0]+mesh_offset[0],local[1]+mesh_offset[1],local[2]+mesh_offset[2]];*corner=[cf.position.x+cf.orientation.x.x*local[0]+cf.orientation.x.y*local[1]+cf.orientation.x.z*local[2],cf.position.y+cf.orientation.y.x*local[0]+cf.orientation.y.y*local[1]+cf.orientation.y.z*local[2],cf.position.z+cf.orientation.z.x*local[0]+cf.orientation.z.y*local[1]+cf.orientation.z.z*local[2]];}
+            }
+            let (vertices,faces)=if mesh_type==Some(3) || mesh_type==Some(4) {
+                let segments=16usize; let rings=if mesh_type==Some(3){8}else{1};
+                let mut local_vertices=Vec::new();
+                if mesh_type==Some(3) {
+                    for ring in 0..=rings { let latitude=std::f32::consts::PI*(ring as f32/rings as f32-0.5); for segment in 0..segments { let longitude=std::f32::consts::TAU*segment as f32/segments as f32; local_vertices.push([latitude.cos()*longitude.cos()*size.x*mesh_scale[0]*0.5+mesh_offset[0],latitude.sin()*size.y*mesh_scale[1]*0.5+mesh_offset[1],latitude.cos()*longitude.sin()*size.z*mesh_scale[2]*0.5+mesh_offset[2]]); } }
+                } else {
+                    for side in [-1.0,1.0] { for segment in 0..segments { let angle=std::f32::consts::TAU*segment as f32/segments as f32; local_vertices.push([side*size.x*mesh_scale[0]*0.5+mesh_offset[0],angle.cos()*size.y*mesh_scale[1]*0.5+mesh_offset[1],angle.sin()*size.z*mesh_scale[2]*0.5+mesh_offset[2]]); } }
+                }
+                let vertices=local_vertices.into_iter().map(|local|[cf.position.x+cf.orientation.x.x*local[0]+cf.orientation.x.y*local[1]+cf.orientation.x.z*local[2],cf.position.y+cf.orientation.y.x*local[0]+cf.orientation.y.y*local[1]+cf.orientation.y.z*local[2],cf.position.z+cf.orientation.z.x*local[0]+cf.orientation.z.y*local[1]+cf.orientation.z.z*local[2]]).collect();
+                let mut faces=Vec::new();
+                if mesh_type==Some(3) { for ring in 0..rings { for segment in 0..segments { let next=(segment+1)%segments; faces.push(vec![ring*segments+segment,ring*segments+next,(ring+1)*segments+next,(ring+1)*segments+segment]); } } }
+                else { for segment in 0..segments { let next=(segment+1)%segments; faces.push(vec![segment,next,segments+next,segments+segment]); } faces.push((0..segments).rev().collect()); faces.push((segments..segments*2).collect()); }
+                (vertices,faces)
+            } else if instance.class == "WedgePart" || mesh_type==Some(2) {
+                (vec![primitive_corners[0],primitive_corners[1],primitive_corners[4],primitive_corners[5],primitive_corners[6],primitive_corners[7]],vec![
                     vec![0,1,3,2],vec![2,3,5,4],vec![0,2,4],vec![1,5,3],vec![0,4,5,1]])
             } else if instance.class == "CornerWedgePart" {
-                (vec![corners[0],corners[1],corners[4],corners[5],corners[7]],vec![
+                (vec![primitive_corners[0],primitive_corners[1],primitive_corners[4],primitive_corners[5],primitive_corners[7]],vec![
                     vec![0,1,3,2],vec![1,4,3],vec![2,3,4],vec![0,2,4],vec![0,4,1]])
             } else {
-                (corners.to_vec(),vec![vec![0,1,3,2],vec![4,6,7,5],vec![0,4,5,1],vec![2,3,7,6],vec![0,2,6,4],vec![1,5,7,3]])
+                (primitive_corners.to_vec(),vec![vec![0,1,3,2],vec![4,6,7,5],vec![0,4,5,1],vec![2,3,7,6],vec![0,2,6,4],vec![1,5,7,3]])
             };
             output.push(ViewportBox { vertices, faces, color: part_color });
         }
