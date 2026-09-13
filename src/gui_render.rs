@@ -1476,7 +1476,14 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
 }
 
 struct ViewportBox { corners: [[f32; 3]; 8], color: Color32 }
-struct ViewportMesh { vertices: Vec<[f32;3]>, faces: Vec<[u32;3]>, colors: Vec<[f32;4]>, color: Color32 }
+struct ViewportMesh {
+    vertices: Vec<[f32;3]>, faces: Vec<[u32;3]>, colors: Vec<[f32;4]>, uvs: Vec<[f32;2]>,
+    color: Color32, texture: Option<String>,
+}
+struct ViewportPolygon {
+    depth: f32, points: Vec<Pos2>, color: Color32,
+    texture: Option<(String, Vec<Pos2>)>,
+}
 
 fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<ViewportBox>, meshes: &mut Vec<ViewportMesh>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
@@ -1507,13 +1514,15 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
                 let local=[(vertex[0]-midpoint[0])*size.x/range[0],(vertex[1]-midpoint[1])*size.y/range[1],(vertex[2]-midpoint[2])*size.z/range[2]];
                 [cf.position.x+cf.orientation.x.x*local[0]+cf.orientation.x.y*local[1]+cf.orientation.x.z*local[2],cf.position.y+cf.orientation.y.x*local[0]+cf.orientation.y.y*local[1]+cf.orientation.y.z*local[2],cf.position.z+cf.orientation.z.x*local[0]+cf.orientation.z.y*local[1]+cf.orientation.z.z*local[2]]
             }).collect();
-            meshes.push(ViewportMesh{vertices,faces:mesh.faces,colors:mesh.colors,color:part_color});
+            let texture=content(instance.properties.get(&rbx_dom_weak::ustr("TextureID")));
+            meshes.push(ViewportMesh{vertices,faces:mesh.faces,colors:mesh.colors,uvs:mesh.uvs,color:part_color,texture});
         } else { output.push(ViewportBox { corners, color: part_color }); }
     }
     for child in instance.children() { gather_viewport_parts(dom, *child, output, meshes); }
 }
 
-fn paint_viewport_frame(painter: &egui::Painter, node: &GuiNode, dom: &WeakDom) {
+fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, dom: &WeakDom,
+                        textures: &mut std::collections::HashMap<String, egui::TextureHandle>) {
     let Some(frame) = dom.get_by_ref(node.referent) else { return; };
     let ambient = color(frame.properties.get(&rbx_dom_weak::ustr("Ambient")), 255, [200,200,200]);
     let image_tint = color(frame.properties.get(&rbx_dom_weak::ustr("ImageColor3")), 255, [255,255,255]);
@@ -1581,7 +1590,7 @@ fn paint_viewport_frame(painter: &egui::Painter, node: &GuiNode, dom: &WeakDom) 
                 ((part.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32/(255.0*255.0)) as u8,
                 ((part.color.a() as u16*image_alpha as u16)/255) as u8);
             let depth=face.iter().map(|index|projected[*index].1).sum::<f32>()*0.25;
-            polygons.push((depth,face.map(|index|projected[index].0).to_vec(),lit));
+            polygons.push(ViewportPolygon{depth,points:face.map(|index|projected[index].0).to_vec(),color:lit,texture:None});
         } }
     }
     for mesh in meshes {
@@ -1603,11 +1612,22 @@ fn paint_viewport_frame(painter: &egui::Painter, node: &GuiNode, dom: &WeakDom) 
                 ((mesh.color.g() as f32)*(ambient.g() as f32+light_color.g() as f32*illumination).min(255.0)*image_tint.g() as f32*vertex_color[1]/(255.0*255.0)) as u8,
                 ((mesh.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32*vertex_color[2]/(255.0*255.0)) as u8,
                 ((mesh.color.a() as f32*image_alpha as f32*vertex_color[3])/255.0) as u8);
-            polygons.push(((pa.1+pb.1+pc.1)/3.0,vec![pa.0,pb.0,pc.0],lit));
+            let texture=mesh.texture.as_ref().filter(|_|indices.iter().all(|index|*index<mesh.uvs.len())).map(|uri|(
+                uri.clone(),indices.iter().map(|index|Pos2::new(mesh.uvs[*index][0],mesh.uvs[*index][1])).collect()));
+            polygons.push(ViewportPolygon{depth:(pa.1+pb.1+pc.1)/3.0,points:vec![pa.0,pb.0,pc.0],color:lit,texture});
         }
     }
-    polygons.sort_by(|a,b| b.0.total_cmp(&a.0));
-    for (_,points,color) in polygons { painter.add(egui::Shape::convex_polygon(points,color,Stroke::new(0.5,shade_color(color,0.65)))); }
+    polygons.sort_by(|a,b| b.depth.total_cmp(&a.depth));
+    for polygon in polygons {
+        if let Some((uri,uvs))=polygon.texture {
+            if let Some(texture)=ensure_gui_texture(ui,textures,&uri) {
+                let mut mesh=egui::Mesh::with_texture(texture);
+                for (point,uv) in polygon.points.into_iter().zip(uvs) { mesh.vertices.push(egui::epaint::Vertex{pos:point,uv,color:polygon.color}); }
+                mesh.indices.extend_from_slice(&[0,1,2]); painter.add(egui::Shape::mesh(mesh)); continue;
+            }
+        }
+        painter.add(egui::Shape::convex_polygon(polygon.points,polygon.color,Stroke::new(0.5,shade_color(polygon.color,0.65))));
+    }
 }
 
 fn ensure_gui_texture(ui: &egui::Ui, textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
@@ -1997,7 +2017,7 @@ pub fn draw_starter_gui(
             }
         }
         if node.class == "ViewportFrame" {
-            paint_viewport_frame(&painter, &node, dom);
+            paint_viewport_frame(&painter, ui, &node, dom, textures);
         }
         let displayed_image = if pressed {
             node.pressed_image.as_ref().or(node.hover_image.as_ref()).or(node.image.as_ref())
