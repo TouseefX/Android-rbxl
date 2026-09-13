@@ -1015,32 +1015,30 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
 }
 
 fn paint_gradient(painter: &egui::Painter, rect: Rect, base: Color32,
-                  gradient: &(f32, Vec2, Vec<Color32>), object_rotation: f32) {
-    let (rotation, offset, samples) = gradient;
-    if samples.len() < 2 { return; }
-    let radians = rotation.to_radians();
-    let direction = Vec2::new(radians.cos(), radians.sin());
-    let perpendicular = Vec2::new(-direction.y, direction.x);
-    let along = direction.x.abs() * rect.width() * 0.5 + direction.y.abs() * rect.height() * 0.5;
-    let across = perpendicular.x.abs() * rect.width() * 0.5 + perpendicular.y.abs() * rect.height() * 0.5 + 2.0;
-    let center = rect.center() + Vec2::new(offset.x * rect.width(), offset.y * rect.height());
-    for index in 0..samples.len() - 1 {
-        let t0 = index as f32 / (samples.len() - 1) as f32;
-        let t1 = (index + 1) as f32 / (samples.len() - 1) as f32;
-        let a = -along + along * 2.0 * t0;
-        let b = -along + along * 2.0 * t1;
-        let mut points = vec![
-            center + direction * a - perpendicular * across,
-            center + direction * b - perpendicular * across,
-            center + direction * b + perpendicular * across,
-            center + direction * a + perpendicular * across,
-        ];
-        if object_rotation.abs() >= 0.001 {
-            let radians = object_rotation.to_radians();
-            for point in &mut points { *point = rotate_point(*point, rect.center(), radians); }
+                  gradient: &(f32, Vec2, Vec<Color32>), object_rotation: f32,
+                  corner_radius: f32) {
+    if gradient.2.len() < 2 || rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
+    // A regular mesh gives smooth interpolation at arbitrary angles and lets
+    // UICorner alpha-mask the same gradient without leaking through corners.
+    let divisions = if corner_radius > 0.0 { 16usize } else { 8usize };
+    let mut mesh = egui::Mesh::default();
+    for y in 0..=divisions {
+        for x in 0..=divisions {
+            let fx=x as f32/divisions as f32; let fy=y as f32/divisions as f32;
+            let unrotated=Pos2::new(rect.left()+rect.width()*fx, rect.top()+rect.height()*fy);
+            let mut color=multiply_color(base,sample_gradient(gradient,unrotated,rect));
+            let coverage=rounded_coverage(unrotated,rect,corner_radius);
+            color=Color32::from_rgba_unmultiplied(color.r(),color.g(),color.b(),(color.a() as f32*coverage) as u8);
+            let pos=if object_rotation.abs()>=0.001 { rotate_point(unrotated,rect.center(),object_rotation.to_radians()) } else { unrotated };
+            mesh.vertices.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color });
         }
-        painter.add(egui::Shape::convex_polygon(points, multiply_color(base, samples[index]), Stroke::NONE));
     }
+    let stride=divisions+1;
+    for y in 0..divisions { for x in 0..divisions {
+        let a=(y*stride+x) as u32; let b=a+1; let c=a+stride as u32; let d=c+1;
+        mesh.add_triangle(a,b,d); mesh.add_triangle(a,d,c);
+    }}
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn rotated_bounds(rect: Rect, rotation: f32) -> Rect {
@@ -1676,7 +1674,7 @@ pub fn draw_starter_gui(
         }
         if let Some(gradient) = &node.gradient {
             paint_gradient(&painter.with_clip_rect(rotated_bounds(node.rect, node.rotation).intersect(node.clip)), node.rect,
-                shade_color(node.background, button_factor), gradient, node.rotation);
+                shade_color(node.background, button_factor), gradient, node.rotation, node.corner_radius);
         }
         if node.rotation.abs() < 0.001 {
             if node.border_size > 0.0 {
