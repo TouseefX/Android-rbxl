@@ -5,6 +5,9 @@
 use bevy_egui::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 
+#[derive(Clone, Copy)]
+struct RoundedMask { rect: Rect, radius: f32, rotation: f32 }
+
 struct GuiNode {
     referent: Ref,
     class: String,
@@ -12,6 +15,7 @@ struct GuiNode {
     content_rect: Rect,
     gui_scale: f32,
     clip: Rect,
+    rounded_clip: Option<RoundedMask>,
     display_order: i32,
     z: i32,
     global_z: bool,
@@ -588,6 +592,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             content_rect,
             gui_scale: scale,
             clip: parent_clip.intersect(rect),
+            rounded_clip: None,
             display_order,
             z,
             global_z,
@@ -1029,7 +1034,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
 
 fn paint_gradient(painter: &egui::Painter, rect: Rect, base: Color32,
                   gradient: &(f32, Vec2, Vec<Color32>), object_rotation: f32,
-                  corner_radius: f32) {
+                  corner_radius: f32, rounded_clip: Option<RoundedMask>) {
     if gradient.2.len() < 2 || rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
     // A regular mesh gives smooth interpolation at arbitrary angles and lets
     // UICorner alpha-mask the same gradient without leaking through corners.
@@ -1040,9 +1045,13 @@ fn paint_gradient(painter: &egui::Painter, rect: Rect, base: Color32,
             let fx=x as f32/divisions as f32; let fy=y as f32/divisions as f32;
             let unrotated=Pos2::new(rect.left()+rect.width()*fx, rect.top()+rect.height()*fy);
             let mut color=multiply_color(base,sample_gradient(gradient,unrotated,rect));
-            let coverage=rounded_coverage(unrotated,rect,corner_radius);
-            color=Color32::from_rgba_unmultiplied(color.r(),color.g(),color.b(),(color.a() as f32*coverage) as u8);
+            let mut coverage=rounded_coverage(unrotated,rect,corner_radius);
             let pos=if object_rotation.abs()>=0.001 { rotate_point(unrotated,rect.center(),object_rotation.to_radians()) } else { unrotated };
+            if let Some(mask)=rounded_clip {
+                let mask_local=rotate_point(pos,mask.rect.center(),-mask.rotation.to_radians());
+                coverage*=rounded_coverage(mask_local,mask.rect,mask.radius);
+            }
+            color=Color32::from_rgba_unmultiplied(color.r(),color.g(),color.b(),(color.a() as f32*coverage) as u8);
             mesh.vertices.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color });
         }
     }
@@ -1184,14 +1193,22 @@ fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
     painter.layout_job(job)
 }
 
-fn gradient_galley(mut galley: std::sync::Arc<egui::Galley>, origin: Pos2,
-                   gradient: &(f32, Vec2, Vec<Color32>), rect: Rect) -> std::sync::Arc<egui::Galley> {
+fn mask_galley(mut galley: std::sync::Arc<egui::Galley>, origin: Pos2,
+               gradient: Option<&(f32, Vec2, Vec<Color32>)>, rounded_clip: Option<RoundedMask>,
+               rect: Rect, object_rotation: f32) -> std::sync::Arc<egui::Galley> {
     let mutable = std::sync::Arc::make_mut(&mut galley);
     for placed_row in &mut mutable.rows {
         let row_origin = origin + placed_row.pos.to_vec2();
         let row = std::sync::Arc::make_mut(&mut placed_row.row);
         for vertex in &mut row.visuals.mesh.vertices {
-            vertex.color = multiply_color(vertex.color, sample_gradient(gradient, row_origin + vertex.pos.to_vec2(), rect));
+            let point=row_origin+vertex.pos.to_vec2();
+            if let Some(gradient)=gradient { vertex.color=multiply_color(vertex.color,sample_gradient(gradient,point,rect)); }
+            if let Some(mask)=rounded_clip {
+                let screen_point=if object_rotation.abs()>=0.001 { rotate_point(point,rect.center(),object_rotation.to_radians()) } else { point };
+                let local=rotate_point(screen_point,mask.rect.center(),-mask.rotation.to_radians());
+                let coverage=rounded_coverage(local,mask.rect,mask.radius);
+                vertex.color=Color32::from_rgba_unmultiplied(vertex.color.r(),vertex.color.g(),vertex.color.b(),(vertex.color.a() as f32*coverage) as u8);
+            }
         }
     }
     galley
@@ -1233,6 +1250,27 @@ fn sample_gradient(gradient: &(f32, Vec2, Vec<Color32>), point: Pos2, rect: Rect
         (a.a() as f32+(b.a() as f32-a.a() as f32)*mix) as u8)
 }
 
+fn paint_masked_solid(painter: &egui::Painter, rect: Rect, color: Color32, radius: f32,
+                      rotation: f32, rounded_clip: Option<RoundedMask>) {
+    let divisions=16usize; let mut mesh=egui::Mesh::default();
+    for y in 0..=divisions { for x in 0..=divisions {
+        let fx=x as f32/divisions as f32; let fy=y as f32/divisions as f32;
+        let local=Pos2::new(rect.left()+rect.width()*fx,rect.top()+rect.height()*fy);
+        let mut coverage=rounded_coverage(local,rect,radius);
+        let pos=if rotation.abs()>=0.001 { rotate_point(local,rect.center(),rotation.to_radians()) } else { local };
+        if let Some(mask)=rounded_clip {
+            let mask_local=rotate_point(pos,mask.rect.center(),-mask.rotation.to_radians());
+            coverage*=rounded_coverage(mask_local,mask.rect,mask.radius);
+        }
+        let vertex_color=Color32::from_rgba_unmultiplied(color.r(),color.g(),color.b(),(color.a() as f32*coverage) as u8);
+        mesh.vertices.push(egui::epaint::Vertex { pos,uv:egui::epaint::WHITE_UV,color:vertex_color });
+    }}
+    let stride=divisions+1;
+    for y in 0..divisions { for x in 0..divisions { let a=(y*stride+x) as u32; let b=a+1; let c=a+stride as u32; let d=c+1;
+        mesh.add_triangle(a,b,d); mesh.add_triangle(a,d,c); }}
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 fn rounded_coverage(point: Pos2, rect: Rect, radius: f32) -> f32 {
     if radius <= 0.0 { return 1.0; }
     let radius = radius.min(rect.width().min(rect.height())*0.5);
@@ -1244,12 +1282,12 @@ fn rounded_coverage(point: Pos2, rect: Rect, radius: f32) -> f32 {
 fn paint_texture_quad(painter: &egui::Painter, texture: egui::TextureId, destination: Rect,
                       uv: Rect, tint: Color32, rotation: f32, pivot: Pos2,
                       gradient: Option<&(f32, Vec2, Vec<Color32>)>, gradient_rect: Rect,
-                      corner_radius: f32) {
-    if gradient.is_none() && rotation.abs() < 0.001 && corner_radius <= 0.0 {
+                      corner_radius: f32, rounded_clip: Option<RoundedMask>) {
+    if gradient.is_none() && rotation.abs() < 0.001 && corner_radius <= 0.0 && rounded_clip.is_none() {
         painter.image(texture, destination, uv, tint);
         return;
     }
-    let divisions = if corner_radius > 0.0 { 16usize } else if gradient.is_some() { 8usize } else { 1usize };
+    let divisions = if corner_radius > 0.0 || rounded_clip.is_some() { 16usize } else if gradient.is_some() { 8usize } else { 1usize };
     let mut mesh = egui::Mesh::with_texture(texture);
     for y in 0..=divisions {
         for x in 0..=divisions {
@@ -1257,9 +1295,13 @@ fn paint_texture_quad(painter: &egui::Painter, texture: egui::TextureId, destina
             let mut pos=Pos2::new(destination.left()+destination.width()*fx, destination.top()+destination.height()*fy);
             let uv_pos=Pos2::new(uv.left()+uv.width()*fx, uv.top()+uv.height()*fy);
             let mut color=gradient.map(|value| multiply_color(tint, sample_gradient(value,pos,gradient_rect))).unwrap_or(tint);
-            let coverage=rounded_coverage(pos,gradient_rect,corner_radius);
-            color=Color32::from_rgba_unmultiplied(color.r(),color.g(),color.b(),(color.a() as f32*coverage) as u8);
+            let mut coverage=rounded_coverage(pos,gradient_rect,corner_radius);
             if rotation.abs() >= 0.001 { pos=rotate_point(pos,pivot,rotation.to_radians()); }
+            if let Some(mask)=rounded_clip {
+                let local=rotate_point(pos,mask.rect.center(),-mask.rotation.to_radians());
+                coverage*=rounded_coverage(local,mask.rect,mask.radius);
+            }
+            color=Color32::from_rgba_unmultiplied(color.r(),color.g(),color.b(),(color.a() as f32*coverage) as u8);
             mesh.vertices.push(egui::epaint::Vertex { pos, uv: uv_pos, color });
         }
     }
@@ -1290,7 +1332,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
         // Slice (nine-slice)
         1 => {
             let Some(slice) = node.slice_center else {
-                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
+                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
                 return;
             };
             let mut left = (slice[0] - node.image_rect_offset.x).max(0.0) * node.slice_scale;
@@ -1315,7 +1357,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                     paint_texture_quad(painter, texture.id(),
                         Rect::from_min_max(Pos2::new(dx[x], dy[y]), Pos2::new(dx[x + 1], dy[y + 1])),
                         Rect::from_min_max(Pos2::new(ux[x], uy[y]), Pos2::new(ux[x + 1], uy[y + 1])),
-                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
+                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
                 }
             }
         }
@@ -1340,7 +1382,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                         uv.min.y + uv.height() * fraction.y,
                     ));
                     paint_texture_quad(painter, texture.id(), Rect::from_min_max(min, max), tile_uv,
-                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
+                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
                 }
             }
         }
@@ -1354,7 +1396,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 Vec2::new(bounds.width(), bounds.width() / image_aspect)
             };
             paint_texture_quad(painter, texture.id(), Rect::from_center_size(bounds.center(), size), uv,
-                tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
+                tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
         }
         // Crop
         4 => {
@@ -1372,10 +1414,10 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 crop_uv.min.x += margin;
                 crop_uv.max.x -= margin;
             }
-            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius);
+            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip);
         }
         // Stretch
-        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius),
+        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.rect, node.corner_radius, node.rounded_clip),
     }
 }
 
@@ -1621,6 +1663,24 @@ pub fn draw_starter_gui(
                 global_z, 1.0, 1.0, Color32::WHITE, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
         }
     }
+    // Resolve rounded ClipsDescendants masks after all containers have their
+    // final screen transforms (including SurfaceGui orientation).
+    let visual_bounds: std::collections::HashMap<Ref, RoundedMask> = nodes.iter().map(|node| (
+        node.referent, RoundedMask { rect: node.rect, radius: node.corner_radius, rotation: node.rotation }
+    )).collect();
+    for node in &mut nodes {
+        let mut parent = dom.get_by_ref(node.referent).map(|instance| instance.parent());
+        while let Some(referent) = parent.filter(|referent| !referent.is_none()) {
+            let Some(instance) = dom.get_by_ref(referent) else { break; };
+            if bool_value(instance.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), false) {
+                if let Some(mask) = visual_bounds.get(&referent).filter(|mask| mask.radius > 0.0) {
+                    node.rounded_clip = Some(*mask);
+                    break;
+                }
+            }
+            parent = Some(instance.parent());
+        }
+    }
     nodes.sort_by(|left, right| {
         left.display_order.cmp(&right.display_order).then_with(|| {
             if left.global_z && right.global_z {
@@ -1699,7 +1759,9 @@ pub fn draw_starter_gui(
         let hovered = is_button && node.interactable && response.hovered() && pointer_inside;
         let button_factor = if node.auto_button_color && pressed { 0.72 }
             else if node.auto_button_color && hovered { 0.88 } else { 1.0 };
-        if node.rotation.abs() < 0.001 {
+        if node.rounded_clip.is_some() {
+            paint_masked_solid(&painter,node.rect,shade_color(node.background,button_factor),node.corner_radius,node.rotation,node.rounded_clip);
+        } else if node.rotation.abs() < 0.001 {
             painter.rect_filled(node.rect, node.corner_radius, shade_color(node.background, button_factor));
         } else {
             let radians = node.rotation.to_radians();
@@ -1710,7 +1772,7 @@ pub fn draw_starter_gui(
         }
         if let Some(gradient) = &node.gradient {
             paint_gradient(&painter.with_clip_rect(rotated_bounds(node.rect, node.rotation).intersect(node.clip)), node.rect,
-                shade_color(node.background, button_factor), gradient, node.rotation, node.corner_radius);
+                shade_color(node.background, button_factor), gradient, node.rotation, node.corner_radius, node.rounded_clip);
         }
         if node.rotation.abs() < 0.001 {
             if node.border_size > 0.0 {
@@ -1821,9 +1883,9 @@ pub fn draw_starter_gui(
                         node.rotation, node.rect.center());
                 }
             }
-            let final_galley = node.gradient.as_ref()
-                .map(|gradient| gradient_galley(galley.clone(), pos, gradient, node.rect))
-                .unwrap_or(galley);
+            let final_galley = if node.gradient.is_some() || node.rounded_clip.is_some() {
+                mask_galley(galley.clone(),pos,node.gradient.as_ref(),node.rounded_clip,node.rect,node.rotation)
+            } else { galley };
             if node.font_bold {
                 paint_galley(&painter, pos + Vec2::new(0.35, 0.0), final_galley.clone(), text_color,
                     false, node.rotation, node.rect.center());
