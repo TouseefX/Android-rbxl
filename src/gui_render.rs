@@ -1502,6 +1502,16 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
 }
 
 fn paint_viewport_frame(painter: &egui::Painter, node: &GuiNode, dom: &WeakDom) {
+    let Some(frame) = dom.get_by_ref(node.referent) else { return; };
+    let ambient = color(frame.properties.get(&rbx_dom_weak::ustr("Ambient")), 255, [200,200,200]);
+    let image_tint = color(frame.properties.get(&rbx_dom_weak::ustr("ImageColor3")), 255, [255,255,255]);
+    let image_alpha = ((1.0-number(frame.properties.get(&rbx_dom_weak::ustr("ImageTransparency")),0.0).clamp(0.0,1.0))*255.0) as u8;
+    let light_color = color(frame.properties.get(&rbx_dom_weak::ustr("LightColor")), 255, [255,255,255]);
+    let light_direction = match frame.properties.get(&rbx_dom_weak::ustr("LightDirection")) {
+        Some(Variant::Vector3(value)) => [value.x,value.y,value.z], _ => [-1.0,-1.0,-1.0],
+    };
+    let light_length=(light_direction[0]*light_direction[0]+light_direction[1]*light_direction[1]+light_direction[2]*light_direction[2]).sqrt().max(0.001);
+    let light=[-light_direction[0]/light_length,-light_direction[1]/light_length,-light_direction[2]/light_length];
     let mut parts = Vec::new();
     gather_viewport_parts(dom, node.referent, &mut parts);
     if parts.is_empty() { return; }
@@ -1518,29 +1528,47 @@ fn paint_viewport_frame(painter: &egui::Painter, node: &GuiNode, dom: &WeakDom) 
             [-cf.orientation.x.z,-cf.orientation.y.z,-cf.orientation.z.z],
             [cf.orientation.x.x,cf.orientation.y.x,cf.orientation.z.x],
             [cf.orientation.x.y,cf.orientation.y.y,cf.orientation.z.y],
+            number(camera.properties.get(&rbx_dom_weak::ustr("FieldOfView")), 70.0).clamp(1.0, 120.0),
         )), _ => None,
     });
-    let (camera,forward,right,up) = supplied_camera.unwrap_or_else(|| {
+    let (camera,forward,right,up,field_of_view) = supplied_camera.unwrap_or_else(|| {
         let camera=[center[0]+extent*1.5,center[1]+extent*1.2,center[2]+extent*1.5];
         let forward={let v=[center[0]-camera[0],center[1]-camera[1],center[2]-camera[2]];let l=(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt();[v[0]/l,v[1]/l,v[2]/l]};
         let right={let v=[forward[2],0.0,-forward[0]];let l=(v[0]*v[0]+v[2]*v[2]).sqrt().max(0.001);[v[0]/l,0.0,v[2]/l]};
         let up=[right[1]*forward[2]-right[2]*forward[1],right[2]*forward[0]-right[0]*forward[2],right[0]*forward[1]-right[1]*forward[0]];
-        (camera,forward,right,up)
+        (camera,forward,right,up,70.0)
     });
+    let focal_length = node.content_rect.height()*0.5/(field_of_view.to_radians()*0.5).tan();
     let project = |point: [f32;3]| -> Option<(Pos2,f32)> {
         let relative=[point[0]-camera[0],point[1]-camera[1],point[2]-camera[2]];
         let depth=relative[0]*forward[0]+relative[1]*forward[1]+relative[2]*forward[2];
         if depth <= 0.01 { return None; }
         let x=(relative[0]*right[0]+relative[1]*right[1]+relative[2]*right[2])/depth;
         let y=(relative[0]*up[0]+relative[1]*up[1]+relative[2]*up[2])/depth;
-        Some((node.content_rect.center()+Vec2::new(x,-y)*node.content_rect.height()*0.8, depth))
+        Some((node.content_rect.center()+Vec2::new(x,-y)*focal_length, depth))
     };
     let faces = [[0,1,3,2],[4,6,7,5],[0,4,5,1],[2,3,7,6],[0,2,6,4],[1,5,7,3]];
     let mut polygons = Vec::new();
     for part in parts {
         let mut projected=[(Pos2::ZERO,0.0);8]; let mut valid=true;
         for index in 0..8 { if let Some(value)=project(part.corners[index]) { projected[index]=value; } else { valid=false; break; } }
-        if valid { for face in faces { let depth=face.iter().map(|index|projected[*index].1).sum::<f32>()*0.25; polygons.push((depth,face.map(|index|projected[index].0),part.color)); } }
+        if valid { for face in faces {
+            let a=part.corners[face[0]]; let b=part.corners[face[1]]; let c=part.corners[face[2]];
+            let ab=[b[0]-a[0],b[1]-a[1],b[2]-a[2]]; let ac=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
+            let normal=[ab[1]*ac[2]-ab[2]*ac[1],ab[2]*ac[0]-ab[0]*ac[2],ab[0]*ac[1]-ab[1]*ac[0]];
+            let normal_length=(normal[0]*normal[0]+normal[1]*normal[1]+normal[2]*normal[2]).sqrt().max(0.001);
+            let normal=[normal[0]/normal_length,normal[1]/normal_length,normal[2]/normal_length];
+            let to_camera=[camera[0]-a[0],camera[1]-a[1],camera[2]-a[2]];
+            if normal[0]*to_camera[0]+normal[1]*to_camera[1]+normal[2]*to_camera[2] >= 0.0 { continue; }
+            let illumination=(-normal[0]*light[0]-normal[1]*light[1]-normal[2]*light[2]).max(0.0);
+            let lit=Color32::from_rgba_unmultiplied(
+                ((part.color.r() as f32)*(ambient.r() as f32+light_color.r() as f32*illumination).min(255.0)*image_tint.r() as f32/(255.0*255.0)) as u8,
+                ((part.color.g() as f32)*(ambient.g() as f32+light_color.g() as f32*illumination).min(255.0)*image_tint.g() as f32/(255.0*255.0)) as u8,
+                ((part.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32/(255.0*255.0)) as u8,
+                image_alpha);
+            let depth=face.iter().map(|index|projected[*index].1).sum::<f32>()*0.25;
+            polygons.push((depth,face.map(|index|projected[index].0),lit));
+        } }
     }
     polygons.sort_by(|a,b| b.0.total_cmp(&a.0));
     for (_,points,color) in polygons { painter.add(egui::Shape::convex_polygon(points.to_vec(),color,Stroke::new(0.5,shade_color(color,0.65)))); }
