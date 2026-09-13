@@ -503,7 +503,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     let current_order = *sequence;
     let mut sort_path = parent_path.to_vec();
     sort_path.push((z, current_order));
-    let content_rect = padded_rect(dom, instance, rect, scale);
+    let mut content_rect = padded_rect(dom, instance, rect, scale);
 
     if is_gui_object(&instance.class) {
         let transparency = number(instance.properties.get(&rbx_dom_weak::ustr("BackgroundTransparency")), 0.0).clamp(0.0, 1.0);
@@ -582,6 +582,21 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             if automatic_canvas == 1 || automatic_canvas == 3 { canvas_size.x = canvas_size.x.max(required.x); }
             if automatic_canvas == 2 || automatic_canvas == 3 { canvas_size.y = canvas_size.y.max(required.y); }
         }
+        let scroll_bar_thickness = number(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarThickness")), 12.0).max(0.0) * scale;
+        if instance.class == "ScrollingFrame" && scroll_bar_thickness > 0.0 {
+            let horizontal_inset = enum_value(instance.properties.get(&rbx_dom_weak::ustr("HorizontalScrollBarInset")), 0);
+            let vertical_inset = enum_value(instance.properties.get(&rbx_dom_weak::ustr("VerticalScrollBarInset")), 0);
+            let horizontal_visible = canvas_size.x > content_rect.width();
+            let vertical_visible = canvas_size.y > content_rect.height();
+            if horizontal_inset == 2 || (horizontal_inset == 1 && horizontal_visible) {
+                content_rect.max.y = (content_rect.max.y-scroll_bar_thickness).max(content_rect.min.y);
+            }
+            if vertical_inset == 2 || (vertical_inset == 1 && vertical_visible) {
+                let left = enum_value(instance.properties.get(&rbx_dom_weak::ustr("VerticalScrollBarPosition")), 0) == 1;
+                if left { content_rect.min.x = (content_rect.min.x+scroll_bar_thickness).min(content_rect.max.x); }
+                else { content_rect.max.x = (content_rect.max.x-scroll_bar_thickness).max(content_rect.min.x); }
+            }
+        }
         let scroll_bar_transparency = number(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarImageTransparency")), 0.0).clamp(0.0, 1.0);
         let order = *sequence;
         *sequence += 1;
@@ -658,7 +673,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             slice_scale: number(instance.properties.get(&rbx_dom_weak::ustr("SliceScale")), 1.0).max(0.0),
             canvas_size,
             canvas_position: vector2(instance.properties.get(&rbx_dom_weak::ustr("CanvasPosition")), Vec2::ZERO) * scale,
-            scroll_bar_thickness: number(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarThickness")), 12.0).max(0.0) * scale,
+            scroll_bar_thickness,
             scroll_bar_color: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarImageColor3")),
                 ((1.0-scroll_bar_transparency)*255.0) as u8, [255,255,255]), modulation),
             scrolling_direction: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScrollingDirection")), 4),
