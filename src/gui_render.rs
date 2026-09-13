@@ -1475,7 +1475,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
     }
 }
 
-struct ViewportBox { corners: [[f32; 3]; 8], color: Color32 }
+struct ViewportBox { vertices: Vec<[f32; 3]>, faces: Vec<Vec<usize>>, color: Color32 }
 struct ViewportMesh {
     vertices: Vec<[f32;3]>, faces: Vec<[u32;3]>, colors: Vec<[f32;4]>, uvs: Vec<[f32;2]>,
     color: Color32, texture: Option<String>,
@@ -1516,7 +1516,18 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
             }).collect();
             let texture=content(instance.properties.get(&rbx_dom_weak::ustr("TextureID")));
             meshes.push(ViewportMesh{vertices,faces:mesh.faces,colors:mesh.colors,uvs:mesh.uvs,color:part_color,texture});
-        } else { output.push(ViewportBox { corners, color: part_color }); }
+        } else {
+            let (vertices,faces)=if instance.class == "WedgePart" {
+                (vec![corners[0],corners[1],corners[4],corners[5],corners[6],corners[7]],vec![
+                    vec![0,1,3,2],vec![2,3,5,4],vec![0,2,4],vec![1,5,3],vec![0,4,5,1]])
+            } else if instance.class == "CornerWedgePart" {
+                (vec![corners[0],corners[1],corners[4],corners[5],corners[7]],vec![
+                    vec![0,1,3,2],vec![1,4,3],vec![2,3,4],vec![0,2,4],vec![0,4,1]])
+            } else {
+                (corners.to_vec(),vec![vec![0,1,3,2],vec![4,6,7,5],vec![0,4,5,1],vec![2,3,7,6],vec![0,2,6,4],vec![1,5,7,3]])
+            };
+            output.push(ViewportBox { vertices, faces, color: part_color });
+        }
     }
     for child in instance.children() { gather_viewport_parts(dom, *child, output, meshes); }
 }
@@ -1539,7 +1550,7 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
     if parts.is_empty() && meshes.is_empty() { return; }
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
-    for part in &parts { for corner in part.corners { for axis in 0..3 { min[axis]=min[axis].min(corner[axis]); max[axis]=max[axis].max(corner[axis]); } } }
+    for part in &parts { for vertex in &part.vertices { for axis in 0..3 { min[axis]=min[axis].min(vertex[axis]); max[axis]=max[axis].max(vertex[axis]); } } }
     for mesh in &meshes { for vertex in &mesh.vertices { for axis in 0..3 { min[axis]=min[axis].min(vertex[axis]); max[axis]=max[axis].max(vertex[axis]); } } }
     let center = [(min[0]+max[0])*0.5, (min[1]+max[1])*0.5, (min[2]+max[2])*0.5];
     let extent = (max[0]-min[0]).max(max[1]-min[1]).max(max[2]-min[2]).max(1.0);
@@ -1570,28 +1581,30 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
         let y=(relative[0]*up[0]+relative[1]*up[1]+relative[2]*up[2])/depth;
         Some((node.content_rect.center()+Vec2::new(x,-y)*focal_length, depth))
     };
-    let faces = [[0,1,3,2],[4,6,7,5],[0,4,5,1],[2,3,7,6],[0,2,6,4],[1,5,7,3]];
     let mut polygons = Vec::new();
     for part in parts {
-        let mut projected=[(Pos2::ZERO,0.0);8]; let mut valid=true;
-        for index in 0..8 { if let Some(value)=project(part.corners[index]) { projected[index]=value; } else { valid=false; break; } }
-        if valid { for face in faces {
-            let a=part.corners[face[0]]; let b=part.corners[face[1]]; let c=part.corners[face[2]];
-            let ab=[b[0]-a[0],b[1]-a[1],b[2]-a[2]]; let ac=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
-            let normal=[ab[1]*ac[2]-ab[2]*ac[1],ab[2]*ac[0]-ab[0]*ac[2],ab[0]*ac[1]-ab[1]*ac[0]];
-            let normal_length=(normal[0]*normal[0]+normal[1]*normal[1]+normal[2]*normal[2]).sqrt().max(0.001);
-            let normal=[normal[0]/normal_length,normal[1]/normal_length,normal[2]/normal_length];
+        let projected:Vec<Option<(Pos2,f32)>>=part.vertices.iter().map(|vertex|project(*vertex)).collect();
+        let part_center={let mut value=[0.0;3];for vertex in &part.vertices{for axis in 0..3{value[axis]+=vertex[axis]/part.vertices.len() as f32;}}value};
+        for face in part.faces {
+            if face.len()<3 || face.iter().any(|index|projected[*index].is_none()){continue;}
+            let a=part.vertices[face[0]];let b=part.vertices[face[1]];let c=part.vertices[face[2]];
+            let ab=[b[0]-a[0],b[1]-a[1],b[2]-a[2]];let ac=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
+            let mut normal=[ab[1]*ac[2]-ab[2]*ac[1],ab[2]*ac[0]-ab[0]*ac[2],ab[0]*ac[1]-ab[1]*ac[0]];
+            let face_center={let mut value=[0.0;3];for index in &face{for axis in 0..3{value[axis]+=part.vertices[*index][axis]/face.len() as f32;}}value};
+            if normal[0]*(face_center[0]-part_center[0])+normal[1]*(face_center[1]-part_center[1])+normal[2]*(face_center[2]-part_center[2])<0.0{normal=[-normal[0],-normal[1],-normal[2]];}
+            let normal_length=(normal[0]*normal[0]+normal[1]*normal[1]+normal[2]*normal[2]).sqrt().max(0.001);let normal=[normal[0]/normal_length,normal[1]/normal_length,normal[2]/normal_length];
             let to_camera=[camera[0]-a[0],camera[1]-a[1],camera[2]-a[2]];
-            if normal[0]*to_camera[0]+normal[1]*to_camera[1]+normal[2]*to_camera[2] >= 0.0 { continue; }
-            let illumination=(-normal[0]*light[0]-normal[1]*light[1]-normal[2]*light[2]).max(0.0);
+            if normal[0]*to_camera[0]+normal[1]*to_camera[1]+normal[2]*to_camera[2]<=0.0{continue;}
+            let illumination=(normal[0]*light[0]+normal[1]*light[1]+normal[2]*light[2]).max(0.0);
             let lit=Color32::from_rgba_unmultiplied(
                 ((part.color.r() as f32)*(ambient.r() as f32+light_color.r() as f32*illumination).min(255.0)*image_tint.r() as f32/(255.0*255.0)) as u8,
                 ((part.color.g() as f32)*(ambient.g() as f32+light_color.g() as f32*illumination).min(255.0)*image_tint.g() as f32/(255.0*255.0)) as u8,
                 ((part.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32/(255.0*255.0)) as u8,
                 ((part.color.a() as u16*image_alpha as u16)/255) as u8);
-            let depth=face.iter().map(|index|projected[*index].1).sum::<f32>()*0.25;
-            polygons.push(ViewportPolygon{depth,points:face.map(|index|projected[index].0).to_vec(),color:lit,texture:None});
-        } }
+            let depth=face.iter().map(|index|projected[*index].unwrap().1).sum::<f32>()/face.len() as f32;
+            let points=face.iter().map(|index|projected[*index].unwrap().0).collect();
+            polygons.push(ViewportPolygon{depth,points,color:lit,texture:None});
+        }
     }
     for mesh in meshes {
         for face in mesh.faces {
