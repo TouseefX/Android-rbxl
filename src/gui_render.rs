@@ -2026,7 +2026,28 @@ pub fn draw_starter_gui(
             let index=match (current,reverse){(Some(0),true)=>candidates.len()-1,(Some(index),true)=>index-1,(Some(index),false)=>(index+1)%candidates.len(),(None,true)=>candidates.len()-1,(None,false)=>0};
             Some(candidates[index].2)
         }
-    } else {None};
+    } else {
+        let direction=ui.input(|input| {
+            if input.key_pressed(egui::Key::ArrowLeft){Some((Vec2::new(-1.0,0.0),"NextSelectionLeft"))}
+            else if input.key_pressed(egui::Key::ArrowRight){Some((Vec2::new(1.0,0.0),"NextSelectionRight"))}
+            else if input.key_pressed(egui::Key::ArrowUp){Some((Vec2::new(0.0,-1.0),"NextSelectionUp"))}
+            else if input.key_pressed(egui::Key::ArrowDown){Some((Vec2::new(0.0,1.0),"NextSelectionDown"))}
+            else{None}
+        });
+        direction.and_then(|(direction,next_property)| {
+            let current=nodes.iter().find(|node|Some(node.referent)==selected&&node.selectable&&node.interactable)?;
+            if let Some(Variant::Ref(target))=dom.get_by_ref(current.referent).and_then(|instance|instance.properties.get(&rbx_dom_weak::ustr(next_property))) {
+                if nodes.iter().any(|node|node.referent==*target&&node.selectable&&node.interactable){return Some(*target);}
+            }
+            let origin=current.rect.center();
+            nodes.iter().filter(|node|node.referent!=current.referent&&node.selectable&&node.interactable).filter_map(|node|{
+                let delta=node.rect.center()-origin; let forward=delta.dot(direction);
+                if forward<=0.5{return None;}
+                let perpendicular=(delta.x*direction.y-delta.y*direction.x).abs();
+                Some((forward+perpendicular*2.0,node.selection_order,node.order,node.referent))
+            }).min_by(|left,right|left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)).then(left.2.cmp(&right.2))).map(|candidate|candidate.3)
+        })
+    };
     let mut clicked = keyboard_selection;
     // rect, color, owner, horizontal, canvas maximum, thumb travel
     let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool, [Option<String>; 3])> = Vec::new();
