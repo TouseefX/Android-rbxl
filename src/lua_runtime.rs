@@ -540,6 +540,39 @@ fn install_enum(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
+fn make_signal(lua: &Lua) -> LuaResult<Table> {
+    let signal=lua.create_table();
+    let callbacks: Rc<RefCell<Vec<(Function,bool)>>> = Rc::new(RefCell::new(Vec::new()));
+    let connected=callbacks.clone();
+    signal.set("Connect",lua.create_function(move |lua,(_signal,callback):(Table,Function)|{
+        connected.borrow_mut().push((callback,false));
+        let connection=lua.create_table(); connection.set("Connected",true)?;
+        connection.set("Disconnect",lua.create_function(|_,_connection:Table|Ok(()))?)?;
+        Ok(connection)
+    })?)?;
+    let once_callbacks=callbacks.clone();
+    signal.set("Once",lua.create_function(move |lua,(_signal,callback):(Table,Function)|{
+        once_callbacks.borrow_mut().push((callback,true));
+        let connection=lua.create_table(); connection.set("Connected",true)?;
+        connection.set("Disconnect",lua.create_function(|_,_connection:Table|Ok(()))?)?;
+        Ok(connection)
+    })?)?;
+    let fired=callbacks;
+    signal.set("Fire",lua.create_function(move |_,(_signal,args):(Table,Variadic<Value>)|{
+        let callbacks=fired.borrow().clone();
+        for (callback,_) in callbacks{callback.call::<()>(args.clone())?;}
+        fired.borrow_mut().retain(|(_,once)|!*once); Ok(())
+    })?)?;
+    signal.set("Wait",lua.create_function(|_,_signal:Table|Ok(Variadic::<Value>::new()))?)?;
+    Ok(signal)
+}
+
+fn is_instance_signal(key: &str) -> bool {
+    matches!(key,"Activated"|"MouseButton1Click"|"MouseButton1Down"|"MouseButton1Up"|
+        "MouseEnter"|"MouseLeave"|"InputBegan"|"InputChanged"|"InputEnded"|
+        "Focused"|"FocusLost"|"Changed"|"AncestryChanged"|"Destroying")
+}
+
 fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     let t = lua.create_table();
     t.set("Name", name)?;
@@ -558,6 +591,9 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
         "SetAttribute",
     ] {
         t.set(m, noop.clone())?;
+    }
+    for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","Changed","AncestryChanged","Destroying"] {
+        t.set(event,make_signal(lua)?)?;
     }
     let class_name = class.to_string();
     let isa = lua.create_function(move |_, (_self, name): (Table, String)| Ok(name == class_name))?;
@@ -1010,6 +1046,11 @@ fn make_instance_metatable(
         lua.create_function(move |lua, (this, key): (Table, String)| {
             if let Some(f) = method_for(lua, dom.clone(), cache.clone(), mt_handle.borrow().as_ref().unwrap().clone(), &key)? {
                 return Ok(Value::Function(f));
+            }
+            if is_instance_signal(&key) {
+                if let Ok(existing)=this.raw_get::<Table>(&key){return Ok(Value::Table(existing));}
+                let signal=make_signal(lua)?; this.raw_set(&key,signal.clone())?;
+                return Ok(Value::Table(signal));
             }
             let Some(r) = table_to_ref(&this)? else { return Ok(Value::Nil) };
             let d = dom.borrow();
