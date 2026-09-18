@@ -196,6 +196,8 @@ pub struct EditorApp {
     editor_word_wrap: bool,
     editor_focus_mode: bool,
     show_stats: bool,
+    /// Whether StarterGui/BillboardGui/SurfaceGui previews are drawn over the viewport.
+    show_gui_preview: bool,
     /// GPU textures retained by the StarterGui preview.
     gui_textures: HashMap<String, egui::TextureHandle>,
     /// Editor-preview scroll positions, keyed by ScrollingFrame referent.
@@ -376,6 +378,7 @@ impl Default for EditorApp {
             editor_word_wrap: saved_settings.editor_word_wrap,
             editor_focus_mode: false,
             show_stats: false,
+            show_gui_preview: true,
             gui_textures: HashMap::new(),
             gui_scroll_offsets: HashMap::new(),
             gui_text_inputs: HashMap::new(),
@@ -638,6 +641,9 @@ impl EditorApp {
                             if ui.button("📊 Stats").clicked() {
                                 self.show_stats = !self.show_stats; ui.close();
                             }
+                            if ui.button(if self.show_gui_preview { "🙈 Hide GUI Preview" } else { "👁 Show GUI Preview" }).clicked() {
+                                self.show_gui_preview = !self.show_gui_preview; ui.close();
+                            }
                             if ui.button("⚙ Settings").clicked() {
                                 self.active_tab = ActiveTab::Settings; ui.close();
                             }
@@ -663,6 +669,9 @@ impl EditorApp {
                         }
                         if ui.button("📊 Stats").clicked() {
                             self.show_stats = !self.show_stats;
+                        }
+                        if ui.button(if self.show_gui_preview { "🙈 GUI" } else { "👁 GUI" }).on_hover_text("Toggle GUI preview overlays").clicked() {
+                            self.show_gui_preview = !self.show_gui_preview;
                         }
                     }
                     if ui.button(format!("🖥️ Output ({})", self.output_logs.len())).clicked() {
@@ -1133,13 +1142,13 @@ impl EditorApp {
 
         // StarterGui is previewed as a real screen-space hierarchy over the 3D
         // scene. Clicking a GUI object synchronizes selection with Explorer.
-        let clicked_gui = if let Some(dom) = self.dom.as_ref() {
-            crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures,
-                &mut self.gui_scroll_offsets, &mut self.gui_text_inputs,
-                self.selected, orbit, viewport_scene)
-        } else {
-            None
-        };
+        let clicked_gui = if self.show_gui_preview {
+            if let Some(dom) = self.dom.as_ref() {
+                crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures,
+                    &mut self.gui_scroll_offsets, &mut self.gui_text_inputs,
+                    self.selected, orbit, viewport_scene)
+            } else { None }
+        } else { None };
         if let Some(clicked) = clicked_gui {
             self.selected = Some(clicked);
             self.status = "Selected GUI object from viewport".into();
