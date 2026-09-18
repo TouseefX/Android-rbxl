@@ -185,6 +185,7 @@ fn build_vm() -> LuaResult<Lua> {
     install_color3(&lua)?;
     install_cframe(&lua)?;
     install_udim2(&lua)?;
+    install_tween_info(&lua)?;
     install_enum(&lua)?;
     install_instance_stub(&lua)?;
     install_plugin_stub(&lua)?;
@@ -508,6 +509,19 @@ fn install_udim2(lua: &Lua) -> LuaResult<()> {
     )?;
     lua.globals().set("UDim2", ud)?;
     Ok(())
+}
+
+fn install_tween_info(lua: &Lua) -> LuaResult<()> {
+    let tween_info=lua.create_table();
+    tween_info.set("new",lua.create_function(|lua,args:Variadic<Value>|{
+        let info=lua.create_table();
+        let number=|index:usize,fallback:f64|match args.get(index){Some(Value::Number(value))=>*value,Some(Value::Integer(value))=>*value as f64,_=>fallback};
+        info.set("Time",number(0,1.0))?; info.set("EasingStyle",args.get(1).cloned().unwrap_or(Value::Nil))?;
+        info.set("EasingDirection",args.get(2).cloned().unwrap_or(Value::Nil))?; info.set("RepeatCount",number(3,0.0) as i64)?;
+        info.set("Reverses",matches!(args.get(4),Some(Value::Boolean(true))))?; info.set("DelayTime",number(5,0.0))?;
+        info.set_metatable(Some(typed_metatable(lua,"TweenInfo")?)); Ok(info)
+    })?)?;
+    lua.globals().set("TweenInfo",tween_info)
 }
 
 fn install_enum(lua: &Lua) -> LuaResult<()> {
@@ -1138,6 +1152,33 @@ fn method_for(
     let d = dom.clone();
     let c = cache.clone();
     let f = match name {
+        "Create" => Some(lua.create_function(move |lua, (service, target, _info, goals): (Table, Table, Value, Table)| {
+            let class:String=service.raw_get("_class").unwrap_or_default();
+            if class!="TweenService" { return Err(LuaError::runtime("Create is only available on TweenService")); }
+            let target_ref=table_to_ref(&target)?;
+            let tween=lua.create_table();
+            let completed=make_signal(lua)?;
+            tween.set("Completed",completed.clone())?;
+            let play_dom=d.clone(); let play_goals=goals.clone();
+            let play_completed=completed.clone();
+            tween.set("Play",lua.create_function(move |lua,_tween:Table|{
+                if let Some(referent)=target_ref {
+                    let mut updates=Vec::new();
+                    for pair in play_goals.clone().pairs::<Value,Value>() {
+                        let (key,value)=pair?;
+                        if let Value::String(key)=key { if let Some(value)=value_to_variant(lua,&value)? { updates.push((key.to_str()?,value)); } }
+                    }
+                    if let Some(instance)=play_dom.borrow_mut().get_by_ref_mut(referent) {
+                        for (key,value) in updates { instance.properties.insert(rbx_dom_weak::Ustr::from(key.as_str()),value); COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1); }
+                    }
+                }
+                let fire:Function=play_completed.get("Fire")?;
+                fire.call::<()>((play_completed.clone(),Variadic::<Value>::new()))
+            })?)?;
+            tween.set("Pause",lua.create_function(|_,_tween:Table|Ok(()))?)?;
+            tween.set("Cancel",lua.create_function(|_,_tween:Table|Ok(()))?)?;
+            Ok(tween)
+        })?),
         "GetService" => Some(lua.create_function(move |lua, (_this, name): (Table, String)| {
             // Virtual (non-DOM) services are exposed as globals.
             match name.as_str() {
