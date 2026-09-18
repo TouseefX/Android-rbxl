@@ -1971,8 +1971,16 @@ pub fn draw_starter_gui(
             if gui.class != "ScreenGui" || matches!(gui.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
             let display_order = enum_value(gui.properties.get(&rbx_dom_weak::ustr("DisplayOrder")), 0);
             let global_z = enum_value(gui.properties.get(&rbx_dom_weak::ustr("ZIndexBehavior")), 1) == 0;
+            // ScreenInsets.None=0, DeviceSafeInsets=1, CoreUISafeInsets=2,
+            // TopbarSafeInsets=3. The editor viewport already excludes Android
+            // system cutouts, so only Roblox's core/top-bar inset remains.
+            let ignore_inset=bool_value(gui.properties.get(&rbx_dom_weak::ustr("IgnoreGuiInset")),false);
+            let screen_insets=if ignore_inset { 0 } else { enum_value(gui.properties.get(&rbx_dom_weak::ustr("ScreenInsets")),2) };
+            let root_rect=if screen_insets==2 || screen_insets==3 {
+                Rect::from_min_max(Pos2::new(viewport.left(),(viewport.top()+58.0).min(viewport.bottom())),viewport.max)
+            } else { viewport };
             let root_path = vec![(0, screen_order)];
-            collect(dom, &layout_painter, *child, viewport, viewport, display_order,
+            collect(dom, &layout_painter, *child, root_rect, viewport, display_order,
                 global_z, 1.0, 1.0, Color32::WHITE, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
         }
     }
