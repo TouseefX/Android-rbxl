@@ -1506,14 +1506,29 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
         }
         let part_alpha=((1.0-number(instance.properties.get(&rbx_dom_weak::ustr("Transparency")),0.0).clamp(0.0,1.0))*255.0) as u8;
         let part_color=color(instance.properties.get(&rbx_dom_weak::ustr("Color")),part_alpha,[163,162,165]);
-        let mut mesh_id = if instance.class == "MeshPart" { content(instance.properties.get(&rbx_dom_weak::ustr("MeshId"))) } else { None };
-        let mut texture = if instance.class == "MeshPart" { content(instance.properties.get(&rbx_dom_weak::ustr("TextureID"))) } else { None };
+        let mut mesh_id = if instance.class == "MeshPart" {
+            content(instance.properties.get(&rbx_dom_weak::ustr("MeshId")))
+                .or_else(||content(instance.properties.get(&rbx_dom_weak::ustr("MeshContent"))))
+        } else { None };
+        let mut texture = if instance.class == "MeshPart" {
+            content(instance.properties.get(&rbx_dom_weak::ustr("TextureID")))
+                .or_else(||content(instance.properties.get(&rbx_dom_weak::ustr("TextureId"))))
+                .or_else(||content(instance.properties.get(&rbx_dom_weak::ustr("TextureContent"))))
+        } else { None };
         let mut mesh_scale = [1.0,1.0,1.0];
         let mut mesh_offset = [0.0,0.0,0.0];
-        let mut mesh_type = None;
-        if instance.class != "MeshPart" {
-            for child in instance.children().filter_map(|child|dom.get_by_ref(*child)) {
-                if child.class != "SpecialMesh" && child.class != "BlockMesh" { continue; }
+        let mut mesh_type = match instance.properties.get(&rbx_dom_weak::ustr("Shape")) {
+            Some(Variant::Enum(value))=>match value.clone().to_u32(){0=>Some(3),2=>Some(4),3=>Some(2),_=>None},
+            Some(Variant::String(value))=>match value.as_str(){"Ball"=>Some(3),"Cylinder"=>Some(4),"Wedge"=>Some(2),_=>None},
+            _=>None,
+        };
+        for child in instance.children().filter_map(|child|dom.get_by_ref(*child)) {
+            if child.class == "SurfaceAppearance" {
+                texture=content(child.properties.get(&rbx_dom_weak::ustr("ColorMap")))
+                    .or_else(||content(child.properties.get(&rbx_dom_weak::ustr("ColorMapContent")))).or(texture);
+                continue;
+            }
+            if instance.class != "MeshPart" && (child.class == "SpecialMesh" || child.class == "BlockMesh") {
                 mesh_id=content(child.properties.get(&rbx_dom_weak::ustr("MeshId"))).or(mesh_id);
                 texture=content(child.properties.get(&rbx_dom_weak::ustr("TextureId"))).or(texture);
                 if let Some(Variant::Vector3(value))=child.properties.get(&rbx_dom_weak::ustr("Scale")){mesh_scale=[value.x,value.y,value.z];}
