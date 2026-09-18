@@ -1152,6 +1152,23 @@ fn method_for(
     let d = dom.clone();
     let c = cache.clone();
     let f = match name {
+        "TweenPosition" | "TweenSize" => {
+            let property=if name=="TweenPosition"{"Position"}else{"Size"}.to_string();
+            Some(lua.create_function(move |lua,(this,args):(Table,Variadic<Value>)|{
+                let Some(referent)=table_to_ref(&this)? else{return Ok(false);};
+                let Some(first)=args.first() else{return Ok(false);};
+                let Some(value)=value_to_variant(lua,first)? else{return Ok(false);};
+                if let Some(instance)=d.borrow_mut().get_by_ref_mut(referent){instance.properties.insert(rbx_dom_weak::Ustr::from(property.as_str()),value);COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);}
+                if let Some(Value::Function(callback))=args.last(){callback.call::<()>(())?;} Ok(true)
+            })?)
+        },
+        "TweenSizeAndPosition" => Some(lua.create_function(move |lua,(this,args):(Table,Variadic<Value>)|{
+            let Some(referent)=table_to_ref(&this)? else{return Ok(false);};
+            let size=args.first().map(|value|value_to_variant(lua,value)).transpose()?.flatten();
+            let position=args.get(1).map(|value|value_to_variant(lua,value)).transpose()?.flatten();
+            if let Some(instance)=d.borrow_mut().get_by_ref_mut(referent){if let Some(value)=size{instance.properties.insert(rbx_dom_weak::Ustr::from("Size"),value);}if let Some(value)=position{instance.properties.insert(rbx_dom_weak::Ustr::from("Position"),value);}COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);}
+            if let Some(Value::Function(callback))=args.last(){callback.call::<()>(())?;} Ok(true)
+        })?),
         "Create" => Some(lua.create_function(move |lua, (service, target, _info, goals): (Table, Table, Value, Table)| {
             let class:String=service.raw_get("_class").unwrap_or_default();
             if class!="TweenService" { return Err(LuaError::runtime("Create is only available on TweenService")); }
