@@ -1484,6 +1484,28 @@ struct ViewportPolygon {
     depth: f32, points: Vec<Pos2>, color: Color32,
     texture: Option<(String, Vec<Pos2>)>,
 }
+#[derive(Clone, Copy)]
+struct ViewportClipVertex { position: [f32;3], uv: [f32;2] }
+
+fn clip_viewport_near(vertices: Vec<ViewportClipVertex>, camera: [f32;3], forward: [f32;3]) -> Vec<ViewportClipVertex> {
+    let depth=|point:[f32;3]|(point[0]-camera[0])*forward[0]+(point[1]-camera[1])*forward[1]+(point[2]-camera[2])*forward[2];
+    let near=0.01; let mut output=Vec::new();
+    for index in 0..vertices.len() {
+        let current=vertices[index]; let previous=vertices[(index+vertices.len()-1)%vertices.len()];
+        let current_depth=depth(current.position); let previous_depth=depth(previous.position);
+        let current_inside=current_depth>=near; let previous_inside=previous_depth>=near;
+        if current_inside != previous_inside {
+            let amount=((near-previous_depth)/(current_depth-previous_depth)).clamp(0.0,1.0);
+            output.push(ViewportClipVertex { position:[
+                previous.position[0]+(current.position[0]-previous.position[0])*amount,
+                previous.position[1]+(current.position[1]-previous.position[1])*amount,
+                previous.position[2]+(current.position[2]-previous.position[2])*amount,
+            ], uv:[previous.uv[0]+(current.uv[0]-previous.uv[0])*amount,previous.uv[1]+(current.uv[1]-previous.uv[1])*amount] });
+        }
+        if current_inside { output.push(current); }
+    }
+    output
+}
 
 fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<ViewportBox>, meshes: &mut Vec<ViewportMesh>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
@@ -1626,17 +1648,16 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
     let project = |point: [f32;3]| -> Option<(Pos2,f32)> {
         let relative=[point[0]-camera[0],point[1]-camera[1],point[2]-camera[2]];
         let depth=relative[0]*forward[0]+relative[1]*forward[1]+relative[2]*forward[2];
-        if depth <= 0.01 { return None; }
+        if depth < 0.01 { return None; }
         let x=(relative[0]*right[0]+relative[1]*right[1]+relative[2]*right[2])/depth;
         let y=(relative[0]*up[0]+relative[1]*up[1]+relative[2]*up[2])/depth;
         Some((node.content_rect.center()+Vec2::new(x,-y)*focal_length, depth))
     };
     let mut polygons = Vec::new();
     for part in parts {
-        let projected:Vec<Option<(Pos2,f32)>>=part.vertices.iter().map(|vertex|project(*vertex)).collect();
         let part_center={let mut value=[0.0;3];for vertex in &part.vertices{for axis in 0..3{value[axis]+=vertex[axis]/part.vertices.len() as f32;}}value};
         for face in part.faces {
-            if face.len()<3 || face.iter().any(|index|projected[*index].is_none()){continue;}
+            if face.len()<3 {continue;}
             let a=part.vertices[face[0]];let b=part.vertices[face[1]];let c=part.vertices[face[2]];
             let ab=[b[0]-a[0],b[1]-a[1],b[2]-a[2]];let ac=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
             let mut normal=[ab[1]*ac[2]-ab[2]*ac[1],ab[2]*ac[0]-ab[0]*ac[2],ab[0]*ac[1]-ab[1]*ac[0]];
@@ -1651,9 +1672,11 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
                 ((part.color.g() as f32)*(ambient.g() as f32+light_color.g() as f32*illumination).min(255.0)*image_tint.g() as f32/(255.0*255.0)) as u8,
                 ((part.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32/(255.0*255.0)) as u8,
                 ((part.color.a() as u16*image_alpha as u16)/255) as u8);
-            let depth=face.iter().map(|index|projected[*index].unwrap().1).sum::<f32>()/face.len() as f32;
-            let points=face.iter().map(|index|projected[*index].unwrap().0).collect();
-            polygons.push(ViewportPolygon{depth,points,color:lit,texture:None});
+            let clipped=clip_viewport_near(face.iter().map(|index|ViewportClipVertex{position:part.vertices[*index],uv:[0.0,0.0]}).collect(),camera,forward);
+            let projected:Vec<(Pos2,f32)>=clipped.iter().filter_map(|vertex|project(vertex.position)).collect();
+            if projected.len()<3{continue;}
+            let depth=projected.iter().map(|value|value.1).sum::<f32>()/projected.len() as f32;
+            polygons.push(ViewportPolygon{depth,points:projected.into_iter().map(|value|value.0).collect(),color:lit,texture:None});
         }
     }
     for mesh in meshes {
@@ -1661,7 +1684,6 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
             let indices=[face[0] as usize,face[1] as usize,face[2] as usize];
             if indices.iter().any(|index|*index>=mesh.vertices.len()){continue;}
             let [a,b,c]=indices.map(|index|mesh.vertices[index]);
-            let Some(pa)=project(a) else{continue;}; let Some(pb)=project(b) else{continue;}; let Some(pc)=project(c) else{continue;};
             let ab=[b[0]-a[0],b[1]-a[1],b[2]-a[2]];let ac=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
             let normal=[ab[1]*ac[2]-ab[2]*ac[1],ab[2]*ac[0]-ab[0]*ac[2],ab[0]*ac[1]-ab[1]*ac[0]];
             let length=(normal[0]*normal[0]+normal[1]*normal[1]+normal[2]*normal[2]).sqrt().max(0.001);let normal=[normal[0]/length,normal[1]/length,normal[2]/length];
@@ -1675,9 +1697,13 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
                 ((mesh.color.g() as f32)*(ambient.g() as f32+light_color.g() as f32*illumination).min(255.0)*image_tint.g() as f32*vertex_color[1]/(255.0*255.0)) as u8,
                 ((mesh.color.b() as f32)*(ambient.b() as f32+light_color.b() as f32*illumination).min(255.0)*image_tint.b() as f32*vertex_color[2]/(255.0*255.0)) as u8,
                 ((mesh.color.a() as f32*image_alpha as f32*vertex_color[3])/255.0) as u8);
-            let texture=mesh.texture.as_ref().filter(|_|indices.iter().all(|index|*index<mesh.uvs.len())).map(|uri|(
-                uri.clone(),indices.iter().map(|index|Pos2::new(mesh.uvs[*index][0],mesh.uvs[*index][1])).collect()));
-            polygons.push(ViewportPolygon{depth:(pa.1+pb.1+pc.1)/3.0,points:vec![pa.0,pb.0,pc.0],color:lit,texture});
+            let source_uvs=indices.map(|index|mesh.uvs.get(index).copied().unwrap_or([0.0,0.0]));
+            let clipped=clip_viewport_near(vec![ViewportClipVertex{position:a,uv:source_uvs[0]},ViewportClipVertex{position:b,uv:source_uvs[1]},ViewportClipVertex{position:c,uv:source_uvs[2]}],camera,forward);
+            let projected:Vec<(Pos2,f32)>=clipped.iter().filter_map(|vertex|project(vertex.position)).collect();
+            if projected.len()<3{continue;}
+            let texture=mesh.texture.as_ref().map(|uri|(uri.clone(),clipped.iter().map(|vertex|Pos2::new(vertex.uv[0],vertex.uv[1])).collect()));
+            let depth=projected.iter().map(|value|value.1).sum::<f32>()/projected.len() as f32;
+            polygons.push(ViewportPolygon{depth,points:projected.into_iter().map(|value|value.0).collect(),color:lit,texture});
         }
     }
     polygons.sort_by(|a,b| b.depth.total_cmp(&a.depth));
@@ -1686,7 +1712,8 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
             if let Some(texture)=ensure_gui_texture(ui,textures,&uri) {
                 let mut mesh=egui::Mesh::with_texture(texture);
                 for (point,uv) in polygon.points.into_iter().zip(uvs) { mesh.vertices.push(egui::epaint::Vertex{pos:point,uv,color:polygon.color}); }
-                mesh.indices.extend_from_slice(&[0,1,2]); painter.add(egui::Shape::mesh(mesh)); continue;
+                for index in 1..mesh.vertices.len().saturating_sub(1) { mesh.indices.extend_from_slice(&[0,index as u32,index as u32+1]); }
+                painter.add(egui::Shape::mesh(mesh)); continue;
             }
         }
         painter.add(egui::Shape::convex_polygon(polygon.points,polygon.color,Stroke::new(0.5,shade_color(polygon.color,0.65))));
