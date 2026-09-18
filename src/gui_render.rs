@@ -1970,8 +1970,13 @@ pub fn draw_starter_gui(
         }
     }
 
-    if let Some(starter) = starter.and_then(|referent| dom.get_by_ref(referent)) {
-        for (screen_order, child) in starter.children().iter().enumerate() {
+    let mut gui_roots=Vec::new();
+    if let Some(starter)=starter { gui_roots.push(starter); }
+    gather_class(dom,dom.root_ref(),"PlayerGui",&mut gui_roots);
+    let mut screen_order=0usize;
+    for root in gui_roots {
+        let Some(container)=dom.get_by_ref(root) else {continue;};
+        for child in container.children() {
             let Some(gui) = dom.get_by_ref(*child) else { continue; };
             if gui.class != "ScreenGui" || matches!(gui.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
             let display_order = enum_value(gui.properties.get(&rbx_dom_weak::ustr("DisplayOrder")), 0);
@@ -1984,7 +1989,7 @@ pub fn draw_starter_gui(
             let root_rect=if screen_insets==2 || screen_insets==3 {
                 Rect::from_min_max(Pos2::new(viewport.left(),(viewport.top()+58.0).min(viewport.bottom())),viewport.max)
             } else { viewport };
-            let root_path = vec![(0, screen_order)];
+            let root_path = vec![(0, screen_order)]; screen_order+=1;
             collect(dom, &layout_painter, *child, root_rect, viewport, display_order,
                 global_z, 1.0, 1.0, Color32::WHITE, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
         }
