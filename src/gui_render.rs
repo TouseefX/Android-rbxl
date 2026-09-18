@@ -59,6 +59,8 @@ struct GuiNode {
     image_color: Color32,
     auto_button_color: bool,
     interactable: bool,
+    selectable: bool,
+    selection_order: i32,
     image_rect_offset: Vec2,
     image_rect_size: Vec2,
     image_scale_type: i32,
@@ -666,6 +668,9 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             auto_button_color: bool_value(instance.properties.get(&rbx_dom_weak::ustr("AutoButtonColor")), true),
             interactable: bool_value(instance.properties.get(&rbx_dom_weak::ustr("Active")), true)
                 && bool_value(instance.properties.get(&rbx_dom_weak::ustr("Interactable")), true),
+            selectable: bool_value(instance.properties.get(&rbx_dom_weak::ustr("Selectable")),
+                matches!(instance.class.as_str(),"TextButton"|"ImageButton"|"TextBox")),
+            selection_order: number(instance.properties.get(&rbx_dom_weak::ustr("SelectionOrder")),0.0) as i32,
             image_rect_offset: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectOffset")), Vec2::ZERO),
             image_rect_size: vector2(instance.properties.get(&rbx_dom_weak::ustr("ImageRectSize")), Vec2::ZERO),
             image_scale_type: enum_value(instance.properties.get(&rbx_dom_weak::ustr("ScaleType")), 0),
@@ -2011,7 +2016,18 @@ pub fn draw_starter_gui(
             }
         })
     });
-    let mut clicked = None;
+    let keyboard_selection = if ui.input(|input|input.key_pressed(egui::Key::Tab)) {
+        let reverse=ui.input(|input|input.modifiers.shift);
+        let mut candidates:Vec<(i32,usize,Ref)>=nodes.iter().filter(|node|node.selectable&&node.interactable)
+            .map(|node|(node.selection_order,node.order,node.referent)).collect();
+        candidates.sort_by_key(|candidate|(candidate.0,candidate.1));
+        if candidates.is_empty(){None}else{
+            let current=candidates.iter().position(|candidate|Some(candidate.2)==selected);
+            let index=match (current,reverse){(Some(0),true)=>candidates.len()-1,(Some(index),true)=>index-1,(Some(index),false)=>(index+1)%candidates.len(),(None,true)=>candidates.len()-1,(None,false)=>0};
+            Some(candidates[index].2)
+        }
+    } else {None};
+    let mut clicked = keyboard_selection;
     // rect, color, owner, horizontal, canvas maximum, thumb travel
     let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool, [Option<String>; 3])> = Vec::new();
     for node in nodes {
