@@ -749,6 +749,7 @@ pub struct GuiPlaySession {
     synchronized_properties: std::collections::HashMap<DomRef, Vec<String>>,
     active_tweens: Rc<RefCell<Vec<ActiveGuiTween>>>,
     pending_instances: Rc<RefCell<Vec<Table>>>,
+    pending_destructions: Rc<RefCell<Vec<Table>>>,
     last_tick: std::time::Instant,
 }
 
@@ -766,16 +767,19 @@ impl GuiPlaySession {
         let lua=build_vm().map_err(|error|error.to_string())?;
         let active_tweens=Rc::new(RefCell::new(Vec::<ActiveGuiTween>::new()));
         let pending_instances=Rc::new(RefCell::new(Vec::<Table>::new()));
+        let pending_destructions=Rc::new(RefCell::new(Vec::<Table>::new()));
         let mut instances=std::collections::HashMap::new();
-        fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>)->LuaResult<()> {
+        fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>,destructions:Rc<RefCell<Vec<Table>>>)->LuaResult<()> {
             let Some(instance)=dom.get_by_ref(referent) else{return Ok(());};
             let table=make_instance(lua,&instance.class,&instance.name)?;
             table.raw_set("_ref",ref_to_i64(referent))?;
+            let destroy_table=table.clone();let destroy_queue=destructions.clone();
+            table.raw_set("Destroy",lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())})?)?;
             for (key,value) in &instance.properties { if let Ok(value)=variant_to_value(lua,value){table.raw_set(key.as_str(),value)?;} }
             instances.insert(referent,table);
-            for child in instance.children(){create(lua,dom,*child,instances)?;} Ok(())
+            for child in instance.children(){create(lua,dom,*child,instances,destructions.clone())?;} Ok(())
         }
-        create(&lua,dom,dom.root_ref(),&mut instances).map_err(|error|error.to_string())?;
+        create(&lua,dom,dom.root_ref(),&mut instances,pending_destructions.clone()).map_err(|error|error.to_string())?;
         for (referent,table) in &instances {
             let Some(instance)=dom.get_by_ref(*referent) else{continue;};
             if let Some(parent)=instances.get(&instance.parent()){table.raw_set("Parent",parent.clone()).map_err(|error|error.to_string())?;}
@@ -830,9 +834,11 @@ impl GuiPlaySession {
         }
         if let Some(game)=instances.get(&dom.root_ref()) { game.raw_set("Players",players).map_err(|error|error.to_string())?; }
         let runtime_instance=lua.create_table().map_err(|error|error.to_string())?;
-        let creation_queue=pending_instances.clone();
+        let creation_queue=pending_instances.clone();let destruction_queue=pending_destructions.clone();
         runtime_instance.set("new",lua.create_function(move |lua,(class,parent):(String,Option<Table>)|{
             let table=make_instance(lua,&class,&class)?;
+            let destroy_table=table.clone();let destroy_queue=destruction_queue.clone();
+            table.raw_set("Destroy",lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())})?)?;
             if let Some(parent)=parent { table.raw_set("Parent",parent.clone())?; parent.raw_set(class.as_str(),table.clone())?; }
             creation_queue.borrow_mut().push(table.clone()); Ok(table)
         }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
@@ -848,7 +854,7 @@ impl GuiPlaySession {
             if let Err(error)=lua.load(source).set_name(instance.name.as_str()).exec(){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}
         }
         let synchronized_properties=instances.keys().map(|referent|(*referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect())).collect();
-        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,last_tick:std::time::Instant::now()})
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,last_tick:std::time::Instant::now()})
     }
 
     pub fn tick(&mut self)->Result<(),String>{
@@ -892,6 +898,30 @@ impl GuiPlaySession {
             self.synchronized_properties.insert(referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect());
             created+=1;
         }
+        let destructions:Vec<Table>=self.pending_destructions.borrow_mut().drain(..).collect();
+        let mut destroyed=0usize;
+        for table in destructions {
+            if let Some(referent)=table_to_ref(&table).map_err(|error|error.to_string())? {
+                if referent!=dom.root_ref() && dom.get_by_ref(referent).is_some(){dom.destroy(referent);destroyed+=1;}
+                self.instances.remove(&referent);self.synchronized_properties.remove(&referent);
+            }
+        }
+        let hierarchy:Vec<(DomRef,String,Option<DomRef>)>=self.instances.iter().filter_map(|(referent,table)|{
+            let name=table.raw_get::<String>("Name").ok()?;
+            let parent=table.raw_get::<Table>("Parent").ok().and_then(|parent|table_to_ref(&parent).ok().flatten());
+            Some((*referent,name,parent))
+        }).collect();
+        for (referent,name,parent) in hierarchy {
+            if referent==dom.root_ref(){continue;}
+            let current_parent=dom.get_by_ref(referent).map(|instance|instance.parent());
+            let mut renamed=false;let mut moved=false;
+            if let Some(instance)=dom.get_by_ref_mut(referent){if instance.name!=name{instance.name=name;renamed=true;}}
+            if let (Some(current),Some(parent))=(current_parent,parent){if current!=parent&&dom.get_by_ref(parent).is_some(){dom.transfer_within(referent,parent);moved=true;}}
+            if let Some(table)=self.instances.get(&referent) {
+                if renamed {if let Ok(signal)=table.raw_get::<Table>("Changed"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,"Name")).map_err(|error|error.to_string())?;}}
+                if moved {if let Ok(signal)=table.raw_get::<Table>("AncestryChanged"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,table.clone(),table.raw_get::<Value>("Parent").unwrap_or(Value::Nil))).map_err(|error|error.to_string())?;}}
+            }
+        }
         let mut updates=Vec::new();
         for (referent,names) in &self.synchronized_properties {
             let Some(table)=self.instances.get(referent) else{continue;};
@@ -904,7 +934,7 @@ impl GuiPlaySession {
                 }
             }
         }
-        let count=updates.len()+created;
+        let count=updates.len()+created+destroyed;
         for (referent,name,value) in updates {if let Some(instance)=dom.get_by_ref_mut(referent){instance.properties.insert(rbx_dom_weak::Ustr::from(name.as_str()),value);}}
         Ok(count)
     }
