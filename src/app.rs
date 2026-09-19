@@ -204,6 +204,9 @@ pub struct EditorApp {
     gui_scroll_offsets: HashMap<Ref, egui::Vec2>,
     /// Editable preview state for Roblox TextBox controls.
     gui_text_inputs: HashMap<Ref, String>,
+    /// Retained pointer state and events for the persistent GUI play-session bridge.
+    gui_hovered: std::collections::HashSet<Ref>,
+    gui_runtime_events: Vec<crate::gui_render::GuiRuntimeEvent>,
     rename_buffer: String,
     project_name: String,
     show_quick_open: bool,
@@ -382,6 +385,8 @@ impl Default for EditorApp {
             gui_textures: HashMap::new(),
             gui_scroll_offsets: HashMap::new(),
             gui_text_inputs: HashMap::new(),
+            gui_hovered: std::collections::HashSet::new(),
+            gui_runtime_events: Vec::new(),
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
             show_quick_open: false,
@@ -490,6 +495,8 @@ impl EditorApp {
                 self.gui_textures.clear();
                 self.gui_scroll_offsets.clear();
                 self.gui_text_inputs.clear();
+                self.gui_hovered.clear();
+                self.gui_runtime_events.clear();
                 self.needs_3d_rebuild = true;
                 self.status = format!("Loaded ({})", self.place_format.label());
                 // New document → fresh undo history.
@@ -1146,9 +1153,12 @@ impl EditorApp {
             if let Some(dom) = self.dom.as_ref() {
                 crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures,
                     &mut self.gui_scroll_offsets, &mut self.gui_text_inputs,
+                    &mut self.gui_hovered, &mut self.gui_runtime_events,
                     self.selected, orbit, viewport_scene)
             } else { None }
-        } else { None };
+        } else {
+            self.gui_hovered.clear(); self.gui_runtime_events.clear(); None
+        };
         if let Some(clicked) = clicked_gui {
             self.selected = Some(clicked);
             self.status = "Selected GUI object from viewport".into();

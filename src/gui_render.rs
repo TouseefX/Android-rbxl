@@ -5,6 +5,11 @@
 use bevy_egui::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuiRuntimeEventKind { MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated }
+#[derive(Debug, Clone, Copy)]
+pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind }
+
 #[derive(Clone, Copy)]
 struct RoundedMask { rect: Rect, radius: f32, rotation: f32 }
 
@@ -1764,6 +1769,8 @@ pub fn draw_starter_gui(
     textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
     scroll_offsets: &mut std::collections::HashMap<Ref, Vec2>,
     text_inputs: &mut std::collections::HashMap<Ref, String>,
+    hovered_gui: &mut std::collections::HashSet<Ref>,
+    runtime_events: &mut Vec<GuiRuntimeEvent>,
     selected: Option<Ref>,
     orbit: &crate::bevy_render::OrbitCam,
     viewport_scene: &crate::bevy_render::ViewportScene,
@@ -2053,6 +2060,8 @@ pub fn draw_starter_gui(
             }).min_by(|left,right|left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)).then(left.2.cmp(&right.2))).map(|candidate|candidate.3)
         })
     };
+    runtime_events.clear();
+    let mut current_hovered=std::collections::HashSet::new();
     let mut clicked = keyboard_selection;
     // rect, color, owner, horizontal, canvas maximum, thumb travel
     let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool, [Option<String>; 3])> = Vec::new();
@@ -2071,6 +2080,13 @@ pub fn draw_starter_gui(
             let local = rotate_point(affine_point, node.rect.center(), -node.rotation.to_radians());
             node.rect.contains(local) && node.clip.contains(point)
         }).unwrap_or(false);
+        if pointer_inside && node.interactable { current_hovered.insert(node.referent); }
+        let is_button=matches!(node.class.as_str(),"TextButton"|"ImageButton");
+        if is_button && node.interactable && response.clicked() && pointer_inside {
+            for kind in [GuiRuntimeEventKind::MouseButton1Down,GuiRuntimeEventKind::MouseButton1Up,GuiRuntimeEventKind::MouseButton1Click,GuiRuntimeEventKind::Activated] {
+                runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind});
+            }
+        }
         if node.class == "ScrollingFrame" {
             let allow_x = node.scrolling_direction != 2;
             let allow_y = node.scrolling_direction != 1;
@@ -2316,5 +2332,8 @@ pub fn draw_starter_gui(
             ui.ctx().request_repaint();
         }
     }
+    for referent in current_hovered.difference(hovered_gui) { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::MouseEnter}); }
+    for referent in hovered_gui.difference(&current_hovered) { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::MouseLeave}); }
+    *hovered_gui=current_hovered;
     clicked
 }
