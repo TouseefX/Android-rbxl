@@ -1178,6 +1178,10 @@ impl EditorApp {
                 if let Err(error)=session.fire(event.referent,name){log::error!("GUI event {name}: {error}");}
             }
         }
+        if let (Some(session),Some(dom))=(self.gui_play_session.as_ref(),self.dom.as_mut()) {
+            match session.synchronize_to_dom(dom) { Ok(changed) if changed>0=>self.needs_3d_rebuild=true,Err(error)=>log::error!("GUI property sync: {error}"),_=>{} }
+            if let Err(error)=session.synchronize_from_dom(dom){log::error!("GUI reverse property sync: {error}");}
+        }
         let play_output=self.gui_play_session.as_ref().map(|session|session.drain_output()).unwrap_or_default();
         for line in play_output { match line.level { lua_runtime::Level::Error=>self.log_error(line.text), _=>self.log_info(line.text) } }
         if let Some(clicked) = clicked_gui {

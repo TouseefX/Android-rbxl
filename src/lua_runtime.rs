@@ -732,6 +732,7 @@ use rbx_dom_weak::{
 pub struct GuiPlaySession {
     lua: Lua,
     instances: std::collections::HashMap<DomRef, Table>,
+    synchronized_properties: std::collections::HashMap<DomRef, Vec<String>>,
 }
 
 impl GuiPlaySession {
@@ -767,7 +768,9 @@ impl GuiPlaySession {
             lua.globals().set("script",table.clone()).map_err(|error|error.to_string())?;
             if let Err(error)=lua.load(source).set_name(instance.name.as_str()).exec(){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}
         }
-        Ok(Self{lua,instances})
+        let common=["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
+        let synchronized_properties=instances.keys().map(|referent|(*referent,common.iter().map(|name|(*name).to_string()).collect())).collect();
+        Ok(Self{lua,instances,synchronized_properties})
     }
 
     pub fn fire(&self,referent:DomRef,event:&str)->Result<(),String>{
@@ -775,6 +778,32 @@ impl GuiPlaySession {
         let Ok(signal)=instance.raw_get::<Table>(event) else{return Ok(());};
         let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;
         fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())
+    }
+
+    pub fn synchronize_to_dom(&self,dom:&mut WeakDom)->Result<usize,String>{
+        let mut updates=Vec::new();
+        for (referent,names) in &self.synchronized_properties {
+            let Some(table)=self.instances.get(referent) else{continue;};
+            for name in names {
+                let Ok(value)=table.raw_get::<Value>(name.as_str()) else{continue;};
+                if value.is_nil(){continue;}
+                if let Some(value)=value_to_variant(&self.lua,&value).map_err(|error|error.to_string())? {
+                    let changed=dom.get_by_ref(*referent).and_then(|instance|instance.properties.get(&rbx_dom_weak::Ustr::from(name.as_str()))).map(|existing|existing!=&value).unwrap_or(true);
+                    if changed{updates.push((*referent,name.clone(),value));}
+                }
+            }
+        }
+        let count=updates.len();
+        for (referent,name,value) in updates {if let Some(instance)=dom.get_by_ref_mut(referent){instance.properties.insert(rbx_dom_weak::Ustr::from(name.as_str()),value);}}
+        Ok(count)
+    }
+
+    pub fn synchronize_from_dom(&self,dom:&WeakDom)->Result<(),String>{
+        for (referent,names) in &self.synchronized_properties {
+            let (Some(table),Some(instance))=(self.instances.get(referent),dom.get_by_ref(*referent)) else{continue;};
+            for name in names {if let Some(value)=instance.properties.get(&rbx_dom_weak::Ustr::from(name.as_str())) { let value=variant_to_value(&self.lua,value).map_err(|error|error.to_string())?;table.raw_set(name.as_str(),value).map_err(|error|error.to_string())?; }}
+        }
+        Ok(())
     }
 
     pub fn drain_output(&self)->Vec<OutputLine>{let _=&self.lua;take_log()}
@@ -1466,6 +1495,15 @@ fn variant_to_value(lua: &Lua, v: &DomVariant) -> LuaResult<Value> {
             t.set("X", v.x as f64)?; t.set("Y", v.y as f64)?; t.set("Z", v.z as f64)?;
             Value::Table(t)
         }
+        Variant::Vector2(v) => {
+            let t=lua.create_table();t.set("X",v.x as f64)?;t.set("Y",v.y as f64)?;Value::Table(t)
+        }
+        Variant::UDim(v) => {
+            let t=lua.create_table();t.set("Scale",v.scale as f64)?;t.set("Offset",v.offset as i64)?;Value::Table(t)
+        }
+        Variant::UDim2(v) => {
+            let t=lua.create_table();t.set("XScale",v.x.scale as f64)?;t.set("XOffset",v.x.offset as i64)?;t.set("YScale",v.y.scale as f64)?;t.set("YOffset",v.y.offset as i64)?;Value::Table(t)
+        }
         Variant::Color3(c) => {
             let t = lua.create_table();
             t.set("R", c.r as f64)?; t.set("G", c.g as f64)?; t.set("B", c.b as f64)?;
@@ -1485,7 +1523,13 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
         Value::Number(n) => Some(DomVariant::Float64(*n)),
         Value::Table(t) => {
             let has = |k: &str| t.get::<Value>(k).is_ok();
-            if has("R") && has("G") && has("B") {
+            if has("XScale") && has("XOffset") && has("YScale") && has("YOffset") {
+                Some(DomVariant::UDim2(ty::UDim2::new(
+                    ty::UDim::new(t.get::<f64>("XScale")? as f32,t.get::<i64>("XOffset")? as i32),
+                    ty::UDim::new(t.get::<f64>("YScale")? as f32,t.get::<i64>("YOffset")? as i32))))
+            } else if has("Scale") && has("Offset") {
+                Some(DomVariant::UDim(ty::UDim::new(t.get::<f64>("Scale")? as f32,t.get::<i64>("Offset")? as i32)))
+            } else if has("R") && has("G") && has("B") {
                 Some(DomVariant::Color3(ty::Color3::new(
                     t.get::<f64>("R")? as f32,
                     t.get::<f64>("G")? as f32,
@@ -1497,6 +1541,8 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
                     t.get::<f64>("Y")? as f32,
                     t.get::<f64>("Z")? as f32,
                 )))
+            } else if has("X") && has("Y") {
+                Some(DomVariant::Vector2(ty::Vector2::new(t.get::<f64>("X")? as f32,t.get::<f64>("Y")? as f32)))
             } else {
                 None
             }
