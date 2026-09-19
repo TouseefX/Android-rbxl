@@ -760,6 +760,8 @@ pub struct GuiPlaySession {
     scheduled_tasks: Rc<RefCell<Vec<ScheduledGuiTask>>>,
     run_service: Table,
     user_input_service: Table,
+    respawn_requested: Rc<Cell<bool>>,
+    respawn_properties: std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>,
     last_tick: std::time::Instant,
 }
 
@@ -784,6 +786,7 @@ impl GuiPlaySession {
         let pending_instances=Rc::new(RefCell::new(Vec::<Table>::new()));
         let pending_destructions=Rc::new(RefCell::new(Vec::<Table>::new()));
         let scheduled_tasks=Rc::new(RefCell::new(Vec::<ScheduledGuiTask>::new()));
+        let respawn_requested=Rc::new(Cell::new(false));
         let mut instances=std::collections::HashMap::new();
         fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>,destructions:Rc<RefCell<Vec<Table>>>)->LuaResult<()> {
             let Some(instance)=dom.get_by_ref(referent) else{return Ok(());};
@@ -849,6 +852,8 @@ impl GuiPlaySession {
             .filter(|instance|instance.class=="Players").and_then(|_|instances.get(referent).cloned()))
             .unwrap_or(make_instance(&lua,"Players","Players").map_err(|error|error.to_string())?);
         let local_player=make_instance(&lua,"Player","LocalPlayer").map_err(|error|error.to_string())?;
+        let respawn_flag=respawn_requested.clone();
+        local_player.raw_set("LoadCharacter",lua.create_function(move |_,_player:Table|{respawn_flag.set(true);Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
         let player_gui=instances.iter().find_map(|(referent,table)|dom.get_by_ref(*referent)
             .filter(|instance|instance.class=="PlayerGui").map(|_|table.clone()))
             .unwrap_or(make_instance(&lua,"PlayerGui","PlayerGui").map_err(|error|error.to_string())?);
@@ -898,7 +903,18 @@ impl GuiPlaySession {
             if let Err(error)=lua.load(source).set_name(instance.name.as_str()).exec(){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}
         }
         let synchronized_properties=instances.keys().map(|referent|(*referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect())).collect();
-        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduled_tasks,run_service,user_input_service,last_tick:std::time::Instant::now()})
+        let mut respawn_properties=std::collections::HashMap::new();
+        fn snapshot_tree(dom:&WeakDom,referent:DomRef,out:&mut std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>){if let Some(instance)=dom.get_by_ref(referent){out.insert(referent,instance.properties.iter().map(|(key,value)|(key.clone(),value.clone())).collect());for child in instance.children(){snapshot_tree(dom,*child,out);}}}
+        if let Some(starter)=dom.root().children().iter().find_map(|referent|dom.get_by_ref(*referent).filter(|instance|instance.class=="StarterGui")) {for child in starter.children(){if dom.get_by_ref(*child).is_some_and(|instance|instance.class=="ScreenGui"&&instance.properties.get(&rbx_dom_weak::ustr("ResetOnSpawn")).map(|value|!matches!(value,DomVariant::Bool(false))).unwrap_or(true)){snapshot_tree(dom,*child,&mut respawn_properties);}}}
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduled_tasks,run_service,user_input_service,respawn_requested,respawn_properties,last_tick:std::time::Instant::now()})
+    }
+
+    pub fn take_respawn_request(&self)->bool{self.respawn_requested.replace(false)}
+
+    pub fn restore_for_respawn(&self,dom:&mut WeakDom){
+        let roots:Vec<DomRef>=self.respawn_properties.keys().copied().filter(|referent|dom.get_by_ref(*referent).is_some_and(|instance|instance.class=="ScreenGui")).collect();
+        let mut remove=Vec::new();for root in roots{let mut stack=dom.get_by_ref(root).map(|instance|instance.children().to_vec()).unwrap_or_default();while let Some(child)=stack.pop(){if self.respawn_properties.contains_key(&child){if let Some(instance)=dom.get_by_ref(child){stack.extend_from_slice(instance.children());}}else{remove.push(child);}}}for referent in remove{if dom.get_by_ref(referent).is_some(){dom.destroy(referent);}}
+        for (referent,properties) in &self.respawn_properties{if let Some(instance)=dom.get_by_ref_mut(*referent){instance.properties.clear();for (key,value) in properties{instance.properties.insert(key.clone(),value.clone());}}}
     }
 
     pub fn tick(&mut self)->Result<(),String>{
