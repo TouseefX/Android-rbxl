@@ -581,7 +581,8 @@ fn make_signal(lua: &Lua) -> LuaResult<Table> {
         }}
         fired.borrow_mut().retain(|(_,once,active)|active.get()&&!*once); Ok(())
     })?)?;
-    signal.set("Wait",lua.create_function(|_,_signal:Table|Ok(Variadic::<Value>::new()))?)?;
+    if let Ok(wait)=lua.globals().get::<Function>("_arena_signal_wait") { signal.set("Wait",wait)?; }
+    else { signal.set("Wait",lua.create_function(|_,_signal:Table|Ok(Variadic::<Value>::new()))?)?; }
     Ok(signal)
 }
 
@@ -872,7 +873,7 @@ impl GuiPlaySession {
                 }
             }
         }
-        if let Some(game)=instances.get(&dom.root_ref()) { game.raw_set("Players",players).map_err(|error|error.to_string())?; }
+        if let Some(game)=instances.get(&dom.root_ref()) { game.raw_set("Players",players.clone()).map_err(|error|error.to_string())?; }
         let runtime_instance=lua.create_table().map_err(|error|error.to_string())?;
         let creation_queue=pending_instances.clone();let destruction_queue=pending_destructions.clone();
         runtime_instance.set("new",lua.create_function(move |lua,(class,parent):(String,Option<Table>)|{
@@ -913,8 +914,26 @@ impl GuiPlaySession {
                     elseif record.remaining<=0 then table.remove(waiting,index); resumeTask(record) end
                 end
             end
+            function _arena_resume_task(thread, ...)
+                task.cancel(thread)
+                local ok, delay = coroutine.resume(thread, ...)
+                if not ok then warn(delay); return end
+                if coroutine.status(thread) ~= "dead" then schedule(thread, delay, table.pack(), true) end
+            end
+            function _arena_signal_wait(signal)
+                local thread = coroutine.running()
+                local connection
+                connection = signal:Connect(function(...)
+                    connection:Disconnect()
+                    _arena_resume_task(thread, ...)
+                end)
+                return coroutine.yield(math.huge)
+            end
         "#).exec().map_err(|error|error.to_string())?;
         let scheduler_step:Function=lua.globals().get("_arena_step_tasks").map_err(|error|error.to_string())?;
+        let signal_wait:Function=lua.globals().get("_arena_signal_wait").map_err(|error|error.to_string())?;
+        let upgrade_signals=|table:&Table|->Result<(),String>{for pair in table.clone().pairs::<Value,Value>(){let(_,value)=pair.map_err(|error|error.to_string())?;if let Value::Table(candidate)=value{if candidate.raw_get::<Function>("Connect").is_ok()&&candidate.raw_get::<Function>("Fire").is_ok(){candidate.raw_set("Wait",signal_wait.clone()).map_err(|error|error.to_string())?;}}}Ok(())};
+        for table in instances.values(){upgrade_signals(table)?;}upgrade_signals(&run_service)?;upgrade_signals(&user_input_service)?;upgrade_signals(&players)?;upgrade_signals(&local_player)?;upgrade_signals(&player_gui)?;
 
         // Execute LocalScripts once. Their signal connections remain retained by
         // these Instance tables and are fired from viewport events every frame.
@@ -923,7 +942,10 @@ impl GuiPlaySession {
             if instance.class!="LocalScript"{continue;}
             let Some(DomVariant::String(source))=instance.properties.get(&rbx_dom_weak::ustr("Source")) else{continue;};
             lua.globals().set("script",table.clone()).map_err(|error|error.to_string())?;
-            if let Err(error)=lua.load(source).set_name(instance.name.as_str()).exec(){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}
+            match lua.load(source).set_name(instance.name.as_str()).into_function() {
+                Ok(function)=>{let task:Table=lua.globals().get("task").map_err(|error|error.to_string())?;let spawn:Function=task.get("spawn").map_err(|error|error.to_string())?;if let Err(error)=spawn.call::<()>(function){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}},
+                Err(error)=>with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)})),
+            }
         }
         let synchronized_properties=instances.keys().map(|referent|(*referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect())).collect();
         let mut respawn_properties=std::collections::HashMap::new();
