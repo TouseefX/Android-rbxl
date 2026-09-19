@@ -729,15 +729,35 @@ use rbx_dom_weak::{
 
 /// Persistent, frame-to-frame Luau state used by the GUI preview play session.
 /// Instance tables and connected callbacks remain alive until another place is loaded.
+struct ActiveGuiTween {
+    target: Table,
+    goals: Vec<(String,Value,Value)>,
+    elapsed: f32,
+    duration: f32,
+    completed: Table,
+}
+
 pub struct GuiPlaySession {
     lua: Lua,
     instances: std::collections::HashMap<DomRef, Table>,
     synchronized_properties: std::collections::HashMap<DomRef, Vec<String>>,
+    active_tweens: Rc<RefCell<Vec<ActiveGuiTween>>>,
+    last_tick: std::time::Instant,
+}
+
+fn interpolate_gui_value(lua:&Lua,start:&Value,end:&Value,amount:f32)->LuaResult<Value>{
+    Ok(match (start,end) {
+        (Value::Number(a),Value::Number(b))=>Value::Number(a+(b-a)*amount as f64),
+        (Value::Integer(a),Value::Integer(b))=>Value::Integer((*a as f64+(*b as f64-*a as f64)*amount as f64).round() as i64),
+        (Value::Table(a),Value::Table(b))=>{let result=lua.create_table();for pair in b.clone().pairs::<Value,Value>(){let(key,end)=pair?;let start=a.raw_get::<Value>(key.clone()).unwrap_or(Value::Nil);result.raw_set(key,interpolate_gui_value(lua,&start,&end,amount)?)?;}Value::Table(result)},
+        _=>if amount>=1.0{end.clone()}else{start.clone()},
+    })
 }
 
 impl GuiPlaySession {
     pub fn new(dom: &WeakDom) -> Result<Self, String> {
         let lua=build_vm().map_err(|error|error.to_string())?;
+        let active_tweens=Rc::new(RefCell::new(Vec::<ActiveGuiTween>::new()));
         let mut instances=std::collections::HashMap::new();
         fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>)->LuaResult<()> {
             let Some(instance)=dom.get_by_ref(referent) else{return Ok(());};
@@ -754,6 +774,22 @@ impl GuiPlaySession {
         }
         if let Some(game)=instances.get(&dom.root_ref()) {
             lua.globals().set("game",game.clone()).map_err(|error|error.to_string())?;
+            let tween_service=make_instance(&lua,"TweenService","TweenService").map_err(|error|error.to_string())?;
+            let tween_queue=active_tweens.clone();
+            tween_service.set("Create",lua.create_function(move |lua,(_service,target,info,goals):(Table,Table,Table,Table)|{
+                let tween=lua.create_table(); let completed=make_signal(lua)?; tween.set("Completed",completed.clone())?;
+                let duration=info.get::<f64>("Time").unwrap_or(1.0).max(0.0) as f32;
+                let queue=tween_queue.clone();
+                tween.set("Play",lua.create_function(move |_,_tween:Table|{
+                    let mut values=Vec::new();
+                    for pair in goals.clone().pairs::<Value,Value>() { let (key,end)=pair?; if let Value::String(key)=key { let key=key.to_str()?;let start=target.raw_get::<Value>(key.as_str()).unwrap_or(Value::Nil);values.push((key,start,end)); } }
+                    queue.borrow_mut().push(ActiveGuiTween{target:target.clone(),goals:values,elapsed:0.0,duration,completed:completed.clone()});Ok(())
+                })?)?;
+                tween.set("Pause",lua.create_function(|_,_tween:Table|Ok(()))?)?;
+                tween.set("Cancel",lua.create_function(|_,_tween:Table|Ok(()))?)?; Ok(tween)
+            }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+            game.raw_set("TweenService",tween_service.clone()).map_err(|error|error.to_string())?;
+            lua.globals().set("TweenService",tween_service).map_err(|error|error.to_string())?;
             let game_table=game.clone();
             game.set("GetService",lua.create_function(move |lua,(_game,name):(Table,String)|{
                 game_table.raw_get::<Value>(&name).or_else(|_|Ok(Value::Table(make_instance(lua,&name,&name)?)))
@@ -770,7 +806,19 @@ impl GuiPlaySession {
         }
         let common=["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
         let synchronized_properties=instances.keys().map(|referent|(*referent,common.iter().map(|name|(*name).to_string()).collect())).collect();
-        Ok(Self{lua,instances,synchronized_properties})
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,last_tick:std::time::Instant::now()})
+    }
+
+    pub fn tick(&mut self)->Result<(),String>{
+        let now=std::time::Instant::now();let delta=(now-self.last_tick).as_secs_f32().min(0.1);self.last_tick=now;
+        let mut completed=Vec::new();
+        {
+            let mut tweens=self.active_tweens.borrow_mut();
+            for tween in tweens.iter_mut(){tween.elapsed+=delta;let amount=if tween.duration<=0.0{1.0}else{(tween.elapsed/tween.duration).clamp(0.0,1.0)};for(key,start,end)in &tween.goals{let value=interpolate_gui_value(&self.lua,start,end,amount).map_err(|error|error.to_string())?;tween.target.raw_set(key.as_str(),value).map_err(|error|error.to_string())?;}if amount>=1.0{completed.push(tween.completed.clone());}}
+            tweens.retain(|tween|tween.elapsed<tween.duration&&tween.duration>0.0);
+        }
+        for signal in completed{let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}
+        Ok(())
     }
 
     pub fn fire(&self,referent:DomRef,event:&str)->Result<(),String>{

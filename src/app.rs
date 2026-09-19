@@ -1165,6 +1165,7 @@ impl EditorApp {
         } else {
             self.gui_hovered.clear(); self.gui_runtime_events.clear(); None
         };
+        if let Some(session)=self.gui_play_session.as_mut() { if let Err(error)=session.tick(){log::error!("GUI tween tick: {error}");} }
         if let Some(session)=self.gui_play_session.as_ref() {
             for event in &self.gui_runtime_events {
                 if event.kind==crate::gui_render::GuiRuntimeEventKind::TextChanged {
