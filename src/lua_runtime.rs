@@ -735,6 +735,8 @@ use rbx_dom_weak::{
 /// Instance tables and connected callbacks remain alive until another place is loaded.
 const GUI_SYNC_PROPERTIES:&[&str]=&["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
 
+struct ScheduledGuiTask { remaining:f32, callback:Function, args:Vec<Value> }
+
 struct ActiveGuiTween {
     target: Table,
     goals: Vec<(String,Value,Value)>,
@@ -750,6 +752,8 @@ pub struct GuiPlaySession {
     active_tweens: Rc<RefCell<Vec<ActiveGuiTween>>>,
     pending_instances: Rc<RefCell<Vec<Table>>>,
     pending_destructions: Rc<RefCell<Vec<Table>>>,
+    scheduled_tasks: Rc<RefCell<Vec<ScheduledGuiTask>>>,
+    run_service: Table,
     last_tick: std::time::Instant,
 }
 
@@ -768,6 +772,7 @@ impl GuiPlaySession {
         let active_tweens=Rc::new(RefCell::new(Vec::<ActiveGuiTween>::new()));
         let pending_instances=Rc::new(RefCell::new(Vec::<Table>::new()));
         let pending_destructions=Rc::new(RefCell::new(Vec::<Table>::new()));
+        let scheduled_tasks=Rc::new(RefCell::new(Vec::<ScheduledGuiTask>::new()));
         let mut instances=std::collections::HashMap::new();
         fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>,destructions:Rc<RefCell<Vec<Table>>>)->LuaResult<()> {
             let Some(instance)=dom.get_by_ref(referent) else{return Ok(());};
@@ -785,8 +790,12 @@ impl GuiPlaySession {
             if let Some(parent)=instances.get(&instance.parent()){table.raw_set("Parent",parent.clone()).map_err(|error|error.to_string())?;}
             for child in instance.children(){if let (Some(child_instance),Some(child_table))=(dom.get_by_ref(*child),instances.get(child)){table.raw_set(child_instance.name.as_str(),child_table.clone()).map_err(|error|error.to_string())?;}}
         }
+        let run_service=make_instance(&lua,"RunService","RunService").map_err(|error|error.to_string())?;
+        for event in ["Heartbeat","RenderStepped","Stepped"] {run_service.raw_set(event,make_signal(&lua).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;}
         if let Some(game)=instances.get(&dom.root_ref()) {
             lua.globals().set("game",game.clone()).map_err(|error|error.to_string())?;
+            game.raw_set("RunService",run_service.clone()).map_err(|error|error.to_string())?;
+            lua.globals().set("RunService",run_service.clone()).map_err(|error|error.to_string())?;
             let tween_service=make_instance(&lua,"TweenService","TweenService").map_err(|error|error.to_string())?;
             let tween_queue=active_tweens.clone();
             tween_service.set("Create",lua.create_function(move |lua,(_service,target,info,goals):(Table,Table,Table,Table)|{
@@ -843,6 +852,16 @@ impl GuiPlaySession {
             creation_queue.borrow_mut().push(table.clone()); Ok(table)
         }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
         lua.globals().set("Instance",runtime_instance).map_err(|error|error.to_string())?;
+        let task=lua.create_table().map_err(|error|error.to_string())?;
+        let defer_queue=scheduled_tasks.clone();
+        task.set("defer",lua.create_function(move |_,(callback,args):(Function,Variadic<Value>)|{defer_queue.borrow_mut().push(ScheduledGuiTask{remaining:0.0,callback,args:args.into_iter().collect()});Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        let spawn_queue=scheduled_tasks.clone();
+        task.set("spawn",lua.create_function(move |_,(callback,args):(Function,Variadic<Value>)|{spawn_queue.borrow_mut().push(ScheduledGuiTask{remaining:0.0,callback,args:args.into_iter().collect()});Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        let delay_queue=scheduled_tasks.clone();
+        task.set("delay",lua.create_function(move |_,(duration,callback,args):(f64,Function,Variadic<Value>)|{delay_queue.borrow_mut().push(ScheduledGuiTask{remaining:duration.max(0.0)as f32,callback,args:args.into_iter().collect()});Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        task.set("wait",lua.create_function(|_,duration:Option<f64>|Ok(duration.unwrap_or(0.0))).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        task.set("cancel",lua.create_function(|_,_:Value|Ok(())).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        lua.globals().set("task",task).map_err(|error|error.to_string())?;
 
         // Execute LocalScripts once. Their signal connections remain retained by
         // these Instance tables and are fired from viewport events every frame.
@@ -854,11 +873,14 @@ impl GuiPlaySession {
             if let Err(error)=lua.load(source).set_name(instance.name.as_str()).exec(){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}
         }
         let synchronized_properties=instances.keys().map(|referent|(*referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect())).collect();
-        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,last_tick:std::time::Instant::now()})
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduled_tasks,run_service,last_tick:std::time::Instant::now()})
     }
 
     pub fn tick(&mut self)->Result<(),String>{
         let now=std::time::Instant::now();let delta=(now-self.last_tick).as_secs_f32().min(0.1);self.last_tick=now;
+        for event in ["RenderStepped","Stepped","Heartbeat"] {if let Ok(signal)=self.run_service.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,delta as f64)).map_err(|error|error.to_string())?;}}
+        let ready={let mut tasks=self.scheduled_tasks.borrow_mut();for task in tasks.iter_mut(){task.remaining-=delta;}let mut ready=Vec::new();let mut index=0;while index<tasks.len(){if tasks[index].remaining<=0.0{ready.push(tasks.remove(index));}else{index+=1;}}ready};
+        for task in ready{task.callback.call::<()>(MultiValue::from_vec(task.args)).map_err(|error|error.to_string())?;}
         let mut completed=Vec::new();
         {
             let mut tweens=self.active_tweens.borrow_mut();
