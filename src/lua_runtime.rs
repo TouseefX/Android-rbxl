@@ -742,6 +742,11 @@ struct ActiveGuiTween {
     goals: Vec<(String,Value,Value)>,
     elapsed: f32,
     duration: f32,
+    repeat_count: i32,
+    reverses: bool,
+    easing_style: String,
+    easing_direction: String,
+    control: Rc<Cell<u8>>, // 0 running, 1 paused, 2 cancelled
     completed: Table,
 }
 
@@ -756,6 +761,11 @@ pub struct GuiPlaySession {
     run_service: Table,
     user_input_service: Table,
     last_tick: std::time::Instant,
+}
+
+fn ease_gui_tween(amount:f32,style:&str,direction:&str)->f32 {
+    let curve=|value:f32|match style {"Quad"=>value*value,"Cubic"=>value*value*value,"Quart"=>value.powi(4),"Quint"=>value.powi(5),"Sine"=>1.0-(value*std::f32::consts::FRAC_PI_2).cos(),"Exponential"=>if value<=0.0{0.0}else{2.0f32.powf(10.0*(value-1.0))},"Circular"=>1.0-(1.0-value*value).max(0.0).sqrt(),_=>value};
+    match direction {"In"=>curve(amount),"InOut"=>if amount<0.5{curve(amount*2.0)*0.5}else{1.0-curve((1.0-amount)*2.0)*0.5},_=>1.0-curve(1.0-amount)}
 }
 
 fn interpolate_gui_value(lua:&Lua,start:&Value,end:&Value,amount:f32)->LuaResult<Value>{
@@ -809,14 +819,21 @@ impl GuiPlaySession {
             tween_service.set("Create",lua.create_function(move |lua,(_service,target,info,goals):(Table,Table,Table,Table)|{
                 let tween=lua.create_table(); let completed=make_signal(lua)?; tween.set("Completed",completed.clone())?;
                 let duration=info.get::<f64>("Time").unwrap_or(1.0).max(0.0) as f32;
-                let queue=tween_queue.clone();
+                let delay=info.get::<f64>("DelayTime").unwrap_or(0.0).max(0.0) as f32;
+                let repeat_count=info.get::<i64>("RepeatCount").unwrap_or(0) as i32;
+                let reverses=info.get::<bool>("Reverses").unwrap_or(false);
+                let enum_name=|key:&str,fallback:&str|info.get::<Table>(key).ok().and_then(|value|value.get::<String>("Name").ok()).unwrap_or_else(||fallback.to_string());
+                let easing_style=enum_name("EasingStyle","Linear");let easing_direction=enum_name("EasingDirection","Out");
+                let control=Rc::new(Cell::new(0u8));let started=Rc::new(Cell::new(false));
+                let queue=tween_queue.clone();let play_control=control.clone();let play_started=started.clone();
                 tween.set("Play",lua.create_function(move |_,_tween:Table|{
-                    let mut values=Vec::new();
+                    if play_started.replace(true){play_control.set(0);return Ok(());}
+                    play_control.set(0);let mut values=Vec::new();
                     for pair in goals.clone().pairs::<Value,Value>() { let (key,end)=pair?; if let Value::String(key)=key { let key=key.to_str()?;let start=target.raw_get::<Value>(key.as_str()).unwrap_or(Value::Nil);values.push((key,start,end)); } }
-                    queue.borrow_mut().push(ActiveGuiTween{target:target.clone(),goals:values,elapsed:0.0,duration,completed:completed.clone()});Ok(())
+                    queue.borrow_mut().push(ActiveGuiTween{target:target.clone(),goals:values,elapsed:-delay,duration,repeat_count,reverses,easing_style:easing_style.clone(),easing_direction:easing_direction.clone(),control:play_control.clone(),completed:completed.clone()});Ok(())
                 })?)?;
-                tween.set("Pause",lua.create_function(|_,_tween:Table|Ok(()))?)?;
-                tween.set("Cancel",lua.create_function(|_,_tween:Table|Ok(()))?)?; Ok(tween)
+                let pause_control=control.clone();tween.set("Pause",lua.create_function(move |_,_tween:Table|{pause_control.set(1);Ok(())})?)?;
+                let cancel_control=control;tween.set("Cancel",lua.create_function(move |_,_tween:Table|{cancel_control.set(2);Ok(())})?)?; Ok(tween)
             }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
             game.raw_set("TweenService",tween_service.clone()).map_err(|error|error.to_string())?;
             lua.globals().set("TweenService",tween_service).map_err(|error|error.to_string())?;
@@ -892,8 +909,20 @@ impl GuiPlaySession {
         let mut completed=Vec::new();
         {
             let mut tweens=self.active_tweens.borrow_mut();
-            for tween in tweens.iter_mut(){tween.elapsed+=delta;let amount=if tween.duration<=0.0{1.0}else{(tween.elapsed/tween.duration).clamp(0.0,1.0)};for(key,start,end)in &tween.goals{let value=interpolate_gui_value(&self.lua,start,end,amount).map_err(|error|error.to_string())?;tween.target.raw_set(key.as_str(),value).map_err(|error|error.to_string())?;}if amount>=1.0{completed.push(tween.completed.clone());}}
-            tweens.retain(|tween|tween.elapsed<tween.duration&&tween.duration>0.0);
+            for tween in tweens.iter_mut(){
+                if tween.control.get()!=0{continue;}tween.elapsed+=delta;if tween.elapsed<0.0{continue;}
+                let iteration_duration=tween.duration.max(0.0001)*if tween.reverses{2.0}else{1.0};
+                let total_duration=if tween.repeat_count<0{f32::INFINITY}else{iteration_duration*(tween.repeat_count+1)as f32};
+                let finished=tween.elapsed>=total_duration;
+                let within=tween.elapsed%iteration_duration;
+                let mut linear=if tween.duration<=0.0{1.0}else{(within/tween.duration).clamp(0.0,1.0)};
+                if tween.reverses&&within>=tween.duration{linear=1.0-((within-tween.duration)/tween.duration.max(0.0001)).clamp(0.0,1.0);}
+                if finished{linear=if tween.reverses{0.0}else{1.0};}
+                let amount=ease_gui_tween(linear,&tween.easing_style,&tween.easing_direction);
+                for(key,start,end)in &tween.goals{let value=interpolate_gui_value(&self.lua,start,end,amount).map_err(|error|error.to_string())?;tween.target.raw_set(key.as_str(),value).map_err(|error|error.to_string())?;}
+                if finished{completed.push(tween.completed.clone());tween.control.set(2);}
+            }
+            tweens.retain(|tween|tween.control.get()!=2);
         }
         for signal in completed{let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}
         Ok(())
