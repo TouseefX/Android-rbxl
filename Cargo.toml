@@ -109,7 +109,9 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 debug = false
-panic = "abort"
+# Command-bar Luau runs are isolated with catch_unwind so a malformed script or
+# VM edge case reports an editor error instead of terminating the Android app.
+panic = "unwind"
 
 # Keep dependency crate sizes down too.
 [profile.release.package."*"]

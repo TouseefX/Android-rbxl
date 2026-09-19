@@ -772,6 +772,15 @@ thread_local! {
 /// property get/set, `:Clone()`, `:Destroy()`, `:FindFirstChild()`, and
 /// `:GetChildren()`.
 pub fn run_command(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Result<CommandOutcome, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(||run_command_inner(dom_rc,source,name)))
+        .unwrap_or_else(|panic| {
+            let detail=panic.downcast_ref::<&str>().map(|value|(*value).to_string())
+                .or_else(||panic.downcast_ref::<String>().cloned()).unwrap_or_else(||"unknown VM panic".into());
+            Err(format!("Luau command recovered from an internal error: {detail}"))
+        })
+}
+
+fn run_command_inner(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Result<CommandOutcome, String> {
     LOG.with(|c| c.borrow_mut().clear());
     COMMAND_OUTCOME.with(|c| *c.borrow_mut() = CommandOutcome::default());
 
@@ -1067,33 +1076,24 @@ fn make_instance_metatable(
                 return Ok(Value::Table(signal));
             }
             let Some(r) = table_to_ref(&this)? else { return Ok(Value::Nil) };
-            let d = dom.borrow();
-            let Some(inst) = d.get_by_ref(r) else { return Ok(Value::Nil) };
-            let v = match key.as_str() {
-                "Name" => Value::String(lua.create_string(&inst.name)),
-                "ClassName" => Value::String(lua.create_string(&inst.class)),
-                "Parent" => {
-                    let p = inst.parent();
-                    if p.is_none() { Value::Nil } else {
-                        Value::Table(ref_to_table(lua, dom.clone(), cache.clone(), mt_handle.borrow().as_ref().unwrap().clone(), p)?)
-                    }
-                },
-                _ => {
-                    if let Some(prop) = inst.properties.get(&rbx_dom_weak::Ustr::from(key.as_str())) {
-                        variant_to_value(lua, prop)?
-                    } else {
-                        let mut found = None;
-                        for &c in inst.children() {
-                            if d.get_by_ref(c).is_some_and(|i| i.name == key) { found = Some(c); break; }
-                        }
-                        match found {
-                            Some(c) => Value::Table(ref_to_table(lua, dom.clone(), cache.clone(), mt_handle.borrow().as_ref().unwrap().clone(), c)?),
-                            None => Value::Nil,
-                        }
-                    }
+            enum Resolved { Text(String), Property(DomVariant), Instance(DomRef), Nil }
+            let resolved={
+                let d=dom.borrow();
+                let Some(inst)=d.get_by_ref(r) else{return Ok(Value::Nil);};
+                match key.as_str(){
+                    "Name"=>Resolved::Text(inst.name.clone()),
+                    "ClassName"=>Resolved::Text(inst.class.to_string()),
+                    "Parent"=>if inst.parent().is_none(){Resolved::Nil}else{Resolved::Instance(inst.parent())},
+                    _=>if let Some(property)=inst.properties.get(&rbx_dom_weak::Ustr::from(key.as_str())){Resolved::Property(property.clone())}
+                        else{inst.children().iter().copied().find(|child|d.get_by_ref(*child).is_some_and(|instance|instance.name==key)).map(Resolved::Instance).unwrap_or(Resolved::Nil)},
                 }
             };
-            Ok(v)
+            Ok(match resolved {
+                Resolved::Text(value)=>Value::String(lua.create_string(&value)),
+                Resolved::Property(value)=>variant_to_value(lua,&value)?,
+                Resolved::Instance(value)=>Value::Table(ref_to_table(lua,dom.clone(),cache.clone(),mt_handle.borrow().as_ref().unwrap().clone(),value)?),
+                Resolved::Nil=>Value::Nil,
+            })
         })?
     };
     mt.set("__index", index)?;
