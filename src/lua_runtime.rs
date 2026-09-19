@@ -572,9 +572,13 @@ fn make_signal(lua: &Lua) -> LuaResult<Table> {
         Ok(connection)
     })?)?;
     let fired=callbacks;
-    signal.set("Fire",lua.create_function(move |_,(_signal,args):(Table,Variadic<Value>)|{
+    signal.set("Fire",lua.create_function(move |lua,(_signal,args):(Table,Variadic<Value>)|{
         let callbacks=fired.borrow().clone();
-        for (callback,once,active) in callbacks{if active.get(){callback.call::<()>(args.clone())?;if once{active.set(false);}}}
+        for (callback,once,active) in callbacks{if active.get(){
+            if lua.globals().get::<Function>("_arena_step_tasks").is_ok() {let task:Table=lua.globals().get("task")?;let spawn:Function=task.get("spawn")?;let mut values=vec![Value::Function(callback.clone())];values.extend(args.clone());spawn.call::<()>(MultiValue::from_vec(values))?;}
+            else{callback.call::<()>(args.clone())?;}
+            if once{active.set(false);}
+        }}
         fired.borrow_mut().retain(|(_,once,active)|active.get()&&!*once); Ok(())
     })?)?;
     signal.set("Wait",lua.create_function(|_,_signal:Table|Ok(Variadic::<Value>::new()))?)?;
@@ -735,8 +739,6 @@ use rbx_dom_weak::{
 /// Instance tables and connected callbacks remain alive until another place is loaded.
 const GUI_SYNC_PROPERTIES:&[&str]=&["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
 
-struct ScheduledGuiTask { remaining:f32, callback:Function, args:Vec<Value> }
-
 struct ActiveGuiTween {
     target: Table,
     goals: Vec<(String,Value,Value)>,
@@ -757,7 +759,7 @@ pub struct GuiPlaySession {
     active_tweens: Rc<RefCell<Vec<ActiveGuiTween>>>,
     pending_instances: Rc<RefCell<Vec<Table>>>,
     pending_destructions: Rc<RefCell<Vec<Table>>>,
-    scheduled_tasks: Rc<RefCell<Vec<ScheduledGuiTask>>>,
+    scheduler_step: Function,
     run_service: Table,
     user_input_service: Table,
     respawn_requested: Rc<Cell<bool>>,
@@ -785,7 +787,6 @@ impl GuiPlaySession {
         let active_tweens=Rc::new(RefCell::new(Vec::<ActiveGuiTween>::new()));
         let pending_instances=Rc::new(RefCell::new(Vec::<Table>::new()));
         let pending_destructions=Rc::new(RefCell::new(Vec::<Table>::new()));
-        let scheduled_tasks=Rc::new(RefCell::new(Vec::<ScheduledGuiTask>::new()));
         let respawn_requested=Rc::new(Cell::new(false));
         let mut instances=std::collections::HashMap::new();
         fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>,destructions:Rc<RefCell<Vec<Table>>>)->LuaResult<()> {
@@ -882,16 +883,38 @@ impl GuiPlaySession {
             creation_queue.borrow_mut().push(table.clone()); Ok(table)
         }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
         lua.globals().set("Instance",runtime_instance).map_err(|error|error.to_string())?;
-        let task=lua.create_table().map_err(|error|error.to_string())?;
-        let defer_queue=scheduled_tasks.clone();
-        task.set("defer",lua.create_function(move |_,(callback,args):(Function,Variadic<Value>)|{defer_queue.borrow_mut().push(ScheduledGuiTask{remaining:0.0,callback,args:args.into_iter().collect()});Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
-        let spawn_queue=scheduled_tasks.clone();
-        task.set("spawn",lua.create_function(move |_,(callback,args):(Function,Variadic<Value>)|{spawn_queue.borrow_mut().push(ScheduledGuiTask{remaining:0.0,callback,args:args.into_iter().collect()});Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
-        let delay_queue=scheduled_tasks.clone();
-        task.set("delay",lua.create_function(move |_,(duration,callback,args):(f64,Function,Variadic<Value>)|{delay_queue.borrow_mut().push(ScheduledGuiTask{remaining:duration.max(0.0)as f32,callback,args:args.into_iter().collect()});Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
-        task.set("wait",lua.create_function(|_,duration:Option<f64>|Ok(duration.unwrap_or(0.0))).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
-        task.set("cancel",lua.create_function(|_,_:Value|Ok(())).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
-        lua.globals().set("task",task).map_err(|error|error.to_string())?;
+        lua.load(r#"
+            local waiting = {}
+            local function schedule(thread, delay, args, started)
+                table.insert(waiting, {thread=thread, remaining=math.max(tonumber(delay) or 0, 0), waited=math.max(tonumber(delay) or 0, 0), args=args, started=started or false})
+                return thread
+            end
+            local function resumeTask(record)
+                if record.cancelled then return end
+                local ok, delay
+                if record.started then ok, delay = coroutine.resume(record.thread, record.waited)
+                else record.started=true; ok, delay = coroutine.resume(record.thread, table.unpack(record.args, 1, record.args.n)) end
+                if not ok then warn(delay); return end
+                if coroutine.status(record.thread) ~= "dead" then schedule(record.thread, delay, table.pack(), true) end
+            end
+            task = {}
+            function task.spawn(callback, ...)
+                local record={thread=coroutine.create(callback),remaining=0,waited=0,args=table.pack(...),started=false}
+                resumeTask(record); return record.thread
+            end
+            function task.defer(callback, ...) return schedule(coroutine.create(callback), 0, table.pack(...)) end
+            function task.delay(duration, callback, ...) return schedule(coroutine.create(callback), duration, table.pack(...)) end
+            function task.wait(duration) return coroutine.yield(math.max(tonumber(duration) or 0, 0)) end
+            function task.cancel(thread) for _,record in ipairs(waiting) do if record.thread==thread then record.cancelled=true end end end
+            function _arena_step_tasks(delta)
+                for index=#waiting,1,-1 do
+                    local record=waiting[index]; record.remaining-=delta
+                    if record.cancelled then table.remove(waiting,index)
+                    elseif record.remaining<=0 then table.remove(waiting,index); resumeTask(record) end
+                end
+            end
+        "#).exec().map_err(|error|error.to_string())?;
+        let scheduler_step:Function=lua.globals().get("_arena_step_tasks").map_err(|error|error.to_string())?;
 
         // Execute LocalScripts once. Their signal connections remain retained by
         // these Instance tables and are fired from viewport events every frame.
@@ -906,7 +929,7 @@ impl GuiPlaySession {
         let mut respawn_properties=std::collections::HashMap::new();
         fn snapshot_tree(dom:&WeakDom,referent:DomRef,out:&mut std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>){if let Some(instance)=dom.get_by_ref(referent){out.insert(referent,instance.properties.iter().map(|(key,value)|(key.clone(),value.clone())).collect());for child in instance.children(){snapshot_tree(dom,*child,out);}}}
         if let Some(starter)=dom.root().children().iter().find_map(|referent|dom.get_by_ref(*referent).filter(|instance|instance.class=="StarterGui")) {for child in starter.children(){if dom.get_by_ref(*child).is_some_and(|instance|instance.class=="ScreenGui"&&instance.properties.get(&rbx_dom_weak::ustr("ResetOnSpawn")).map(|value|!matches!(value,DomVariant::Bool(false))).unwrap_or(true)){snapshot_tree(dom,*child,&mut respawn_properties);}}}
-        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduled_tasks,run_service,user_input_service,respawn_requested,respawn_properties,last_tick:std::time::Instant::now()})
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduler_step,run_service,user_input_service,respawn_requested,respawn_properties,last_tick:std::time::Instant::now()})
     }
 
     pub fn take_respawn_request(&self)->bool{self.respawn_requested.replace(false)}
@@ -920,8 +943,7 @@ impl GuiPlaySession {
     pub fn tick(&mut self)->Result<(),String>{
         let now=std::time::Instant::now();let delta=(now-self.last_tick).as_secs_f32().min(0.1);self.last_tick=now;
         for event in ["RenderStepped","Stepped","Heartbeat"] {if let Ok(signal)=self.run_service.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,delta as f64)).map_err(|error|error.to_string())?;}}
-        let ready={let mut tasks=self.scheduled_tasks.borrow_mut();for task in tasks.iter_mut(){task.remaining-=delta;}let mut ready=Vec::new();let mut index=0;while index<tasks.len(){if tasks[index].remaining<=0.0{ready.push(tasks.remove(index));}else{index+=1;}}ready};
-        for task in ready{task.callback.call::<()>(MultiValue::from_vec(task.args)).map_err(|error|error.to_string())?;}
+        self.scheduler_step.call::<()>(delta as f64).map_err(|error|error.to_string())?;
         let mut completed=Vec::new();
         {
             let mut tweens=self.active_tweens.borrow_mut();
