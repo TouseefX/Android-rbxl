@@ -24,7 +24,7 @@
 use luaur::{
     Error as LuaError, Function, Lua, MultiValue, Result as LuaResult, Table, Value, Variadic,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// Result of running a script: captured output + success flag.
 #[derive(Debug, Clone)]
@@ -556,26 +556,26 @@ fn install_enum(lua: &Lua) -> LuaResult<()> {
 
 fn make_signal(lua: &Lua) -> LuaResult<Table> {
     let signal=lua.create_table();
-    let callbacks: Rc<RefCell<Vec<(Function,bool)>>> = Rc::new(RefCell::new(Vec::new()));
+    let callbacks: Rc<RefCell<Vec<(Function,bool,Rc<Cell<bool>>)>>>=Rc::new(RefCell::new(Vec::new()));
     let connected=callbacks.clone();
     signal.set("Connect",lua.create_function(move |lua,(_signal,callback):(Table,Function)|{
-        connected.borrow_mut().push((callback,false));
+        let active=Rc::new(Cell::new(true)); connected.borrow_mut().push((callback,false,active.clone()));
         let connection=lua.create_table(); connection.set("Connected",true)?;
-        connection.set("Disconnect",lua.create_function(|_,_connection:Table|Ok(()))?)?;
+        connection.set("Disconnect",lua.create_function(move |_,connection:Table|{active.set(false);connection.set("Connected",false)} )?)?;
         Ok(connection)
     })?)?;
     let once_callbacks=callbacks.clone();
     signal.set("Once",lua.create_function(move |lua,(_signal,callback):(Table,Function)|{
-        once_callbacks.borrow_mut().push((callback,true));
+        let active=Rc::new(Cell::new(true)); once_callbacks.borrow_mut().push((callback,true,active.clone()));
         let connection=lua.create_table(); connection.set("Connected",true)?;
-        connection.set("Disconnect",lua.create_function(|_,_connection:Table|Ok(()))?)?;
+        connection.set("Disconnect",lua.create_function(move |_,connection:Table|{active.set(false);connection.set("Connected",false)} )?)?;
         Ok(connection)
     })?)?;
     let fired=callbacks;
     signal.set("Fire",lua.create_function(move |_,(_signal,args):(Table,Variadic<Value>)|{
         let callbacks=fired.borrow().clone();
-        for (callback,_) in callbacks{callback.call::<()>(args.clone())?;}
-        fired.borrow_mut().retain(|(_,once)|!*once); Ok(())
+        for (callback,once,active) in callbacks{if active.get(){callback.call::<()>(args.clone())?;if once{active.set(false);}}}
+        fired.borrow_mut().retain(|(_,once,active)|active.get()&&!*once); Ok(())
     })?)?;
     signal.set("Wait",lua.create_function(|_,_signal:Table|Ok(Variadic::<Value>::new()))?)?;
     Ok(signal)
