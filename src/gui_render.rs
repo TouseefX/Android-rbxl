@@ -2081,7 +2081,12 @@ pub fn draw_starter_gui(
         let pointer_inside = ui.input(|input| input.pointer.hover_pos()).map(|point| {
             let affine_point=node.surface_warp.map(|warp| inverse_surface_point(point,warp)).unwrap_or(point);
             let local = rotate_point(affine_point, node.rect.center(), -node.rotation.to_radians());
-            node.rect.contains(local) && node.clip.contains(point)
+            let own_shape=node.rect.contains(local)&&rounded_coverage(local,node.rect,node.corner_radius)>0.0;
+            let inherited_shape=node.rounded_clips.iter().all(|mask|{
+                let local=rotate_point(point,mask.rect.center(),-mask.rotation.to_radians());
+                rounded_coverage(local,mask.rect,mask.radius)>0.0
+            });
+            own_shape && inherited_shape && node.clip.contains(point)
         }).unwrap_or(false);
         if pointer_inside && node.interactable { current_hovered.insert(node.referent); }
         let is_button=matches!(node.class.as_str(),"TextButton"|"ImageButton");
@@ -2294,8 +2299,14 @@ pub fn draw_starter_gui(
             paint_galley(&painter, pos, final_galley, text_color, false, render_rotation, node.rect.center());
         }
         if selected == Some(node.referent) {
-            painter.rect_stroke(node.rect, 0.0, Stroke::new(2.0, Color32::from_rgb(0, 162, 255)), egui::StrokeKind::Outside);
-            for corner in [node.rect.left_top(), node.rect.right_top(), node.rect.left_bottom(), node.rect.right_bottom()] {
+            let transform_corner=|corner:Pos2|{
+                let rotated=rotate_point(corner,node.rect.center(),node.rotation.to_radians());
+                node.surface_warp.map(|warp|warp_surface_point(rotated,warp)).unwrap_or(rotated)
+            };
+            let corners=[transform_corner(node.rect.left_top()),transform_corner(node.rect.right_top()),
+                transform_corner(node.rect.right_bottom()),transform_corner(node.rect.left_bottom())];
+            painter.line(vec![corners[0],corners[1],corners[2],corners[3],corners[0]],Stroke::new(2.0,Color32::from_rgb(0,162,255)));
+            for corner in corners {
                 painter.rect_filled(Rect::from_center_size(corner, Vec2::splat(6.0)), 0.0, Color32::WHITE);
                 painter.rect_stroke(Rect::from_center_size(corner, Vec2::splat(6.0)), 0.0,
                     Stroke::new(1.0, Color32::from_rgb(0, 110, 220)), egui::StrokeKind::Inside);
