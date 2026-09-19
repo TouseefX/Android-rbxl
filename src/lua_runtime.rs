@@ -908,11 +908,18 @@ impl GuiPlaySession {
             function task.wait(duration) return coroutine.yield(math.max(tonumber(duration) or 0, 0)) end
             function task.cancel(thread) for _,record in ipairs(waiting) do if record.thread==thread then record.cancelled=true end end end
             function _arena_step_tasks(delta)
-                for index=#waiting,1,-1 do
-                    local record=waiting[index]; record.remaining-=delta; record.elapsed+=delta
-                    if record.cancelled then table.remove(waiting,index)
-                    elseif record.remaining<=0 then table.remove(waiting,index); resumeTask(record) end
+                local ready = {}
+                local remove = {}
+                for index, record in ipairs(waiting) do
+                    record.remaining -= delta
+                    record.elapsed += delta
+                    if record.cancelled then table.insert(remove, index)
+                    elseif record.remaining <= 0 then table.insert(remove, index); table.insert(ready, record) end
                 end
+                for index=#remove,1,-1 do table.remove(waiting, remove[index]) end
+                -- Resume in insertion order. New waits created by these
+                -- callbacks remain queued until the next scheduler step.
+                for _, record in ipairs(ready) do resumeTask(record) end
             end
             function _arena_resume_task(thread, ...)
                 task.cancel(thread)
@@ -941,8 +948,13 @@ impl GuiPlaySession {
             let Some(instance)=dom.get_by_ref(*referent) else{continue;};
             if instance.class!="LocalScript"{continue;}
             let Some(DomVariant::String(source))=instance.properties.get(&rbx_dom_weak::ustr("Source")) else{continue;};
-            lua.globals().set("script",table.clone()).map_err(|error|error.to_string())?;
-            match lua.load(source).set_name(instance.name.as_str()).into_function() {
+            let environment=lua.create_table().map_err(|error|error.to_string())?;
+            environment.raw_set("script",table.clone()).map_err(|error|error.to_string())?;
+            environment.raw_set("_G",lua.globals()).map_err(|error|error.to_string())?;
+            let metatable=lua.create_table().map_err(|error|error.to_string())?;
+            metatable.raw_set("__index",lua.globals()).map_err(|error|error.to_string())?;
+            environment.set_metatable(Some(metatable)).map_err(|error|error.to_string())?;
+            match lua.load(source).set_name(instance.name.as_str()).set_environment(environment).into_function() {
                 Ok(function)=>{let task:Table=lua.globals().get("task").map_err(|error|error.to_string())?;let spawn:Function=task.get("spawn").map_err(|error|error.to_string())?;if let Err(error)=spawn.call::<()>(function){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}},
                 Err(error)=>with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)})),
             }
