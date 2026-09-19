@@ -207,6 +207,7 @@ pub struct EditorApp {
     /// Retained pointer state and events for the persistent GUI play-session bridge.
     gui_hovered: std::collections::HashSet<Ref>,
     gui_runtime_events: Vec<crate::gui_render::GuiRuntimeEvent>,
+    gui_play_session: Option<crate::lua_runtime::GuiPlaySession>,
     rename_buffer: String,
     project_name: String,
     show_quick_open: bool,
@@ -387,6 +388,7 @@ impl Default for EditorApp {
             gui_text_inputs: HashMap::new(),
             gui_hovered: std::collections::HashSet::new(),
             gui_runtime_events: Vec::new(),
+            gui_play_session: None,
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
             show_quick_open: false,
@@ -490,6 +492,10 @@ impl EditorApp {
         self.place_format = rbxl::PlaceFormat::detect(&bytes);
         match rbxl::load_place(bytes) {
             Ok(dom) => {
+                self.gui_play_session = match lua_runtime::GuiPlaySession::new(&dom) {
+                    Ok(session)=>Some(session),
+                    Err(error)=>{log::error!("GUI play session: {error}");None}
+                };
                 self.dom = Some(dom);
                 self.selected = None;
                 self.gui_textures.clear();
@@ -1159,6 +1165,21 @@ impl EditorApp {
         } else {
             self.gui_hovered.clear(); self.gui_runtime_events.clear(); None
         };
+        if let Some(session)=self.gui_play_session.as_ref() {
+            for event in &self.gui_runtime_events {
+                let name=match event.kind {
+                    crate::gui_render::GuiRuntimeEventKind::MouseEnter=>"MouseEnter",
+                    crate::gui_render::GuiRuntimeEventKind::MouseLeave=>"MouseLeave",
+                    crate::gui_render::GuiRuntimeEventKind::MouseButton1Down=>"MouseButton1Down",
+                    crate::gui_render::GuiRuntimeEventKind::MouseButton1Up=>"MouseButton1Up",
+                    crate::gui_render::GuiRuntimeEventKind::MouseButton1Click=>"MouseButton1Click",
+                    crate::gui_render::GuiRuntimeEventKind::Activated=>"Activated",
+                };
+                if let Err(error)=session.fire(event.referent,name){log::error!("GUI event {name}: {error}");}
+            }
+        }
+        let play_output=self.gui_play_session.as_ref().map(|session|session.drain_output()).unwrap_or_default();
+        for line in play_output { match line.level { lua_runtime::Level::Error=>self.log_error(line.text), _=>self.log_info(line.text) } }
         if let Some(clicked) = clicked_gui {
             self.selected = Some(clicked);
             self.status = "Selected GUI object from viewport".into();

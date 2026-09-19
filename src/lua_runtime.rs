@@ -726,6 +726,60 @@ use rbx_dom_weak::{
     InstanceBuilder, WeakDom,
 };
 
+
+/// Persistent, frame-to-frame Luau state used by the GUI preview play session.
+/// Instance tables and connected callbacks remain alive until another place is loaded.
+pub struct GuiPlaySession {
+    lua: Lua,
+    instances: std::collections::HashMap<DomRef, Table>,
+}
+
+impl GuiPlaySession {
+    pub fn new(dom: &WeakDom) -> Result<Self, String> {
+        let lua=build_vm().map_err(|error|error.to_string())?;
+        let mut instances=std::collections::HashMap::new();
+        fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>)->LuaResult<()> {
+            let Some(instance)=dom.get_by_ref(referent) else{return Ok(());};
+            let table=make_instance(lua,&instance.class,&instance.name)?;
+            for (key,value) in &instance.properties { if let Ok(value)=variant_to_value(lua,value){table.raw_set(key.as_str(),value)?;} }
+            instances.insert(referent,table);
+            for child in instance.children(){create(lua,dom,*child,instances)?;} Ok(())
+        }
+        create(&lua,dom,dom.root_ref(),&mut instances).map_err(|error|error.to_string())?;
+        for (referent,table) in &instances {
+            let Some(instance)=dom.get_by_ref(*referent) else{continue;};
+            if let Some(parent)=instances.get(&instance.parent()){table.raw_set("Parent",parent.clone()).map_err(|error|error.to_string())?;}
+            for child in instance.children(){if let (Some(child_instance),Some(child_table))=(dom.get_by_ref(*child),instances.get(child)){table.raw_set(child_instance.name.as_str(),child_table.clone()).map_err(|error|error.to_string())?;}}
+        }
+        if let Some(game)=instances.get(&dom.root_ref()) {
+            lua.globals().set("game",game.clone()).map_err(|error|error.to_string())?;
+            let game_table=game.clone();
+            game.set("GetService",lua.create_function(move |lua,(_game,name):(Table,String)|{
+                game_table.raw_get::<Value>(&name).or_else(|_|Ok(Value::Table(make_instance(lua,&name,&name)?)))
+            }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        }
+        // Execute LocalScripts once. Their signal connections remain retained by
+        // these Instance tables and are fired from viewport events every frame.
+        for (referent,table) in &instances {
+            let Some(instance)=dom.get_by_ref(*referent) else{continue;};
+            if instance.class!="LocalScript"{continue;}
+            let Some(DomVariant::String(source))=instance.properties.get(&rbx_dom_weak::ustr("Source")) else{continue;};
+            lua.globals().set("script",table.clone()).map_err(|error|error.to_string())?;
+            if let Err(error)=lua.load(source).set_name(instance.name.as_str()).exec(){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}
+        }
+        Ok(Self{lua,instances})
+    }
+
+    pub fn fire(&self,referent:DomRef,event:&str)->Result<(),String>{
+        let Some(instance)=self.instances.get(&referent) else{return Ok(());};
+        let Ok(signal)=instance.raw_get::<Table>(event) else{return Ok(());};
+        let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;
+        fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())
+    }
+
+    pub fn drain_output(&self)->Vec<OutputLine>{let _=&self.lua;take_log()}
+}
+
 /// Summary returned by the command bar so the editor can refresh explorer/3D.
 #[derive(Debug, Clone, Default)]
 pub struct CommandOutcome {
