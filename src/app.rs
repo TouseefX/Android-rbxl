@@ -1167,6 +1167,10 @@ impl EditorApp {
         };
         if let Some(session)=self.gui_play_session.as_ref() {
             for event in &self.gui_runtime_events {
+                if event.kind==crate::gui_render::GuiRuntimeEventKind::TextChanged {
+                    if let Some(text)=self.gui_text_inputs.get(&event.referent) { if let Err(error)=session.set_text(event.referent,text){log::error!("TextBox runtime update: {error}");} }
+                    continue;
+                }
                 let name=match event.kind {
                     crate::gui_render::GuiRuntimeEventKind::MouseEnter=>"MouseEnter",
                     crate::gui_render::GuiRuntimeEventKind::MouseLeave=>"MouseLeave",
@@ -1174,6 +1178,9 @@ impl EditorApp {
                     crate::gui_render::GuiRuntimeEventKind::MouseButton1Up=>"MouseButton1Up",
                     crate::gui_render::GuiRuntimeEventKind::MouseButton1Click=>"MouseButton1Click",
                     crate::gui_render::GuiRuntimeEventKind::Activated=>"Activated",
+                    crate::gui_render::GuiRuntimeEventKind::Focused=>"Focused",
+                    crate::gui_render::GuiRuntimeEventKind::FocusLost=>"FocusLost",
+                    crate::gui_render::GuiRuntimeEventKind::TextChanged=>unreachable!(),
                 };
                 if let Err(error)=session.fire(event.referent,name){log::error!("GUI event {name}: {error}");}
             }

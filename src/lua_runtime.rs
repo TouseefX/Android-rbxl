@@ -780,6 +780,14 @@ impl GuiPlaySession {
         fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())
     }
 
+    pub fn set_text(&self,referent:DomRef,text:&str)->Result<(),String>{
+        let Some(instance)=self.instances.get(&referent) else{return Ok(());};
+        instance.raw_set("Text",text).map_err(|error|error.to_string())?;
+        if let Ok(signal)=instance.raw_get::<Table>("Changed") { let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,"Text")).map_err(|error|error.to_string())?; }
+        if let Ok(signal)=instance.raw_get::<Table>("_property_signal_Text") { let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,)).map_err(|error|error.to_string())?; }
+        Ok(())
+    }
+
     pub fn synchronize_to_dom(&self,dom:&mut WeakDom)->Result<usize,String>{
         let mut updates=Vec::new();
         for (referent,names) in &self.synchronized_properties {

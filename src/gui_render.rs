@@ -6,7 +6,7 @@ use bevy_egui::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuiRuntimeEventKind { MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated }
+pub enum GuiRuntimeEventKind { MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, Focused, FocusLost, TextChanged }
 #[derive(Debug, Clone, Copy)]
 pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind }
 
@@ -2235,7 +2235,12 @@ pub fn draw_starter_gui(
                     .text_color(node.text_color).hint_text(hint).frame(false)
             };
             let text_response = ui.put(node.content_rect, widget);
-            if text_response.gained_focus() && node.clear_text_on_focus { value.clear(); }
+            if text_response.gained_focus() {
+                if node.clear_text_on_focus { value.clear(); runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::TextChanged}); }
+                runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::Focused});
+            }
+            if text_response.changed() { runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::TextChanged}); }
+            if text_response.lost_focus() { runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::FocusLost}); }
             if text_response.clicked() { clicked = Some(node.referent); }
         }
         if !node.text.is_empty() && !editable_textbox {
