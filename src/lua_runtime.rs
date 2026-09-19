@@ -754,6 +754,7 @@ pub struct GuiPlaySession {
     pending_destructions: Rc<RefCell<Vec<Table>>>,
     scheduled_tasks: Rc<RefCell<Vec<ScheduledGuiTask>>>,
     run_service: Table,
+    user_input_service: Table,
     last_tick: std::time::Instant,
 }
 
@@ -792,10 +793,17 @@ impl GuiPlaySession {
         }
         let run_service=make_instance(&lua,"RunService","RunService").map_err(|error|error.to_string())?;
         for event in ["Heartbeat","RenderStepped","Stepped"] {run_service.raw_set(event,make_signal(&lua).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;}
+        let user_input_service=make_instance(&lua,"UserInputService","UserInputService").map_err(|error|error.to_string())?;
+        for event in ["InputBegan","InputChanged","InputEnded","TouchStarted","TouchMoved","TouchEnded","TextBoxFocused","TextBoxFocusReleased"] {user_input_service.raw_set(event,make_signal(&lua).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;}
+        user_input_service.raw_set("TouchEnabled",cfg!(target_os="android")).map_err(|error|error.to_string())?;
+        user_input_service.raw_set("KeyboardEnabled",true).map_err(|error|error.to_string())?;
+        user_input_service.raw_set("MouseEnabled",true).map_err(|error|error.to_string())?;
         if let Some(game)=instances.get(&dom.root_ref()) {
             lua.globals().set("game",game.clone()).map_err(|error|error.to_string())?;
             game.raw_set("RunService",run_service.clone()).map_err(|error|error.to_string())?;
             lua.globals().set("RunService",run_service.clone()).map_err(|error|error.to_string())?;
+            game.raw_set("UserInputService",user_input_service.clone()).map_err(|error|error.to_string())?;
+            lua.globals().set("UserInputService",user_input_service.clone()).map_err(|error|error.to_string())?;
             let tween_service=make_instance(&lua,"TweenService","TweenService").map_err(|error|error.to_string())?;
             let tween_queue=active_tweens.clone();
             tween_service.set("Create",lua.create_function(move |lua,(_service,target,info,goals):(Table,Table,Table,Table)|{
@@ -873,7 +881,7 @@ impl GuiPlaySession {
             if let Err(error)=lua.load(source).set_name(instance.name.as_str()).exec(){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}
         }
         let synchronized_properties=instances.keys().map(|referent|(*referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect())).collect();
-        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduled_tasks,run_service,last_tick:std::time::Instant::now()})
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduled_tasks,run_service,user_input_service,last_tick:std::time::Instant::now()})
     }
 
     pub fn tick(&mut self)->Result<(),String>{
@@ -891,11 +899,26 @@ impl GuiPlaySession {
         Ok(())
     }
 
+    pub fn fire_pointer_input(&self,referent:DomRef,began:bool)->Result<(),String>{
+        let input=self.lua.create_table().map_err(|error|error.to_string())?;
+        let input_name=if cfg!(target_os="android"){"Touch"}else{"MouseButton1"};
+        let input_type=self.lua.create_table().map_err(|error|error.to_string())?;input_type.set("Name",input_name).map_err(|error|error.to_string())?;
+        let state=self.lua.create_table().map_err(|error|error.to_string())?;state.set("Name",if began{"Begin"}else{"End"}).map_err(|error|error.to_string())?;
+        let position=self.lua.create_table().map_err(|error|error.to_string())?;position.set("X",0.0).map_err(|error|error.to_string())?;position.set("Y",0.0).map_err(|error|error.to_string())?;position.set("Z",0.0).map_err(|error|error.to_string())?;
+        input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("UserInputState",state).map_err(|error|error.to_string())?;input.set("Position",position).map_err(|error|error.to_string())?;
+        let event=if began{"InputBegan"}else{"InputEnded"};
+        if let Some(instance)=self.instances.get(&referent){if let Ok(signal)=instance.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone())).map_err(|error|error.to_string())?;}}
+        if let Ok(signal)=self.user_input_service.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone(),false)).map_err(|error|error.to_string())?;}
+        if input_name=="Touch" {let touch_event=if began{"TouchStarted"}else{"TouchEnded"};if let Ok(signal)=self.user_input_service.raw_get::<Table>(touch_event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,false)).map_err(|error|error.to_string())?;}}
+        Ok(())
+    }
+
     pub fn fire(&self,referent:DomRef,event:&str)->Result<(),String>{
         let Some(instance)=self.instances.get(&referent) else{return Ok(());};
-        let Ok(signal)=instance.raw_get::<Table>(event) else{return Ok(());};
-        let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;
-        fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())
+        if let Ok(signal)=instance.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}
+        let service_event=match event{"Focused"=>Some("TextBoxFocused"),"FocusLost"=>Some("TextBoxFocusReleased"),_=>None};
+        if let Some(service_event)=service_event{if let Ok(signal)=self.user_input_service.raw_get::<Table>(service_event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,instance.clone())).map_err(|error|error.to_string())?;}}
+        Ok(())
     }
 
     pub fn set_text(&self,referent:DomRef,text:&str)->Result<(),String>{

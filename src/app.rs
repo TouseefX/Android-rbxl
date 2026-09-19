@@ -1172,6 +1172,9 @@ impl EditorApp {
                     if let Some(text)=self.gui_text_inputs.get(&event.referent) { if let Err(error)=session.set_text(event.referent,text){log::error!("TextBox runtime update: {error}");} }
                     continue;
                 }
+                if matches!(event.kind,crate::gui_render::GuiRuntimeEventKind::MouseButton1Down|crate::gui_render::GuiRuntimeEventKind::MouseButton1Up) {
+                    if let Err(error)=session.fire_pointer_input(event.referent,event.kind==crate::gui_render::GuiRuntimeEventKind::MouseButton1Down){log::error!("GUI input dispatch: {error}");}
+                }
                 let name=match event.kind {
                     crate::gui_render::GuiRuntimeEventKind::MouseEnter=>"MouseEnter",
                     crate::gui_render::GuiRuntimeEventKind::MouseLeave=>"MouseLeave",
