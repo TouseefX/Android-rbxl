@@ -1152,6 +1152,24 @@ fn method_for(
     let d = dom.clone();
     let c = cache.clone();
     let f = match name {
+        "JumpTo" => Some(lua.create_function(move |_,(layout,page):(Table,Table)|{
+            let Some(layout_ref)=table_to_ref(&layout)? else{return Ok(());};
+            let Some(page_ref)=table_to_ref(&page)? else{return Ok(());};
+            if let Some(instance)=d.borrow_mut().get_by_ref_mut(layout_ref){instance.properties.insert(rbx_dom_weak::Ustr::from("CurrentPage"),DomVariant::Ref(page_ref));COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);} Ok(())
+        })?),
+        "JumpToIndex" => Some(lua.create_function(move |_,(layout,index):(Table,i64)|{
+            let Some(layout_ref)=table_to_ref(&layout)? else{return Ok(());};
+            let page={let dom=d.borrow();let Some(layout_instance)=dom.get_by_ref(layout_ref)else{return Ok(());};let Some(parent)=dom.get_by_ref(layout_instance.parent())else{return Ok(());};let mut pages:Vec<DomRef>=parent.children().iter().copied().filter(|child|*child!=layout_ref).collect();pages.sort_by_key(|child|dom.get_by_ref(*child).and_then(|instance|instance.properties.get(&rbx_dom_weak::ustr("LayoutOrder"))).and_then(|value|match value{DomVariant::Int32(value)=>Some(*value),DomVariant::Int64(value)=>Some(*value as i32),_=>None}).unwrap_or(0));pages.get(index.max(0) as usize).copied()};
+            if let Some(page)=page{if let Some(instance)=d.borrow_mut().get_by_ref_mut(layout_ref){instance.properties.insert(rbx_dom_weak::Ustr::from("CurrentPage"),DomVariant::Ref(page));COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);}} Ok(())
+        })?),
+        "Next" | "Previous" => {
+            let step=if name=="Next"{1isize}else{-1isize};
+            Some(lua.create_function(move |_,layout:Table|{
+                let Some(layout_ref)=table_to_ref(&layout)? else{return Ok(());};
+                let page={let dom=d.borrow();let Some(layout_instance)=dom.get_by_ref(layout_ref)else{return Ok(());};let current=match layout_instance.properties.get(&rbx_dom_weak::ustr("CurrentPage")){Some(DomVariant::Ref(value))=>Some(*value),_=>None};let Some(parent)=dom.get_by_ref(layout_instance.parent())else{return Ok(());};let mut pages:Vec<DomRef>=parent.children().iter().copied().filter(|child|*child!=layout_ref).collect();pages.sort_by_key(|child|dom.get_by_ref(*child).and_then(|instance|instance.properties.get(&rbx_dom_weak::ustr("LayoutOrder"))).and_then(|value|match value{DomVariant::Int32(value)=>Some(*value),DomVariant::Int64(value)=>Some(*value as i32),_=>None}).unwrap_or(0));if pages.is_empty(){None}else{let current_index=current.and_then(|value|pages.iter().position(|page|*page==value)).unwrap_or(0)as isize;Some(pages[(current_index+step).clamp(0,pages.len()as isize-1)as usize])}};
+                if let Some(page)=page{if let Some(instance)=d.borrow_mut().get_by_ref_mut(layout_ref){instance.properties.insert(rbx_dom_weak::Ustr::from("CurrentPage"),DomVariant::Ref(page));COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);}} Ok(())
+            })?)
+        },
         "TweenPosition" | "TweenSize" => {
             let property=if name=="TweenPosition"{"Position"}else{"Size"}.to_string();
             Some(lua.create_function(move |lua,(this,args):(Table,Variadic<Value>)|{
