@@ -938,6 +938,20 @@ impl GuiPlaySession {
         if let Ok(signal)=self.user_input_service.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,processed)).map_err(|error|error.to_string())?;}Ok(())
     }
 
+    pub fn fire_pointer_changed(&self,referent:DomRef,screen_position:[f32;2],delta:[f32;2])->Result<(),String>{
+        let input=self.lua.create_table().map_err(|error|error.to_string())?;
+        let input_name=if cfg!(target_os="android"){"Touch"}else{"MouseMovement"};
+        let input_type=self.lua.create_table().map_err(|error|error.to_string())?;input_type.set("Name",input_name).map_err(|error|error.to_string())?;
+        let state=self.lua.create_table().map_err(|error|error.to_string())?;state.set("Name","Change").map_err(|error|error.to_string())?;
+        let position=self.lua.create_table().map_err(|error|error.to_string())?;position.set("X",screen_position[0]).map_err(|error|error.to_string())?;position.set("Y",screen_position[1]).map_err(|error|error.to_string())?;position.set("Z",0.0).map_err(|error|error.to_string())?;
+        let delta_value=self.lua.create_table().map_err(|error|error.to_string())?;delta_value.set("X",delta[0]).map_err(|error|error.to_string())?;delta_value.set("Y",delta[1]).map_err(|error|error.to_string())?;delta_value.set("Z",0.0).map_err(|error|error.to_string())?;
+        input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("UserInputState",state).map_err(|error|error.to_string())?;input.set("Position",position).map_err(|error|error.to_string())?;input.set("Delta",delta_value).map_err(|error|error.to_string())?;
+        if let Some(instance)=self.instances.get(&referent){if let Ok(signal)=instance.raw_get::<Table>("InputChanged"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone())).map_err(|error|error.to_string())?;}}
+        if let Ok(signal)=self.user_input_service.raw_get::<Table>("InputChanged"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone(),false)).map_err(|error|error.to_string())?;}
+        if input_name=="Touch" {if let Ok(signal)=self.user_input_service.raw_get::<Table>("TouchMoved"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,false)).map_err(|error|error.to_string())?;}}
+        Ok(())
+    }
+
     pub fn fire_pointer_input(&self,referent:DomRef,began:bool,screen_position:[f32;2])->Result<(),String>{
         let input=self.lua.create_table().map_err(|error|error.to_string())?;
         let input_name=if cfg!(target_os="android"){"Touch"}else{"MouseButton1"};

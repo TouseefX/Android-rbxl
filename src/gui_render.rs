@@ -6,9 +6,9 @@ use bevy_egui::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuiRuntimeEventKind { MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, Focused, FocusLost, TextChanged }
+pub enum GuiRuntimeEventKind { MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, InputChanged, Focused, FocusLost, TextChanged }
 #[derive(Debug, Clone, Copy)]
-pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind, pub position: [f32;2] }
+pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind, pub position: [f32;2], pub delta: [f32;2] }
 
 #[derive(Clone, Copy)]
 struct RoundedMask { rect: Rect, radius: f32, rotation: f32 }
@@ -2063,7 +2063,9 @@ pub fn draw_starter_gui(
     runtime_events.clear();
     let mut current_hovered=std::collections::HashSet::new();
     let runtime_pointer=ui.input(|input|input.pointer.hover_pos()).unwrap_or(Pos2::ZERO);
+    let pointer_delta=ui.input(|input|input.pointer.delta());
     let runtime_position=[runtime_pointer.x,runtime_pointer.y];
+    let runtime_delta=[pointer_delta.x,pointer_delta.y];
     let mut clicked = keyboard_selection;
     // rect, color, owner, horizontal, canvas maximum, thumb travel
     let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool, [Option<String>; 3])> = Vec::new();
@@ -2086,7 +2088,7 @@ pub fn draw_starter_gui(
         let is_button=matches!(node.class.as_str(),"TextButton"|"ImageButton");
         if is_button && node.interactable && response.clicked() && pointer_inside {
             for kind in [GuiRuntimeEventKind::MouseButton1Down,GuiRuntimeEventKind::MouseButton1Up,GuiRuntimeEventKind::MouseButton1Click,GuiRuntimeEventKind::Activated] {
-                runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind,position:runtime_position});
+                runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind,position:runtime_position,delta:runtime_delta});
             }
         }
         if node.class == "ScrollingFrame" {
@@ -2238,11 +2240,11 @@ pub fn draw_starter_gui(
             };
             let text_response = ui.put(node.content_rect, widget);
             if text_response.gained_focus() {
-                if node.clear_text_on_focus { value.clear(); runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::TextChanged,position:runtime_position}); }
-                runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::Focused,position:runtime_position});
+                if node.clear_text_on_focus { value.clear(); runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::TextChanged,position:runtime_position,delta:runtime_delta}); }
+                runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::Focused,position:runtime_position,delta:runtime_delta});
             }
-            if text_response.changed() { runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::TextChanged,position:runtime_position}); }
-            if text_response.lost_focus() { runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::FocusLost,position:runtime_position}); }
+            if text_response.changed() { runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::TextChanged,position:runtime_position,delta:runtime_delta}); }
+            if text_response.lost_focus() { runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::FocusLost,position:runtime_position,delta:runtime_delta}); }
             if text_response.clicked() { clicked = Some(node.referent); }
         }
         if !node.text.is_empty() && !editable_textbox {
@@ -2339,8 +2341,9 @@ pub fn draw_starter_gui(
             ui.ctx().request_repaint();
         }
     }
-    for referent in current_hovered.difference(hovered_gui) { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::MouseEnter,position:runtime_position}); }
-    for referent in hovered_gui.difference(&current_hovered) { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::MouseLeave,position:runtime_position}); }
+    if pointer_delta!=Vec2::ZERO { for referent in &current_hovered { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::InputChanged,position:runtime_position,delta:runtime_delta}); } }
+    for referent in current_hovered.difference(hovered_gui) { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::MouseEnter,position:runtime_position,delta:runtime_delta}); }
+    for referent in hovered_gui.difference(&current_hovered) { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::MouseLeave,position:runtime_position,delta:runtime_delta}); }
     *hovered_gui=current_hovered;
     clicked
 }

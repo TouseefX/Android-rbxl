@@ -1177,6 +1177,10 @@ impl EditorApp {
                     if let Some(text)=self.gui_text_inputs.get(&event.referent) { if let Err(error)=session.set_text(event.referent,text){log::error!("TextBox runtime update: {error}");} }
                     continue;
                 }
+                if event.kind==crate::gui_render::GuiRuntimeEventKind::InputChanged {
+                    if let Err(error)=session.fire_pointer_changed(event.referent,event.position,event.delta){log::error!("GUI pointer movement: {error}");}
+                    continue;
+                }
                 if matches!(event.kind,crate::gui_render::GuiRuntimeEventKind::MouseButton1Down|crate::gui_render::GuiRuntimeEventKind::MouseButton1Up) {
                     if let Err(error)=session.fire_pointer_input(event.referent,event.kind==crate::gui_render::GuiRuntimeEventKind::MouseButton1Down,event.position){log::error!("GUI input dispatch: {error}");}
                 }
@@ -1187,6 +1191,7 @@ impl EditorApp {
                     crate::gui_render::GuiRuntimeEventKind::MouseButton1Up=>"MouseButton1Up",
                     crate::gui_render::GuiRuntimeEventKind::MouseButton1Click=>"MouseButton1Click",
                     crate::gui_render::GuiRuntimeEventKind::Activated=>"Activated",
+                    crate::gui_render::GuiRuntimeEventKind::InputChanged=>unreachable!(),
                     crate::gui_render::GuiRuntimeEventKind::Focused=>"Focused",
                     crate::gui_render::GuiRuntimeEventKind::FocusLost=>"FocusLost",
                     crate::gui_render::GuiRuntimeEventKind::TextChanged=>unreachable!(),
