@@ -600,7 +600,6 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
         "GetActor",
         "Clone",
         "Destroy",
-        "GetPropertyChangedSignal",
         "GetAttribute",
         "SetAttribute",
     ] {
@@ -609,6 +608,10 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","Changed","AncestryChanged","Destroying"] {
         t.set(event,make_signal(lua)?)?;
     }
+    t.set("GetPropertyChangedSignal",lua.create_function(|lua,(this,property):(Table,String)|{
+        let key=format!("_property_signal_{property}");
+        if let Ok(signal)=this.raw_get::<Table>(&key){return Ok(signal);}let signal=make_signal(lua)?;this.raw_set(key,signal.clone())?;Ok(signal)
+    })?)?;
     let class_name = class.to_string();
     let isa = lua.create_function(move |_, (_self, name): (Table, String)| Ok(name == class_name))?;
     t.set("IsA", isa)?;
@@ -1103,9 +1106,10 @@ fn make_instance_metatable(
         let dom = dom.clone();
         lua.create_function(move |lua, (this, key, value): (Table, String, Value)| {
             let Some(r) = table_to_ref(&this)? else { return Ok(()) };
+            let mut changed=false;
             match key.as_str() {
                 "Name" => if let Value::String(s) = value {
-                    if let Ok(mut d) = dom.try_borrow_mut() { if let Some(i) = d.get_by_ref_mut(r) { i.name = s.to_str()?; } }
+                    if let Ok(mut d) = dom.try_borrow_mut() { if let Some(i) = d.get_by_ref_mut(r) { i.name = s.to_str()?; changed=true; } }
                 },
                 "ClassName" => {} // read-only
                 "Parent" => {
@@ -1114,16 +1118,22 @@ fn make_instance_metatable(
                         Value::Nil => dom.borrow().root_ref(),
                         _ => return Err(LuaError::runtime("Parent must be an Instance or nil")),
                     };
-                    dom.borrow_mut().transfer_within(r, new_parent);
+                    dom.borrow_mut().transfer_within(r, new_parent); changed=true;
                 }
                 _ => if let Some(variant) = value_to_variant(lua, &value)? {
                     if let Ok(mut d) = dom.try_borrow_mut() {
                         if let Some(i) = d.get_by_ref_mut(r) {
                             i.properties.insert(rbx_dom_weak::Ustr::from(&key), variant);
+                            changed=true;
                             COMMAND_OUTCOME.with(|o| o.borrow_mut().mutated += 1);
                         }
                     }
                 }
+            }
+            if changed {
+                if let Ok(signal)=this.raw_get::<Table>("Changed") { let fire:Function=signal.get("Fire")?; fire.call::<()>((signal,key.clone()))?; }
+                let cache_key=format!("_property_signal_{key}");
+                if let Ok(signal)=this.raw_get::<Table>(&cache_key) { let fire:Function=signal.get("Fire")?; fire.call::<()>((signal,))?; }
             }
             Ok(())
         })?
@@ -1152,6 +1162,11 @@ fn method_for(
     let d = dom.clone();
     let c = cache.clone();
     let f = match name {
+        "GetPropertyChangedSignal" => Some(lua.create_function(|lua,(this,property):(Table,String)|{
+            let cache_key=format!("_property_signal_{property}");
+            if let Ok(signal)=this.raw_get::<Table>(&cache_key){return Ok(signal);}
+            let signal=make_signal(lua)?; this.raw_set(cache_key,signal.clone())?; Ok(signal)
+        })?),
         "JumpTo" => Some(lua.create_function(move |_,(layout,page):(Table,Table)|{
             let Some(layout_ref)=table_to_ref(&layout)? else{return Ok(());};
             let Some(page_ref)=table_to_ref(&page)? else{return Ok(());};
