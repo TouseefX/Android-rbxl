@@ -990,8 +990,9 @@ impl GuiPlaySession {
             let parent_ref=parent_table.as_ref().and_then(|parent|table_to_ref(parent).ok().flatten()).unwrap_or_else(||dom.root_ref());
             let class=table.raw_get::<String>("ClassName").unwrap_or_else(|_|"Frame".into());
             let name=table.raw_get::<String>("Name").unwrap_or_else(|_|class.clone());
-            let referent=dom.insert(parent_ref,InstanceBuilder::new(class).with_name(name));
+            let referent=dom.insert(parent_ref,InstanceBuilder::new(class.clone()).with_name(name.clone()));
             table.raw_set("_ref",ref_to_i64(referent)).map_err(|error|error.to_string())?;
+            if let Some(parent)=self.instances.get(&parent_ref){parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;if name!=class{parent.raw_set(class.as_str(),Value::Nil).map_err(|error|error.to_string())?;}}
             self.instances.insert(referent,table);
             self.synchronized_properties.insert(referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect());
             created+=1;
@@ -1000,7 +1001,15 @@ impl GuiPlaySession {
         let mut destroyed=0usize;
         for table in destructions {
             if let Some(referent)=table_to_ref(&table).map_err(|error|error.to_string())? {
-                if referent!=dom.root_ref() && dom.get_by_ref(referent).is_some(){dom.destroy(referent);destroyed+=1;}
+                if referent!=dom.root_ref() {
+                    if let Some(instance)=dom.get_by_ref(referent){if let Some(parent)=self.instances.get(&instance.parent()){parent.raw_set(instance.name.as_str(),Value::Nil).map_err(|error|error.to_string())?;}}
+                    if dom.get_by_ref(referent).is_some(){
+                        let mut stack=vec![referent];let mut subtree=Vec::new();while let Some(item)=stack.pop(){if let Some(instance)=dom.get_by_ref(item){stack.extend_from_slice(instance.children());subtree.push(item);}}
+                        dom.destroy(referent);destroyed+=subtree.len();
+                        for item in subtree {if let Some(runtime)=self.instances.remove(&item){runtime.raw_set("Parent",Value::Nil).map_err(|error|error.to_string())?;}self.synchronized_properties.remove(&item);}
+                    }
+                }
+                table.raw_set("Parent",Value::Nil).map_err(|error|error.to_string())?;
                 self.instances.remove(&referent);self.synchronized_properties.remove(&referent);
             }
         }
@@ -1011,11 +1020,17 @@ impl GuiPlaySession {
         }).collect();
         for (referent,name,parent) in hierarchy {
             if referent==dom.root_ref(){continue;}
-            let current_parent=dom.get_by_ref(referent).map(|instance|instance.parent());
-            let mut renamed=false;let mut moved=false;
-            if let Some(instance)=dom.get_by_ref_mut(referent){if instance.name!=name{instance.name=name;renamed=true;}}
-            if let (Some(current),Some(parent))=(current_parent,parent){if current!=parent&&dom.get_by_ref(parent).is_some(){dom.transfer_within(referent,parent);moved=true;}}
+            let current=dom.get_by_ref(referent).map(|instance|(instance.parent(),instance.name.clone()));
+            let Some((current_parent,old_name))=current else{continue;};
+            let renamed=old_name!=name;let mut moved=false;
+            if renamed {if let Some(instance)=dom.get_by_ref_mut(referent){instance.name=name.clone();}}
+            if let Some(parent)=parent {if current_parent!=parent&&dom.get_by_ref(parent).is_some(){dom.transfer_within(referent,parent);moved=true;}}
             if let Some(table)=self.instances.get(&referent) {
+                if renamed||moved {
+                    if let Some(old_parent)=self.instances.get(&current_parent){old_parent.raw_set(old_name.as_str(),Value::Nil).map_err(|error|error.to_string())?;}
+                    let effective_parent=parent.unwrap_or(current_parent);
+                    if let Some(new_parent)=self.instances.get(&effective_parent){new_parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;table.raw_set("Parent",new_parent.clone()).map_err(|error|error.to_string())?;}
+                }
                 if renamed {if let Ok(signal)=table.raw_get::<Table>("Changed"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,"Name")).map_err(|error|error.to_string())?;}}
                 if moved {if let Ok(signal)=table.raw_get::<Table>("AncestryChanged"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,table.clone(),table.raw_get::<Value>("Parent").unwrap_or(Value::Nil))).map_err(|error|error.to_string())?;}}
             }
