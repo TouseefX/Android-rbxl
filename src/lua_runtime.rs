@@ -887,20 +887,20 @@ impl GuiPlaySession {
         lua.load(r#"
             local waiting = {}
             local function schedule(thread, delay, args, started)
-                table.insert(waiting, {thread=thread, remaining=math.max(tonumber(delay) or 0, 0), waited=math.max(tonumber(delay) or 0, 0), args=args, started=started or false})
+                table.insert(waiting, {thread=thread, remaining=math.max(tonumber(delay) or 0, 0), elapsed=0, args=args, started=started or false})
                 return thread
             end
             local function resumeTask(record)
                 if record.cancelled then return end
                 local ok, delay
-                if record.started then ok, delay = coroutine.resume(record.thread, record.waited)
+                if record.started then ok, delay = coroutine.resume(record.thread, record.elapsed)
                 else record.started=true; ok, delay = coroutine.resume(record.thread, table.unpack(record.args, 1, record.args.n)) end
                 if not ok then warn(delay); return end
                 if coroutine.status(record.thread) ~= "dead" then schedule(record.thread, delay, table.pack(), true) end
             end
             task = {}
             function task.spawn(callback, ...)
-                local record={thread=coroutine.create(callback),remaining=0,waited=0,args=table.pack(...),started=false}
+                local record={thread=coroutine.create(callback),remaining=0,elapsed=0,args=table.pack(...),started=false}
                 resumeTask(record); return record.thread
             end
             function task.defer(callback, ...) return schedule(coroutine.create(callback), 0, table.pack(...)) end
@@ -909,7 +909,7 @@ impl GuiPlaySession {
             function task.cancel(thread) for _,record in ipairs(waiting) do if record.thread==thread then record.cancelled=true end end end
             function _arena_step_tasks(delta)
                 for index=#waiting,1,-1 do
-                    local record=waiting[index]; record.remaining-=delta
+                    local record=waiting[index]; record.remaining-=delta; record.elapsed+=delta
                     if record.cancelled then table.remove(waiting,index)
                     elseif record.remaining<=0 then table.remove(waiting,index); resumeTask(record) end
                 end
