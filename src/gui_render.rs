@@ -6,7 +6,7 @@ use bevy_egui::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuiRuntimeEventKind { MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, InputChanged, Focused, FocusLost, TextChanged }
+pub enum GuiRuntimeEventKind { MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, InputChanged, Focused, FocusLost, SelectionGained, SelectionLost, TextChanged }
 #[derive(Debug, Clone, Copy)]
 pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind, pub position: [f32;2], pub delta: [f32;2] }
 
@@ -2095,6 +2095,11 @@ pub fn draw_starter_gui(
                 runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind,position:runtime_position,delta:runtime_delta});
             }
         }
+        let keyboard_activated=is_button&&node.interactable&&selected==Some(node.referent)&&ui.input(|input|input.key_pressed(egui::Key::Enter)||input.key_pressed(egui::Key::Space));
+        if keyboard_activated {
+            runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::Activated,position:runtime_position,delta:runtime_delta});
+            clicked=Some(node.referent);
+        }
         if node.class == "ScrollingFrame" {
             let allow_x = node.scrolling_direction != 2;
             let allow_y = node.scrolling_direction != 1;
@@ -2355,5 +2360,9 @@ pub fn draw_starter_gui(
     for referent in current_hovered.difference(hovered_gui) { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::MouseEnter,position:runtime_position,delta:runtime_delta}); }
     for referent in hovered_gui.difference(&current_hovered) { runtime_events.push(GuiRuntimeEvent{referent:*referent,kind:GuiRuntimeEventKind::MouseLeave,position:runtime_position,delta:runtime_delta}); }
     *hovered_gui=current_hovered;
+    if clicked.is_some() && clicked!=selected {
+        if let Some(referent)=selected { runtime_events.push(GuiRuntimeEvent{referent,kind:GuiRuntimeEventKind::SelectionLost,position:runtime_position,delta:runtime_delta}); }
+        if let Some(referent)=clicked { runtime_events.push(GuiRuntimeEvent{referent,kind:GuiRuntimeEventKind::SelectionGained,position:runtime_position,delta:runtime_delta}); }
+    }
     clicked
 }

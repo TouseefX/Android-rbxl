@@ -1194,6 +1194,8 @@ impl EditorApp {
                     crate::gui_render::GuiRuntimeEventKind::InputChanged=>unreachable!(),
                     crate::gui_render::GuiRuntimeEventKind::Focused=>"Focused",
                     crate::gui_render::GuiRuntimeEventKind::FocusLost=>"FocusLost",
+                    crate::gui_render::GuiRuntimeEventKind::SelectionGained=>"SelectionGained",
+                    crate::gui_render::GuiRuntimeEventKind::SelectionLost=>"SelectionLost",
                     crate::gui_render::GuiRuntimeEventKind::TextChanged=>unreachable!(),
                 };
                 if let Err(error)=session.fire(event.referent,name){log::error!("GUI event {name}: {error}");}

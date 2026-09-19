@@ -583,7 +583,7 @@ fn make_signal(lua: &Lua) -> LuaResult<Table> {
 fn is_instance_signal(key: &str) -> bool {
     matches!(key,"Activated"|"MouseButton1Click"|"MouseButton1Down"|"MouseButton1Up"|
         "MouseEnter"|"MouseLeave"|"InputBegan"|"InputChanged"|"InputEnded"|
-        "Focused"|"FocusLost"|"Changed"|"AncestryChanged"|"Destroying")
+        "Focused"|"FocusLost"|"SelectionGained"|"SelectionLost"|"Changed"|"AncestryChanged"|"Destroying")
 }
 
 fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
@@ -608,7 +608,7 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
         for pair in this.clone().pairs::<Value,Value>() { let (_,value)=pair?; if let Value::Table(child)=&value { if child.raw_get::<Table>("Parent").ok().as_ref()==Some(&this){children.push(value);} } }
         Ok(children)
     })?)?;
-    for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","Changed","AncestryChanged","Destroying"] {
+    for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","SelectionGained","SelectionLost","Changed","AncestryChanged","Destroying"] {
         t.set(event,make_signal(lua)?)?;
     }
     t.set("GetPropertyChangedSignal",lua.create_function(|lua,(this,property):(Table,String)|{
