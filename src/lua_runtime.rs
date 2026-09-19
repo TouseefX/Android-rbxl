@@ -593,10 +593,7 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     t.set("ClassName", class)?;
     let noop = lua.create_function(|_, _: Variadic<Value>| Ok(Variadic::<Value>::new()))?;
     for m in [
-        "GetChildren",
         "GetDescendants",
-        "FindFirstChild",
-        "WaitForChild",
         "GetActor",
         "Clone",
         "Destroy",
@@ -605,6 +602,13 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     ] {
         t.set(m, noop.clone())?;
     }
+    t.set("FindFirstChild",lua.create_function(|_,(this,name):(Table,String)|this.raw_get::<Value>(&name).or(Ok(Value::Nil)))?)?;
+    t.set("WaitForChild",lua.create_function(|_,(this,name):(Table,String)|this.raw_get::<Value>(&name).or(Ok(Value::Nil)))?)?;
+    t.set("GetChildren",lua.create_function(|_,this:Table|{
+        let mut children=Vec::new();
+        for pair in this.clone().pairs::<Value,Value>() { let (_,value)=pair?; if let Value::Table(child)=&value { if child.raw_get::<Table>("Parent").ok().as_ref()==Some(&this){children.push(value);} } }
+        Ok(children)
+    })?)?;
     for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","Changed","AncestryChanged","Destroying"] {
         t.set(event,make_signal(lua)?)?;
     }
@@ -795,6 +799,32 @@ impl GuiPlaySession {
                 game_table.raw_get::<Value>(&name).or_else(|_|Ok(Value::Table(make_instance(lua,&name,&name)?)))
             }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
         }
+        // Build the client-side Players.LocalPlayer.PlayerGui view and clone
+        // StarterGui's ScreenGuis into it. The retained tables keep their DOM
+        // referents so viewport events still dispatch to the correct callbacks.
+        let players=dom.root().children().iter().find_map(|referent|dom.get_by_ref(*referent)
+            .filter(|instance|instance.class=="Players").and_then(|_|instances.get(referent).cloned()))
+            .unwrap_or(make_instance(&lua,"Players","Players").map_err(|error|error.to_string())?);
+        let local_player=make_instance(&lua,"Player","LocalPlayer").map_err(|error|error.to_string())?;
+        let player_gui=instances.iter().find_map(|(referent,table)|dom.get_by_ref(*referent)
+            .filter(|instance|instance.class=="PlayerGui").map(|_|table.clone()))
+            .unwrap_or(make_instance(&lua,"PlayerGui","PlayerGui").map_err(|error|error.to_string())?);
+        players.raw_set("LocalPlayer",local_player.clone()).map_err(|error|error.to_string())?;
+        local_player.raw_set("Parent",players.clone()).map_err(|error|error.to_string())?;
+        local_player.raw_set("PlayerGui",player_gui.clone()).map_err(|error|error.to_string())?;
+        player_gui.raw_set("Parent",local_player.clone()).map_err(|error|error.to_string())?;
+        if let Some(starter_ref)=dom.root().children().iter().find(|referent|dom.get_by_ref(**referent).is_some_and(|instance|instance.class=="StarterGui")) {
+            if let Some(starter)=dom.get_by_ref(*starter_ref) {
+                for child in starter.children() {
+                    if let (Some(instance),Some(table))=(dom.get_by_ref(*child),instances.get(child)) {
+                        player_gui.raw_set(instance.name.as_str(),table.clone()).map_err(|error|error.to_string())?;
+                        table.raw_set("Parent",player_gui.clone()).map_err(|error|error.to_string())?;
+                    }
+                }
+            }
+        }
+        if let Some(game)=instances.get(&dom.root_ref()) { game.raw_set("Players",players).map_err(|error|error.to_string())?; }
+
         // Execute LocalScripts once. Their signal connections remain retained by
         // these Instance tables and are fired from viewport events every frame.
         for (referent,table) in &instances {
