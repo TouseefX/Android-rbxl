@@ -942,6 +942,27 @@ impl GuiPlaySession {
         let upgrade_signals=|table:&Table|->Result<(),String>{for pair in table.clone().pairs::<Value,Value>(){let(_,value)=pair.map_err(|error|error.to_string())?;if let Value::Table(candidate)=value{if candidate.raw_get::<Function>("Connect").is_ok()&&candidate.raw_get::<Function>("Fire").is_ok(){candidate.raw_set("Wait",signal_wait.clone()).map_err(|error|error.to_string())?;}}}Ok(())};
         for table in instances.values(){upgrade_signals(table)?;}upgrade_signals(&run_service)?;upgrade_signals(&user_input_service)?;upgrade_signals(&players)?;upgrade_signals(&local_player)?;upgrade_signals(&player_gui)?;
 
+        // Roblox ModuleScript require with one-time result caching. Module
+        // environments are isolated like LocalScripts while sharing _G.
+        let module_sources:std::collections::HashMap<DomRef,String>=instances.keys().filter_map(|referent|dom.get_by_ref(*referent).filter(|instance|instance.class=="ModuleScript").and_then(|instance|match instance.properties.get(&rbx_dom_weak::ustr("Source")){Some(DomVariant::String(source))=>Some((*referent,source.clone())),_=>None})).collect();
+        let require_instances=instances.clone();
+        let module_cache:Rc<RefCell<std::collections::HashMap<DomRef,Value>>>=Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let require_cache=module_cache.clone();
+        let loading_modules:Rc<RefCell<std::collections::HashSet<DomRef>>>=Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let require_loading=loading_modules;
+        lua.globals().set("require",lua.create_function(move |lua,module:Value|{
+            let Value::Table(module)=module else{return Err(LuaError::runtime("require expects a ModuleScript"));};
+            let Some(referent)=table_to_ref(&module)? else{return Err(LuaError::runtime("require expects a retained ModuleScript"));};
+            if let Some(value)=require_cache.borrow().get(&referent){return Ok(value.clone());}
+            if !require_loading.borrow_mut().insert(referent){return Err(LuaError::runtime("ModuleScript requested recursively"));}
+            let Some(source)=module_sources.get(&referent) else{require_loading.borrow_mut().remove(&referent);return Err(LuaError::runtime("required Instance is not a ModuleScript"));};
+            let environment=lua.create_table();environment.raw_set("script",require_instances.get(&referent).cloned().unwrap_or(module))?;environment.raw_set("_G",lua.globals())?;
+            let metatable=lua.create_table();metatable.raw_set("__index",lua.globals())?;environment.set_metatable(Some(metatable))?;
+            let result=lua.load(source).set_name("ModuleScript").set_environment(environment).eval::<Value>();
+            require_loading.borrow_mut().remove(&referent);
+            let value=result?;require_cache.borrow_mut().insert(referent,value.clone());Ok(value)
+        }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+
         // Execute LocalScripts once. Their signal connections remain retained by
         // these Instance tables and are fired from viewport events every frame.
         for (referent,table) in &instances {
