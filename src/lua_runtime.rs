@@ -525,33 +525,27 @@ fn install_tween_info(lua: &Lua) -> LuaResult<()> {
 }
 
 fn install_enum(lua: &Lua) -> LuaResult<()> {
-    // Permissive: Enum.Material.Plastic returns a table {Name, Value=0,
-    // EnumType}. Numeric values don't match real Roblox — good enough for
-    // logic tests that branch on enum *names*.
-    let item_mt = lua.create_table();
-    item_mt.set(
-        "__index",
-        lua.create_function(|lua, (_, key): (Table, String)| {
-            let t = lua.create_table();
-            t.set("Name", key.clone())?;
-            t.set("Value", 0i64)?;
-            t.set("EnumType", key)?;
-            Ok(t)
-        })?,
-    )?;
-    let group_mt = lua.create_table();
-    group_mt.set(
-        "__index",
-        lua.create_function(move |lua, (_t, _key): (Table, String)| {
-            let group = lua.create_table();
-            group.set_metatable(Some(item_mt.clone()));
-            Ok(group)
-        })?,
-    )?;
-    let enum_root = lua.create_table();
-    enum_root.set_metatable(Some(group_mt));
-    lua.globals().set("Enum", enum_root)?;
-    Ok(())
+    let root_mt=lua.create_table();
+    root_mt.set("__index",lua.create_function(|lua,(_root,enum_type):(Table,String)|{
+        let group=lua.create_table();let item_mt=lua.create_table();let captured=enum_type.clone();
+        item_mt.set("__index",lua.create_function(move |lua,(_group,name):(Table,String)|{
+            let value=match (captured.as_str(),name.as_str()) {
+                ("AutomaticSize","X")=>1,("AutomaticSize","Y")=>2,("AutomaticSize","XY")=>3,
+                ("ZIndexBehavior","Sibling")=>1,
+                ("ScaleType","Slice")=>1,("ScaleType","Tile")=>2,("ScaleType","Fit")=>3,("ScaleType","Crop")=>4,
+                ("TextXAlignment","Center")=>1,("TextXAlignment","Right")=>2,
+                ("TextYAlignment","Center")=>1,("TextYAlignment","Bottom")=>2,
+                ("EasingDirection","Out")=>1,("EasingDirection","InOut")=>2,
+                ("FillDirection","Vertical")=>1,("ScrollingDirection","X")=>1,("ScrollingDirection","Y")=>2,
+                ("VerticalScrollBarPosition","Left")=>1,("ResamplerMode","Pixelated")=>1,
+                ("ScreenInsets","DeviceSafeInsets")=>1,("ScreenInsets","CoreUISafeInsets")=>2,("ScreenInsets","TopbarSafeInsets")=>3,
+                _=>0,
+            };
+            let item=lua.create_table();item.set("Name",name)?;item.set("Value",value)?;item.set("EnumType",captured.clone())?;Ok(item)
+        })?)?;
+        group.set_metatable(Some(item_mt));group.raw_set("Name",enum_type)?;Ok(group)
+    })?)?;
+    let enum_root=lua.create_table();enum_root.set_metatable(Some(root_mt));lua.globals().set("Enum",enum_root)
 }
 
 fn make_signal(lua: &Lua) -> LuaResult<Table> {
@@ -768,6 +762,20 @@ pub struct GuiPlaySession {
     last_tick: std::time::Instant,
 }
 
+fn preserve_variant_type(existing:Option<&DomVariant>,value:DomVariant)->DomVariant {
+    match (existing,value) {
+        (Some(DomVariant::Float32(_)),DomVariant::Float64(value))=>DomVariant::Float32(value as f32),
+        (Some(DomVariant::Int32(_)),DomVariant::Float64(value))=>DomVariant::Int32(value.round() as i32),
+        (Some(DomVariant::Int64(_)),DomVariant::Float64(value))=>DomVariant::Int64(value.round() as i64),
+        (Some(DomVariant::Int32(_)),DomVariant::Int64(value))=>DomVariant::Int32(value as i32),
+        (Some(DomVariant::Float32(_)),DomVariant::Int64(value))=>DomVariant::Float32(value as f32),
+        (Some(DomVariant::Float64(_)),DomVariant::Int64(value))=>DomVariant::Float64(value as f64),
+        (Some(DomVariant::Enum(_)),DomVariant::Float64(value))=>DomVariant::Enum(rbx_dom_weak::types::Enum::from_u32(value.max(0.0) as u32)),
+        (Some(DomVariant::Enum(_)),DomVariant::Int64(value))=>DomVariant::Enum(rbx_dom_weak::types::Enum::from_u32(value.max(0) as u32)),
+        (_,value)=>value,
+    }
+}
+
 fn ease_gui_tween(amount:f32,style:&str,direction:&str)->f32 {
     let curve=|value:f32|match style {"Quad"=>value*value,"Cubic"=>value*value*value,"Quart"=>value.powi(4),"Quint"=>value.powi(5),"Sine"=>1.0-(value*std::f32::consts::FRAC_PI_2).cos(),"Exponential"=>if value<=0.0{0.0}else{2.0f32.powf(10.0*(value-1.0))},"Circular"=>1.0-(1.0-value*value).max(0.0).sqrt(),_=>value};
     match direction {"In"=>curve(amount),"InOut"=>if amount<0.5{curve(amount*2.0)*0.5}else{1.0-curve((1.0-amount)*2.0)*0.5},_=>1.0-curve(1.0-amount)}
@@ -980,7 +988,11 @@ impl GuiPlaySession {
                 Err(error)=>with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)})),
             }
         }
-        let synchronized_properties=instances.keys().map(|referent|(*referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect())).collect();
+        let synchronized_properties=instances.keys().map(|referent|{
+            let mut names:Vec<String>=dom.get_by_ref(*referent).map(|instance|instance.properties.keys().map(|key|key.as_str().to_string()).collect()).unwrap_or_default();
+            for name in GUI_SYNC_PROPERTIES {if !names.iter().any(|existing|existing==name){names.push((*name).to_string());}}
+            (*referent,names)
+        }).collect();
         let mut respawn_properties=std::collections::HashMap::new();
         fn snapshot_tree(dom:&WeakDom,referent:DomRef,out:&mut std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>){if let Some(instance)=dom.get_by_ref(referent){out.insert(referent,instance.properties.iter().map(|(key,value)|(key.clone(),value.clone())).collect());for child in instance.children(){snapshot_tree(dom,*child,out);}}}
         if let Some(starter)=dom.root().children().iter().find_map(|referent|dom.get_by_ref(*referent).filter(|instance|instance.class=="StarterGui")) {for child in starter.children(){if dom.get_by_ref(*child).is_some_and(|instance|instance.class=="ScreenGui"&&instance.properties.get(&rbx_dom_weak::ustr("ResetOnSpawn")).map(|value|!matches!(value,DomVariant::Bool(false))).unwrap_or(true)){snapshot_tree(dom,*child,&mut respawn_properties);}}}
@@ -1135,7 +1147,9 @@ impl GuiPlaySession {
                 let Ok(value)=table.raw_get::<Value>(name.as_str()) else{continue;};
                 if value.is_nil(){continue;}
                 if let Some(value)=value_to_variant(&self.lua,&value).map_err(|error|error.to_string())? {
-                    let changed=dom.get_by_ref(*referent).and_then(|instance|instance.properties.get(&rbx_dom_weak::Ustr::from(name.as_str()))).map(|existing|existing!=&value).unwrap_or(true);
+                    let existing=dom.get_by_ref(*referent).and_then(|instance|instance.properties.get(&rbx_dom_weak::Ustr::from(name.as_str())));
+                    let value=preserve_variant_type(existing,value);
+                    let changed=existing.map(|existing|existing!=&value).unwrap_or(true);
                     if changed{updates.push((*referent,name.clone(),value));}
                 }
             }
@@ -1876,6 +1890,8 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
                     ty::UDim::new(t.get::<f64>("YScale")? as f32,t.get::<i64>("YOffset")? as i32))))
             } else if has("Scale") && has("Offset") {
                 Some(DomVariant::UDim(ty::UDim::new(t.get::<f64>("Scale")? as f32,t.get::<i64>("Offset")? as i32)))
+            } else if has("EnumType") && has("Value") {
+                Some(DomVariant::Enum(ty::Enum::from_u32(t.get::<i64>("Value")?.max(0) as u32)))
             } else if has("R") && has("G") && has("B") {
                 Some(DomVariant::Color3(ty::Color3::new(
                     t.get::<f64>("R")? as f32,
