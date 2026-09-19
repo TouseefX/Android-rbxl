@@ -733,6 +733,8 @@ use rbx_dom_weak::{
 
 /// Persistent, frame-to-frame Luau state used by the GUI preview play session.
 /// Instance tables and connected callbacks remain alive until another place is loaded.
+const GUI_SYNC_PROPERTIES:&[&str]=&["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
+
 struct ActiveGuiTween {
     target: Table,
     goals: Vec<(String,Value,Value)>,
@@ -746,6 +748,7 @@ pub struct GuiPlaySession {
     instances: std::collections::HashMap<DomRef, Table>,
     synchronized_properties: std::collections::HashMap<DomRef, Vec<String>>,
     active_tweens: Rc<RefCell<Vec<ActiveGuiTween>>>,
+    pending_instances: Rc<RefCell<Vec<Table>>>,
     last_tick: std::time::Instant,
 }
 
@@ -762,10 +765,12 @@ impl GuiPlaySession {
     pub fn new(dom: &WeakDom) -> Result<Self, String> {
         let lua=build_vm().map_err(|error|error.to_string())?;
         let active_tweens=Rc::new(RefCell::new(Vec::<ActiveGuiTween>::new()));
+        let pending_instances=Rc::new(RefCell::new(Vec::<Table>::new()));
         let mut instances=std::collections::HashMap::new();
         fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>)->LuaResult<()> {
             let Some(instance)=dom.get_by_ref(referent) else{return Ok(());};
             let table=make_instance(lua,&instance.class,&instance.name)?;
+            table.raw_set("_ref",ref_to_i64(referent))?;
             for (key,value) in &instance.properties { if let Ok(value)=variant_to_value(lua,value){table.raw_set(key.as_str(),value)?;} }
             instances.insert(referent,table);
             for child in instance.children(){create(lua,dom,*child,instances)?;} Ok(())
@@ -824,6 +829,14 @@ impl GuiPlaySession {
             }
         }
         if let Some(game)=instances.get(&dom.root_ref()) { game.raw_set("Players",players).map_err(|error|error.to_string())?; }
+        let runtime_instance=lua.create_table().map_err(|error|error.to_string())?;
+        let creation_queue=pending_instances.clone();
+        runtime_instance.set("new",lua.create_function(move |lua,(class,parent):(String,Option<Table>)|{
+            let table=make_instance(lua,&class,&class)?;
+            if let Some(parent)=parent { table.raw_set("Parent",parent.clone())?; parent.raw_set(class.as_str(),table.clone())?; }
+            creation_queue.borrow_mut().push(table.clone()); Ok(table)
+        }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        lua.globals().set("Instance",runtime_instance).map_err(|error|error.to_string())?;
 
         // Execute LocalScripts once. Their signal connections remain retained by
         // these Instance tables and are fired from viewport events every frame.
@@ -834,9 +847,8 @@ impl GuiPlaySession {
             lua.globals().set("script",table.clone()).map_err(|error|error.to_string())?;
             if let Err(error)=lua.load(source).set_name(instance.name.as_str()).exec(){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}
         }
-        let common=["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
-        let synchronized_properties=instances.keys().map(|referent|(*referent,common.iter().map(|name|(*name).to_string()).collect())).collect();
-        Ok(Self{lua,instances,synchronized_properties,active_tweens,last_tick:std::time::Instant::now()})
+        let synchronized_properties=instances.keys().map(|referent|(*referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect())).collect();
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,last_tick:std::time::Instant::now()})
     }
 
     pub fn tick(&mut self)->Result<(),String>{
@@ -866,7 +878,20 @@ impl GuiPlaySession {
         Ok(())
     }
 
-    pub fn synchronize_to_dom(&self,dom:&mut WeakDom)->Result<usize,String>{
+    pub fn synchronize_to_dom(&mut self,dom:&mut WeakDom)->Result<usize,String>{
+        let pending:Vec<Table>=self.pending_instances.borrow_mut().drain(..).collect();
+        let mut created=0usize;
+        for table in pending {
+            let parent_table=table.raw_get::<Table>("Parent").ok();
+            let parent_ref=parent_table.as_ref().and_then(|parent|table_to_ref(parent).ok().flatten()).unwrap_or_else(||dom.root_ref());
+            let class=table.raw_get::<String>("ClassName").unwrap_or_else(|_|"Frame".into());
+            let name=table.raw_get::<String>("Name").unwrap_or_else(|_|class.clone());
+            let referent=dom.insert(parent_ref,InstanceBuilder::new(class).with_name(name));
+            table.raw_set("_ref",ref_to_i64(referent)).map_err(|error|error.to_string())?;
+            self.instances.insert(referent,table);
+            self.synchronized_properties.insert(referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect());
+            created+=1;
+        }
         let mut updates=Vec::new();
         for (referent,names) in &self.synchronized_properties {
             let Some(table)=self.instances.get(referent) else{continue;};
@@ -879,7 +904,7 @@ impl GuiPlaySession {
                 }
             }
         }
-        let count=updates.len();
+        let count=updates.len()+created;
         for (referent,name,value) in updates {if let Some(instance)=dom.get_by_ref_mut(referent){instance.properties.insert(rbx_dom_weak::Ustr::from(name.as_str()),value);}}
         Ok(count)
     }
