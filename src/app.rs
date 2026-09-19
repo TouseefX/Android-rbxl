@@ -1166,6 +1166,11 @@ impl EditorApp {
             self.gui_hovered.clear(); self.gui_runtime_events.clear(); None
         };
         if let Some(session)=self.gui_play_session.as_mut() { if let Err(error)=session.tick(){log::error!("GUI tween tick: {error}");} }
+        let keyboard_events:Vec<(String,bool)>=ui.input(|input|input.events.iter().filter_map(|event|match event {egui::Event::Key{key,pressed,repeat,..} if !*repeat=>Some((format!("{key:?}"),*pressed)),_=>None}).collect());
+        let keyboard_processed=ui.ctx().wants_keyboard_input();
+        if let Some(session)=self.gui_play_session.as_ref() {
+            for (key,pressed) in keyboard_events {if let Err(error)=session.fire_keyboard_input(&key,pressed,keyboard_processed){log::error!("Keyboard input dispatch: {error}");}}
+        }
         if let Some(session)=self.gui_play_session.as_ref() {
             for event in &self.gui_runtime_events {
                 if event.kind==crate::gui_render::GuiRuntimeEventKind::TextChanged {
@@ -1173,7 +1178,7 @@ impl EditorApp {
                     continue;
                 }
                 if matches!(event.kind,crate::gui_render::GuiRuntimeEventKind::MouseButton1Down|crate::gui_render::GuiRuntimeEventKind::MouseButton1Up) {
-                    if let Err(error)=session.fire_pointer_input(event.referent,event.kind==crate::gui_render::GuiRuntimeEventKind::MouseButton1Down){log::error!("GUI input dispatch: {error}");}
+                    if let Err(error)=session.fire_pointer_input(event.referent,event.kind==crate::gui_render::GuiRuntimeEventKind::MouseButton1Down,event.position){log::error!("GUI input dispatch: {error}");}
                 }
                 let name=match event.kind {
                     crate::gui_render::GuiRuntimeEventKind::MouseEnter=>"MouseEnter",

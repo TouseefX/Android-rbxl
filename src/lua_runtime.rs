@@ -899,12 +899,22 @@ impl GuiPlaySession {
         Ok(())
     }
 
-    pub fn fire_pointer_input(&self,referent:DomRef,began:bool)->Result<(),String>{
+    pub fn fire_keyboard_input(&self,key_name:&str,began:bool,processed:bool)->Result<(),String>{
+        let input=self.lua.create_table().map_err(|error|error.to_string())?;
+        let input_type=self.lua.create_table().map_err(|error|error.to_string())?;input_type.set("Name","Keyboard").map_err(|error|error.to_string())?;
+        let key_code=self.lua.create_table().map_err(|error|error.to_string())?;key_code.set("Name",key_name).map_err(|error|error.to_string())?;
+        let state=self.lua.create_table().map_err(|error|error.to_string())?;state.set("Name",if began{"Begin"}else{"End"}).map_err(|error|error.to_string())?;
+        input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("KeyCode",key_code).map_err(|error|error.to_string())?;input.set("UserInputState",state).map_err(|error|error.to_string())?;
+        let event=if began{"InputBegan"}else{"InputEnded"};
+        if let Ok(signal)=self.user_input_service.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,processed)).map_err(|error|error.to_string())?;}Ok(())
+    }
+
+    pub fn fire_pointer_input(&self,referent:DomRef,began:bool,screen_position:[f32;2])->Result<(),String>{
         let input=self.lua.create_table().map_err(|error|error.to_string())?;
         let input_name=if cfg!(target_os="android"){"Touch"}else{"MouseButton1"};
         let input_type=self.lua.create_table().map_err(|error|error.to_string())?;input_type.set("Name",input_name).map_err(|error|error.to_string())?;
         let state=self.lua.create_table().map_err(|error|error.to_string())?;state.set("Name",if began{"Begin"}else{"End"}).map_err(|error|error.to_string())?;
-        let position=self.lua.create_table().map_err(|error|error.to_string())?;position.set("X",0.0).map_err(|error|error.to_string())?;position.set("Y",0.0).map_err(|error|error.to_string())?;position.set("Z",0.0).map_err(|error|error.to_string())?;
+        let position=self.lua.create_table().map_err(|error|error.to_string())?;position.set("X",screen_position[0]).map_err(|error|error.to_string())?;position.set("Y",screen_position[1]).map_err(|error|error.to_string())?;position.set("Z",0.0).map_err(|error|error.to_string())?;
         input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("UserInputState",state).map_err(|error|error.to_string())?;input.set("Position",position).map_err(|error|error.to_string())?;
         let event=if began{"InputBegan"}else{"InputEnded"};
         if let Some(instance)=self.instances.get(&referent){if let Ok(signal)=instance.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone())).map_err(|error|error.to_string())?;}}
