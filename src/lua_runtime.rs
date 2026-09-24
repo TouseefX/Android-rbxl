@@ -826,6 +826,7 @@ pub struct GuiPlaySession {
     user_input_service: Table,
     respawn_requested: Rc<Cell<bool>>,
     respawn_properties: std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>,
+    pointer_position: Rc<Cell<[f32;2]>>,
     last_tick: std::time::Instant,
 }
 
@@ -885,7 +886,11 @@ impl GuiPlaySession {
         }
         let run_service=make_instance(&lua,"RunService","RunService").map_err(|error|error.to_string())?;
         for event in ["Heartbeat","RenderStepped","Stepped"] {run_service.raw_set(event,make_signal(&lua).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;}
+        let pointer_position=Rc::new(Cell::new([0.0f32,0.0f32]));
         let user_input_service=make_instance(&lua,"UserInputService","UserInputService").map_err(|error|error.to_string())?;
+        let mouse_position=pointer_position.clone();user_input_service.raw_set("GetMouseLocation",lua.create_function(move |lua,_service:Table|{let value=mouse_position.get();let result=lua.create_table();result.set("X",value[0])?;result.set("Y",value[1])?;Ok(result)})?).map_err(|error|error.to_string())?;
+        user_input_service.raw_set("GetPlatform",lua.create_function(|lua,_service:Table|{let result=lua.create_table();result.set("Name",if cfg!(target_os="android"){"Android"}else{"Windows"})?;Ok(result)})?).map_err(|error|error.to_string())?;
+        user_input_service.raw_set("IsKeyDown",lua.create_function(|_,(_service,_key):(Table,Value)|Ok(false))?).map_err(|error|error.to_string())?;
         for event in ["InputBegan","InputChanged","InputEnded","TouchStarted","TouchMoved","TouchEnded","TextBoxFocused","TextBoxFocusReleased"] {user_input_service.raw_set(event,make_signal(&lua).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;}
         user_input_service.raw_set("TouchEnabled",cfg!(target_os="android")).map_err(|error|error.to_string())?;
         user_input_service.raw_set("KeyboardEnabled",true).map_err(|error|error.to_string())?;
@@ -926,6 +931,21 @@ impl GuiPlaySession {
             http_service.raw_set("UrlEncode",lua.create_function(|_,(_service,text):(Table,String)|{let mut encoded=String::new();for byte in text.bytes(){if byte.is_ascii_alphanumeric()||matches!(byte,b'-'|b'_'|b'.'|b'~'){encoded.push(byte as char);}else{encoded.push_str(&format!("%{byte:02X}"));}}Ok(encoded)})?).map_err(|error|error.to_string())?;
             http_service.raw_set("RequestAsync",lua.create_function(|lua,(_service,_request):(Table,Table)|{let response=lua.create_table();response.set("Success",false)?;response.set("StatusCode",0)?;response.set("StatusMessage","HTTP requests are disabled in GUI preview")?;response.set("Body","")?;response.set("Headers",lua.create_table())?;Ok(response)})?).map_err(|error|error.to_string())?;
             game.raw_set("HttpService",http_service.clone()).map_err(|error|error.to_string())?;lua.globals().set("HttpService",http_service).map_err(|error|error.to_string())?;
+
+            let collection=make_instance(&lua,"CollectionService","CollectionService").map_err(|error|error.to_string())?;let tags=lua.create_table().map_err(|error|error.to_string())?;let added=lua.create_table().map_err(|error|error.to_string())?;let removed=lua.create_table().map_err(|error|error.to_string())?;
+            let add_tags=tags.clone();let add_signals=added.clone();collection.raw_set("AddTag",lua.create_function(move |lua,(_service,instance,tag):(Table,Table,String)|{let instance_tags=add_tags.raw_get::<Table>(instance.clone()).unwrap_or(lua.create_table());if !instance_tags.raw_get::<bool>(&tag).unwrap_or(false){instance_tags.raw_set(&tag,true)?;add_tags.raw_set(instance.clone(),instance_tags)?;if let Ok(signal)=add_signals.raw_get::<Table>(&tag){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,instance))?;}}Ok(())})?).map_err(|error|error.to_string())?;
+            let remove_tags=tags.clone();let remove_signals=removed.clone();collection.raw_set("RemoveTag",lua.create_function(move |_,(_service,instance,tag):(Table,Table,String)|{if let Ok(instance_tags)=remove_tags.raw_get::<Table>(instance.clone()){if instance_tags.raw_get::<bool>(&tag).unwrap_or(false){instance_tags.raw_set(&tag,Value::Nil)?;if let Ok(signal)=remove_signals.raw_get::<Table>(&tag){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,instance))?;}}}Ok(())})?).map_err(|error|error.to_string())?;
+            let has_tags=tags.clone();collection.raw_set("HasTag",lua.create_function(move |_,(_service,instance,tag):(Table,Table,String)|Ok(has_tags.raw_get::<Table>(instance).ok().and_then(|value|value.raw_get::<bool>(tag).ok()).unwrap_or(false)))?).map_err(|error|error.to_string())?;
+            let get_tags=tags.clone();collection.raw_set("GetTags",lua.create_function(move |_,(_service,instance):(Table,Table)|{let mut result=Vec::new();if let Ok(values)=get_tags.raw_get::<Table>(instance){for pair in values.pairs::<String,bool>(){let(tag,active)=pair?;if active{result.push(tag);}}}Ok(result)})?).map_err(|error|error.to_string())?;
+            let tagged=tags.clone();collection.raw_set("GetTagged",lua.create_function(move |_,(_service,tag):(Table,String)|{let mut result=Vec::new();for pair in tagged.clone().pairs::<Table,Table>(){let(instance,values)=pair?;if values.raw_get::<bool>(&tag).unwrap_or(false){result.push(instance);}}Ok(result)})?).map_err(|error|error.to_string())?;
+            for (method,signals) in [("GetInstanceAddedSignal",added),("GetInstanceRemovedSignal",removed)]{collection.raw_set(method,lua.create_function(move |lua,(_service,tag):(Table,String)|{if let Ok(signal)=signals.raw_get::<Table>(&tag){return Ok(signal);}let signal=make_signal(lua)?;signals.raw_set(tag,signal.clone())?;Ok(signal)})?).map_err(|error|error.to_string())?;}
+            game.raw_set("CollectionService",collection.clone()).map_err(|error|error.to_string())?;lua.globals().set("CollectionService",collection).map_err(|error|error.to_string())?;
+
+            let debris=make_instance(&lua,"Debris","Debris").map_err(|error|error.to_string())?;debris.raw_set("AddItem",lua.create_function(|lua,(_service,item,lifetime):(Table,Table,Option<f64>)|{let callback=lua.create_function(move |_,()|{if let Ok(destroy)=item.raw_get::<Function>("Destroy"){destroy.call::<()>(item.clone())?;}Ok(())})?;let task:Table=lua.globals().get("task")?;let delay:Function=task.get("delay")?;delay.call::<()>((lifetime.unwrap_or(10.0),callback))})?).map_err(|error|error.to_string())?;game.raw_set("Debris",debris.clone()).map_err(|error|error.to_string())?;lua.globals().set("Debris",debris).map_err(|error|error.to_string())?;
+
+            let content=make_instance(&lua,"ContentProvider","ContentProvider").map_err(|error|error.to_string())?;content.raw_set("PreloadAsync",lua.create_function(|_,(_service,items,callback):(Table,Table,Option<Function>)|{if let Some(callback)=callback{for value in items.sequence_values::<Value>(){let value=value?;callback.call::<()>((value,"Success"))?;}}Ok(())})?).map_err(|error|error.to_string())?;content.raw_set("RequestQueueSize",0i64).map_err(|error|error.to_string())?;game.raw_set("ContentProvider",content.clone()).map_err(|error|error.to_string())?;lua.globals().set("ContentProvider",content).map_err(|error|error.to_string())?;
+
+            let core_enabled=Rc::new(RefCell::new(std::collections::HashMap::<String,bool>::new()));let starter=instances.iter().find_map(|(referent,table)|dom.get_by_ref(*referent).filter(|instance|instance.class=="StarterGui").map(|_|table.clone())).unwrap_or(make_instance(&lua,"StarterGui","StarterGui").map_err(|error|error.to_string())?);let set_core=core_enabled.clone();starter.raw_set("SetCoreGuiEnabled",lua.create_function(move |_,(_service,kind,enabled):(Table,Value,bool)|{let name=match kind{Value::Table(value)=>value.raw_get::<String>("Name").unwrap_or_else(|_|"All".into()),Value::String(value)=>value.to_str()?.to_string(),_=>"All".into()};set_core.borrow_mut().insert(name,enabled);Ok(())})?).map_err(|error|error.to_string())?;let get_core=core_enabled;starter.raw_set("GetCoreGuiEnabled",lua.create_function(move |_,(_service,kind):(Table,Value)|{let name=match kind{Value::Table(value)=>value.raw_get::<String>("Name").unwrap_or_else(|_|"All".into()),Value::String(value)=>value.to_str()?.to_string(),_=>"All".into()};Ok(*get_core.borrow().get(&name).unwrap_or(&true))})?).map_err(|error|error.to_string())?;game.raw_set("StarterGui",starter.clone()).map_err(|error|error.to_string())?;lua.globals().set("StarterGui",starter).map_err(|error|error.to_string())?;
             let game_table=game.clone();
             game.set("GetService",lua.create_function(move |lua,(_game,name):(Table,String)|{
                 game_table.raw_get::<Value>(&name).or_else(|_|Ok(Value::Table(make_instance(lua,&name,&name)?)))
@@ -1090,7 +1110,7 @@ impl GuiPlaySession {
         let mut respawn_properties=std::collections::HashMap::new();
         fn snapshot_tree(dom:&WeakDom,referent:DomRef,out:&mut std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>){if let Some(instance)=dom.get_by_ref(referent){out.insert(referent,instance.properties.iter().map(|(key,value)|(key.clone(),value.clone())).collect());for child in instance.children(){snapshot_tree(dom,*child,out);}}}
         if let Some(starter)=dom.root().children().iter().find_map(|referent|dom.get_by_ref(*referent).filter(|instance|instance.class=="StarterGui")) {for child in starter.children(){if dom.get_by_ref(*child).is_some_and(|instance|instance.class=="ScreenGui"&&instance.properties.get(&rbx_dom_weak::ustr("ResetOnSpawn")).map(|value|!matches!(value,DomVariant::Bool(false))).unwrap_or(true)){snapshot_tree(dom,*child,&mut respawn_properties);}}}
-        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduler_step,run_service,user_input_service,respawn_requested,respawn_properties,last_tick:std::time::Instant::now()})
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduler_step,run_service,user_input_service,respawn_requested,respawn_properties,pointer_position,last_tick:std::time::Instant::now()})
     }
 
     pub fn take_respawn_request(&self)->bool{self.respawn_requested.replace(false)}
@@ -1138,6 +1158,7 @@ impl GuiPlaySession {
     }
 
     pub fn fire_pointer_changed(&self,referent:DomRef,screen_position:[f32;2],delta:[f32;2])->Result<(),String>{
+        self.pointer_position.set(screen_position);
         let input=self.lua.create_table().map_err(|error|error.to_string())?;
         let input_name=if cfg!(target_os="android"){"Touch"}else{"MouseMovement"};
         let input_type=self.lua.create_table().map_err(|error|error.to_string())?;input_type.set("Name",input_name).map_err(|error|error.to_string())?;
@@ -1152,6 +1173,7 @@ impl GuiPlaySession {
     }
 
     pub fn fire_pointer_input(&self,referent:DomRef,began:bool,screen_position:[f32;2])->Result<(),String>{
+        self.pointer_position.set(screen_position);
         let input=self.lua.create_table().map_err(|error|error.to_string())?;
         let input_name=if cfg!(target_os="android"){"Touch"}else{"MouseButton1"};
         let input_type=self.lua.create_table().map_err(|error|error.to_string())?;input_type.set("Name",input_name).map_err(|error|error.to_string())?;
