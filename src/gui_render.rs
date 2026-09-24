@@ -8,21 +8,24 @@ use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 pub fn install_roblox_fonts(ctx:&egui::Context) {
     let mut fonts=egui::FontDefinitions::default();
     for (name,bytes) in [
+        ("BuilderSansThin",include_bytes!("../content/fonts/BuilderSans-Thin-100.otf").as_slice()),
+        ("BuilderSansLight",include_bytes!("../content/fonts/BuilderSans-Light-300.otf").as_slice()),
         ("BuilderSansRegular",include_bytes!("../content/fonts/BuilderSans-Regular-400.otf").as_slice()),
         ("BuilderSansMedium",include_bytes!("../content/fonts/BuilderSans-Medium-500.otf").as_slice()),
         ("BuilderSansBold",include_bytes!("../content/fonts/BuilderSans-Bold-700.otf").as_slice()),
         ("BuilderSansExtraBold",include_bytes!("../content/fonts/BuilderSans-ExtraBold-800.otf").as_slice()),
+        ("BuilderMonoLight",include_bytes!("../content/fonts/BuilderMono-Light-300.otf").as_slice()),
         ("BuilderMonoRegular",include_bytes!("../content/fonts/BuilderMono-Regular-400.otf").as_slice()),
         ("BuilderMonoBold",include_bytes!("../content/fonts/BuilderMono-Bold-700.otf").as_slice()),
     ] { fonts.font_data.insert(name.into(),egui::FontData::from_static(bytes).into()); }
-    for name in ["BuilderSansRegular","BuilderSansMedium","BuilderSansBold","BuilderSansExtraBold","BuilderMonoRegular","BuilderMonoBold"] {
+    for name in ["BuilderSansThin","BuilderSansLight","BuilderSansRegular","BuilderSansMedium","BuilderSansBold","BuilderSansExtraBold","BuilderMonoLight","BuilderMonoRegular","BuilderMonoBold"] {
         fonts.families.insert(egui::FontFamily::Name(name.into()),vec![name.into()]);
     }
     ctx.set_fonts(fonts);
 }
 
 fn roblox_font_family(monospace:bool,weight:u16)->egui::FontFamily {
-    egui::FontFamily::Name((if monospace {if weight>=600{"BuilderMonoBold"}else{"BuilderMonoRegular"}} else if weight>=800{"BuilderSansExtraBold"}else if weight>=600{"BuilderSansBold"}else if weight>=500{"BuilderSansMedium"}else{"BuilderSansRegular"}).into())
+    egui::FontFamily::Name((if monospace {if weight>=600{"BuilderMonoBold"}else if weight<=300{"BuilderMonoLight"}else{"BuilderMonoRegular"}} else if weight>=800{"BuilderSansExtraBold"}else if weight>=600{"BuilderSansBold"}else if weight>=500{"BuilderSansMedium"}else if weight<=100{"BuilderSansThin"}else if weight<=300{"BuilderSansLight"}else{"BuilderSansRegular"}).into())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,11 +511,14 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
            nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
-    let group_transparency = if instance.class == "CanvasGroup" {
+    // Roblox only flattens CanvasGroup under Sibling ZIndexBehavior. Under
+    // Global it behaves as an ordinary clipping GuiObject.
+    let composited_group = instance.class == "CanvasGroup" && !global_z;
+    let group_transparency = if composited_group {
         number(instance.properties.get(&rbx_dom_weak::ustr("GroupTransparency")), 0.0).clamp(0.0, 1.0)
     } else { 0.0 };
     let opacity = inherited_opacity * (1.0 - group_transparency);
-    let local_tint = if instance.class == "CanvasGroup" {
+    let local_tint = if composited_group {
         color(instance.properties.get(&rbx_dom_weak::ustr("GroupColor3")), 255, [255, 255, 255])
     } else { Color32::WHITE };
     let tint = multiply_color(inherited_tint, local_tint);
@@ -525,7 +531,9 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     let rect = forced_rect.or_else(|| overrides.get(&referent).copied()).unwrap_or_else(|| {
         if is_screen { parent_rect } else { gui_rect(dom, painter, instance, parent_rect, scale) }
     });
-    let clips = matches!(instance.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), Some(Variant::Bool(true)));
+    // CanvasGroup's backing texture is exactly its AbsoluteSize, therefore it
+    // always clips regardless of the serialized ClipsDescendants value.
+    let clips = instance.class == "CanvasGroup" || matches!(instance.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), Some(Variant::Bool(true)));
     let child_clip = if clips { parent_clip.intersect(rect) } else { parent_clip };
     let z = match instance.properties.get(&rbx_dom_weak::ustr("ZIndex")) {
         Some(Variant::Int32(v)) => *v,
