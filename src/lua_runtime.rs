@@ -624,6 +624,10 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     t.set("FindFirstChildOfClass",lua.create_function(|_,(this,class):(Table,String)|{for child in instance_children(&this)?{if child.raw_get::<String>("ClassName")?==class{return Ok(Some(child));}}Ok(None)})?)?;
     t.set("GetFullName",lua.create_function(|_,this:Table|{let mut names=vec![this.raw_get::<String>("Name")?];let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{names.push(parent.raw_get::<String>("Name")?);current=parent.raw_get::<Table>("Parent").ok();}names.reverse();Ok(names.join("."))})?)?;
     t.set("IsDescendantOf",lua.create_function(|_,(this,ancestor):(Table,Table)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent==ancestor{return Ok(true);}current=parent.raw_get::<Table>("Parent").ok();}Ok(false)})?)?;
+    t.set("IsAncestorOf",lua.create_function(|_,(this,descendant):(Table,Table)|{let mut current=descendant.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent==this{return Ok(true);}current=parent.raw_get::<Table>("Parent").ok();}Ok(false)})?)?;
+    t.set("FindFirstAncestor",lua.create_function(|_,(this,name):(Table,String)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent.raw_get::<String>("Name")?==name{return Ok(Some(parent));}current=parent.raw_get::<Table>("Parent").ok();}Ok(None)})?)?;
+    t.set("FindFirstAncestorWhichIsA",lua.create_function(|_,(this,class):(Table,String)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if class_is_a(&parent.raw_get::<String>("ClassName")?,&class){return Ok(Some(parent));}current=parent.raw_get::<Table>("Parent").ok();}Ok(None)})?)?;
+    t.set("FindFirstAncestorOfClass",lua.create_function(|_,(this,class):(Table,String)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent.raw_get::<String>("ClassName")?==class{return Ok(Some(parent));}current=parent.raw_get::<Table>("Parent").ok();}Ok(None)})?)?;
     let attributes=lua.create_table();t.raw_set("_attributes",attributes)?;
     t.set("GetAttribute",lua.create_function(|_,(this,name):(Table,String)|this.raw_get::<Table>("_attributes")?.raw_get::<Value>(name))?)?;
     t.set("SetAttribute",lua.create_function(|_,(this,name,value):(Table,String,Value)|{this.raw_get::<Table>("_attributes")?.raw_set(&name,value)?;if let Ok(signal)=this.raw_get::<Table>(&format!("_attribute_signal_{name}")){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}Ok(())})?)?;
@@ -641,6 +645,7 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     t.set("IsA", isa)?;
     let mt = typed_metatable(lua, "Instance")?;
     let _ = t.set_metatable(Some(mt));
+    if let Ok(install)=lua.globals().get::<Function>("_arena_install_instance_wait"){install.call::<()>(t.clone())?;}
     Ok(t)
 }
 
@@ -991,7 +996,22 @@ impl GuiPlaySession {
                 end)
                 return coroutine.yield(math.huge)
             end
+            function _arena_install_instance_wait(instance)
+                instance.WaitForChild = function(self, name, timeout)
+                    local child = rawget(self, name)
+                    if child ~= nil then return child end
+                    local elapsed = 0
+                    while timeout == nil or elapsed < timeout do
+                        elapsed += task.wait()
+                        child = rawget(self, name)
+                        if child ~= nil then return child end
+                    end
+                    return nil
+                end
+            end
         "#).exec().map_err(|error|error.to_string())?;
+        let install_wait:Function=lua.globals().get("_arena_install_instance_wait").map_err(|error|error.to_string())?;
+        for table in instances.values(){install_wait.call::<()>(table.clone()).map_err(|error|error.to_string())?;}
         let scheduler_step:Function=lua.globals().get("_arena_step_tasks").map_err(|error|error.to_string())?;
         let signal_wait:Function=lua.globals().get("_arena_signal_wait").map_err(|error|error.to_string())?;
         let upgrade_signals=|table:&Table|->Result<(),String>{for pair in table.clone().pairs::<Value,Value>(){let(_,value)=pair.map_err(|error|error.to_string())?;if let Value::Table(candidate)=value{if candidate.raw_get::<Function>("Connect").is_ok()&&candidate.raw_get::<Function>("Fire").is_ok(){candidate.raw_set("Wait",signal_wait.clone()).map_err(|error|error.to_string())?;}}}Ok(())};
