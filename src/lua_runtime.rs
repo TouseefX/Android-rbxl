@@ -586,28 +586,49 @@ fn is_instance_signal(key: &str) -> bool {
         "Focused"|"FocusLost"|"SelectionGained"|"SelectionLost"|"Changed"|"AncestryChanged"|"Destroying")
 }
 
+fn instance_children(this:&Table)->LuaResult<Vec<Table>> {
+    let mut children=Vec::new();for pair in this.clone().pairs::<Value,Value>(){let(_,value)=pair?;if let Value::Table(child)=value{if child.raw_get::<Table>("Parent").ok().as_ref()==Some(this){children.push(child);}}}Ok(children)
+}
+
+fn class_is_a(class:&str,target:&str)->bool {
+    if class==target||target=="Instance" {return true;}
+    match target {
+        "GuiBase"=>matches!(class,"ScreenGui"|"BillboardGui"|"SurfaceGui"|"GuiObject"|"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
+        "GuiBase2d"=>matches!(class,"GuiObject"|"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
+        "LayerCollector"=>matches!(class,"ScreenGui"|"BillboardGui"|"SurfaceGui"),
+        "GuiObject"=>matches!(class,"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
+        "GuiButton"=>matches!(class,"TextButton"|"ImageButton"),
+        "GuiLabel"=>matches!(class,"TextLabel"|"ImageLabel"),
+        "UIComponent"=>class.starts_with("UI"),
+        "LuaSourceContainer"=>matches!(class,"LocalScript"|"ModuleScript"|"Script"),
+        "BaseScript"=>matches!(class,"LocalScript"|"Script"),
+        _=>false,
+    }
+}
+
 fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     let t = lua.create_table();
     t.set("Name", name)?;
     t.set("ClassName", class)?;
     let noop = lua.create_function(|_, _: Variadic<Value>| Ok(Variadic::<Value>::new()))?;
-    for m in [
-        "GetDescendants",
-        "GetActor",
-        "Clone",
-        "Destroy",
-        "GetAttribute",
-        "SetAttribute",
-    ] {
-        t.set(m, noop.clone())?;
-    }
-    t.set("FindFirstChild",lua.create_function(|_,(this,name):(Table,String)|this.raw_get::<Value>(&name).or(Ok(Value::Nil)))?)?;
-    t.set("WaitForChild",lua.create_function(|_,(this,name):(Table,String)|this.raw_get::<Value>(&name).or(Ok(Value::Nil)))?)?;
-    t.set("GetChildren",lua.create_function(|_,this:Table|{
-        let mut children=Vec::new();
-        for pair in this.clone().pairs::<Value,Value>() { let (_,value)=pair?; if let Value::Table(child)=&value { if child.raw_get::<Table>("Parent").ok().as_ref()==Some(&this){children.push(value);} } }
-        Ok(children)
+    for m in ["GetActor","Clone","Destroy"] {t.set(m,noop.clone())?;}
+    t.set("FindFirstChild",lua.create_function(|_,(this,name,recursive):(Table,String,Option<bool>)|{
+        if let Ok(value)=this.raw_get::<Value>(&name){if !matches!(value,Value::Nil){return Ok(value);}}
+        if recursive.unwrap_or(false){let mut stack=instance_children(&this)?;while let Some(child)=stack.pop(){if child.raw_get::<String>("Name").ok().as_deref()==Some(name.as_str()){return Ok(Value::Table(child));}stack.extend(instance_children(&child)?);}}
+        Ok(Value::Nil)
     })?)?;
+    t.set("WaitForChild",lua.create_function(|_,(this,name,_timeout):(Table,String,Option<f64>)|this.raw_get::<Value>(&name).or(Ok(Value::Nil)))?)?;
+    t.set("GetChildren",lua.create_function(|_,this:Table|instance_children(&this))?)?;
+    t.set("GetDescendants",lua.create_function(|_,this:Table|{let mut descendants=Vec::new();let mut stack=instance_children(&this)?;while let Some(child)=stack.pop(){stack.extend(instance_children(&child)?);descendants.push(child);}Ok(descendants)})?)?;
+    t.set("FindFirstChildWhichIsA",lua.create_function(|_,(this,class,recursive):(Table,String,Option<bool>)|{let mut stack=instance_children(&this)?;while let Some(child)=stack.pop(){if class_is_a(&child.raw_get::<String>("ClassName")?,&class){return Ok(Some(child));}if recursive.unwrap_or(false){stack.extend(instance_children(&child)?);}}Ok(None)})?)?;
+    t.set("FindFirstChildOfClass",lua.create_function(|_,(this,class):(Table,String)|{for child in instance_children(&this)?{if child.raw_get::<String>("ClassName")?==class{return Ok(Some(child));}}Ok(None)})?)?;
+    t.set("GetFullName",lua.create_function(|_,this:Table|{let mut names=vec![this.raw_get::<String>("Name")?];let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{names.push(parent.raw_get::<String>("Name")?);current=parent.raw_get::<Table>("Parent").ok();}names.reverse();Ok(names.join("."))})?)?;
+    t.set("IsDescendantOf",lua.create_function(|_,(this,ancestor):(Table,Table)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent==ancestor{return Ok(true);}current=parent.raw_get::<Table>("Parent").ok();}Ok(false)})?)?;
+    let attributes=lua.create_table();t.raw_set("_attributes",attributes)?;
+    t.set("GetAttribute",lua.create_function(|_,(this,name):(Table,String)|this.raw_get::<Table>("_attributes")?.raw_get::<Value>(name))?)?;
+    t.set("SetAttribute",lua.create_function(|_,(this,name,value):(Table,String,Value)|{this.raw_get::<Table>("_attributes")?.raw_set(&name,value)?;if let Ok(signal)=this.raw_get::<Table>(&format!("_attribute_signal_{name}")){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}Ok(())})?)?;
+    t.set("GetAttributeChangedSignal",lua.create_function(|lua,(this,name):(Table,String)|{let key=format!("_attribute_signal_{name}");if let Ok(signal)=this.raw_get::<Table>(&key){return Ok(signal);}let signal=make_signal(lua)?;this.raw_set(key,signal.clone())?;Ok(signal)})?)?;
+    t.set("GetAttributes",lua.create_function(|_,this:Table|Ok(this.raw_get::<Table>("_attributes")?))?)?;
     for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","SelectionGained","SelectionLost","Changed","AncestryChanged","Destroying"] {
         t.set(event,make_signal(lua)?)?;
     }
@@ -616,7 +637,7 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
         if let Ok(signal)=this.raw_get::<Table>(&key){return Ok(signal);}let signal=make_signal(lua)?;this.raw_set(key,signal.clone())?;Ok(signal)
     })?)?;
     let class_name = class.to_string();
-    let isa = lua.create_function(move |_, (_self, name): (Table, String)| Ok(name == class_name))?;
+    let isa = lua.create_function(move |_, (_self, name): (Table, String)| Ok(class_is_a(&class_name,&name)))?;
     t.set("IsA", isa)?;
     let mt = typed_metatable(lua, "Instance")?;
     let _ = t.set_metatable(Some(mt));
@@ -747,7 +768,7 @@ fn clone_runtime_instance(lua:&Lua,source:&Table,queue:Rc<RefCell<Vec<Table>>>,p
     if let Some(parent)=parent {clone.raw_set("Parent",parent.clone())?;parent.raw_set(name.as_str(),clone.clone())?;}
     for pair in source.clone().pairs::<Value,Value>() {
         let (key,value)=pair?;let Value::String(key_string)=&key else{continue;};let key_name=key_string.to_str()?;
-        if key_name.starts_with('_')||matches!(key_name.as_str(),"Name"|"ClassName"|"Parent"|"Clone"|"Destroy")||matches!(value,Value::Function(_)){continue;}
+        if key_name=="_ref"||key_name=="_destroyed"||key_name.starts_with("_property_signal_")||matches!(key_name.as_str(),"Name"|"ClassName"|"Parent"|"Clone"|"Destroy")||matches!(value,Value::Function(_)){continue;}
         if let Value::Table(table)=&value {if table.raw_get::<Function>("Connect").is_ok(){continue;}if table.raw_get::<Table>("Parent").ok().as_ref()==Some(source){continue;}}
         clone.raw_set(key,clone_runtime_value(lua,value)?)?;
     }
