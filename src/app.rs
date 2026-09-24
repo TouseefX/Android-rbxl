@@ -198,6 +198,7 @@ pub struct EditorApp {
     show_stats: bool,
     /// Whether StarterGui/BillboardGui/SurfaceGui previews are drawn over the viewport.
     show_gui_preview: bool,
+    roblox_fonts_installed: bool,
     /// GPU textures retained by the StarterGui preview.
     gui_textures: HashMap<String, egui::TextureHandle>,
     /// Editor-preview scroll positions, keyed by ScrollingFrame referent.
@@ -383,6 +384,7 @@ impl Default for EditorApp {
             editor_focus_mode: false,
             show_stats: false,
             show_gui_preview: true,
+            roblox_fonts_installed: false,
             gui_textures: HashMap::new(),
             gui_scroll_offsets: HashMap::new(),
             gui_text_inputs: HashMap::new(),
@@ -576,6 +578,7 @@ impl EditorApp {
     /// is the Bevy viewport camera, steered by the 3D tab. Runs each frame from
     /// a Bevy system.
     pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam, viewport_scene: &crate::bevy_render::ViewportScene) {
+        if !self.roblox_fonts_installed {crate::gui_render::install_roblox_fonts(ctx);self.roblox_fonts_installed=true;}
         self.drain_events();
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
             self.show_quick_open = true;
