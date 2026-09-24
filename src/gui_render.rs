@@ -57,7 +57,8 @@ pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind, p
 
 #[derive(Clone, Copy)]
 struct RoundedMask { rect: Rect, radius: f32, rotation: f32 }
-type GuiGradient=(f32,Vec2,Vec<Color32>);
+#[derive(Clone)]
+struct GuiGradient { rotation:f32, offset:Vec2, colors:Vec<Color32>, scale:f32, tile_mode:i32, kind:i32 }
 
 #[derive(Clone, Copy)]
 struct SurfaceWarp { source: Rect, rotation: f32, quad: [Pos2; 4] }
@@ -66,6 +67,7 @@ struct GuiNode {
     referent: Ref,
     class: String,
     rect: Rect,
+    background_rect: Rect,
     content_rect: Rect,
     gui_scale: f32,
     clip: Rect,
@@ -478,9 +480,12 @@ fn multiply_color(a: Color32, b: Color32) -> Color32 {
     )
 }
 
-fn gradient_samples(instance: &rbx_dom_weak::Instance) -> Option<(f32, Vec2, Vec<Color32>)> {
+fn gradient_samples(instance: &rbx_dom_weak::Instance) -> Option<GuiGradient> {
     let rotation = number(instance.properties.get(&rbx_dom_weak::ustr("Rotation")), 0.0);
     let offset = vector2(instance.properties.get(&rbx_dom_weak::ustr("Offset")), Vec2::ZERO);
+    let scale=number(instance.properties.get(&rbx_dom_weak::ustr("Scale")),1.0).abs().max(0.0001);
+    let tile_mode=enum_value(instance.properties.get(&rbx_dom_weak::ustr("TileMode")),0);
+    let kind=enum_value(instance.properties.get(&rbx_dom_weak::ustr("Type")),0);
     let colors = match instance.properties.get(&rbx_dom_weak::ustr("Color")) {
         Some(Variant::ColorSequence(sequence)) => &sequence.keypoints,
         _ => return None,
@@ -512,7 +517,7 @@ fn gradient_samples(instance: &rbx_dom_weak::Instance) -> Option<(f32, Vec2, Vec
         }).unwrap_or(0.0).clamp(0.0, 1.0);
         Color32::from_rgba_unmultiplied(rgb.r(), rgb.g(), rgb.b(), ((1.0-transparency)*255.0) as u8)
     };
-    Some((rotation, offset, (0..=32).map(|index| sample_color(index as f32 / 32.0)).collect()))
+    Some(GuiGradient{rotation,offset,colors:(0..=32).map(|index|sample_color(index as f32/32.0)).collect(),scale,tile_mode,kind})
 }
 
 fn child_of_class<'a>(dom: &'a WeakDom, instance: &rbx_dom_weak::Instance, class: &str)
@@ -682,6 +687,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             referent,
             class: instance.class.to_string(),
             rect,
+            background_rect:rect,
             content_rect,
             gui_scale: scale,
             clip: parent_clip.intersect(rect),
@@ -1372,14 +1378,18 @@ fn apply_gradients(mut color:Color32,point:Pos2,gradient:Option<&GuiGradient>,gr
 }
 
 fn sample_gradient(gradient: &GuiGradient, point: Pos2, rect: Rect) -> Color32 {
-    let (rotation, offset, samples) = gradient;
-    if samples.is_empty() { return Color32::WHITE; }
-    let radians = rotation.to_radians();
-    let direction = Vec2::new(radians.cos(), radians.sin());
-    let center = rect.center() + Vec2::new(offset.x*rect.width(), offset.y*rect.height());
-    let extent = direction.x.abs()*rect.width()*0.5 + direction.y.abs()*rect.height()*0.5;
-    let position = ((point-center).dot(direction)/(extent*2.0).max(0.001) + 0.5).clamp(0.0,1.0);
-    let scaled = position*(samples.len()-1) as f32;
+    let samples=&gradient.colors;if samples.is_empty(){return Color32::WHITE;}
+    let radians=gradient.rotation.to_radians();let direction=Vec2::new(radians.cos(),radians.sin());
+    let center=rect.center()+Vec2::new(gradient.offset.x*rect.width(),gradient.offset.y*rect.height());
+    let extent=direction.x.abs()*rect.width()*0.5+direction.y.abs()*rect.height()*0.5;
+    let mut position=match gradient.kind {
+        1=>(point-center).length()/(rect.width().hypot(rect.height())*0.5).max(0.001),
+        2=>{let delta=point-center;((delta.y.atan2(delta.x)-radians)/std::f32::consts::TAU).rem_euclid(1.0)},
+        _=>(point-center).dot(direction)/(extent*2.0).max(0.001)+0.5,
+    };
+    position=(position-0.5)/gradient.scale+0.5;
+    position=match gradient.tile_mode {1=>position.rem_euclid(1.0),2=>{let value=position.rem_euclid(2.0);if value>1.0{2.0-value}else{value}},_=>position.clamp(0.0,1.0)};
+    let scaled=position*(samples.len()-1) as f32;
     let lower = scaled.floor() as usize;
     let upper = (lower+1).min(samples.len()-1);
     let mix = scaled-lower as f32;
@@ -2115,9 +2125,12 @@ pub fn draw_starter_gui(
             } else { viewport };
             let clip_to_safe=bool_value(gui.properties.get(&rbx_dom_weak::ustr("ClipToDeviceSafeArea")),true)&&screen_insets!=0;
             let root_clip=if clip_to_safe{root_rect}else{viewport};
-            let root_path = vec![(0, screen_order)]; screen_order+=1;
+            let root_path = vec![(0, screen_order)]; screen_order+=1;let first_node=nodes.len();
             collect(dom, &layout_painter, *child, root_rect, root_clip, display_order,
                 global_z, 1.0, 1.0, Color32::WHITE, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
+            if enum_value(gui.properties.get(&rbx_dom_weak::ustr("SafeAreaCompatibility")),1)==1&&screen_insets!=0 {
+                for node in &mut nodes[first_node..] {if node.rect.left()<=root_rect.left()+0.5&&node.rect.right()>=root_rect.right()-0.5&&node.rect.top()<=root_rect.top()+0.5&&node.rect.bottom()>=root_rect.bottom()-0.5{node.background_rect=viewport;}}
+            }
         }
     }
     // Resolve rounded ClipsDescendants masks after all containers have their
@@ -2125,7 +2138,7 @@ pub fn draw_starter_gui(
     let visual_bounds: std::collections::HashMap<Ref, RoundedMask> = nodes.iter().map(|node| (
         node.referent, RoundedMask { rect: node.rect, radius: node.corner_radius, rotation: node.rotation }
     )).collect();
-    let canvas_gradients:std::collections::HashMap<Ref,((f32,Vec2,Vec<Color32>),Rect)>=nodes.iter().filter(|node|node.class=="CanvasGroup"&&!node.global_z).filter_map(|node|node.gradient.clone().map(|gradient|(node.referent,(gradient,node.rect)))).collect();
+    let canvas_gradients:std::collections::HashMap<Ref,(GuiGradient,Rect)>=nodes.iter().filter(|node|node.class=="CanvasGroup"&&!node.global_z).filter_map(|node|node.gradient.clone().map(|gradient|(node.referent,(gradient,node.rect)))).collect();
     for node in &mut nodes {
         let mut parent = dom.get_by_ref(node.referent).map(|instance| instance.parent());
         while let Some(referent) = parent.filter(|referent| !referent.is_none()) {
@@ -2280,21 +2293,22 @@ pub fn draw_starter_gui(
         let hovered = is_button && node.interactable && response.hovered() && pointer_inside;
         let button_factor = if node.auto_button_color && pressed { 0.72 }
             else if node.auto_button_color && hovered { 0.88 } else { 1.0 };
+        let background_painter=if node.background_rect!=node.rect{ui.painter().with_clip_rect(viewport)}else{painter.clone()};
         if node.gradient.is_none()&&node.group_gradients.is_empty() {
         if !node.rounded_clips.is_empty() || node.surface_warp.is_some() {
-            paint_masked_solid(&painter,node.rect,shade_color(node.background,button_factor),node.corner_radius,node.rotation,&node.rounded_clips,node.surface_warp);
+            paint_masked_solid(&background_painter,node.background_rect,shade_color(node.background,button_factor),node.corner_radius,node.rotation,&node.rounded_clips,node.surface_warp);
         } else if node.rotation.abs() < 0.001 {
-            painter.rect_filled(node.rect, node.corner_radius, shade_color(node.background, button_factor));
+            background_painter.rect_filled(node.background_rect,node.corner_radius,shade_color(node.background,button_factor));
         } else {
             let radians = node.rotation.to_radians();
-            let corners = [node.rect.left_top(), node.rect.right_top(), node.rect.right_bottom(), node.rect.left_bottom()]
-                .into_iter().map(|point| rotate_point(point, node.rect.center(), radians)).collect();
-            painter.add(egui::Shape::convex_polygon(corners,
-                shade_color(node.background, button_factor), Stroke::NONE));
+            let corners = [node.background_rect.left_top(),node.background_rect.right_top(),node.background_rect.right_bottom(),node.background_rect.left_bottom()]
+                .into_iter().map(|point| rotate_point(point,node.background_rect.center(),radians)).collect();
+            background_painter.add(egui::Shape::convex_polygon(corners,
+                shade_color(node.background,button_factor),Stroke::NONE));
         }}
         if node.gradient.is_some()||!node.group_gradients.is_empty() {
-            paint_gradient(&painter.with_clip_rect(rotated_bounds(node.rect, node.rotation).intersect(node.clip)), node.rect,node.gradient_rect,
-                shade_color(node.background, button_factor),node.gradient.as_ref(),&node.group_gradients,node.rotation,node.corner_radius,&node.rounded_clips,node.surface_warp);
+            paint_gradient(&background_painter.with_clip_rect(rotated_bounds(node.background_rect,node.rotation).intersect(if node.background_rect!=node.rect{viewport}else{node.clip})),node.background_rect,node.gradient_rect,
+                shade_color(node.background,button_factor),node.gradient.as_ref(),&node.group_gradients,node.rotation,node.corner_radius,&node.rounded_clips,node.surface_warp);
         }
         if node.rotation.abs() < 0.001 {
             if node.border_size > 0.0 {
