@@ -1800,17 +1800,25 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
     }
     depth_cells.sort_by(|a,b| b.depth.total_cmp(&a.depth));
     let pointer=ui.input(|input|input.pointer.hover_pos()); let mut hovered=None;
-    for polygon in depth_cells {
-        if pointer.map_or(false,|point|point_in_polygon(point,&polygon.points)){hovered=Some(polygon.referent);}
+    for mut polygon in depth_cells {
+        let mut vertex_colors=Vec::with_capacity(polygon.points.len());
+        for point in &mut polygon.points {
+            let local=*point;let mut coverage=if node.content_rect.contains(local){rounded_coverage(local,node.rect,node.corner_radius)}else{0.0};
+            let mut screen=rotate_point(local,node.rect.center(),node.rotation.to_radians());if let Some(warp)=node.surface_warp{screen=warp_surface_point(screen,warp);}
+            for mask in &node.rounded_clips{let mask_local=rotate_point(screen,mask.rect.center(),-mask.rotation.to_radians());coverage*=rounded_coverage(mask_local,mask.rect,mask.radius);}
+            vertex_colors.push(Color32::from_rgba_unmultiplied(polygon.color.r(),polygon.color.g(),polygon.color.b(),(polygon.color.a() as f32*coverage) as u8));*point=screen;
+        }
+        let pointer_hits=pointer.map_or(false,|point|{if !point_in_polygon(point,&polygon.points){return false;}let affine=node.surface_warp.map(|warp|inverse_surface_point(point,warp)).unwrap_or(point);let local=rotate_point(affine,node.rect.center(),-node.rotation.to_radians());node.content_rect.contains(local)&&rounded_coverage(local,node.rect,node.corner_radius)>0.0&&node.rounded_clips.iter().all(|mask|{let mask_local=rotate_point(point,mask.rect.center(),-mask.rotation.to_radians());rounded_coverage(mask_local,mask.rect,mask.radius)>0.0})});
+        if pointer_hits{hovered=Some(polygon.referent);}
         if let Some((uri,uvs))=polygon.texture {
             if let Some(texture)=ensure_gui_texture(ui,textures,&uri) {
                 let mut mesh=egui::Mesh::with_texture(texture);
-                for (point,uv) in polygon.points.into_iter().zip(uvs) { mesh.vertices.push(egui::epaint::Vertex{pos:point,uv,color:polygon.color}); }
+                for ((point,uv),color) in polygon.points.into_iter().zip(uvs).zip(vertex_colors) { mesh.vertices.push(egui::epaint::Vertex{pos:point,uv,color}); }
                 for index in 1..mesh.vertices.len().saturating_sub(1) { mesh.indices.extend_from_slice(&[0,index as u32,index as u32+1]); }
                 painter.add(egui::Shape::mesh(mesh)); continue;
             }
         }
-        let mut mesh=egui::Mesh::default();for point in polygon.points{mesh.vertices.push(egui::epaint::Vertex{pos:point,uv:egui::epaint::WHITE_UV,color:polygon.color});}mesh.indices.extend_from_slice(&[0,1,2]);painter.add(egui::Shape::mesh(mesh));
+        let mut mesh=egui::Mesh::default();for(point,color)in polygon.points.into_iter().zip(vertex_colors){mesh.vertices.push(egui::epaint::Vertex{pos:point,uv:egui::epaint::WHITE_UV,color});}mesh.indices.extend_from_slice(&[0,1,2]);painter.add(egui::Shape::mesh(mesh));
     }
     hovered
 }
