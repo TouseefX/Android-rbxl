@@ -183,6 +183,7 @@ fn build_vm() -> LuaResult<Lua> {
     install_vector3(&lua)?;
     install_vector2(&lua)?;
     install_color3(&lua)?;
+    install_sequences(&lua)?;
     install_cframe(&lua)?;
     install_udim2(&lua)?;
     install_tween_info(&lua)?;
@@ -448,34 +449,26 @@ fn install_color3(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
+fn install_sequences(lua:&Lua)->LuaResult<()> {
+    let color_keypoint=lua.create_table();color_keypoint.set("new",lua.create_function(|lua,(time,value):(f64,Table)|{let point=lua.create_table();point.set("Time",time)?;point.set("Value",value)?;point.set_metatable(Some(typed_metatable(lua,"ColorSequenceKeypoint")?));Ok(point)})?)?;lua.globals().set("ColorSequenceKeypoint",color_keypoint)?;
+    let number_keypoint=lua.create_table();number_keypoint.set("new",lua.create_function(|lua,(time,value,envelope):(f64,f64,Option<f64>)|{let point=lua.create_table();point.set("Time",time)?;point.set("Value",value)?;point.set("Envelope",envelope.unwrap_or(0.0))?;point.set_metatable(Some(typed_metatable(lua,"NumberSequenceKeypoint")?));Ok(point)})?)?;lua.globals().set("NumberSequenceKeypoint",number_keypoint)?;
+    let color_sequence=lua.create_table();color_sequence.set("new",lua.create_function(|lua,args:Variadic<Value>|{let points=if let Some(Value::Table(points))=args.first(){if points.raw_get::<Value>("R").is_err(){points.clone()}else{let output=lua.create_table();for(index,(time,value))in [(0.0,points.clone()),(1.0,args.get(1).and_then(|value|match value{Value::Table(value)=>Some(value.clone()),_=>None}).unwrap_or(points.clone()))].into_iter().enumerate(){let point=lua.create_table();point.set("Time",time)?;point.set("Value",value)?;output.raw_set(index+1,point)?;}output}}else{let points=lua.create_table();if let Some(Value::Table(first))=args.first(){let point=lua.create_table();point.set("Time",0.0)?;point.set("Value",first.clone())?;points.raw_set(1,point)?;}if let Some(Value::Table(last))=args.get(1).or(args.first()){let point=lua.create_table();point.set("Time",1.0)?;point.set("Value",last.clone())?;points.raw_set(2,point)?;}points};let sequence=lua.create_table();sequence.set("Keypoints",points)?;sequence.set_metatable(Some(typed_metatable(lua,"ColorSequence")?));Ok(sequence)})?)?;lua.globals().set("ColorSequence",color_sequence)?;
+    let number_sequence=lua.create_table();number_sequence.set("new",lua.create_function(|lua,args:Variadic<Value>|{let points=if let Some(Value::Table(points))=args.first(){points.clone()}else{let first=match args.first(){Some(Value::Number(value))=>*value,Some(Value::Integer(value))=>*value as f64,_=>0.0};let last=match args.get(1){Some(Value::Number(value))=>*value,Some(Value::Integer(value))=>*value as f64,_=>first};let points=lua.create_table();for(index,(time,value))in [(0.0,first),(1.0,last)].into_iter().enumerate(){let point=lua.create_table();point.set("Time",time)?;point.set("Value",value)?;point.set("Envelope",0.0)?;points.raw_set(index+1,point)?;}points};let sequence=lua.create_table();sequence.set("Keypoints",points)?;sequence.set_metatable(Some(typed_metatable(lua,"NumberSequence")?));Ok(sequence)})?)?;lua.globals().set("NumberSequence",number_sequence)?;Ok(())
+}
+
 fn install_cframe(lua: &Lua) -> LuaResult<()> {
     let cf = lua.create_table();
     cf.set(
         "new",
-        lua.create_function(|lua, (x, y, z): (f64, f64, f64)| {
-            let t = lua.create_table();
-            t.set("X", x)?;
-            t.set("Y", y)?;
-            t.set("Z", z)?;
-            let p = lua.create_table();
-            p.set("X", x)?;
-            p.set("Y", y)?;
-            p.set("Z", z)?;
-            t.set("Position", p)?;
-            t.set_metatable(Some(typed_metatable(lua, "CFrame")?));
-            Ok(t)
+        lua.create_function(|lua,args:Variadic<f64>| {
+            let value=|index:usize,default:f64|args.get(index).copied().unwrap_or(default);let(x,y,z)=(value(0,0.0),value(1,0.0),value(2,0.0));
+            let matrix=if args.len()>=12{[value(3,1.0),value(4,0.0),value(5,0.0),value(6,0.0),value(7,1.0),value(8,0.0),value(9,0.0),value(10,0.0),value(11,1.0)]}else{[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]};
+            let t=lua.create_table();t.set("X",x)?;t.set("Y",y)?;t.set("Z",z)?;for(index,name)in ["R00","R01","R02","R10","R11","R12","R20","R21","R22"].into_iter().enumerate(){t.set(name,matrix[index])?;}let p=lua.create_table();p.set("X",x)?;p.set("Y",y)?;p.set("Z",z)?;t.set("Position",p)?;t.set_metatable(Some(typed_metatable(lua,"CFrame")?));Ok(t)
         })?,
     )?;
     cf.set(
         "Angles",
-        lua.create_function(|lua, (rx, ry, rz): (f64, f64, f64)| {
-            let t = lua.create_table();
-            t.set("RX", rx)?;
-            t.set("RY", ry)?;
-            t.set("RZ", rz)?;
-            t.set_metatable(Some(typed_metatable(lua, "CFrame")?));
-            Ok(t)
-        })?,
+        lua.create_function(|lua,(rx,ry,rz):(f64,f64,f64)|{let(sx,cx)=rx.sin_cos();let(sy,cy)=ry.sin_cos();let(sz,cz)=rz.sin_cos();let matrix=[cy*cz,-cy*sz,sy,cx*sz+sx*sy*cz,cx*cz-sx*sy*sz,-sx*cy,sx*sz-cx*sy*cz,sx*cz+cx*sy*sz,cx*cy];let t=lua.create_table();t.set("X",0.0)?;t.set("Y",0.0)?;t.set("Z",0.0)?;for(index,name)in["R00","R01","R02","R10","R11","R12","R20","R21","R22"].into_iter().enumerate(){t.set(name,matrix[index])?;}let p=lua.create_table();p.set("X",0.0)?;p.set("Y",0.0)?;p.set("Z",0.0)?;t.set("Position",p)?;t.set_metatable(Some(typed_metatable(lua,"CFrame")?));Ok(t)})?,
     )?;
     lua.globals().set("CFrame", cf)?;
     Ok(())
@@ -2019,6 +2012,7 @@ fn variant_to_value(lua: &Lua, v: &DomVariant) -> LuaResult<Value> {
         Variant::Float64(n) => Value::Number(*n),
         Variant::Int32(n) => Value::Number(*n as f64),
         Variant::Int64(n) => Value::Number(*n as f64),
+        Variant::CFrame(cf)=>{let t=lua.create_table();t.set("X",cf.position.x)?;t.set("Y",cf.position.y)?;t.set("Z",cf.position.z)?;for(name,value)in [("R00",cf.orientation.x.x),("R01",cf.orientation.y.x),("R02",cf.orientation.z.x),("R10",cf.orientation.x.y),("R11",cf.orientation.y.y),("R12",cf.orientation.z.y),("R20",cf.orientation.x.z),("R21",cf.orientation.y.z),("R22",cf.orientation.z.z)]{t.set(name,value)?;}let position=lua.create_table();position.set("X",cf.position.x)?;position.set("Y",cf.position.y)?;position.set("Z",cf.position.z)?;t.set("Position",position)?;t.set_metatable(Some(typed_metatable(lua,"CFrame")?));Value::Table(t)}
         Variant::Vector3(v) => {
             let t = lua.create_table();
             t.set("X", v.x as f64)?; t.set("Y", v.y as f64)?; t.set("Z", v.z as f64)?;
@@ -2039,6 +2033,10 @@ fn variant_to_value(lua: &Lua, v: &DomVariant) -> LuaResult<Value> {
             Value::Table(t)
         }
         Variant::Enum(e) => Value::Number(e.to_u32() as f64),
+        Variant::ColorSequence(sequence)=>{let result=lua.create_table();let points=lua.create_table();for(index,point)in sequence.keypoints.iter().enumerate(){let item=lua.create_table();item.set("Time",point.time)?;let value=lua.create_table();value.set("R",point.color.r)?;value.set("G",point.color.g)?;value.set("B",point.color.b)?;item.set("Value",value)?;points.raw_set(index+1,item)?;}result.set("Keypoints",points)?;Value::Table(result)}
+        Variant::NumberSequence(sequence)=>{let result=lua.create_table();let points=lua.create_table();for(index,point)in sequence.keypoints.iter().enumerate(){let item=lua.create_table();item.set("Time",point.time)?;item.set("Value",point.value)?;item.set("Envelope",point.envelope)?;points.raw_set(index+1,item)?;}result.set("Keypoints",points)?;Value::Table(result)}
+        Variant::NumberRange(range)=>{let result=lua.create_table();result.set("Min",range.min)?;result.set("Max",range.max)?;Value::Table(result)}
+        Variant::Rect(rect)=>{let result=lua.create_table();let min=lua.create_table();min.set("X",rect.min.x)?;min.set("Y",rect.min.y)?;let max=lua.create_table();max.set("X",rect.max.x)?;max.set("Y",rect.max.y)?;result.set("Min",min)?;result.set("Max",max)?;Value::Table(result)}
         _ => Value::Nil,
     })
 }
@@ -2053,7 +2051,14 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
         Value::Table(t) => {
             let has = |k: &str| t.get::<Value>(k).is_ok();
             if let Some(referent)=table_to_ref(t)? {Some(DomVariant::Ref(referent))}
-            else if has("XScale") && has("XOffset") && has("YScale") && has("YOffset") {
+            else if has("R00")&&has("R22") {Some(DomVariant::CFrame(ty::CFrame{position:ty::Vector3::new(t.get::<f64>("X")? as f32,t.get::<f64>("Y")? as f32,t.get::<f64>("Z")? as f32),orientation:ty::Matrix3{x:ty::Vector3::new(t.get::<f64>("R00")? as f32,t.get::<f64>("R10")? as f32,t.get::<f64>("R20")? as f32),y:ty::Vector3::new(t.get::<f64>("R01")? as f32,t.get::<f64>("R11")? as f32,t.get::<f64>("R21")? as f32),z:ty::Vector3::new(t.get::<f64>("R02")? as f32,t.get::<f64>("R12")? as f32,t.get::<f64>("R22")? as f32)}}))}
+            else if has("Keypoints") {
+                let points=t.get::<Table>("Keypoints")?;let first=points.raw_get::<Table>(1).ok();let color=first.as_ref().and_then(|point|point.raw_get::<Table>("Value").ok()).is_some();
+                if color{let mut keypoints=Vec::new();for point in points.sequence_values::<Table>(){let point=point?;let value=point.get::<Table>("Value")?;keypoints.push(ty::ColorSequenceKeypoint::new(point.get::<f64>("Time")? as f32,ty::Color3::new(value.get::<f64>("R")? as f32,value.get::<f64>("G")? as f32,value.get::<f64>("B")? as f32)));}Some(DomVariant::ColorSequence(ty::ColorSequence{keypoints}))}
+                else{let mut keypoints=Vec::new();for point in points.sequence_values::<Table>(){let point=point?;keypoints.push(ty::NumberSequenceKeypoint::new(point.get::<f64>("Time")? as f32,point.get::<f64>("Value")? as f32,point.get::<f64>("Envelope").unwrap_or(0.0) as f32));}Some(DomVariant::NumberSequence(ty::NumberSequence{keypoints}))}
+            } else if has("Min")&&has("Max") {
+                match (t.get::<Value>("Min")?,t.get::<Value>("Max")?){(Value::Table(min),Value::Table(max))=>Some(DomVariant::Rect(ty::Rect::new(ty::Vector2::new(min.get::<f64>("X")? as f32,min.get::<f64>("Y")? as f32),ty::Vector2::new(max.get::<f64>("X")? as f32,max.get::<f64>("Y")? as f32)))),(min,max)=>{let number=|value:Value|match value{Value::Number(value)=>Some(value as f32),Value::Integer(value)=>Some(value as f32),_=>None};match(number(min),number(max)){(Some(min),Some(max))=>Some(DomVariant::NumberRange(ty::NumberRange::new(min,max))),_=>None}}}
+            } else if has("XScale") && has("XOffset") && has("YScale") && has("YOffset") {
                 Some(DomVariant::UDim2(ty::UDim2::new(
                     ty::UDim::new(t.get::<f64>("XScale")? as f32,t.get::<i64>("XOffset")? as i32),
                     ty::UDim::new(t.get::<f64>("YScale")? as f32,t.get::<i64>("YOffset")? as i32))))
