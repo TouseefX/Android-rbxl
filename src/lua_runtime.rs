@@ -734,6 +734,22 @@ use rbx_dom_weak::{
 /// Instance tables and connected callbacks remain alive until another place is loaded.
 const GUI_SYNC_PROPERTIES:&[&str]=&["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
 
+fn clone_runtime_instance(lua:&Lua,source:&Table,queue:Rc<RefCell<Vec<Table>>>,parent:Option<Table>)->LuaResult<Table>{
+    let class=source.raw_get::<String>("ClassName").unwrap_or_else(|_|"Folder".into());
+    let name=source.raw_get::<String>("Name").unwrap_or_else(|_|class.clone());
+    let clone=make_instance(lua,&class,&name)?;
+    if let Some(parent)=parent {clone.raw_set("Parent",parent.clone())?;parent.raw_set(name.as_str(),clone.clone())?;}
+    for pair in source.clone().pairs::<Value,Value>() {
+        let (key,value)=pair?;let Value::String(key_string)=&key else{continue;};let key_name=key_string.to_str()?;
+        if key_name.starts_with('_')||matches!(key_name.as_str(),"Name"|"ClassName"|"Parent"|"Clone"|"Destroy")||matches!(value,Value::Function(_)){continue;}
+        if let Value::Table(table)=&value {if table.raw_get::<Function>("Connect").is_ok(){continue;}if table.raw_get::<Table>("Parent").ok().as_ref()==Some(source){continue;}}
+        clone.raw_set(key,value)?;
+    }
+    queue.borrow_mut().push(clone.clone());
+    for pair in source.clone().pairs::<Value,Value>() {let(_,value)=pair?;if let Value::Table(child)=value{if child.raw_get::<Table>("Parent").ok().as_ref()==Some(source){clone_runtime_instance(lua,&child,queue.clone(),Some(clone.clone()))?;}}}
+    Ok(clone)
+}
+
 struct ActiveGuiTween {
     target: Table,
     goals: Vec<(String,Value,Value)>,
@@ -798,17 +814,19 @@ impl GuiPlaySession {
         let pending_destructions=Rc::new(RefCell::new(Vec::<Table>::new()));
         let respawn_requested=Rc::new(Cell::new(false));
         let mut instances=std::collections::HashMap::new();
-        fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>,destructions:Rc<RefCell<Vec<Table>>>)->LuaResult<()> {
+        fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>,creations:Rc<RefCell<Vec<Table>>>,destructions:Rc<RefCell<Vec<Table>>>)->LuaResult<()> {
             let Some(instance)=dom.get_by_ref(referent) else{return Ok(());};
             let table=make_instance(lua,&instance.class,&instance.name)?;
             table.raw_set("_ref",ref_to_i64(referent))?;
             let destroy_table=table.clone();let destroy_queue=destructions.clone();
             table.raw_set("Destroy",lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())})?)?;
+            let clone_table=table.clone();let clone_queue=creations.clone();
+            table.raw_set("Clone",lua.create_function(move |lua,_this:Table|clone_runtime_instance(lua,&clone_table,clone_queue.clone(),None))?)?;
             for (key,value) in &instance.properties { if let Ok(value)=variant_to_value(lua,value){table.raw_set(key.as_str(),value)?;} }
             instances.insert(referent,table);
-            for child in instance.children(){create(lua,dom,*child,instances,destructions.clone())?;} Ok(())
+            for child in instance.children(){create(lua,dom,*child,instances,creations.clone(),destructions.clone())?;} Ok(())
         }
-        create(&lua,dom,dom.root_ref(),&mut instances,pending_destructions.clone()).map_err(|error|error.to_string())?;
+        create(&lua,dom,dom.root_ref(),&mut instances,pending_instances.clone(),pending_destructions.clone()).map_err(|error|error.to_string())?;
         for (referent,table) in &instances {
             let Some(instance)=dom.get_by_ref(*referent) else{continue;};
             if let Some(parent)=instances.get(&instance.parent()){table.raw_set("Parent",parent.clone()).map_err(|error|error.to_string())?;}
@@ -888,6 +906,8 @@ impl GuiPlaySession {
             let table=make_instance(lua,&class,&class)?;
             let destroy_table=table.clone();let destroy_queue=destruction_queue.clone();
             table.raw_set("Destroy",lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())})?)?;
+            let clone_table=table.clone();let clone_queue=creation_queue.clone();
+            table.raw_set("Clone",lua.create_function(move |lua,_this:Table|clone_runtime_instance(lua,&clone_table,clone_queue.clone(),None))?)?;
             if let Some(parent)=parent { table.raw_set("Parent",parent.clone())?; parent.raw_set(class.as_str(),table.clone())?; }
             creation_queue.borrow_mut().push(table.clone()); Ok(table)
         }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
@@ -1097,9 +1117,16 @@ impl GuiPlaySession {
             let name=table.raw_get::<String>("Name").unwrap_or_else(|_|class.clone());
             let referent=dom.insert(parent_ref,InstanceBuilder::new(class.clone()).with_name(name.clone()));
             table.raw_set("_ref",ref_to_i64(referent)).map_err(|error|error.to_string())?;
+            let destroy_table=table.clone();let destroy_queue=self.pending_destructions.clone();
+            table.raw_set("Destroy",self.lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+            let clone_table=table.clone();let clone_queue=self.pending_instances.clone();
+            table.raw_set("Clone",self.lua.create_function(move |lua,_this:Table|clone_runtime_instance(lua,&clone_table,clone_queue.clone(),None)).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
             if let Some(parent)=self.instances.get(&parent_ref){parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;if name!=class{parent.raw_set(class.as_str(),Value::Nil).map_err(|error|error.to_string())?;}}
-            self.instances.insert(referent,table);
+            self.instances.insert(referent,table.clone());
             self.synchronized_properties.insert(referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect());
+            if class=="LocalScript" {
+                if let Ok(source)=table.raw_get::<String>("Source") {let environment=self.lua.create_table();environment.raw_set("script",table.clone()).map_err(|error|error.to_string())?;environment.raw_set("_G",self.lua.globals()).map_err(|error|error.to_string())?;let metatable=self.lua.create_table();metatable.raw_set("__index",self.lua.globals()).map_err(|error|error.to_string())?;environment.set_metatable(Some(metatable)).map_err(|error|error.to_string())?;let function=self.lua.load(&source).set_name(name.as_str()).set_environment(environment).into_function().map_err(|error|error.to_string())?;let task:Table=self.lua.globals().get("task").map_err(|error|error.to_string())?;let spawn:Function=task.get("spawn").map_err(|error|error.to_string())?;spawn.call::<()>(function).map_err(|error|error.to_string())?;}
+            }
             created+=1;
         }
         let destructions:Vec<Table>=self.pending_destructions.borrow_mut().drain(..).collect();
