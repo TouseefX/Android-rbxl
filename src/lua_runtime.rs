@@ -654,6 +654,20 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     Ok(t)
 }
 
+fn lua_to_json(value:Value,depth:usize)->LuaResult<serde_json::Value>{
+    if depth>64{return Err(LuaError::runtime("JSON nesting exceeds 64 levels"));}
+    Ok(match value {Value::Nil=>serde_json::Value::Null,Value::Boolean(value)=>serde_json::Value::Bool(value),Value::Integer(value)=>serde_json::Value::Number(value.into()),Value::Number(value)=>serde_json::Number::from_f64(value).map(serde_json::Value::Number).ok_or_else(||LuaError::runtime("JSON cannot encode NaN or infinity"))?,Value::String(value)=>serde_json::Value::String(value.to_str()?.to_string()),Value::Table(table)=>{
+        let length=table.raw_len();let mut array=Vec::new();let mut object=serde_json::Map::new();let mut array_only=true;
+        for pair in table.clone().pairs::<Value,Value>(){let(key,value)=pair?;match key{Value::Integer(index)if index>=1&&(index as usize)<=length=>{},Value::String(key)=>{array_only=false;object.insert(key.to_str()?.to_string(),lua_to_json(value,depth+1)?);},_=>return Err(LuaError::runtime("JSON object keys must be strings")),}}
+        if array_only{for index in 1..=length{array.push(lua_to_json(table.raw_get::<Value>(index)?,depth+1)?);}serde_json::Value::Array(array)}else{if length>0{return Err(LuaError::runtime("JSON cannot encode mixed array and object keys"));}serde_json::Value::Object(object)}
+    },_=>return Err(LuaError::runtime("unsupported value for JSON encoding"))})
+}
+
+fn json_to_lua(lua:&Lua,value:&serde_json::Value,depth:usize)->LuaResult<Value>{
+    if depth>64{return Err(LuaError::runtime("JSON nesting exceeds 64 levels"));}
+    Ok(match value{serde_json::Value::Null=>Value::Nil,serde_json::Value::Bool(value)=>Value::Boolean(*value),serde_json::Value::Number(value)=>Value::Number(value.as_f64().unwrap_or(0.0)),serde_json::Value::String(value)=>Value::String(lua.create_string(value)?),serde_json::Value::Array(values)=>{let table=lua.create_table();for(index,value)in values.iter().enumerate(){table.raw_set(index+1,json_to_lua(lua,value,depth+1)?)?;}Value::Table(table)},serde_json::Value::Object(values)=>{let table=lua.create_table();for(key,value)in values{table.raw_set(key.as_str(),json_to_lua(lua,value,depth+1)?)?;}Value::Table(table)}})
+}
+
 fn install_instance_stub(lua: &Lua) -> LuaResult<()> {
     let inst = lua.create_table();
     let new_fn = lua.create_function(|lua, (class, name): (String, Option<String>)| {
@@ -905,6 +919,13 @@ impl GuiPlaySession {
             }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
             game.raw_set("TweenService",tween_service.clone()).map_err(|error|error.to_string())?;
             lua.globals().set("TweenService",tween_service).map_err(|error|error.to_string())?;
+            let http_service=make_instance(&lua,"HttpService","HttpService").map_err(|error|error.to_string())?;
+            http_service.raw_set("JSONEncode",lua.create_function(|_,(_service,value):(Table,Value)|serde_json::to_string(&lua_to_json(value,0)?).map_err(|error|LuaError::runtime(error.to_string())))?).map_err(|error|error.to_string())?;
+            http_service.raw_set("JSONDecode",lua.create_function(|lua,(_service,text):(Table,String)|{let value:serde_json::Value=serde_json::from_str(&text).map_err(|error|LuaError::runtime(error.to_string()))?;json_to_lua(lua,&value,0)})?).map_err(|error|error.to_string())?;
+            http_service.raw_set("GenerateGUID",lua.create_function(|_,(_service,wrap):(Table,Option<bool>)|{static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);let count=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);let nanos=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();let raw=format!("{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",(nanos>>64)as u32,(nanos>>48)as u16,(nanos>>36)as u16&0xfff,(count>>48)as u16&0xfff,count&0xffffffffffff);Ok(if wrap.unwrap_or(false){format!("{{{raw}}}")}else{raw})})?).map_err(|error|error.to_string())?;
+            http_service.raw_set("UrlEncode",lua.create_function(|_,(_service,text):(Table,String)|{let mut encoded=String::new();for byte in text.bytes(){if byte.is_ascii_alphanumeric()||matches!(byte,b'-'|b'_'|b'.'|b'~'){encoded.push(byte as char);}else{encoded.push_str(&format!("%{byte:02X}"));}}Ok(encoded)})?).map_err(|error|error.to_string())?;
+            http_service.raw_set("RequestAsync",lua.create_function(|lua,(_service,_request):(Table,Table)|{let response=lua.create_table();response.set("Success",false)?;response.set("StatusCode",0)?;response.set("StatusMessage","HTTP requests are disabled in GUI preview")?;response.set("Body","")?;response.set("Headers",lua.create_table())?;Ok(response)})?).map_err(|error|error.to_string())?;
+            game.raw_set("HttpService",http_service.clone()).map_err(|error|error.to_string())?;lua.globals().set("HttpService",http_service).map_err(|error|error.to_string())?;
             let game_table=game.clone();
             game.set("GetService",lua.create_function(move |lua,(_game,name):(Table,String)|{
                 game_table.raw_get::<Value>(&name).or_else(|_|Ok(Value::Table(make_instance(lua,&name,&name)?)))
