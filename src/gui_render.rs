@@ -14,18 +14,26 @@ pub fn install_roblox_fonts(ctx:&egui::Context) {
         ("BuilderSansMedium",include_bytes!("../content/fonts/BuilderSans-Medium-500.otf").as_slice()),
         ("BuilderSansBold",include_bytes!("../content/fonts/BuilderSans-Bold-700.otf").as_slice()),
         ("BuilderSansExtraBold",include_bytes!("../content/fonts/BuilderSans-ExtraBold-800.otf").as_slice()),
+        ("BuilderExtendedLight",include_bytes!("../content/fonts/BuilderExtended-Light-300.otf").as_slice()),
+        ("BuilderExtendedRegular",include_bytes!("../content/fonts/BuilderExtended-Regular-400.otf").as_slice()),
+        ("BuilderExtendedSemiBold",include_bytes!("../content/fonts/BuilderExtended-SemiBold-600.otf").as_slice()),
+        ("BuilderExtendedBold",include_bytes!("../content/fonts/BuilderExtended-Bold-700.otf").as_slice()),
+        ("BuilderExtendedExtraBold",include_bytes!("../content/fonts/BuilderExtended-ExtraBold-800.otf").as_slice()),
         ("BuilderMonoLight",include_bytes!("../content/fonts/BuilderMono-Light-300.otf").as_slice()),
         ("BuilderMonoRegular",include_bytes!("../content/fonts/BuilderMono-Regular-400.otf").as_slice()),
         ("BuilderMonoBold",include_bytes!("../content/fonts/BuilderMono-Bold-700.otf").as_slice()),
     ] { fonts.font_data.insert(name.into(),egui::FontData::from_static(bytes).into()); }
-    for name in ["BuilderSansThin","BuilderSansLight","BuilderSansRegular","BuilderSansMedium","BuilderSansBold","BuilderSansExtraBold","BuilderMonoLight","BuilderMonoRegular","BuilderMonoBold"] {
+    for name in ["BuilderSansThin","BuilderSansLight","BuilderSansRegular","BuilderSansMedium","BuilderSansBold","BuilderSansExtraBold","BuilderExtendedLight","BuilderExtendedRegular","BuilderExtendedSemiBold","BuilderExtendedBold","BuilderExtendedExtraBold","BuilderMonoLight","BuilderMonoRegular","BuilderMonoBold"] {
         fonts.families.insert(egui::FontFamily::Name(name.into()),vec![name.into()]);
     }
     ctx.set_fonts(fonts);
 }
 
-fn roblox_font_family(monospace:bool,weight:u16)->egui::FontFamily {
-    egui::FontFamily::Name((if monospace {if weight>=600{"BuilderMonoBold"}else if weight<=300{"BuilderMonoLight"}else{"BuilderMonoRegular"}} else if weight>=800{"BuilderSansExtraBold"}else if weight>=600{"BuilderSansBold"}else if weight>=500{"BuilderSansMedium"}else if weight<=100{"BuilderSansThin"}else if weight<=300{"BuilderSansLight"}else{"BuilderSansRegular"}).into())
+fn roblox_font_family(monospace:bool,extended:bool,weight:u16)->egui::FontFamily {
+    let name=if monospace {if weight>=600{"BuilderMonoBold"}else if weight<=300{"BuilderMonoLight"}else{"BuilderMonoRegular"}}
+    else if extended {if weight>=800{"BuilderExtendedExtraBold"}else if weight>=700{"BuilderExtendedBold"}else if weight>=600{"BuilderExtendedSemiBold"}else if weight<=300{"BuilderExtendedLight"}else{"BuilderExtendedRegular"}}
+    else if weight>=800{"BuilderSansExtraBold"}else if weight>=600{"BuilderSansBold"}else if weight>=500{"BuilderSansMedium"}else if weight<=100{"BuilderSansThin"}else if weight<=300{"BuilderSansLight"}else{"BuilderSansRegular"};
+    egui::FontFamily::Name(name.into())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +81,7 @@ struct GuiNode {
     rich_text: bool,
     line_height: f32,
     font_monospace: bool,
+    font_extended: bool,
     font_weight: u16,
     font_italic: bool,
     font_bold: bool,
@@ -238,7 +247,8 @@ fn gui_rect(
             let legacy_font = enum_value(instance.properties.get(&rbx_dom_weak::ustr("Font")), 3);
             let face_mono = matches!(instance.properties.get(&rbx_dom_weak::ustr("FontFace")),
                 Some(Variant::Font(font)) if font.family.to_ascii_lowercase().contains("mono") || font.family.to_ascii_lowercase().contains("code"));
-            let family = roblox_font_family(legacy_font == 10 || face_mono,if matches!(legacy_font,2|4|16|18|28|30|32|34|36|38|48){700}else if legacy_font==49{800}else if legacy_font==47{500}else{400});
+            let face_extended = matches!(instance.properties.get(&rbx_dom_weak::ustr("FontFace")),Some(Variant::Font(font)) if font.family.to_ascii_lowercase().contains("extended"));
+            let family = roblox_font_family(matches!(legacy_font,10|41) || face_mono,face_extended,if matches!(legacy_font,20|49){800}else if matches!(legacy_font,2|4|16|19|48|51){700}else if matches!(legacy_font,18|47){500}else if legacy_font==5{300}else{400});
             let mut job = egui::text::LayoutJob::simple(text, FontId::new(font_size, family), Color32::WHITE, wrap_width);
             if let Some(section) = job.sections.first_mut() { section.format.line_height = Some(font_size * line_height); }
             let galley = painter.layout_job(job);
@@ -592,8 +602,9 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         let face_family = font_face.map(|font| font.family.to_ascii_lowercase()).unwrap_or_default();
         let face_style = font_face.map(|font| format!("{:?}", font.style).to_ascii_lowercase()).unwrap_or_default();
         let face_weight = font_face.map(|font| format!("{:?}", font.weight).to_ascii_lowercase()).unwrap_or_default();
-        let font_monospace = legacy_font == 10 || face_family.contains("mono") || face_family.contains("code");
-        let font_weight = if face_weight.contains("extra")||face_weight.contains("800")||face_weight.contains("900") {800} else if face_weight.contains("semi")||face_weight.contains("bold")||face_weight.contains("600")||face_weight.contains("700") {700} else if face_weight.contains("medium")||face_weight.contains("500") {500} else if face_weight.contains("light")||face_weight.contains("300") {300} else if face_weight.contains("thin")||face_weight.contains("100") {100} else {match legacy_font {47=>500,48=>700,49=>800,2|4|16|18|28|30|32|34|36|38=>700,_=>400}};
+        let font_monospace = matches!(legacy_font,10|41) || face_family.contains("mono") || face_family.contains("code");
+        let font_extended = face_family.contains("extended");
+        let font_weight = if face_weight.contains("extra")||face_weight.contains("800")||face_weight.contains("900") {800} else if face_weight.contains("semi")||face_weight.contains("bold")||face_weight.contains("600")||face_weight.contains("700") {700} else if face_weight.contains("medium")||face_weight.contains("500") {500} else if face_weight.contains("light")||face_weight.contains("300") {300} else if face_weight.contains("thin")||face_weight.contains("100") {100} else {match legacy_font {20|49=>800,2|4|16|19|48|51=>700,18|47=>500,5=>300,_=>400}};
         let font_italic = legacy_font == 6 || face_style.contains("italic");
         let font_bold = font_weight>=600;
         let (text_min_size, text_max_size) = child_of_class(dom, instance, "UITextSizeConstraint")
@@ -675,6 +686,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             rich_text: bool_value(instance.properties.get(&rbx_dom_weak::ustr("RichText")), false),
             line_height: number(instance.properties.get(&rbx_dom_weak::ustr("LineHeight")), 1.0).max(0.1),
             font_monospace,
+            font_extended,
             font_weight,
             font_italic,
             font_bold,
@@ -1197,7 +1209,7 @@ fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
     let mut stack = vec![egui::TextFormat {
-        font_id: FontId::new(font_size, roblox_font_family(node.font_monospace,node.font_weight)),
+        font_id: FontId::new(font_size, roblox_font_family(node.font_monospace,node.font_extended,node.font_weight)),
         line_height: Some(font_size * node.line_height),
         color: base_color,
         italics: node.font_italic,
@@ -1231,7 +1243,7 @@ fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
             if tag == "i" { format.italics = true; }
             if tag == "u" { format.underline = Stroke::new(1.0, format.color); }
             if tag == "s" || tag == "strike" { format.strikethrough = Stroke::new(1.0, format.color); }
-            if tag == "b" { format.font_id.family=roblox_font_family(node.font_monospace,700); }
+            if tag == "b" { format.font_id.family=roblox_font_family(node.font_monospace,node.font_extended,700); }
             if tag.starts_with("font") {
                 if let Some(value) = rich_attribute(raw_tag, "size").and_then(|value| value.parse::<f32>().ok()) {
                     let scaled = (value * font_size / node.text_size.max(1.0)).max(1.0);
@@ -1248,7 +1260,7 @@ fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
                         (format.color.a() as f32 * (1.0-transparency.clamp(0.0,1.0))) as u8);
                 }
                 if rich_attribute(raw_tag, "face").map(|face| face.to_ascii_lowercase().contains("code")).unwrap_or(false) {
-                    format.font_id.family = roblox_font_family(true,node.font_weight);
+                    format.font_id.family = roblox_font_family(true,false,node.font_weight);
                 }
             }
             stack.push(format);
@@ -1263,7 +1275,7 @@ fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
     let mut job = if node.rich_text {
         rich_layout_job(node, font_size, color, wrap_width)
     } else {
-        let family = roblox_font_family(node.font_monospace,node.font_weight);
+        let family = roblox_font_family(node.font_monospace,node.font_extended,node.font_weight);
         let mut job = egui::text::LayoutJob::simple(
             node.text.clone(), FontId::new(font_size, family), color, wrap_width,
         );
@@ -2270,7 +2282,7 @@ pub fn draw_starter_gui(
         if editable_textbox {
             let value = text_inputs.entry(node.referent).or_insert_with(|| node.text.clone());
             let hint = egui::RichText::new(node.placeholder_text.clone()).color(node.placeholder_color);
-            let textbox_font = FontId::new(node.text_size,roblox_font_family(node.font_monospace,node.font_weight));
+            let textbox_font = FontId::new(node.text_size,roblox_font_family(node.font_monospace,node.font_extended,node.font_weight));
             let widget = if node.multiline {
                 egui::TextEdit::multiline(value)
                     .desired_width(node.content_rect.width()).font(textbox_font.clone())
