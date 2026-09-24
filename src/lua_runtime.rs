@@ -1144,6 +1144,16 @@ impl GuiPlaySession {
         Ok(())
     }
 
+    pub fn fire_activated(&self,referent:DomRef,screen_position:[f32;2],keyboard:bool)->Result<(),String>{
+        let Some(instance)=self.instances.get(&referent) else{return Ok(());};
+        let input=self.lua.create_table().map_err(|error|error.to_string())?;
+        let input_type=self.lua.create_table().map_err(|error|error.to_string())?;input_type.set("Name",if keyboard{"Keyboard"}else if cfg!(target_os="android"){"Touch"}else{"MouseButton1"}).map_err(|error|error.to_string())?;
+        let key_code=self.lua.create_table().map_err(|error|error.to_string())?;key_code.set("Name",if keyboard{"Return"}else{"Unknown"}).map_err(|error|error.to_string())?;
+        let position=self.lua.create_table().map_err(|error|error.to_string())?;position.set("X",screen_position[0]).map_err(|error|error.to_string())?;position.set("Y",screen_position[1]).map_err(|error|error.to_string())?;position.set("Z",0.0).map_err(|error|error.to_string())?;
+        input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("KeyCode",key_code).map_err(|error|error.to_string())?;input.set("Position",position).map_err(|error|error.to_string())?;
+        if let Ok(signal)=instance.raw_get::<Table>("Activated"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,1i64)).map_err(|error|error.to_string())?;}Ok(())
+    }
+
     pub fn fire(&self,referent:DomRef,event:&str)->Result<(),String>{
         let Some(instance)=self.instances.get(&referent) else{return Ok(());};
         if let Ok(signal)=instance.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}

@@ -6,7 +6,7 @@ use bevy_egui::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuiRuntimeEventKind { Layout, MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, InputChanged, Focused, FocusLost, SelectionGained, SelectionLost, TextChanged }
+pub enum GuiRuntimeEventKind { Layout, MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, ActivatedKeyboard, InputChanged, Focused, FocusLost, SelectionGained, SelectionLost, TextChanged }
 #[derive(Debug, Clone, Copy)]
 pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind, pub position: [f32;2], pub delta: [f32;2] }
 
@@ -2098,7 +2098,7 @@ pub fn draw_starter_gui(
         }
         let keyboard_activated=is_button&&node.interactable&&selected==Some(node.referent)&&ui.input(|input|input.key_pressed(egui::Key::Enter)||input.key_pressed(egui::Key::Space));
         if keyboard_activated {
-            runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::Activated,position:runtime_position,delta:runtime_delta});
+            runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::ActivatedKeyboard,position:runtime_position,delta:runtime_delta});
             clicked=Some(node.referent);
         }
         if node.class == "ScrollingFrame" {
