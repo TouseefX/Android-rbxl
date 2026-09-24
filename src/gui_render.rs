@@ -1535,8 +1535,24 @@ struct ViewportMesh {
     color: Color32, texture: Option<String>, referent: Ref,
 }
 struct ViewportPolygon {
-    depth: f32, points: Vec<Pos2>, color: Color32,
+    depth: f32, points: Vec<Pos2>, depths: Vec<f32>, color: Color32,
     texture: Option<(String, Vec<Pos2>)>, referent: Ref,
+}
+
+fn subdivide_viewport_triangle(points:[Pos2;3],depths:[f32;3],uvs:Option<[Pos2;3]>,level:usize,
+                               uri:Option<&str>,color:Color32,referent:Ref,output:&mut Vec<ViewportPolygon>){
+    if level==0 {
+        output.push(ViewportPolygon{depth:(depths[0]+depths[1]+depths[2])/3.0,points:points.to_vec(),depths:depths.to_vec(),color,
+            texture:uri.map(|uri|(uri.to_string(),uvs.unwrap_or([Pos2::ZERO;3]).to_vec())),referent});return;
+    }
+    let midpoint=|a:Pos2,b:Pos2|Pos2::new((a.x+b.x)*0.5,(a.y+b.y)*0.5);
+    let p01=midpoint(points[0],points[1]);let p12=midpoint(points[1],points[2]);let p20=midpoint(points[2],points[0]);
+    let harmonic=|a:f32,b:f32|2.0/(1.0/a.max(0.0001)+1.0/b.max(0.0001));
+    let d01=harmonic(depths[0],depths[1]);let d12=harmonic(depths[1],depths[2]);let d20=harmonic(depths[2],depths[0]);
+    let split_uv=uvs.map(|uv|{let perspective=|a:Pos2,b:Pos2,da:f32,db:f32|{let wa=1.0/da.max(0.0001);let wb=1.0/db.max(0.0001);Pos2::new((a.x*wa+b.x*wb)/(wa+wb),(a.y*wa+b.y*wb)/(wa+wb))};let u01=perspective(uv[0],uv[1],depths[0],depths[1]);let u12=perspective(uv[1],uv[2],depths[1],depths[2]);let u20=perspective(uv[2],uv[0],depths[2],depths[0]);[[uv[0],u01,u20],[u01,uv[1],u12],[u20,u12,uv[2]],[u01,u12,u20]]});
+    for(index,(next_points,next_depths))in [([points[0],p01,p20],[depths[0],d01,d20]),([p01,points[1],p12],[d01,depths[1],d12]),([p20,p12,points[2]],[d20,d12,depths[2]]),([p01,p12,p20],[d01,d12,d20])].into_iter().enumerate(){
+        subdivide_viewport_triangle(next_points,next_depths,split_uv.map(|value|value[index]),level-1,uri,color,referent,output);
+    }
 }
 #[derive(Clone, Copy)]
 struct ViewportClipVertex { position: [f32;3], uv: [f32;2] }
@@ -1738,7 +1754,7 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
             let projected:Vec<(Pos2,f32)>=clipped.iter().filter_map(|vertex|project(vertex.position)).collect();
             if projected.len()<3{continue;}
             let depth=projected.iter().map(|value|value.1).sum::<f32>()/projected.len() as f32;
-            polygons.push(ViewportPolygon{depth,points:projected.into_iter().map(|value|value.0).collect(),color:lit,texture:None,referent:part.referent});
+            polygons.push(ViewportPolygon{depth,points:projected.iter().map(|value|value.0).collect(),depths:projected.iter().map(|value|value.1).collect(),color:lit,texture:None,referent:part.referent});
         }
     }
     for mesh in meshes {
@@ -1765,12 +1781,26 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
             if projected.len()<3{continue;}
             let texture=mesh.texture.as_ref().map(|uri|(uri.clone(),clipped.iter().map(|vertex|Pos2::new(vertex.uv[0],vertex.uv[1])).collect()));
             let depth=projected.iter().map(|value|value.1).sum::<f32>()/projected.len() as f32;
-            polygons.push(ViewportPolygon{depth,points:projected.into_iter().map(|value|value.0).collect(),color:lit,texture,referent:mesh.referent});
+            polygons.push(ViewportPolygon{depth,points:projected.iter().map(|value|value.0).collect(),depths:projected.iter().map(|value|value.1).collect(),color:lit,texture,referent:mesh.referent});
         }
     }
-    polygons.sort_by(|a,b| b.depth.total_cmp(&a.depth));
-    let pointer=ui.input(|input|input.pointer.hover_pos()); let mut hovered=None;
+    // Painter-ordering whole faces fails when large triangles overlap in depth.
+    // Subdivide projected faces and sort the smaller cells independently; this
+    // approximates a depth buffer while retaining egui texture meshes.
+    let mut depth_cells=Vec::new();
     for polygon in polygons {
+        for index in 1..polygon.points.len().saturating_sub(1) {
+            let points=[polygon.points[0],polygon.points[index],polygon.points[index+1]];
+            let depths=[polygon.depths[0],polygon.depths[index],polygon.depths[index+1]];
+            let area=((points[1].x-points[0].x)*(points[2].y-points[0].y)-(points[1].y-points[0].y)*(points[2].x-points[0].x)).abs()*0.5;
+            let level=if area>20_000.0{3}else if area>2_000.0{2}else if area>200.0{1}else{0};
+            let (uri,uvs)=polygon.texture.as_ref().map(|(uri,uvs)|(Some(uri.as_str()),Some([uvs[0],uvs[index],uvs[index+1]]))).unwrap_or((None,None));
+            subdivide_viewport_triangle(points,depths,uvs,level,uri,polygon.color,polygon.referent,&mut depth_cells);
+        }
+    }
+    depth_cells.sort_by(|a,b| b.depth.total_cmp(&a.depth));
+    let pointer=ui.input(|input|input.pointer.hover_pos()); let mut hovered=None;
+    for polygon in depth_cells {
         if pointer.map_or(false,|point|point_in_polygon(point,&polygon.points)){hovered=Some(polygon.referent);}
         if let Some((uri,uvs))=polygon.texture {
             if let Some(texture)=ensure_gui_texture(ui,textures,&uri) {
@@ -1780,7 +1810,7 @@ fn paint_viewport_frame(painter: &egui::Painter, ui: &egui::Ui, node: &GuiNode, 
                 painter.add(egui::Shape::mesh(mesh)); continue;
             }
         }
-        painter.add(egui::Shape::convex_polygon(polygon.points,polygon.color,Stroke::new(0.5,shade_color(polygon.color,0.65))));
+        let mut mesh=egui::Mesh::default();for point in polygon.points{mesh.vertices.push(egui::epaint::Vertex{pos:point,uv:egui::epaint::WHITE_UV,color:polygon.color});}mesh.indices.extend_from_slice(&[0,1,2]);painter.add(egui::Shape::mesh(mesh));
     }
     hovered
 }
