@@ -734,6 +734,12 @@ use rbx_dom_weak::{
 /// Instance tables and connected callbacks remain alive until another place is loaded.
 const GUI_SYNC_PROPERTIES:&[&str]=&["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
 
+fn clone_runtime_value(lua:&Lua,value:Value)->LuaResult<Value>{
+    let Value::Table(source)=value else{return Ok(value);};
+    if source.raw_get::<String>("ClassName").is_ok()||source.raw_get::<Function>("Connect").is_ok(){return Ok(Value::Table(source));}
+    let copy=lua.create_table();for pair in source.clone().pairs::<Value,Value>(){let(key,value)=pair?;copy.raw_set(key,clone_runtime_value(lua,value)?)?;}if let Some(metatable)=source.get_metatable(){copy.set_metatable(Some(metatable))?;}Ok(Value::Table(copy))
+}
+
 fn clone_runtime_instance(lua:&Lua,source:&Table,queue:Rc<RefCell<Vec<Table>>>,parent:Option<Table>)->LuaResult<Table>{
     let class=source.raw_get::<String>("ClassName").unwrap_or_else(|_|"Folder".into());
     let name=source.raw_get::<String>("Name").unwrap_or_else(|_|class.clone());
@@ -743,7 +749,7 @@ fn clone_runtime_instance(lua:&Lua,source:&Table,queue:Rc<RefCell<Vec<Table>>>,p
         let (key,value)=pair?;let Value::String(key_string)=&key else{continue;};let key_name=key_string.to_str()?;
         if key_name.starts_with('_')||matches!(key_name.as_str(),"Name"|"ClassName"|"Parent"|"Clone"|"Destroy")||matches!(value,Value::Function(_)){continue;}
         if let Value::Table(table)=&value {if table.raw_get::<Function>("Connect").is_ok(){continue;}if table.raw_get::<Table>("Parent").ok().as_ref()==Some(source){continue;}}
-        clone.raw_set(key,value)?;
+        clone.raw_set(key,clone_runtime_value(lua,value)?)?;
     }
     queue.borrow_mut().push(clone.clone());
     for pair in source.clone().pairs::<Value,Value>() {let(_,value)=pair?;if let Value::Table(child)=value{if child.raw_get::<Table>("Parent").ok().as_ref()==Some(source){clone_runtime_instance(lua,&child,queue.clone(),Some(clone.clone()))?;}}}
@@ -983,12 +989,13 @@ impl GuiPlaySession {
             let Some(referent)=table_to_ref(&module)? else{return Err(LuaError::runtime("require expects a retained ModuleScript"));};
             if let Some(value)=require_cache.borrow().get(&referent){return Ok(value.clone());}
             if !require_loading.borrow_mut().insert(referent){return Err(LuaError::runtime("ModuleScript requested recursively"));}
-            let Some(source)=module_sources.get(&referent) else{require_loading.borrow_mut().remove(&referent);return Err(LuaError::runtime("required Instance is not a ModuleScript"));};
+            let source=module_sources.get(&referent).cloned().or_else(||module.raw_get::<String>("Source").ok());
+            let Some(source)=source else{require_loading.borrow_mut().remove(&referent);return Err(LuaError::runtime("required Instance is not a ModuleScript"));};
             let environment=lua.create_table();environment.raw_set("script",require_instances.get(&referent).cloned().unwrap_or(module))?;environment.raw_set("_G",lua.globals())?;
             let metatable=lua.create_table();metatable.raw_set("__index",lua.globals())?;environment.set_metatable(Some(metatable))?;
-            let result=lua.load(source).set_name("ModuleScript").set_environment(environment).eval::<Value>();
+            let result=lua.load(&source).set_name("ModuleScript").set_environment(environment).eval::<Value>();
             require_loading.borrow_mut().remove(&referent);
-            let value=result?;require_cache.borrow_mut().insert(referent,value.clone());Ok(value)
+            let value=result?;if matches!(value,Value::Nil){return Err(LuaError::runtime("ModuleScript did not return exactly one value"));}require_cache.borrow_mut().insert(referent,value.clone());Ok(value)
         }).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
 
         // Execute LocalScripts once. Their signal connections remain retained by
@@ -1138,7 +1145,7 @@ impl GuiPlaySession {
                     if dom.get_by_ref(referent).is_some(){
                         let mut stack=vec![referent];let mut subtree=Vec::new();while let Some(item)=stack.pop(){if let Some(instance)=dom.get_by_ref(item){stack.extend_from_slice(instance.children());subtree.push(item);}}
                         dom.destroy(referent);destroyed+=subtree.len();
-                        for item in subtree {if let Some(runtime)=self.instances.remove(&item){runtime.raw_set("Parent",Value::Nil).map_err(|error|error.to_string())?;}self.synchronized_properties.remove(&item);}
+                        for item in subtree {if let Some(runtime)=self.instances.remove(&item){if item!=referent{if let Ok(signal)=runtime.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}}runtime.raw_set("Parent",Value::Nil).map_err(|error|error.to_string())?;runtime.raw_set("_destroyed",true).map_err(|error|error.to_string())?;}self.synchronized_properties.remove(&item);}
                     }
                 }
                 table.raw_set("Parent",Value::Nil).map_err(|error|error.to_string())?;
