@@ -580,10 +580,15 @@ fn make_signal(lua: &Lua) -> LuaResult<Table> {
     Ok(signal)
 }
 
+fn fire_instance_signal(table:&Table,name:&str,args:Vec<Value>)->LuaResult<()> {
+    if let Ok(signal)=table.raw_get::<Table>(name){let fire:Function=signal.get("Fire")?;let mut values=vec![Value::Table(signal)];values.extend(args);fire.call::<()>(MultiValue::from_vec(values))?;}Ok(())
+}
+
 fn is_instance_signal(key: &str) -> bool {
     matches!(key,"Activated"|"MouseButton1Click"|"MouseButton1Down"|"MouseButton1Up"|
         "MouseEnter"|"MouseLeave"|"InputBegan"|"InputChanged"|"InputEnded"|
-        "Focused"|"FocusLost"|"SelectionGained"|"SelectionLost"|"Changed"|"AncestryChanged"|"Destroying")
+        "Focused"|"FocusLost"|"SelectionGained"|"SelectionLost"|"Changed"|"AncestryChanged"|
+        "ChildAdded"|"ChildRemoved"|"DescendantAdded"|"DescendantRemoving"|"Destroying")
 }
 
 fn instance_children(this:&Table)->LuaResult<Vec<Table>> {
@@ -633,7 +638,7 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     t.set("SetAttribute",lua.create_function(|_,(this,name,value):(Table,String,Value)|{this.raw_get::<Table>("_attributes")?.raw_set(&name,value)?;if let Ok(signal)=this.raw_get::<Table>(&format!("_attribute_signal_{name}")){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}Ok(())})?)?;
     t.set("GetAttributeChangedSignal",lua.create_function(|lua,(this,name):(Table,String)|{let key=format!("_attribute_signal_{name}");if let Ok(signal)=this.raw_get::<Table>(&key){return Ok(signal);}let signal=make_signal(lua)?;this.raw_set(key,signal.clone())?;Ok(signal)})?)?;
     t.set("GetAttributes",lua.create_function(|_,this:Table|Ok(this.raw_get::<Table>("_attributes")?))?)?;
-    for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","SelectionGained","SelectionLost","Changed","AncestryChanged","Destroying"] {
+    for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","SelectionGained","SelectionLost","Changed","AncestryChanged","ChildAdded","ChildRemoved","DescendantAdded","DescendantRemoving","Destroying"] {
         t.set(event,make_signal(lua)?)?;
     }
     t.set("GetPropertyChangedSignal",lua.create_function(|lua,(this,property):(Table,String)|{
@@ -1169,7 +1174,7 @@ impl GuiPlaySession {
             table.raw_set("Destroy",self.lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
             let clone_table=table.clone();let clone_queue=self.pending_instances.clone();
             table.raw_set("Clone",self.lua.create_function(move |lua,_this:Table|clone_runtime_instance(lua,&clone_table,clone_queue.clone(),None)).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
-            if let Some(parent)=self.instances.get(&parent_ref){parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;if name!=class{parent.raw_set(class.as_str(),Value::Nil).map_err(|error|error.to_string())?;}}
+            if let Some(parent)=self.instances.get(&parent_ref){parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;if name!=class{parent.raw_set(class.as_str(),Value::Nil).map_err(|error|error.to_string())?;}fire_instance_signal(parent,"ChildAdded",vec![Value::Table(table.clone())]).map_err(|error|error.to_string())?;let mut ancestor=Some(parent.clone());while let Some(current)=ancestor{fire_instance_signal(&current,"DescendantAdded",vec![Value::Table(table.clone())]).map_err(|error|error.to_string())?;ancestor=current.raw_get::<Table>("Parent").ok();}}
             self.instances.insert(referent,table.clone());
             self.synchronized_properties.insert(referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect());
             if class=="LocalScript" {
@@ -1185,6 +1190,7 @@ impl GuiPlaySession {
                     if let Some(instance)=dom.get_by_ref(referent){if let Some(parent)=self.instances.get(&instance.parent()){parent.raw_set(instance.name.as_str(),Value::Nil).map_err(|error|error.to_string())?;}}
                     if dom.get_by_ref(referent).is_some(){
                         let mut stack=vec![referent];let mut subtree=Vec::new();while let Some(item)=stack.pop(){if let Some(instance)=dom.get_by_ref(item){stack.extend_from_slice(instance.children());subtree.push(item);}}
+                        if let Some(root_runtime)=self.instances.get(&referent){let mut ancestor=root_runtime.raw_get::<Table>("Parent").ok();if let Some(parent)=ancestor.as_ref(){fire_instance_signal(parent,"ChildRemoved",vec![Value::Table(root_runtime.clone())]).map_err(|error|error.to_string())?;}while let Some(current)=ancestor{for item in &subtree{if let Some(runtime)=self.instances.get(item){fire_instance_signal(&current,"DescendantRemoving",vec![Value::Table(runtime.clone())]).map_err(|error|error.to_string())?;}}ancestor=current.raw_get::<Table>("Parent").ok();}}
                         dom.destroy(referent);destroyed+=subtree.len();
                         for item in subtree {if let Some(runtime)=self.instances.remove(&item){if item!=referent{if let Ok(signal)=runtime.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}}runtime.raw_set("Parent",Value::Nil).map_err(|error|error.to_string())?;runtime.raw_set("_destroyed",true).map_err(|error|error.to_string())?;}self.synchronized_properties.remove(&item);}
                     }
@@ -1207,9 +1213,10 @@ impl GuiPlaySession {
             if let Some(parent)=parent {if current_parent!=parent&&dom.get_by_ref(parent).is_some(){dom.transfer_within(referent,parent);moved=true;}}
             if let Some(table)=self.instances.get(&referent) {
                 if renamed||moved {
-                    if let Some(old_parent)=self.instances.get(&current_parent){old_parent.raw_set(old_name.as_str(),Value::Nil).map_err(|error|error.to_string())?;}
+                    let mut moved_runtime=vec![table.clone()];let mut stack=instance_children(table).map_err(|error|error.to_string())?;while let Some(child)=stack.pop(){stack.extend(instance_children(&child).map_err(|error|error.to_string())?);moved_runtime.push(child);}
+                    if let Some(old_parent)=self.instances.get(&current_parent){old_parent.raw_set(old_name.as_str(),Value::Nil).map_err(|error|error.to_string())?;if moved{fire_instance_signal(old_parent,"ChildRemoved",vec![Value::Table(table.clone())]).map_err(|error|error.to_string())?;let mut ancestor=Some(old_parent.clone());while let Some(current)=ancestor{for descendant in &moved_runtime{fire_instance_signal(&current,"DescendantRemoving",vec![Value::Table(descendant.clone())]).map_err(|error|error.to_string())?;}ancestor=current.raw_get::<Table>("Parent").ok();}}}
                     let effective_parent=parent.unwrap_or(current_parent);
-                    if let Some(new_parent)=self.instances.get(&effective_parent){new_parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;table.raw_set("Parent",new_parent.clone()).map_err(|error|error.to_string())?;}
+                    if let Some(new_parent)=self.instances.get(&effective_parent){new_parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;table.raw_set("Parent",new_parent.clone()).map_err(|error|error.to_string())?;if moved{fire_instance_signal(new_parent,"ChildAdded",vec![Value::Table(table.clone())]).map_err(|error|error.to_string())?;let mut ancestor=Some(new_parent.clone());while let Some(current)=ancestor{for descendant in &moved_runtime{fire_instance_signal(&current,"DescendantAdded",vec![Value::Table(descendant.clone())]).map_err(|error|error.to_string())?;}ancestor=current.raw_get::<Table>("Parent").ok();}}}
                 }
                 if renamed {if let Ok(signal)=table.raw_get::<Table>("Changed"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,"Name")).map_err(|error|error.to_string())?;}}
                 if moved {if let Ok(signal)=table.raw_get::<Table>("AncestryChanged"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,table.clone(),table.raw_get::<Value>("Parent").unwrap_or(Value::Nil))).map_err(|error|error.to_string())?;}}
