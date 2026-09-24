@@ -6,7 +6,7 @@ use bevy_egui::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuiRuntimeEventKind { MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, InputChanged, Focused, FocusLost, SelectionGained, SelectionLost, TextChanged }
+pub enum GuiRuntimeEventKind { Layout, MouseEnter, MouseLeave, MouseButton1Down, MouseButton1Up, MouseButton1Click, Activated, InputChanged, Focused, FocusLost, SelectionGained, SelectionLost, TextChanged }
 #[derive(Debug, Clone, Copy)]
 pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind, pub position: [f32;2], pub delta: [f32;2] }
 
@@ -2069,6 +2069,7 @@ pub fn draw_starter_gui(
     // rect, color, owner, horizontal, canvas maximum, thumb travel
     let mut scroll_bars: Vec<(Rect, Color32, Ref, bool, f32, f32, f32, bool, [Option<String>; 3])> = Vec::new();
     for node in nodes {
+        runtime_events.push(GuiRuntimeEvent{referent:node.referent,kind:GuiRuntimeEventKind::Layout,position:[node.rect.min.x-viewport.min.x,node.rect.min.y-viewport.min.y],delta:[node.rect.width(),node.rect.height()]});
         if node.clip.width() <= 0.0 || node.clip.height() <= 0.0 { continue; }
         let hit_rect = if let Some(warp)=node.surface_warp {
             let mut bounds=Rect::NOTHING;

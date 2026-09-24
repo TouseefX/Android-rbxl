@@ -1173,6 +1173,10 @@ impl EditorApp {
         }
         if let Some(session)=self.gui_play_session.as_ref() {
             for event in &self.gui_runtime_events {
+                if event.kind==crate::gui_render::GuiRuntimeEventKind::Layout {
+                    if let Err(error)=session.set_absolute_layout(event.referent,event.position,event.delta){log::error!("GUI absolute layout update: {error}");}
+                    continue;
+                }
                 if event.kind==crate::gui_render::GuiRuntimeEventKind::TextChanged {
                     if let Some(text)=self.gui_text_inputs.get(&event.referent) { if let Err(error)=session.set_text(event.referent,text){log::error!("TextBox runtime update: {error}");} }
                     continue;
@@ -1185,6 +1189,7 @@ impl EditorApp {
                     if let Err(error)=session.fire_pointer_input(event.referent,event.kind==crate::gui_render::GuiRuntimeEventKind::MouseButton1Down,event.position){log::error!("GUI input dispatch: {error}");}
                 }
                 let name=match event.kind {
+                    crate::gui_render::GuiRuntimeEventKind::Layout=>unreachable!(),
                     crate::gui_render::GuiRuntimeEventKind::MouseEnter=>"MouseEnter",
                     crate::gui_render::GuiRuntimeEventKind::MouseLeave=>"MouseLeave",
                     crate::gui_render::GuiRuntimeEventKind::MouseButton1Down=>"MouseButton1Down",

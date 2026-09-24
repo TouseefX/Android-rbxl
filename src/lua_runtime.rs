@@ -1152,6 +1152,18 @@ impl GuiPlaySession {
         Ok(())
     }
 
+    pub fn set_absolute_layout(&self,referent:DomRef,position:[f32;2],size:[f32;2])->Result<(),String>{
+        let Some(instance)=self.instances.get(&referent) else{return Ok(());};
+        let changed=|name:&str,value:[f32;2]|instance.raw_get::<Table>(name).ok().map(|old|(old.raw_get::<f64>("X").unwrap_or(f64::NAN)-value[0] as f64).abs()>0.01||(old.raw_get::<f64>("Y").unwrap_or(f64::NAN)-value[1] as f64).abs()>0.01).unwrap_or(true);
+        let position_changed=changed("AbsolutePosition",position);let size_changed=changed("AbsoluteSize",size);
+        let position_value=variant_to_value(&self.lua,&DomVariant::Vector2(ty::Vector2::new(position[0],position[1]))).map_err(|error|error.to_string())?;
+        let size_value=variant_to_value(&self.lua,&DomVariant::Vector2(ty::Vector2::new(size[0],size[1]))).map_err(|error|error.to_string())?;
+        instance.raw_set("AbsolutePosition",position_value).map_err(|error|error.to_string())?;
+        instance.raw_set("AbsoluteSize",size_value).map_err(|error|error.to_string())?;
+        for (name,did_change) in [("AbsolutePosition",position_changed),("AbsoluteSize",size_changed)] {if did_change{fire_instance_signal(instance,"Changed",vec![Value::String(self.lua.create_string(name).map_err(|error|error.to_string())?)]).map_err(|error|error.to_string())?;fire_instance_signal(instance,&format!("_property_signal_{name}"),Vec::new()).map_err(|error|error.to_string())?;}}
+        Ok(())
+    }
+
     pub fn set_text(&self,referent:DomRef,text:&str)->Result<(),String>{
         let Some(instance)=self.instances.get(&referent) else{return Ok(());};
         instance.raw_set("Text",text).map_err(|error|error.to_string())?;
