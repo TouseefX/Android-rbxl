@@ -887,6 +887,9 @@ impl GuiPlaySession {
             if let Some(parent)=instances.get(&instance.parent()){table.raw_set("Parent",parent.clone()).map_err(|error|error.to_string())?;}
             for child in instance.children(){if let (Some(child_instance),Some(child_table))=(dom.get_by_ref(*child),instances.get(child)){table.raw_set(child_instance.name.as_str(),child_table.clone()).map_err(|error|error.to_string())?;}}
         }
+        // Resolve object-reference properties only after every retained Instance
+        // table exists, including forward references such as CurrentCamera.
+        for (referent,table) in &instances {if let Some(instance)=dom.get_by_ref(*referent){for(key,value)in &instance.properties{if let DomVariant::Ref(target)=value{let resolved=instances.get(target).cloned().map(Value::Table).unwrap_or(Value::Nil);table.raw_set(key.as_str(),resolved).map_err(|error|error.to_string())?;}}}}
         let run_service=make_instance(&lua,"RunService","RunService").map_err(|error|error.to_string())?;
         for event in ["Heartbeat","RenderStepped","Stepped"] {run_service.raw_set(event,make_signal(&lua).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;}
         let pointer_position=Rc::new(Cell::new([0.0f32,0.0f32]));
@@ -1327,7 +1330,7 @@ impl GuiPlaySession {
     pub fn synchronize_from_dom(&self,dom:&WeakDom)->Result<(),String>{
         for (referent,names) in &self.synchronized_properties {
             let (Some(table),Some(instance))=(self.instances.get(referent),dom.get_by_ref(*referent)) else{continue;};
-            for name in names {if let Some(value)=instance.properties.get(&rbx_dom_weak::Ustr::from(name.as_str())) { let value=variant_to_value(&self.lua,value).map_err(|error|error.to_string())?;table.raw_set(name.as_str(),value).map_err(|error|error.to_string())?; }}
+            for name in names {if let Some(value)=instance.properties.get(&rbx_dom_weak::Ustr::from(name.as_str())) { let value=if let DomVariant::Ref(target)=value{self.instances.get(target).cloned().map(Value::Table).unwrap_or(Value::Nil)}else{variant_to_value(&self.lua,value).map_err(|error|error.to_string())?};table.raw_set(name.as_str(),value).map_err(|error|error.to_string())?; }}
         }
         Ok(())
     }
@@ -2049,7 +2052,8 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
         Value::Number(n) => Some(DomVariant::Float64(*n)),
         Value::Table(t) => {
             let has = |k: &str| t.get::<Value>(k).is_ok();
-            if has("XScale") && has("XOffset") && has("YScale") && has("YOffset") {
+            if let Some(referent)=table_to_ref(t)? {Some(DomVariant::Ref(referent))}
+            else if has("XScale") && has("XOffset") && has("YScale") && has("YOffset") {
                 Some(DomVariant::UDim2(ty::UDim2::new(
                     ty::UDim::new(t.get::<f64>("XScale")? as f32,t.get::<i64>("XOffset")? as i32),
                     ty::UDim::new(t.get::<f64>("YScale")? as f32,t.get::<i64>("YOffset")? as i32))))

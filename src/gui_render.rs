@@ -2113,8 +2113,10 @@ pub fn draw_starter_gui(
             let root_rect=if screen_insets==2 || screen_insets==3 {
                 Rect::from_min_max(Pos2::new(viewport.left(),(viewport.top()+58.0).min(viewport.bottom())),viewport.max)
             } else { viewport };
+            let clip_to_safe=bool_value(gui.properties.get(&rbx_dom_weak::ustr("ClipToDeviceSafeArea")),true)&&screen_insets!=0;
+            let root_clip=if clip_to_safe{root_rect}else{viewport};
             let root_path = vec![(0, screen_order)]; screen_order+=1;
-            collect(dom, &layout_painter, *child, root_rect, viewport, display_order,
+            collect(dom, &layout_painter, *child, root_rect, root_clip, display_order,
                 global_z, 1.0, 1.0, Color32::WHITE, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
         }
     }
