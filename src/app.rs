@@ -208,6 +208,7 @@ pub struct EditorApp {
     /// Retained pointer state and events for the persistent GUI play-session bridge.
     gui_hovered: std::collections::HashSet<Ref>,
     gui_runtime_events: Vec<crate::gui_render::GuiRuntimeEvent>,
+    gui_navigation_selected: Option<Ref>,
     gui_play_session: Option<crate::lua_runtime::GuiPlaySession>,
     rename_buffer: String,
     project_name: String,
@@ -390,6 +391,7 @@ impl Default for EditorApp {
             gui_text_inputs: HashMap::new(),
             gui_hovered: std::collections::HashSet::new(),
             gui_runtime_events: Vec::new(),
+            gui_navigation_selected: None,
             gui_play_session: None,
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
@@ -1158,12 +1160,14 @@ impl EditorApp {
 
         // StarterGui is previewed as a real screen-space hierarchy over the 3D
         // scene. Clicking a GUI object synchronizes selection with Explorer.
+        if let Some(session)=self.gui_play_session.as_ref(){let selected=session.selected_gui_object();if selected!=self.gui_navigation_selected{if let Some(previous)=self.gui_navigation_selected{if let Err(error)=session.fire(previous,"SelectionLost"){log::error!("GuiService SelectionLost: {error}");}}if let Some(current)=selected{if let Err(error)=session.fire(current,"SelectionGained"){log::error!("GuiService SelectionGained: {error}");}}self.gui_navigation_selected=selected;}}
+        let gui_selected=if self.gui_play_session.is_some(){self.gui_navigation_selected}else{self.selected};
         let clicked_gui = if self.show_gui_preview {
             if let Some(dom) = self.dom.as_ref() {
                 crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures,
                     &mut self.gui_scroll_offsets, &mut self.gui_text_inputs,
                     &mut self.gui_hovered, &mut self.gui_runtime_events,
-                    self.selected, orbit, viewport_scene)
+                    gui_selected, orbit, viewport_scene)
             } else { None }
         } else {
             self.gui_hovered.clear(); self.gui_runtime_events.clear(); None
@@ -1227,7 +1231,8 @@ impl EditorApp {
             self.gui_hovered.clear();self.gui_runtime_events.clear();self.gui_text_inputs.clear();self.needs_3d_rebuild=true;
         }
         if let Some(clicked) = clicked_gui {
-            self.selected = Some(clicked);
+            self.selected = Some(clicked);self.gui_navigation_selected=Some(clicked);
+            if let Some(session)=self.gui_play_session.as_ref(){if let Err(error)=session.set_selected_gui_object(Some(clicked)){log::error!("GuiService selection: {error}");}}
             self.status = "Selected GUI object from viewport".into();
         }
 

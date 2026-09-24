@@ -824,6 +824,7 @@ pub struct GuiPlaySession {
     scheduler_step: Function,
     run_service: Table,
     user_input_service: Table,
+    gui_service: Table,
     respawn_requested: Rc<Cell<bool>>,
     respawn_properties: std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>,
     pointer_position: Rc<Cell<[f32;2]>>,
@@ -899,6 +900,7 @@ impl GuiPlaySession {
         user_input_service.raw_set("TouchEnabled",cfg!(target_os="android")).map_err(|error|error.to_string())?;
         user_input_service.raw_set("KeyboardEnabled",true).map_err(|error|error.to_string())?;
         user_input_service.raw_set("MouseEnabled",true).map_err(|error|error.to_string())?;
+        let gui_service=make_instance(&lua,"GuiService","GuiService").map_err(|error|error.to_string())?;gui_service.raw_set("SelectedObject",Value::Nil).map_err(|error|error.to_string())?;gui_service.raw_set("MenuIsOpen",false).map_err(|error|error.to_string())?;gui_service.raw_set("GetGuiInset",lua.create_function(|lua,_service:Table|{let zero=lua.create_table();zero.set("X",0.0)?;zero.set("Y",0.0)?;Ok((zero.clone(),zero))})?).map_err(|error|error.to_string())?;
         if let Some(game)=instances.get(&dom.root_ref()) {
             lua.globals().set("game",game.clone()).map_err(|error|error.to_string())?;
             game.raw_set("RunService",run_service.clone()).map_err(|error|error.to_string())?;
@@ -953,7 +955,7 @@ impl GuiPlaySession {
 
             let context=make_instance(&lua,"ContextActionService","ContextActionService").map_err(|error|error.to_string())?;let bind_actions=bound_actions.clone();context.raw_set("BindAction",lua.create_function(move |_,args:Variadic<Value>|{let name=match args.get(1){Some(Value::String(value))=>value.to_str()?.to_string(),_=>return Err(LuaError::runtime("BindAction requires an action name"))};let callback=match args.get(2){Some(Value::Function(value))=>value.clone(),_=>return Err(LuaError::runtime("BindAction requires a callback"))};let keys=args.iter().skip(4).filter_map(|value|match value{Value::Table(value)=>value.raw_get::<String>("Name").ok(),Value::String(value)=>value.to_str().ok().map(|value|value.to_string()),_=>None}).collect();bind_actions.borrow_mut().insert(name,(callback,keys));Ok(())})?).map_err(|error|error.to_string())?;let unbind_actions=bound_actions.clone();context.raw_set("UnbindAction",lua.create_function(move |_,(_service,name):(Table,String)|{unbind_actions.borrow_mut().remove(&name);Ok(())})?).map_err(|error|error.to_string())?;let info_actions=bound_actions.clone();context.raw_set("GetAllBoundActionInfo",lua.create_function(move |lua,_service:Table|{let result=lua.create_table();for(name,(_,keys))in info_actions.borrow().iter(){let info=lua.create_table();let input_types=lua.create_table();for(index,key)in keys.iter().enumerate(){input_types.raw_set(index+1,key.as_str())?;}info.set("inputTypes",input_types)?;result.raw_set(name.as_str(),info)?;}Ok(result)})?).map_err(|error|error.to_string())?;game.raw_set("ContextActionService",context.clone()).map_err(|error|error.to_string())?;lua.globals().set("ContextActionService",context).map_err(|error|error.to_string())?;
 
-            let gui_service=make_instance(&lua,"GuiService","GuiService").map_err(|error|error.to_string())?;gui_service.raw_set("SelectedObject",Value::Nil).map_err(|error|error.to_string())?;gui_service.raw_set("MenuIsOpen",false).map_err(|error|error.to_string())?;gui_service.raw_set("GetGuiInset",lua.create_function(|lua,_service:Table|{let zero=lua.create_table();zero.set("X",0.0)?;zero.set("Y",0.0)?;Ok((zero.clone(),zero))})?).map_err(|error|error.to_string())?;game.raw_set("GuiService",gui_service.clone()).map_err(|error|error.to_string())?;lua.globals().set("GuiService",gui_service).map_err(|error|error.to_string())?;
+            game.raw_set("GuiService",gui_service.clone()).map_err(|error|error.to_string())?;lua.globals().set("GuiService",gui_service.clone()).map_err(|error|error.to_string())?;
 
             let localization=make_instance(&lua,"LocalizationService","LocalizationService").map_err(|error|error.to_string())?;localization.raw_set("RobloxLocaleId","en-us").map_err(|error|error.to_string())?;localization.raw_set("SystemLocaleId","en-us").map_err(|error|error.to_string())?;localization.raw_set("GetTranslatorForPlayerAsync",lua.create_function(|lua,(_service,_player):(Table,Table)|{let translator=lua.create_table();translator.set("FormatByKey",lua.create_function(|_,(_translator,key,_args):(Table,String,Option<Table>)|Ok(key))?)?;Ok(translator)})?).map_err(|error|error.to_string())?;game.raw_set("LocalizationService",localization.clone()).map_err(|error|error.to_string())?;lua.globals().set("LocalizationService",localization).map_err(|error|error.to_string())?;
             let game_table=game.clone();
@@ -1120,7 +1122,7 @@ impl GuiPlaySession {
         let mut respawn_properties=std::collections::HashMap::new();
         fn snapshot_tree(dom:&WeakDom,referent:DomRef,out:&mut std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>){if let Some(instance)=dom.get_by_ref(referent){out.insert(referent,instance.properties.iter().map(|(key,value)|(key.clone(),value.clone())).collect());for child in instance.children(){snapshot_tree(dom,*child,out);}}}
         if let Some(starter)=dom.root().children().iter().find_map(|referent|dom.get_by_ref(*referent).filter(|instance|instance.class=="StarterGui")) {for child in starter.children(){if dom.get_by_ref(*child).is_some_and(|instance|instance.class=="ScreenGui"&&instance.properties.get(&rbx_dom_weak::ustr("ResetOnSpawn")).map(|value|!matches!(value,DomVariant::Bool(false))).unwrap_or(true)){snapshot_tree(dom,*child,&mut respawn_properties);}}}
-        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduler_step,run_service,user_input_service,respawn_requested,respawn_properties,pointer_position,pressed_keys,bound_actions,last_tick:std::time::Instant::now()})
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduler_step,run_service,user_input_service,gui_service,respawn_requested,respawn_properties,pointer_position,pressed_keys,bound_actions,last_tick:std::time::Instant::now()})
     }
 
     pub fn take_respawn_request(&self)->bool{self.respawn_requested.replace(false)}
@@ -1209,6 +1211,9 @@ impl GuiPlaySession {
         input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("KeyCode",key_code).map_err(|error|error.to_string())?;input.set("Position",position).map_err(|error|error.to_string())?;
         if let Ok(signal)=instance.raw_get::<Table>("Activated"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,1i64)).map_err(|error|error.to_string())?;}Ok(())
     }
+
+    pub fn selected_gui_object(&self)->Option<DomRef>{self.gui_service.raw_get::<Table>("SelectedObject").ok().and_then(|table|table_to_ref(&table).ok().flatten())}
+    pub fn set_selected_gui_object(&self,referent:Option<DomRef>)->Result<(),String>{let value=referent.and_then(|referent|self.instances.get(&referent).cloned()).map(Value::Table).unwrap_or(Value::Nil);self.gui_service.raw_set("SelectedObject",value).map_err(|error|error.to_string())}
 
     pub fn fire(&self,referent:DomRef,event:&str)->Result<(),String>{
         let Some(instance)=self.instances.get(&referent) else{return Ok(());};
