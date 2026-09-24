@@ -1919,7 +1919,7 @@ pub struct SelectionVisual;
 /// Rebuild the selected-part outline and XYZ move gizmo when selection changes.
 pub fn update_selection_visual(
     mut commands: Commands,
-    editor: Res<crate::app::EditorApp>,
+    editor: NonSend<crate::app::EditorApp>,
     scene: Res<ViewportScene>,
     mut previous: Local<Option<rbx_dom_weak::types::Ref>>,
     old: Query<Entity, With<SelectionVisual>>,

@@ -61,7 +61,7 @@ fn setup_3d(
 /// Draw the egui editor UI each frame (toolbar, tabs, panels) and steer the
 /// Bevy viewport camera from the 3D tab.
 fn draw_editor_ui(
-    mut app: ResMut<EditorApp>,
+    mut app: NonSendMut<EditorApp>,
     mut orbit: ResMut<bevy_render::OrbitCam>,
     mut contexts: EguiContexts,
     viewport_scene: Res<bevy_render::ViewportScene>,
@@ -81,7 +81,7 @@ fn draw_editor_ui(
 /// place was opened (`needs_3d_rebuild`).
 fn rebuild_scene_system(
     mut commands: Commands,
-    mut app: ResMut<EditorApp>,
+    mut app: NonSendMut<EditorApp>,
     mut meshes: ResMut<Assets<bevy::mesh::Mesh>>,
     mut materials: ResMut<Assets<bevy_render::FlatMaterial>>,
     mut images: ResMut<Assets<bevy::image::Image>>,
@@ -133,7 +133,7 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
     // which renders magenta on this device's Adreno GPU).
     bevy_app.add_plugins(bevy_render::FlatMaterialPlugin);
 
-    bevy_app.insert_resource(editor);
+    bevy_app.insert_non_send_resource(editor);
     bevy_app.insert_resource(bevy_render::OrbitCam::default());
     bevy_app.insert_resource(bevy_render::ViewportScene::default());
     bevy_app.insert_resource(bevy::light::AmbientLight {

@@ -140,7 +140,6 @@ enum ViewportGizmoMode {
     Scale,
 }
 
-#[derive(bevy::prelude::Resource)]
 pub struct EditorApp {
     dom: Option<WeakDom>,
     selected: Option<Ref>,

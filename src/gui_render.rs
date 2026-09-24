@@ -1659,7 +1659,7 @@ fn gather_viewport_parts(dom: &WeakDom, referent: Ref, output: &mut Vec<Viewport
             Some(Variant::String(value))=>match value.as_str(){"Ball"=>Some(3),"Cylinder"=>Some(4),"Wedge"=>Some(2),_=>None},
             _=>None,
         };
-        for child in instance.children().filter_map(|child|dom.get_by_ref(*child)) {
+        for child in instance.children().iter().filter_map(|child|dom.get_by_ref(*child)) {
             if child.class == "SurfaceAppearance" {
                 texture=content(child.properties.get(&rbx_dom_weak::ustr("ColorMap")))
                     .or_else(||content(child.properties.get(&rbx_dom_weak::ustr("ColorMapContent")))).or(texture);
