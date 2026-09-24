@@ -22,15 +22,21 @@ pub fn install_roblox_fonts(ctx:&egui::Context) {
         ("BuilderMonoLight",include_bytes!("../content/fonts/BuilderMono-Light-300.otf").as_slice()),
         ("BuilderMonoRegular",include_bytes!("../content/fonts/BuilderMono-Regular-400.otf").as_slice()),
         ("BuilderMonoBold",include_bytes!("../content/fonts/BuilderMono-Bold-700.otf").as_slice()),
+        ("SourceSansRegular",include_bytes!("../content/fonts/SourceSans3-Regular.otf").as_slice()),
+        ("SourceSansLight",include_bytes!("../content/fonts/SourceSans3-Light.otf").as_slice()),
+        ("SourceSansSemiBold",include_bytes!("../content/fonts/SourceSans3-Semibold.otf").as_slice()),
+        ("SourceSansBold",include_bytes!("../content/fonts/SourceSans3-Bold.otf").as_slice()),
+        ("SourceSansItalic",include_bytes!("../content/fonts/SourceSans3-It.otf").as_slice()),
     ] { fonts.font_data.insert(name.into(),egui::FontData::from_static(bytes).into()); }
-    for name in ["BuilderSansThin","BuilderSansLight","BuilderSansRegular","BuilderSansMedium","BuilderSansBold","BuilderSansExtraBold","BuilderExtendedLight","BuilderExtendedRegular","BuilderExtendedSemiBold","BuilderExtendedBold","BuilderExtendedExtraBold","BuilderMonoLight","BuilderMonoRegular","BuilderMonoBold"] {
+    for name in ["BuilderSansThin","BuilderSansLight","BuilderSansRegular","BuilderSansMedium","BuilderSansBold","BuilderSansExtraBold","BuilderExtendedLight","BuilderExtendedRegular","BuilderExtendedSemiBold","BuilderExtendedBold","BuilderExtendedExtraBold","BuilderMonoLight","BuilderMonoRegular","BuilderMonoBold","SourceSansRegular","SourceSansLight","SourceSansSemiBold","SourceSansBold","SourceSansItalic"] {
         fonts.families.insert(egui::FontFamily::Name(name.into()),vec![name.into()]);
     }
     ctx.set_fonts(fonts);
 }
 
-fn roblox_font_family(monospace:bool,extended:bool,weight:u16)->egui::FontFamily {
-    let name=if monospace {if weight>=600{"BuilderMonoBold"}else if weight<=300{"BuilderMonoLight"}else{"BuilderMonoRegular"}}
+fn roblox_font_family(monospace:bool,extended:bool,source_sans:bool,italic:bool,weight:u16)->egui::FontFamily {
+    let name=if source_sans {if italic{"SourceSansItalic"}else if weight>=700{"SourceSansBold"}else if weight>=600{"SourceSansSemiBold"}else if weight<=300{"SourceSansLight"}else{"SourceSansRegular"}}
+    else if monospace {if weight>=600{"BuilderMonoBold"}else if weight<=300{"BuilderMonoLight"}else{"BuilderMonoRegular"}}
     else if extended {if weight>=800{"BuilderExtendedExtraBold"}else if weight>=700{"BuilderExtendedBold"}else if weight>=600{"BuilderExtendedSemiBold"}else if weight<=300{"BuilderExtendedLight"}else{"BuilderExtendedRegular"}}
     else if weight>=800{"BuilderSansExtraBold"}else if weight>=600{"BuilderSansBold"}else if weight>=500{"BuilderSansMedium"}else if weight<=100{"BuilderSansThin"}else if weight<=300{"BuilderSansLight"}else{"BuilderSansRegular"};
     egui::FontFamily::Name(name.into())
@@ -43,6 +49,7 @@ pub struct GuiRuntimeEvent { pub referent: Ref, pub kind: GuiRuntimeEventKind, p
 
 #[derive(Clone, Copy)]
 struct RoundedMask { rect: Rect, radius: f32, rotation: f32 }
+type GuiGradient=(f32,Vec2,Vec<Color32>);
 
 #[derive(Clone, Copy)]
 struct SurfaceWarp { source: Rect, rotation: f32, quad: [Pos2; 4] }
@@ -68,8 +75,9 @@ struct GuiNode {
     rotation: f32,
     ui_stroke: Option<(f32, Color32, f32, egui::StrokeKind)>,
     text_ui_stroke: Option<(f32, Color32)>,
-    gradient: Option<(f32, Vec2, Vec<Color32>)>,
+    gradient: Option<GuiGradient>,
     gradient_rect: Rect,
+    group_gradients: Vec<(GuiGradient,Rect)>,
     text: String,
     text_color: Color32,
     text_size: f32,
@@ -82,6 +90,7 @@ struct GuiNode {
     line_height: f32,
     font_monospace: bool,
     font_extended: bool,
+    font_source_sans: bool,
     font_weight: u16,
     font_italic: bool,
     font_bold: bool,
@@ -248,7 +257,8 @@ fn gui_rect(
             let face_mono = matches!(instance.properties.get(&rbx_dom_weak::ustr("FontFace")),
                 Some(Variant::Font(font)) if font.family.to_ascii_lowercase().contains("mono") || font.family.to_ascii_lowercase().contains("code"));
             let face_extended = matches!(instance.properties.get(&rbx_dom_weak::ustr("FontFace")),Some(Variant::Font(font)) if font.family.to_ascii_lowercase().contains("extended"));
-            let family = roblox_font_family(matches!(legacy_font,10|41) || face_mono,face_extended,if matches!(legacy_font,20|49){800}else if matches!(legacy_font,2|4|16|19|48|51){700}else if matches!(legacy_font,18|47){500}else if legacy_font==5{300}else{400});
+            let face_source = matches!(instance.properties.get(&rbx_dom_weak::ustr("FontFace")),Some(Variant::Font(font)) if font.family.to_ascii_lowercase().contains("source sans") || font.family.to_ascii_lowercase().contains("sourcesans"));
+            let family = roblox_font_family(matches!(legacy_font,10|41) || face_mono,face_extended,matches!(legacy_font,3|4|5|6|16)||face_source,legacy_font==6,if matches!(legacy_font,20|49){800}else if matches!(legacy_font,2|4|16|19|48|51){700}else if matches!(legacy_font,18|47){500}else if legacy_font==5{300}else{400});
             let mut job = egui::text::LayoutJob::simple(text, FontId::new(font_size, family), Color32::WHITE, wrap_width);
             if let Some(section) = job.sections.first_mut() { section.format.line_height = Some(font_size * line_height); }
             let galley = painter.layout_job(job);
@@ -604,6 +614,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         let face_weight = font_face.map(|font| format!("{:?}", font.weight).to_ascii_lowercase()).unwrap_or_default();
         let font_monospace = matches!(legacy_font,10|41) || face_family.contains("mono") || face_family.contains("code");
         let font_extended = face_family.contains("extended");
+        let font_source_sans = matches!(legacy_font,3|4|5|6|16) || face_family.contains("source sans") || face_family.contains("sourcesans");
         let font_weight = if face_weight.contains("extra")||face_weight.contains("800")||face_weight.contains("900") {800} else if face_weight.contains("semi")||face_weight.contains("bold")||face_weight.contains("600")||face_weight.contains("700") {700} else if face_weight.contains("medium")||face_weight.contains("500") {500} else if face_weight.contains("light")||face_weight.contains("300") {300} else if face_weight.contains("thin")||face_weight.contains("100") {100} else {match legacy_font {20|49=>800,2|4|16|19|48|51=>700,18|47=>500,5=>300,_=>400}};
         let font_italic = legacy_font == 6 || face_style.contains("italic");
         let font_bold = font_weight>=600;
@@ -675,6 +686,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             text_ui_stroke,
             gradient,
             gradient_rect: rect,
+            group_gradients: Vec::new(),
             text: match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() },
             text_color: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("TextColor3")), ((1.0-text_transparency)*255.0) as u8, [0,0,0]), modulation),
             text_size: (number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0) * scale).clamp(1.0, 400.0),
@@ -687,6 +699,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             line_height: number(instance.properties.get(&rbx_dom_weak::ustr("LineHeight")), 1.0).max(0.1),
             font_monospace,
             font_extended,
+            font_source_sans,
             font_weight,
             font_italic,
             font_bold,
@@ -1107,9 +1120,9 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
 }
 
 fn paint_gradient(painter: &egui::Painter, rect: Rect, gradient_rect:Rect, base: Color32,
-                  gradient: &(f32, Vec2, Vec<Color32>), object_rotation: f32,
+                  gradient: Option<&GuiGradient>, group_gradients:&[(GuiGradient,Rect)], object_rotation: f32,
                   corner_radius: f32, rounded_clips: &[RoundedMask], surface_warp: Option<SurfaceWarp>) {
-    if gradient.2.len() < 2 || rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
+    if (gradient.is_none()&&group_gradients.is_empty()) || rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
     // A regular mesh gives smooth interpolation at arbitrary angles and lets
     // UICorner alpha-mask the same gradient without leaking through corners.
     let divisions = if corner_radius > 0.0 { 16usize } else { 8usize };
@@ -1118,7 +1131,7 @@ fn paint_gradient(painter: &egui::Painter, rect: Rect, gradient_rect:Rect, base:
         for x in 0..=divisions {
             let fx=x as f32/divisions as f32; let fy=y as f32/divisions as f32;
             let unrotated=Pos2::new(rect.left()+rect.width()*fx, rect.top()+rect.height()*fy);
-            let mut color=multiply_color(base,sample_gradient(gradient,unrotated,gradient_rect));
+            let mut color=apply_gradients(base,unrotated,gradient,gradient_rect,group_gradients);
             let mut coverage=rounded_coverage(unrotated,rect,corner_radius);
             let mut pos=if object_rotation.abs()>=0.001 { rotate_point(unrotated,rect.center(),object_rotation.to_radians()) } else { unrotated };
             if let Some(warp)=surface_warp { pos=warp_surface_point(pos,warp); }
@@ -1209,10 +1222,10 @@ fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
     let mut stack = vec![egui::TextFormat {
-        font_id: FontId::new(font_size, roblox_font_family(node.font_monospace,node.font_extended,node.font_weight)),
+        font_id: FontId::new(font_size, roblox_font_family(node.font_monospace,node.font_extended,node.font_source_sans,node.font_italic,node.font_weight)),
         line_height: Some(font_size * node.line_height),
         color: base_color,
-        italics: node.font_italic,
+        italics: node.font_italic && !node.font_source_sans,
         extra_letter_spacing: 0.0,
         ..Default::default()
     }];
@@ -1243,7 +1256,7 @@ fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
             if tag == "i" { format.italics = true; }
             if tag == "u" { format.underline = Stroke::new(1.0, format.color); }
             if tag == "s" || tag == "strike" { format.strikethrough = Stroke::new(1.0, format.color); }
-            if tag == "b" { format.font_id.family=roblox_font_family(node.font_monospace,node.font_extended,700); }
+            if tag == "b" { format.font_id.family=roblox_font_family(node.font_monospace,node.font_extended,node.font_source_sans,node.font_italic,700); }
             if tag.starts_with("font") {
                 if let Some(value) = rich_attribute(raw_tag, "size").and_then(|value| value.parse::<f32>().ok()) {
                     let scaled = (value * font_size / node.text_size.max(1.0)).max(1.0);
@@ -1260,7 +1273,7 @@ fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
                         (format.color.a() as f32 * (1.0-transparency.clamp(0.0,1.0))) as u8);
                 }
                 if rich_attribute(raw_tag, "face").map(|face| face.to_ascii_lowercase().contains("code")).unwrap_or(false) {
-                    format.font_id.family = roblox_font_family(true,false,node.font_weight);
+                    format.font_id.family = roblox_font_family(true,false,false,false,node.font_weight);
                 }
             }
             stack.push(format);
@@ -1275,13 +1288,13 @@ fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
     let mut job = if node.rich_text {
         rich_layout_job(node, font_size, color, wrap_width)
     } else {
-        let family = roblox_font_family(node.font_monospace,node.font_extended,node.font_weight);
+        let family = roblox_font_family(node.font_monospace,node.font_extended,node.font_source_sans,node.font_italic,node.font_weight);
         let mut job = egui::text::LayoutJob::simple(
             node.text.clone(), FontId::new(font_size, family), color, wrap_width,
         );
         if let Some(section) = job.sections.first_mut() {
             section.format.line_height = Some(font_size * node.line_height);
-            section.format.italics = node.font_italic;
+            section.format.italics = node.font_italic && !node.font_source_sans;
             section.format.extra_letter_spacing = 0.0;
         }
         job
@@ -1296,7 +1309,7 @@ fn layout_text(painter: &egui::Painter, node: &GuiNode, font_size: f32,
 }
 
 fn mask_galley(mut galley: std::sync::Arc<egui::Galley>, origin: Pos2,
-               gradient: Option<&(f32, Vec2, Vec<Color32>)>, rounded_clips: &[RoundedMask],
+               gradient: Option<&GuiGradient>, group_gradients:&[(GuiGradient,Rect)], rounded_clips: &[RoundedMask],
                rect: Rect, gradient_rect:Rect, object_rotation: f32, surface_warp: Option<SurfaceWarp>) -> std::sync::Arc<egui::Galley> {
     let mutable = std::sync::Arc::make_mut(&mut galley);
     for placed_row in &mut mutable.rows {
@@ -1304,7 +1317,7 @@ fn mask_galley(mut galley: std::sync::Arc<egui::Galley>, origin: Pos2,
         let row = std::sync::Arc::make_mut(&mut placed_row.row);
         for vertex in &mut row.visuals.mesh.vertices {
             let point=row_origin+vertex.pos.to_vec2();
-            if let Some(gradient)=gradient { vertex.color=multiply_color(vertex.color,sample_gradient(gradient,point,gradient_rect)); }
+            vertex.color=apply_gradients(vertex.color,point,gradient,gradient_rect,group_gradients);
             let mut screen_point=if object_rotation.abs()>=0.001 { rotate_point(point,rect.center(),object_rotation.to_radians()) } else { point };
             if let Some(warp)=surface_warp {
                 screen_point=warp_surface_point(screen_point,warp);
@@ -1336,7 +1349,12 @@ fn rotate_point(point: Pos2, pivot: Pos2, radians: f32) -> Pos2 {
     pivot + Vec2::new(offset.x*cos - offset.y*sin, offset.x*sin + offset.y*cos)
 }
 
-fn sample_gradient(gradient: &(f32, Vec2, Vec<Color32>), point: Pos2, rect: Rect) -> Color32 {
+fn apply_gradients(mut color:Color32,point:Pos2,gradient:Option<&GuiGradient>,gradient_rect:Rect,groups:&[(GuiGradient,Rect)])->Color32 {
+    if let Some(gradient)=gradient{color=multiply_color(color,sample_gradient(gradient,point,gradient_rect));}
+    for (gradient,rect) in groups{color=multiply_color(color,sample_gradient(gradient,point,*rect));}color
+}
+
+fn sample_gradient(gradient: &GuiGradient, point: Pos2, rect: Rect) -> Color32 {
     let (rotation, offset, samples) = gradient;
     if samples.is_empty() { return Color32::WHITE; }
     let radians = rotation.to_radians();
@@ -1388,20 +1406,20 @@ fn rounded_coverage(point: Pos2, rect: Rect, radius: f32) -> f32 {
 
 fn paint_texture_quad(painter: &egui::Painter, texture: egui::TextureId, destination: Rect,
                       uv: Rect, tint: Color32, rotation: f32, pivot: Pos2,
-                      gradient: Option<&(f32, Vec2, Vec<Color32>)>, gradient_rect: Rect,
+                      gradient: Option<&GuiGradient>, gradient_rect: Rect, group_gradients:&[(GuiGradient,Rect)],
                       corner_radius: f32, rounded_clips: &[RoundedMask], surface_warp: Option<SurfaceWarp>) {
-    if gradient.is_none() && rotation.abs() < 0.001 && corner_radius <= 0.0 && rounded_clips.is_empty() && surface_warp.is_none() {
+    if gradient.is_none() && group_gradients.is_empty() && rotation.abs() < 0.001 && corner_radius <= 0.0 && rounded_clips.is_empty() && surface_warp.is_none() {
         painter.image(texture, destination, uv, tint);
         return;
     }
-    let divisions = if corner_radius > 0.0 || !rounded_clips.is_empty() { 16usize } else if gradient.is_some() { 8usize } else { 1usize };
+    let divisions = if corner_radius > 0.0 || !rounded_clips.is_empty() { 16usize } else if gradient.is_some()||!group_gradients.is_empty() { 8usize } else { 1usize };
     let mut mesh = egui::Mesh::with_texture(texture);
     for y in 0..=divisions {
         for x in 0..=divisions {
             let fx=x as f32/divisions as f32; let fy=y as f32/divisions as f32;
             let mut pos=Pos2::new(destination.left()+destination.width()*fx, destination.top()+destination.height()*fy);
             let uv_pos=Pos2::new(uv.left()+uv.width()*fx, uv.top()+uv.height()*fy);
-            let mut color=gradient.map(|value| multiply_color(tint, sample_gradient(value,pos,gradient_rect))).unwrap_or(tint);
+            let mut color=apply_gradients(tint,pos,gradient,gradient_rect,group_gradients);
             let mut coverage=rounded_coverage(pos,gradient_rect,corner_radius);
             if rotation.abs() >= 0.001 { pos=rotate_point(pos,pivot,rotation.to_radians()); }
             if let Some(warp)=surface_warp { pos=warp_surface_point(pos,warp); }
@@ -1440,7 +1458,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
         // Slice (nine-slice)
         1 => {
             let Some(slice) = node.slice_center else {
-                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, node.corner_radius, &node.rounded_clips, node.surface_warp);
+                paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, &node.group_gradients, node.corner_radius, &node.rounded_clips, node.surface_warp);
                 return;
             };
             let mut left = (slice[0] - node.image_rect_offset.x).max(0.0) * node.slice_scale;
@@ -1465,7 +1483,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                     paint_texture_quad(painter, texture.id(),
                         Rect::from_min_max(Pos2::new(dx[x], dy[y]), Pos2::new(dx[x + 1], dy[y + 1])),
                         Rect::from_min_max(Pos2::new(ux[x], uy[y]), Pos2::new(ux[x + 1], uy[y + 1])),
-                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, node.corner_radius, &node.rounded_clips, node.surface_warp);
+                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, &node.group_gradients, node.corner_radius, &node.rounded_clips, node.surface_warp);
                 }
             }
         }
@@ -1490,7 +1508,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                         uv.min.y + uv.height() * fraction.y,
                     ));
                     paint_texture_quad(painter, texture.id(), Rect::from_min_max(min, max), tile_uv,
-                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, node.corner_radius, &node.rounded_clips, node.surface_warp);
+                        tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, &node.group_gradients, node.corner_radius, &node.rounded_clips, node.surface_warp);
                 }
             }
         }
@@ -1504,7 +1522,7 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 Vec2::new(bounds.width(), bounds.width() / image_aspect)
             };
             paint_texture_quad(painter, texture.id(), Rect::from_center_size(bounds.center(), size), uv,
-                tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, node.corner_radius, &node.rounded_clips, node.surface_warp);
+                tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, &node.group_gradients, node.corner_radius, &node.rounded_clips, node.surface_warp);
         }
         // Crop
         4 => {
@@ -1522,10 +1540,10 @@ fn paint_image(painter: &egui::Painter, node: &GuiNode, texture: &egui::TextureH
                 crop_uv.min.x += margin;
                 crop_uv.max.x -= margin;
             }
-            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, node.corner_radius, &node.rounded_clips, node.surface_warp);
+            paint_texture_quad(painter, texture.id(), bounds, crop_uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, &node.group_gradients, node.corner_radius, &node.rounded_clips, node.surface_warp);
         }
         // Stretch
-        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, node.corner_radius, &node.rounded_clips, node.surface_warp),
+        _ => paint_texture_quad(painter, texture.id(), bounds, uv, tint, node.rotation, node.rect.center(), node.gradient.as_ref(), node.gradient_rect, &node.group_gradients, node.corner_radius, &node.rounded_clips, node.surface_warp),
     }
 }
 
@@ -2098,7 +2116,7 @@ pub fn draw_starter_gui(
                     node.rounded_clips.push(*mask);
                 }
             }
-            if node.gradient.is_none(){if let Some((gradient,rect))=canvas_gradients.get(&referent){node.gradient=Some(gradient.clone());node.gradient_rect=*rect;}}
+            if let Some((gradient,rect))=canvas_gradients.get(&referent){node.group_gradients.push((gradient.clone(),*rect));}
             parent = Some(instance.parent());
         }
     }
@@ -2243,6 +2261,7 @@ pub fn draw_starter_gui(
         let hovered = is_button && node.interactable && response.hovered() && pointer_inside;
         let button_factor = if node.auto_button_color && pressed { 0.72 }
             else if node.auto_button_color && hovered { 0.88 } else { 1.0 };
+        if node.gradient.is_none()&&node.group_gradients.is_empty() {
         if !node.rounded_clips.is_empty() || node.surface_warp.is_some() {
             paint_masked_solid(&painter,node.rect,shade_color(node.background,button_factor),node.corner_radius,node.rotation,&node.rounded_clips,node.surface_warp);
         } else if node.rotation.abs() < 0.001 {
@@ -2253,10 +2272,10 @@ pub fn draw_starter_gui(
                 .into_iter().map(|point| rotate_point(point, node.rect.center(), radians)).collect();
             painter.add(egui::Shape::convex_polygon(corners,
                 shade_color(node.background, button_factor), Stroke::NONE));
-        }
-        if let Some(gradient) = &node.gradient {
+        }}
+        if node.gradient.is_some()||!node.group_gradients.is_empty() {
             paint_gradient(&painter.with_clip_rect(rotated_bounds(node.rect, node.rotation).intersect(node.clip)), node.rect,node.gradient_rect,
-                shade_color(node.background, button_factor), gradient, node.rotation, node.corner_radius, &node.rounded_clips, node.surface_warp);
+                shade_color(node.background, button_factor),node.gradient.as_ref(),&node.group_gradients,node.rotation,node.corner_radius,&node.rounded_clips,node.surface_warp);
         }
         if node.rotation.abs() < 0.001 {
             if node.border_size > 0.0 {
@@ -2320,7 +2339,7 @@ pub fn draw_starter_gui(
         if editable_textbox {
             let value = text_inputs.entry(node.referent).or_insert_with(|| node.text.clone());
             let hint = egui::RichText::new(node.placeholder_text.clone()).color(node.placeholder_color);
-            let textbox_font = FontId::new(node.text_size,roblox_font_family(node.font_monospace,node.font_extended,node.font_weight));
+            let textbox_font = FontId::new(node.text_size,roblox_font_family(node.font_monospace,node.font_extended,node.font_source_sans,node.font_italic,node.font_weight));
             let widget = if node.multiline {
                 egui::TextEdit::multiline(value)
                     .desired_width(node.content_rect.width()).font(textbox_font.clone())
@@ -2376,8 +2395,8 @@ pub fn draw_starter_gui(
                         node.rotation, node.rect.center());
                 }
             }
-            let final_galley = if node.gradient.is_some() || !node.rounded_clips.is_empty() || node.surface_warp.is_some() {
-                mask_galley(galley.clone(),pos,node.gradient.as_ref(),&node.rounded_clips,node.rect,node.gradient_rect,node.rotation,node.surface_warp)
+            let final_galley = if node.gradient.is_some() || !node.group_gradients.is_empty() || !node.rounded_clips.is_empty() || node.surface_warp.is_some() {
+                mask_galley(galley.clone(),pos,node.gradient.as_ref(),&node.group_gradients,&node.rounded_clips,node.rect,node.gradient_rect,node.rotation,node.surface_warp)
             } else { galley };
             let render_rotation=if node.surface_warp.is_some() { 0.0 } else { node.rotation };
             paint_galley(&painter, pos, final_galley, text_color, false, render_rotation, node.rect.center());
