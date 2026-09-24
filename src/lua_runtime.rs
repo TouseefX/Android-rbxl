@@ -896,7 +896,7 @@ impl GuiPlaySession {
         user_input_service.raw_set("TouchEnabled",cfg!(target_os="android")).map_err(|error|error.to_string())?;
         user_input_service.raw_set("KeyboardEnabled",true).map_err(|error|error.to_string())?;
         user_input_service.raw_set("MouseEnabled",true).map_err(|error|error.to_string())?;
-        let gui_service=make_instance(&lua,"GuiService","GuiService").map_err(|error|error.to_string())?;gui_service.raw_set("SelectedObject",Value::Nil).map_err(|error|error.to_string())?;gui_service.raw_set("MenuIsOpen",false).map_err(|error|error.to_string())?;gui_service.raw_set("GetGuiInset",lua.create_function(|lua,_service:Table|{let zero=lua.create_table();zero.set("X",0.0)?;zero.set("Y",0.0)?;Ok((zero.clone(),zero))})?).map_err(|error|error.to_string())?;
+        let gui_service=make_instance(&lua,"GuiService","GuiService").map_err(|error|error.to_string())?;gui_service.raw_set("SelectedObject",Value::Nil).map_err(|error|error.to_string())?;gui_service.raw_set("MenuIsOpen",false).map_err(|error|error.to_string())?;gui_service.raw_set("GetGuiInset",lua.create_function(|lua,_service:Table|{let top_left=lua.create_table();top_left.set("X",0.0)?;top_left.set("Y",58.0)?;let bottom_right=lua.create_table();bottom_right.set("X",0.0)?;bottom_right.set("Y",0.0)?;Ok((top_left,bottom_right))})?).map_err(|error|error.to_string())?;let topbar=lua.create_table().map_err(|error|error.to_string())?;let min=lua.create_table().map_err(|error|error.to_string())?;min.set("X",0.0).map_err(|error|error.to_string())?;min.set("Y",0.0).map_err(|error|error.to_string())?;let max=lua.create_table().map_err(|error|error.to_string())?;max.set("X",0.0).map_err(|error|error.to_string())?;max.set("Y",58.0).map_err(|error|error.to_string())?;topbar.set("Min",min).map_err(|error|error.to_string())?;topbar.set("Max",max).map_err(|error|error.to_string())?;gui_service.raw_set("TopbarInset",topbar).map_err(|error|error.to_string())?;
         if let Some(game)=instances.get(&dom.root_ref()) {
             lua.globals().set("game",game.clone()).map_err(|error|error.to_string())?;
             game.raw_set("RunService",run_service.clone()).map_err(|error|error.to_string())?;
@@ -1137,21 +1137,19 @@ impl GuiPlaySession {
         {
             let mut tweens=self.active_tweens.borrow_mut();
             for tween in tweens.iter_mut(){
-                if tween.control.get()!=0{continue;}tween.elapsed+=delta;if tween.elapsed<0.0{continue;}
+                if tween.control.get()==2{completed.push((tween.completed.clone(),"Cancelled"));continue;}if tween.control.get()!=0{continue;}tween.elapsed+=delta;if tween.elapsed<0.0{continue;}
                 let iteration_duration=tween.duration.max(0.0001)*if tween.reverses{2.0}else{1.0};
                 let total_duration=if tween.repeat_count<0{f32::INFINITY}else{iteration_duration*(tween.repeat_count+1)as f32};
-                let finished=tween.elapsed>=total_duration;
-                let within=tween.elapsed%iteration_duration;
+                let finished=tween.elapsed>=total_duration;let within=tween.elapsed%iteration_duration;
                 let mut linear=if tween.duration<=0.0{1.0}else{(within/tween.duration).clamp(0.0,1.0)};
-                if tween.reverses&&within>=tween.duration{linear=1.0-((within-tween.duration)/tween.duration.max(0.0001)).clamp(0.0,1.0);}
-                if finished{linear=if tween.reverses{0.0}else{1.0};}
+                if tween.reverses&&within>=tween.duration{linear=1.0-((within-tween.duration)/tween.duration.max(0.0001)).clamp(0.0,1.0);}if finished{linear=if tween.reverses{0.0}else{1.0};}
                 let amount=ease_gui_tween(linear,&tween.easing_style,&tween.easing_direction);
-                for(key,start,end)in &tween.goals{let value=interpolate_gui_value(&self.lua,start,end,amount).map_err(|error|error.to_string())?;tween.target.raw_set(key.as_str(),value).map_err(|error|error.to_string())?;}
-                if finished{completed.push(tween.completed.clone());tween.control.set(2);}
+                for(key,start,end)in &tween.goals{let value=interpolate_gui_value(&self.lua,start,end,amount).map_err(|error|error.to_string())?;tween.target.raw_set(key.as_str(),value).map_err(|error|error.to_string())?;fire_instance_signal(&tween.target,"Changed",vec![Value::String(self.lua.create_string(key).map_err(|error|error.to_string())?)]).map_err(|error|error.to_string())?;fire_instance_signal(&tween.target,&format!("_property_signal_{key}"),Vec::new()).map_err(|error|error.to_string())?;}
+                if finished{completed.push((tween.completed.clone(),"Completed"));tween.control.set(2);}
             }
             tweens.retain(|tween|tween.control.get()!=2);
         }
-        for signal in completed{let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}
+        for(signal,state_name)in completed{let state=self.lua.create_table().map_err(|error|error.to_string())?;state.set("Name",state_name).map_err(|error|error.to_string())?;let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,state)).map_err(|error|error.to_string())?;}
         Ok(())
     }
 
