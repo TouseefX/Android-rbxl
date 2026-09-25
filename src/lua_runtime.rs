@@ -24,7 +24,8 @@
 use luaur::{
     Error as LuaError, Function, Lua, MultiValue, Result as LuaResult, Table, Value, Variadic,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use rbx_dom_weak::types as ty;
 
 /// Result of running a script: captured output + success flag.
 #[derive(Debug, Clone)]
@@ -183,8 +184,10 @@ fn build_vm() -> LuaResult<Lua> {
     install_vector3(&lua)?;
     install_vector2(&lua)?;
     install_color3(&lua)?;
+    install_sequences(&lua)?;
     install_cframe(&lua)?;
     install_udim2(&lua)?;
+    install_tween_info(&lua)?;
     install_enum(&lua)?;
     install_instance_stub(&lua)?;
     install_plugin_stub(&lua)?;
@@ -447,34 +450,26 @@ fn install_color3(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
+fn install_sequences(lua:&Lua)->LuaResult<()> {
+    let color_keypoint=lua.create_table();color_keypoint.set("new",lua.create_function(|lua,(time,value):(f64,Table)|{let point=lua.create_table();point.set("Time",time)?;point.set("Value",value)?;point.set_metatable(Some(typed_metatable(lua,"ColorSequenceKeypoint")?));Ok(point)})?)?;lua.globals().set("ColorSequenceKeypoint",color_keypoint)?;
+    let number_keypoint=lua.create_table();number_keypoint.set("new",lua.create_function(|lua,(time,value,envelope):(f64,f64,Option<f64>)|{let point=lua.create_table();point.set("Time",time)?;point.set("Value",value)?;point.set("Envelope",envelope.unwrap_or(0.0))?;point.set_metatable(Some(typed_metatable(lua,"NumberSequenceKeypoint")?));Ok(point)})?)?;lua.globals().set("NumberSequenceKeypoint",number_keypoint)?;
+    let color_sequence=lua.create_table();color_sequence.set("new",lua.create_function(|lua,args:Variadic<Value>|{let points=if let Some(Value::Table(points))=args.first(){if points.raw_get::<Value>("R").is_err(){points.clone()}else{let output=lua.create_table();for(index,(time,value))in [(0.0,points.clone()),(1.0,args.get(1).and_then(|value|match value{Value::Table(value)=>Some(value.clone()),_=>None}).unwrap_or(points.clone()))].into_iter().enumerate(){let point=lua.create_table();point.set("Time",time)?;point.set("Value",value)?;output.raw_set(index+1,point)?;}output}}else{let points=lua.create_table();if let Some(Value::Table(first))=args.first(){let point=lua.create_table();point.set("Time",0.0)?;point.set("Value",first.clone())?;points.raw_set(1,point)?;}if let Some(Value::Table(last))=args.get(1).or(args.first()){let point=lua.create_table();point.set("Time",1.0)?;point.set("Value",last.clone())?;points.raw_set(2,point)?;}points};let sequence=lua.create_table();sequence.set("Keypoints",points)?;sequence.set_metatable(Some(typed_metatable(lua,"ColorSequence")?));Ok(sequence)})?)?;lua.globals().set("ColorSequence",color_sequence)?;
+    let number_sequence=lua.create_table();number_sequence.set("new",lua.create_function(|lua,args:Variadic<Value>|{let points=if let Some(Value::Table(points))=args.first(){points.clone()}else{let first=match args.first(){Some(Value::Number(value))=>*value,Some(Value::Integer(value))=>*value as f64,_=>0.0};let last=match args.get(1){Some(Value::Number(value))=>*value,Some(Value::Integer(value))=>*value as f64,_=>first};let points=lua.create_table();for(index,(time,value))in [(0.0,first),(1.0,last)].into_iter().enumerate(){let point=lua.create_table();point.set("Time",time)?;point.set("Value",value)?;point.set("Envelope",0.0)?;points.raw_set(index+1,point)?;}points};let sequence=lua.create_table();sequence.set("Keypoints",points)?;sequence.set_metatable(Some(typed_metatable(lua,"NumberSequence")?));Ok(sequence)})?)?;lua.globals().set("NumberSequence",number_sequence)?;Ok(())
+}
+
 fn install_cframe(lua: &Lua) -> LuaResult<()> {
     let cf = lua.create_table();
     cf.set(
         "new",
-        lua.create_function(|lua, (x, y, z): (f64, f64, f64)| {
-            let t = lua.create_table();
-            t.set("X", x)?;
-            t.set("Y", y)?;
-            t.set("Z", z)?;
-            let p = lua.create_table();
-            p.set("X", x)?;
-            p.set("Y", y)?;
-            p.set("Z", z)?;
-            t.set("Position", p)?;
-            t.set_metatable(Some(typed_metatable(lua, "CFrame")?));
-            Ok(t)
+        lua.create_function(|lua,args:Variadic<f64>| {
+            let value=|index:usize,default:f64|args.get(index).copied().unwrap_or(default);let(x,y,z)=(value(0,0.0),value(1,0.0),value(2,0.0));
+            let matrix=if args.len()>=12{[value(3,1.0),value(4,0.0),value(5,0.0),value(6,0.0),value(7,1.0),value(8,0.0),value(9,0.0),value(10,0.0),value(11,1.0)]}else{[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]};
+            let t=lua.create_table();t.set("X",x)?;t.set("Y",y)?;t.set("Z",z)?;for(index,name)in ["R00","R01","R02","R10","R11","R12","R20","R21","R22"].into_iter().enumerate(){t.set(name,matrix[index])?;}let p=lua.create_table();p.set("X",x)?;p.set("Y",y)?;p.set("Z",z)?;t.set("Position",p)?;t.set_metatable(Some(typed_metatable(lua,"CFrame")?));Ok(t)
         })?,
     )?;
     cf.set(
         "Angles",
-        lua.create_function(|lua, (rx, ry, rz): (f64, f64, f64)| {
-            let t = lua.create_table();
-            t.set("RX", rx)?;
-            t.set("RY", ry)?;
-            t.set("RZ", rz)?;
-            t.set_metatable(Some(typed_metatable(lua, "CFrame")?));
-            Ok(t)
-        })?,
+        lua.create_function(|lua,(rx,ry,rz):(f64,f64,f64)|{let(sx,cx)=rx.sin_cos();let(sy,cy)=ry.sin_cos();let(sz,cz)=rz.sin_cos();let matrix=[cy*cz,-cy*sz,sy,cx*sz+sx*sy*cz,cx*cz-sx*sy*sz,-sx*cy,sx*sz-cx*sy*cz,sx*cz+cx*sy*sz,cx*cy];let t=lua.create_table();t.set("X",0.0)?;t.set("Y",0.0)?;t.set("Z",0.0)?;for(index,name)in["R00","R01","R02","R10","R11","R12","R20","R21","R22"].into_iter().enumerate(){t.set(name,matrix[index])?;}let p=lua.create_table();p.set("X",0.0)?;p.set("Y",0.0)?;p.set("Z",0.0)?;t.set("Position",p)?;t.set_metatable(Some(typed_metatable(lua,"CFrame")?));Ok(t)})?,
     )?;
     lua.globals().set("CFrame", cf)?;
     Ok(())
@@ -510,34 +505,104 @@ fn install_udim2(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
+fn install_tween_info(lua: &Lua) -> LuaResult<()> {
+    let tween_info=lua.create_table();
+    tween_info.set("new",lua.create_function(|lua,args:Variadic<Value>|{
+        let info=lua.create_table();
+        let number=|index:usize,fallback:f64|match args.get(index){Some(Value::Number(value))=>*value,Some(Value::Integer(value))=>*value as f64,_=>fallback};
+        info.set("Time",number(0,1.0))?; info.set("EasingStyle",args.get(1).cloned().unwrap_or(Value::Nil))?;
+        info.set("EasingDirection",args.get(2).cloned().unwrap_or(Value::Nil))?; info.set("RepeatCount",number(3,0.0) as i64)?;
+        info.set("Reverses",matches!(args.get(4),Some(Value::Boolean(true))))?; info.set("DelayTime",number(5,0.0))?;
+        info.set_metatable(Some(typed_metatable(lua,"TweenInfo")?)); Ok(info)
+    })?)?;
+    lua.globals().set("TweenInfo",tween_info)
+}
+
 fn install_enum(lua: &Lua) -> LuaResult<()> {
-    // Permissive: Enum.Material.Plastic returns a table {Name, Value=0,
-    // EnumType}. Numeric values don't match real Roblox — good enough for
-    // logic tests that branch on enum *names*.
-    let item_mt = lua.create_table();
-    item_mt.set(
-        "__index",
-        lua.create_function(|lua, (_, key): (Table, String)| {
-            let t = lua.create_table();
-            t.set("Name", key.clone())?;
-            t.set("Value", 0i64)?;
-            t.set("EnumType", key)?;
-            Ok(t)
-        })?,
-    )?;
-    let group_mt = lua.create_table();
-    group_mt.set(
-        "__index",
-        lua.create_function(move |lua, (_t, _key): (Table, String)| {
-            let group = lua.create_table();
-            group.set_metatable(Some(item_mt.clone()));
-            Ok(group)
-        })?,
-    )?;
-    let enum_root = lua.create_table();
-    enum_root.set_metatable(Some(group_mt));
-    lua.globals().set("Enum", enum_root)?;
-    Ok(())
+    let root_mt=lua.create_table();
+    root_mt.set("__index",lua.create_function(|lua,(_root,enum_type):(Table,String)|{
+        let group=lua.create_table();let item_mt=lua.create_table();let captured=enum_type.clone();
+        item_mt.set("__index",lua.create_function(move |lua,(_group,name):(Table,String)|{
+            let value=match (captured.as_str(),name.as_str()) {
+                ("AutomaticSize","X")=>1,("AutomaticSize","Y")=>2,("AutomaticSize","XY")=>3,
+                ("ZIndexBehavior","Sibling")=>1,
+                ("ScaleType","Slice")=>1,("ScaleType","Tile")=>2,("ScaleType","Fit")=>3,("ScaleType","Crop")=>4,
+                ("TextXAlignment","Center")=>1,("TextXAlignment","Right")=>2,
+                ("TextYAlignment","Center")=>1,("TextYAlignment","Bottom")=>2,
+                ("EasingDirection","Out")=>1,("EasingDirection","InOut")=>2,
+                ("FillDirection","Vertical")=>1,("ScrollingDirection","X")=>1,("ScrollingDirection","Y")=>2,
+                ("VerticalScrollBarPosition","Left")=>1,("ResamplerMode","Pixelated")=>1,
+                ("ScreenInsets","DeviceSafeInsets")=>1,("ScreenInsets","CoreUISafeInsets")=>2,("ScreenInsets","TopbarSafeInsets")=>3,
+                _=>0,
+            };
+            let item=lua.create_table();item.set("Name",name)?;item.set("Value",value)?;item.set("EnumType",captured.clone())?;Ok(item)
+        })?)?;
+        group.set_metatable(Some(item_mt));group.raw_set("Name",enum_type)?;Ok(group)
+    })?)?;
+    let enum_root=lua.create_table();enum_root.set_metatable(Some(root_mt));lua.globals().set("Enum",enum_root)
+}
+
+fn make_signal(lua: &Lua) -> LuaResult<Table> {
+    let signal=lua.create_table();
+    let callbacks: Rc<RefCell<Vec<(Function,bool,Rc<Cell<bool>>)>>>=Rc::new(RefCell::new(Vec::new()));
+    let connected=callbacks.clone();
+    signal.set("Connect",lua.create_function(move |lua,(_signal,callback):(Table,Function)|{
+        let active=Rc::new(Cell::new(true)); connected.borrow_mut().push((callback,false,active.clone()));
+        let connection=lua.create_table(); connection.set("Connected",true)?;
+        connection.set("Disconnect",lua.create_function(move |_,connection:Table|{active.set(false);connection.set("Connected",false)} )?)?;
+        Ok(connection)
+    })?)?;
+    let once_callbacks=callbacks.clone();
+    signal.set("Once",lua.create_function(move |lua,(_signal,callback):(Table,Function)|{
+        let active=Rc::new(Cell::new(true)); once_callbacks.borrow_mut().push((callback,true,active.clone()));
+        let connection=lua.create_table(); connection.set("Connected",true)?;
+        connection.set("Disconnect",lua.create_function(move |_,connection:Table|{active.set(false);connection.set("Connected",false)} )?)?;
+        Ok(connection)
+    })?)?;
+    let fired=callbacks;
+    signal.set("Fire",lua.create_function(move |lua,(_signal,args):(Table,Variadic<Value>)|{
+        let callbacks=fired.borrow().clone();
+        for (callback,once,active) in callbacks{if active.get(){
+            if lua.globals().get::<Function>("_arena_step_tasks").is_ok() {let task:Table=lua.globals().get("task")?;let spawn:Function=task.get("spawn")?;let mut values=vec![Value::Function(callback.clone())];values.extend(args.clone());spawn.call::<()>(MultiValue::from_vec(values))?;}
+            else{callback.call::<()>(args.clone())?;}
+            if once{active.set(false);}
+        }}
+        fired.borrow_mut().retain(|(_,once,active)|active.get()&&!*once); Ok(())
+    })?)?;
+    if let Ok(wait)=lua.globals().get::<Function>("_arena_signal_wait") { signal.set("Wait",wait)?; }
+    else { signal.set("Wait",lua.create_function(|_,_signal:Table|Ok(Variadic::<Value>::new()))?)?; }
+    Ok(signal)
+}
+
+fn fire_instance_signal(table:&Table,name:&str,args:Vec<Value>)->LuaResult<()> {
+    if let Ok(signal)=table.raw_get::<Table>(name){let fire:Function=signal.get("Fire")?;let mut values=vec![Value::Table(signal)];values.extend(args);fire.call::<()>(MultiValue::from_vec(values))?;}Ok(())
+}
+
+fn is_instance_signal(key: &str) -> bool {
+    matches!(key,"Activated"|"MouseButton1Click"|"MouseButton1Down"|"MouseButton1Up"|
+        "MouseEnter"|"MouseLeave"|"InputBegan"|"InputChanged"|"InputEnded"|
+        "Focused"|"FocusLost"|"SelectionGained"|"SelectionLost"|"Changed"|"AncestryChanged"|
+        "ChildAdded"|"ChildRemoved"|"DescendantAdded"|"DescendantRemoving"|"Destroying")
+}
+
+fn instance_children(this:&Table)->LuaResult<Vec<Table>> {
+    let mut children=Vec::new();for pair in this.clone().pairs::<Value,Value>(){let(_,value)=pair?;if let Value::Table(child)=value{if child.raw_get::<Table>("Parent").ok().as_ref()==Some(this){children.push(child);}}}Ok(children)
+}
+
+fn class_is_a(class:&str,target:&str)->bool {
+    if class==target||target=="Instance" {return true;}
+    match target {
+        "GuiBase"=>matches!(class,"ScreenGui"|"BillboardGui"|"SurfaceGui"|"GuiObject"|"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
+        "GuiBase2d"=>matches!(class,"GuiObject"|"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
+        "LayerCollector"=>matches!(class,"ScreenGui"|"BillboardGui"|"SurfaceGui"),
+        "GuiObject"=>matches!(class,"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
+        "GuiButton"=>matches!(class,"TextButton"|"ImageButton"),
+        "GuiLabel"=>matches!(class,"TextLabel"|"ImageLabel"),
+        "UIComponent"=>class.starts_with("UI"),
+        "LuaSourceContainer"=>matches!(class,"LocalScript"|"ModuleScript"|"Script"),
+        "BaseScript"=>matches!(class,"LocalScript"|"Script"),
+        _=>false,
+    }
 }
 
 fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
@@ -545,26 +610,56 @@ fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
     t.set("Name", name)?;
     t.set("ClassName", class)?;
     let noop = lua.create_function(|_, _: Variadic<Value>| Ok(Variadic::<Value>::new()))?;
-    for m in [
-        "GetChildren",
-        "GetDescendants",
-        "FindFirstChild",
-        "WaitForChild",
-        "GetActor",
-        "Clone",
-        "Destroy",
-        "GetPropertyChangedSignal",
-        "GetAttribute",
-        "SetAttribute",
-    ] {
-        t.set(m, noop.clone())?;
+    for m in ["GetActor","Clone","Destroy"] {t.set(m,noop.clone())?;}
+    t.set("FindFirstChild",lua.create_function(|_,(this,name,recursive):(Table,String,Option<bool>)|{
+        if let Ok(value)=this.raw_get::<Value>(&name){if !matches!(value,Value::Nil){return Ok(value);}}
+        if recursive.unwrap_or(false){let mut stack=instance_children(&this)?;while let Some(child)=stack.pop(){if child.raw_get::<String>("Name").ok().as_deref()==Some(name.as_str()){return Ok(Value::Table(child));}stack.extend(instance_children(&child)?);}}
+        Ok(Value::Nil)
+    })?)?;
+    t.set("WaitForChild",lua.create_function(|_,(this,name,_timeout):(Table,String,Option<f64>)|this.raw_get::<Value>(&name).or(Ok(Value::Nil)))?)?;
+    t.set("GetChildren",lua.create_function(|_,this:Table|instance_children(&this))?)?;
+    t.set("GetDescendants",lua.create_function(|_,this:Table|{let mut descendants=Vec::new();let mut stack=instance_children(&this)?;while let Some(child)=stack.pop(){stack.extend(instance_children(&child)?);descendants.push(child);}Ok(descendants)})?)?;
+    t.set("FindFirstChildWhichIsA",lua.create_function(|_,(this,class,recursive):(Table,String,Option<bool>)|{let mut stack=instance_children(&this)?;while let Some(child)=stack.pop(){if class_is_a(&child.raw_get::<String>("ClassName")?,&class){return Ok(Some(child));}if recursive.unwrap_or(false){stack.extend(instance_children(&child)?);}}Ok(None)})?)?;
+    t.set("FindFirstChildOfClass",lua.create_function(|_,(this,class):(Table,String)|{for child in instance_children(&this)?{if child.raw_get::<String>("ClassName")?==class{return Ok(Some(child));}}Ok(None)})?)?;
+    t.set("GetFullName",lua.create_function(|_,this:Table|{let mut names=vec![this.raw_get::<String>("Name")?];let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{names.push(parent.raw_get::<String>("Name")?);current=parent.raw_get::<Table>("Parent").ok();}names.reverse();Ok(names.join("."))})?)?;
+    t.set("IsDescendantOf",lua.create_function(|_,(this,ancestor):(Table,Table)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent==ancestor{return Ok(true);}current=parent.raw_get::<Table>("Parent").ok();}Ok(false)})?)?;
+    t.set("IsAncestorOf",lua.create_function(|_,(this,descendant):(Table,Table)|{let mut current=descendant.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent==this{return Ok(true);}current=parent.raw_get::<Table>("Parent").ok();}Ok(false)})?)?;
+    t.set("FindFirstAncestor",lua.create_function(|_,(this,name):(Table,String)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent.raw_get::<String>("Name")?==name{return Ok(Some(parent));}current=parent.raw_get::<Table>("Parent").ok();}Ok(None)})?)?;
+    t.set("FindFirstAncestorWhichIsA",lua.create_function(|_,(this,class):(Table,String)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if class_is_a(&parent.raw_get::<String>("ClassName")?,&class){return Ok(Some(parent));}current=parent.raw_get::<Table>("Parent").ok();}Ok(None)})?)?;
+    t.set("FindFirstAncestorOfClass",lua.create_function(|_,(this,class):(Table,String)|{let mut current=this.raw_get::<Table>("Parent").ok();while let Some(parent)=current{if parent.raw_get::<String>("ClassName")?==class{return Ok(Some(parent));}current=parent.raw_get::<Table>("Parent").ok();}Ok(None)})?)?;
+    let attributes=lua.create_table();t.raw_set("_attributes",attributes)?;
+    t.set("GetAttribute",lua.create_function(|_,(this,name):(Table,String)|this.raw_get::<Table>("_attributes")?.raw_get::<Value>(name))?)?;
+    t.set("SetAttribute",lua.create_function(|_,(this,name,value):(Table,String,Value)|{this.raw_get::<Table>("_attributes")?.raw_set(&name,value)?;if let Ok(signal)=this.raw_get::<Table>(&format!("_attribute_signal_{name}")){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}Ok(())})?)?;
+    t.set("GetAttributeChangedSignal",lua.create_function(|lua,(this,name):(Table,String)|{let key=format!("_attribute_signal_{name}");if let Ok(signal)=this.raw_get::<Table>(&key){return Ok(signal);}let signal=make_signal(lua)?;this.raw_set(key,signal.clone())?;Ok(signal)})?)?;
+    t.set("GetAttributes",lua.create_function(|_,this:Table|Ok(this.raw_get::<Table>("_attributes")?))?)?;
+    for event in ["Activated","MouseButton1Click","MouseButton1Down","MouseButton1Up","MouseEnter","MouseLeave","InputBegan","InputChanged","InputEnded","Focused","FocusLost","SelectionGained","SelectionLost","Changed","AncestryChanged","ChildAdded","ChildRemoved","DescendantAdded","DescendantRemoving","Destroying"] {
+        t.set(event,make_signal(lua)?)?;
     }
+    t.set("GetPropertyChangedSignal",lua.create_function(|lua,(this,property):(Table,String)|{
+        let key=format!("_property_signal_{property}");
+        if let Ok(signal)=this.raw_get::<Table>(&key){return Ok(signal);}let signal=make_signal(lua)?;this.raw_set(key,signal.clone())?;Ok(signal)
+    })?)?;
     let class_name = class.to_string();
-    let isa = lua.create_function(move |_, (_self, name): (Table, String)| Ok(name == class_name))?;
+    let isa = lua.create_function(move |_, (_self, name): (Table, String)| Ok(class_is_a(&class_name,&name)))?;
     t.set("IsA", isa)?;
     let mt = typed_metatable(lua, "Instance")?;
     let _ = t.set_metatable(Some(mt));
+    if let Ok(install)=lua.globals().get::<Function>("_arena_install_instance_wait"){install.call::<()>(t.clone())?;}
     Ok(t)
+}
+
+fn lua_to_json(value:Value,depth:usize)->LuaResult<serde_json::Value>{
+    if depth>64{return Err(LuaError::runtime("JSON nesting exceeds 64 levels"));}
+    Ok(match value {Value::Nil=>serde_json::Value::Null,Value::Boolean(value)=>serde_json::Value::Bool(value),Value::Integer(value)=>serde_json::Value::Number(value.into()),Value::Number(value)=>serde_json::Number::from_f64(value).map(serde_json::Value::Number).ok_or_else(||LuaError::runtime("JSON cannot encode NaN or infinity"))?,Value::String(value)=>serde_json::Value::String(value.to_str()?.to_string()),Value::Table(table)=>{
+        let length=table.raw_len();let mut array=Vec::new();let mut object=serde_json::Map::new();let mut array_only=true;
+        for pair in table.clone().pairs::<Value,Value>(){let(key,value)=pair?;match key{Value::Integer(index)if index>=1&&(index as usize)<=length=>{},Value::String(key)=>{array_only=false;object.insert(key.to_str()?.to_string(),lua_to_json(value,depth+1)?);},_=>return Err(LuaError::runtime("JSON object keys must be strings")),}}
+        if array_only{for index in 1..=length{array.push(lua_to_json(table.raw_get::<Value>(index)?,depth+1)?);}serde_json::Value::Array(array)}else{if length>0{return Err(LuaError::runtime("JSON cannot encode mixed array and object keys"));}serde_json::Value::Object(object)}
+    },_=>return Err(LuaError::runtime("unsupported value for JSON encoding"))})
+}
+
+fn json_to_lua(lua:&Lua,value:&serde_json::Value,depth:usize)->LuaResult<Value>{
+    if depth>64{return Err(LuaError::runtime("JSON nesting exceeds 64 levels"));}
+    Ok(match value{serde_json::Value::Null=>Value::Nil,serde_json::Value::Bool(value)=>Value::Boolean(*value),serde_json::Value::Number(value)=>Value::Number(value.as_f64().unwrap_or(0.0)),serde_json::Value::String(value)=>Value::String(lua.create_string(value)),serde_json::Value::Array(values)=>{let table=lua.create_table();for(index,value)in values.iter().enumerate(){table.raw_set(index+1,json_to_lua(lua,value,depth+1)?)?;}Value::Table(table)},serde_json::Value::Object(values)=>{let table=lua.create_table();for(key,value)in values{table.raw_set(key.as_str(),json_to_lua(lua,value,depth+1)?)?;}Value::Table(table)}})
 }
 
 fn install_instance_stub(lua: &Lua) -> LuaResult<()> {
@@ -673,6 +768,568 @@ use rbx_dom_weak::{
     InstanceBuilder, WeakDom,
 };
 
+
+/// Persistent, frame-to-frame Luau state used by the GUI preview play session.
+/// Instance tables and connected callbacks remain alive until another place is loaded.
+const GUI_SYNC_PROPERTIES:&[&str]=&["Visible","Position","Size","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency","Text","TextColor3","TextTransparency","Image","ImageColor3","ImageTransparency","CanvasPosition","CanvasSize","Enabled"];
+
+fn clone_runtime_value(lua:&Lua,value:Value)->LuaResult<Value>{
+    let Value::Table(source)=value else{return Ok(value);};
+    if source.raw_get::<String>("ClassName").is_ok()||source.raw_get::<Function>("Connect").is_ok(){return Ok(Value::Table(source));}
+    let copy=lua.create_table();for pair in source.clone().pairs::<Value,Value>(){let(key,value)=pair?;copy.raw_set(key,clone_runtime_value(lua,value)?)?;}Ok(Value::Table(copy))
+}
+
+fn clone_runtime_instance(lua:&Lua,source:&Table,queue:Rc<RefCell<Vec<Table>>>,parent:Option<Table>)->LuaResult<Table>{
+    let class=source.raw_get::<String>("ClassName").unwrap_or_else(|_|"Folder".into());
+    let name=source.raw_get::<String>("Name").unwrap_or_else(|_|class.clone());
+    let clone=make_instance(lua,&class,&name)?;
+    if let Some(parent)=parent {clone.raw_set("Parent",parent.clone())?;parent.raw_set(name.as_str(),clone.clone())?;}
+    for pair in source.clone().pairs::<Value,Value>() {
+        let (key,value)=pair?;let Value::String(key_string)=&key else{continue;};let key_name=key_string.to_str()?;
+        if key_name=="_ref"||key_name=="_destroyed"||key_name.starts_with("_property_signal_")||matches!(key_name.as_str(),"Name"|"ClassName"|"Parent"|"Clone"|"Destroy")||matches!(value,Value::Function(_)){continue;}
+        if let Value::Table(table)=&value {if table.raw_get::<Function>("Connect").is_ok(){continue;}if table.raw_get::<Table>("Parent").ok().as_ref()==Some(source){continue;}}
+        clone.raw_set(key,clone_runtime_value(lua,value)?)?;
+    }
+    queue.borrow_mut().push(clone.clone());
+    for pair in source.clone().pairs::<Value,Value>() {let(_,value)=pair?;if let Value::Table(child)=value{if child.raw_get::<Table>("Parent").ok().as_ref()==Some(source){clone_runtime_instance(lua,&child,queue.clone(),Some(clone.clone()))?;}}}
+    Ok(clone)
+}
+
+struct ActiveGuiTween {
+    target: Table,
+    goals: Vec<(String,Value,Value)>,
+    elapsed: f32,
+    duration: f32,
+    repeat_count: i32,
+    reverses: bool,
+    easing_style: String,
+    easing_direction: String,
+    control: Rc<Cell<u8>>, // 0 running, 1 paused, 2 cancelled
+    completed: Table,
+}
+
+pub struct GuiPlaySession {
+    lua: Lua,
+    instances: std::collections::HashMap<DomRef, Table>,
+    synchronized_properties: std::collections::HashMap<DomRef, Vec<String>>,
+    active_tweens: Rc<RefCell<Vec<ActiveGuiTween>>>,
+    pending_instances: Rc<RefCell<Vec<Table>>>,
+    pending_destructions: Rc<RefCell<Vec<Table>>>,
+    scheduler_step: Function,
+    run_service: Table,
+    user_input_service: Table,
+    gui_service: Table,
+    respawn_requested: Rc<Cell<bool>>,
+    respawn_properties: std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>,
+    pointer_position: Rc<Cell<[f32;2]>>,
+    pressed_keys: Rc<RefCell<std::collections::HashSet<String>>>,
+    bound_actions: Rc<RefCell<std::collections::HashMap<String,(Function,Vec<String>)>>>,
+    last_tick: std::time::Instant,
+}
+
+fn preserve_variant_type(existing:Option<&DomVariant>,value:DomVariant)->DomVariant {
+    match (existing,value) {
+        (Some(DomVariant::Float32(_)),DomVariant::Float64(value))=>DomVariant::Float32(value as f32),
+        (Some(DomVariant::Int32(_)),DomVariant::Float64(value))=>DomVariant::Int32(value.round() as i32),
+        (Some(DomVariant::Int64(_)),DomVariant::Float64(value))=>DomVariant::Int64(value.round() as i64),
+        (Some(DomVariant::Int32(_)),DomVariant::Int64(value))=>DomVariant::Int32(value as i32),
+        (Some(DomVariant::Float32(_)),DomVariant::Int64(value))=>DomVariant::Float32(value as f32),
+        (Some(DomVariant::Float64(_)),DomVariant::Int64(value))=>DomVariant::Float64(value as f64),
+        (Some(DomVariant::Enum(_)),DomVariant::Float64(value))=>DomVariant::Enum(rbx_dom_weak::types::Enum::from_u32(value.max(0.0) as u32)),
+        (Some(DomVariant::Enum(_)),DomVariant::Int64(value))=>DomVariant::Enum(rbx_dom_weak::types::Enum::from_u32(value.max(0) as u32)),
+        (_,value)=>value,
+    }
+}
+
+fn ease_gui_tween(amount:f32,style:&str,direction:&str)->f32 {
+    let curve=|value:f32|match style {"Quad"=>value*value,"Cubic"=>value*value*value,"Quart"=>value.powi(4),"Quint"=>value.powi(5),"Sine"=>1.0-(value*std::f32::consts::FRAC_PI_2).cos(),"Exponential"=>if value<=0.0{0.0}else{2.0f32.powf(10.0*(value-1.0))},"Circular"=>1.0-(1.0-value*value).max(0.0).sqrt(),_=>value};
+    match direction {"In"=>curve(amount),"InOut"=>if amount<0.5{curve(amount*2.0)*0.5}else{1.0-curve((1.0-amount)*2.0)*0.5},_=>1.0-curve(1.0-amount)}
+}
+
+fn interpolate_gui_value(lua:&Lua,start:&Value,end:&Value,amount:f32)->LuaResult<Value>{
+    Ok(match (start,end) {
+        (Value::Number(a),Value::Number(b))=>Value::Number(a+(b-a)*amount as f64),
+        (Value::Integer(a),Value::Integer(b))=>Value::Integer((*a as f64+(*b as f64-*a as f64)*amount as f64).round() as i64),
+        (Value::Table(a),Value::Table(b))=>{let result=lua.create_table();for pair in b.clone().pairs::<Value,Value>(){let(key,end)=pair?;let start=a.raw_get::<Value>(key.clone()).unwrap_or(Value::Nil);result.raw_set(key,interpolate_gui_value(lua,&start,&end,amount)?)?;}Value::Table(result)},
+        _=>if amount>=1.0{end.clone()}else{start.clone()},
+    })
+}
+
+impl GuiPlaySession {
+    pub fn new(dom: &WeakDom) -> LuaResult<Self> {
+        let lua=build_vm()?;
+        let active_tweens=Rc::new(RefCell::new(Vec::<ActiveGuiTween>::new()));
+        let pending_instances=Rc::new(RefCell::new(Vec::<Table>::new()));
+        let pending_destructions=Rc::new(RefCell::new(Vec::<Table>::new()));
+        let respawn_requested=Rc::new(Cell::new(false));
+        let mut instances=std::collections::HashMap::new();
+        fn create(lua:&Lua,dom:&WeakDom,referent:DomRef,instances:&mut std::collections::HashMap<DomRef,Table>,creations:Rc<RefCell<Vec<Table>>>,destructions:Rc<RefCell<Vec<Table>>>)->LuaResult<()> {
+            let Some(instance)=dom.get_by_ref(referent) else{return Ok(());};
+            let table=make_instance(lua,&instance.class,&instance.name)?;
+            table.raw_set("_ref",ref_to_i64(referent))?;
+            let destroy_table=table.clone();let destroy_queue=destructions.clone();
+            table.raw_set("Destroy",lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())})?)?;
+            let clone_table=table.clone();let clone_queue=creations.clone();
+            table.raw_set("Clone",lua.create_function(move |lua,_this:Table|clone_runtime_instance(lua,&clone_table,clone_queue.clone(),None))?)?;
+            for (key,value) in &instance.properties { if let Ok(value)=variant_to_value(lua,value){table.raw_set(key.as_str(),value)?;} }
+            instances.insert(referent,table);
+            for child in instance.children(){create(lua,dom,*child,instances,creations.clone(),destructions.clone())?;} Ok(())
+        }
+        create(&lua,dom,dom.root_ref(),&mut instances,pending_instances.clone(),pending_destructions.clone())?;
+        for (referent,table) in &instances {
+            let Some(instance)=dom.get_by_ref(*referent) else{continue;};
+            if let Some(parent)=instances.get(&instance.parent()){table.raw_set("Parent",parent.clone())?;}
+            for child in instance.children(){if let (Some(child_instance),Some(child_table))=(dom.get_by_ref(*child),instances.get(child)){table.raw_set(child_instance.name.as_str(),child_table.clone())?;}}
+        }
+        // Resolve object-reference properties only after every retained Instance
+        // table exists, including forward references such as CurrentCamera.
+        for (referent,table) in &instances {if let Some(instance)=dom.get_by_ref(*referent){for(key,value)in &instance.properties{if let DomVariant::Ref(target)=value{let resolved=instances.get(target).cloned().map(Value::Table).unwrap_or(Value::Nil);table.raw_set(key.as_str(),resolved)?;}}}}
+        let run_service=make_instance(&lua,"RunService","RunService")?;
+        for event in ["Heartbeat","RenderStepped","Stepped"] {run_service.raw_set(event,make_signal(&lua)?)?;}
+        let pointer_position=Rc::new(Cell::new([0.0f32,0.0f32]));
+        let pressed_keys=Rc::new(RefCell::new(std::collections::HashSet::<String>::new()));
+        let bound_actions=Rc::new(RefCell::new(std::collections::HashMap::<String,(Function,Vec<String>)>::new()));
+        let user_input_service=make_instance(&lua,"UserInputService","UserInputService")?;
+        let mouse_position=pointer_position.clone();user_input_service.raw_set("GetMouseLocation",lua.create_function(move |lua,_service:Table|{let value=mouse_position.get();let result=lua.create_table();result.set("X",value[0])?;result.set("Y",value[1])?;Ok(result)})?)?;
+        user_input_service.raw_set("GetPlatform",lua.create_function(|lua,_service:Table|{let result=lua.create_table();result.set("Name",if cfg!(target_os="android"){"Android"}else{"Windows"})?;Ok(result)})?)?;
+        let down_keys=pressed_keys.clone();user_input_service.raw_set("IsKeyDown",lua.create_function(move |_,(_service,key):(Table,Value)|{let name=match key{Value::Table(value)=>value.raw_get::<String>("Name").unwrap_or_default(),Value::String(value)=>value.to_str()?.to_string(),_=>String::new()};Ok(down_keys.borrow().contains(&name))})?)?;
+        for event in ["InputBegan","InputChanged","InputEnded","TouchStarted","TouchMoved","TouchEnded","TextBoxFocused","TextBoxFocusReleased"] {user_input_service.raw_set(event,make_signal(&lua)?)?;}
+        user_input_service.raw_set("TouchEnabled",cfg!(target_os="android"))?;
+        user_input_service.raw_set("KeyboardEnabled",true)?;
+        user_input_service.raw_set("MouseEnabled",true)?;
+        let gui_service=make_instance(&lua,"GuiService","GuiService")?;gui_service.raw_set("SelectedObject",Value::Nil)?;gui_service.raw_set("MenuIsOpen",false)?;gui_service.raw_set("GetGuiInset",lua.create_function(|lua,_service:Table|{let top_left=lua.create_table();top_left.set("X",0.0)?;top_left.set("Y",58.0)?;let bottom_right=lua.create_table();bottom_right.set("X",0.0)?;bottom_right.set("Y",0.0)?;Ok((top_left,bottom_right))})?)?;let topbar=lua.create_table();let min=lua.create_table();min.set("X",0.0)?;min.set("Y",0.0)?;let max=lua.create_table();max.set("X",0.0)?;max.set("Y",58.0)?;topbar.set("Min",min)?;topbar.set("Max",max)?;gui_service.raw_set("TopbarInset",topbar)?;
+        if let Some(game)=instances.get(&dom.root_ref()) {
+            lua.globals().set("game",game.clone())?;
+            game.raw_set("RunService",run_service.clone())?;
+            lua.globals().set("RunService",run_service.clone())?;
+            game.raw_set("UserInputService",user_input_service.clone())?;
+            lua.globals().set("UserInputService",user_input_service.clone())?;
+            let tween_service=make_instance(&lua,"TweenService","TweenService")?;
+            let tween_queue=active_tweens.clone();
+            tween_service.set("Create",lua.create_function(move |lua,(_service,target,info,goals):(Table,Table,Table,Table)|{
+                let tween=lua.create_table(); let completed=make_signal(lua)?; tween.set("Completed",completed.clone())?;
+                let duration=info.get::<f64>("Time").unwrap_or(1.0).max(0.0) as f32;
+                let delay=info.get::<f64>("DelayTime").unwrap_or(0.0).max(0.0) as f32;
+                let repeat_count=info.get::<i64>("RepeatCount").unwrap_or(0) as i32;
+                let reverses=info.get::<bool>("Reverses").unwrap_or(false);
+                let enum_name=|key:&str,fallback:&str|info.get::<Table>(key).ok().and_then(|value|value.get::<String>("Name").ok()).unwrap_or_else(||fallback.to_string());
+                let easing_style=enum_name("EasingStyle","Linear");let easing_direction=enum_name("EasingDirection","Out");
+                let control=Rc::new(Cell::new(0u8));let started=Rc::new(Cell::new(false));
+                let queue=tween_queue.clone();let play_control=control.clone();let play_started=started.clone();
+                tween.set("Play",lua.create_function(move |_,_tween:Table|{
+                    if play_started.replace(true){play_control.set(0);return Ok(());}
+                    play_control.set(0);let mut values=Vec::new();
+                    for pair in goals.clone().pairs::<Value,Value>() { let (key,end)=pair?; if let Value::String(key)=key { let key=key.to_str()?;let start=target.raw_get::<Value>(key.as_str()).unwrap_or(Value::Nil);values.push((key,start,end)); } }
+                    queue.borrow_mut().push(ActiveGuiTween{target:target.clone(),goals:values,elapsed:-delay,duration,repeat_count,reverses,easing_style:easing_style.clone(),easing_direction:easing_direction.clone(),control:play_control.clone(),completed:completed.clone()});Ok(())
+                })?)?;
+                let pause_control=control.clone();tween.set("Pause",lua.create_function(move |_,_tween:Table|{pause_control.set(1);Ok(())})?)?;
+                let cancel_control=control;tween.set("Cancel",lua.create_function(move |_,_tween:Table|{cancel_control.set(2);Ok(())})?)?; Ok(tween)
+            })?)?;
+            game.raw_set("TweenService",tween_service.clone())?;
+            lua.globals().set("TweenService",tween_service)?;
+            let http_service=make_instance(&lua,"HttpService","HttpService")?;
+            http_service.raw_set("JSONEncode",lua.create_function(|_,(_service,value):(Table,Value)|serde_json::to_string(&lua_to_json(value,0)?).map_err(|error|LuaError::runtime(error.to_string())))?)?;
+            http_service.raw_set("JSONDecode",lua.create_function(|lua,(_service,text):(Table,String)|{let value:serde_json::Value=serde_json::from_str(&text).map_err(|error|LuaError::runtime(error.to_string()))?;json_to_lua(lua,&value,0)})?)?;
+            http_service.raw_set("GenerateGUID",lua.create_function(|_,(_service,wrap):(Table,Option<bool>)|{static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);let count=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);let nanos=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();let raw=format!("{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",(nanos>>64)as u32,(nanos>>48)as u16,(nanos>>36)as u16&0xfff,(count>>48)as u16&0xfff,count&0xffffffffffff);Ok(if wrap.unwrap_or(false){format!("{{{raw}}}")}else{raw})})?)?;
+            http_service.raw_set("UrlEncode",lua.create_function(|_,(_service,text):(Table,String)|{let mut encoded=String::new();for byte in text.bytes(){if byte.is_ascii_alphanumeric()||matches!(byte,b'-'|b'_'|b'.'|b'~'){encoded.push(byte as char);}else{encoded.push_str(&format!("%{byte:02X}"));}}Ok(encoded)})?)?;
+            http_service.raw_set("RequestAsync",lua.create_function(|lua,(_service,_request):(Table,Table)|{let response=lua.create_table();response.set("Success",false)?;response.set("StatusCode",0)?;response.set("StatusMessage","HTTP requests are disabled in GUI preview")?;response.set("Body","")?;response.set("Headers",lua.create_table())?;Ok(response)})?)?;
+            game.raw_set("HttpService",http_service.clone())?;lua.globals().set("HttpService",http_service)?;
+
+            let collection=make_instance(&lua,"CollectionService","CollectionService")?;let tags=lua.create_table();let added=lua.create_table();let removed=lua.create_table();
+            let add_tags=tags.clone();let add_signals=added.clone();collection.raw_set("AddTag",lua.create_function(move |lua,(_service,instance,tag):(Table,Table,String)|{let instance_tags=add_tags.raw_get::<Table>(instance.clone()).unwrap_or(lua.create_table());if !instance_tags.raw_get::<bool>(&tag).unwrap_or(false){instance_tags.raw_set(&tag,true)?;add_tags.raw_set(instance.clone(),instance_tags)?;if let Ok(signal)=add_signals.raw_get::<Table>(&tag){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,instance))?;}}Ok(())})?)?;
+            let remove_tags=tags.clone();let remove_signals=removed.clone();collection.raw_set("RemoveTag",lua.create_function(move |_,(_service,instance,tag):(Table,Table,String)|{if let Ok(instance_tags)=remove_tags.raw_get::<Table>(instance.clone()){if instance_tags.raw_get::<bool>(&tag).unwrap_or(false){instance_tags.raw_set(&tag,Value::Nil)?;if let Ok(signal)=remove_signals.raw_get::<Table>(&tag){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,instance))?;}}}Ok(())})?)?;
+            let has_tags=tags.clone();collection.raw_set("HasTag",lua.create_function(move |_,(_service,instance,tag):(Table,Table,String)|Ok(has_tags.raw_get::<Table>(instance).ok().and_then(|value|value.raw_get::<bool>(tag).ok()).unwrap_or(false)))?)?;
+            let get_tags=tags.clone();collection.raw_set("GetTags",lua.create_function(move |_,(_service,instance):(Table,Table)|{let mut result=Vec::new();if let Ok(values)=get_tags.raw_get::<Table>(instance){for pair in values.pairs::<String,bool>(){let(tag,active)=pair?;if active{result.push(tag);}}}Ok(result)})?)?;
+            let tagged=tags.clone();collection.raw_set("GetTagged",lua.create_function(move |_,(_service,tag):(Table,String)|{let mut result=Vec::new();for pair in tagged.clone().pairs::<Table,Table>(){let(instance,values)=pair?;if values.raw_get::<bool>(&tag).unwrap_or(false){result.push(instance);}}Ok(result)})?)?;
+            for (method,signals) in [("GetInstanceAddedSignal",added),("GetInstanceRemovedSignal",removed)]{collection.raw_set(method,lua.create_function(move |lua,(_service,tag):(Table,String)|{if let Ok(signal)=signals.raw_get::<Table>(&tag){return Ok(signal);}let signal=make_signal(lua)?;signals.raw_set(tag,signal.clone())?;Ok(signal)})?)?;}
+            game.raw_set("CollectionService",collection.clone())?;lua.globals().set("CollectionService",collection)?;
+
+            let debris=make_instance(&lua,"Debris","Debris")?;debris.raw_set("AddItem",lua.create_function(|lua,(_service,item,lifetime):(Table,Table,Option<f64>)|{let callback=lua.create_function(move |_,()|{if let Ok(destroy)=item.raw_get::<Function>("Destroy"){destroy.call::<()>(item.clone())?;}Ok(())})?;let task:Table=lua.globals().get("task")?;let delay:Function=task.get("delay")?;delay.call::<()>((lifetime.unwrap_or(10.0),callback))})?)?;game.raw_set("Debris",debris.clone())?;lua.globals().set("Debris",debris)?;
+
+            let content=make_instance(&lua,"ContentProvider","ContentProvider")?;content.raw_set("PreloadAsync",lua.create_function(|_,(_service,items,callback):(Table,Table,Option<Function>)|{if let Some(callback)=callback{for value in items.sequence_values::<Value>(){let value=value?;callback.call::<()>((value,"Success"))?;}}Ok(())})?)?;content.raw_set("RequestQueueSize",0i64)?;game.raw_set("ContentProvider",content.clone())?;lua.globals().set("ContentProvider",content)?;
+
+            let core_enabled=Rc::new(RefCell::new(std::collections::HashMap::<String,bool>::new()));let core_values=Rc::new(RefCell::new(std::collections::HashMap::<String,Value>::new()));let starter=instances.iter().find_map(|(referent,table)|dom.get_by_ref(*referent).filter(|instance|instance.class=="StarterGui").map(|_|table.clone())).unwrap_or(make_instance(&lua,"StarterGui","StarterGui")?);let set_core=core_enabled.clone();starter.raw_set("SetCoreGuiEnabled",lua.create_function(move |_,(_service,kind,enabled):(Table,Value,bool)|{let name=match kind{Value::Table(value)=>value.raw_get::<String>("Name").unwrap_or_else(|_|"All".into()),Value::String(value)=>value.to_str()?.to_string(),_=>"All".into()};set_core.borrow_mut().insert(name,enabled);Ok(())})?)?;let get_core=core_enabled;starter.raw_set("GetCoreGuiEnabled",lua.create_function(move |_,(_service,kind):(Table,Value)|{let name=match kind{Value::Table(value)=>value.raw_get::<String>("Name").unwrap_or_else(|_|"All".into()),Value::String(value)=>value.to_str()?.to_string(),_=>"All".into()};Ok(*get_core.borrow().get(&name).unwrap_or(&true))})?)?;let set_values=core_values.clone();starter.raw_set("SetCore",lua.create_function(move |_,(_service,key,value):(Table,String,Value)|{set_values.borrow_mut().insert(key,value);Ok(())})?)?;let get_values=core_values;starter.raw_set("GetCore",lua.create_function(move |_,(_service,key):(Table,String)|Ok(get_values.borrow().get(&key).cloned().unwrap_or(Value::Nil)))?)?;game.raw_set("StarterGui",starter.clone())?;lua.globals().set("StarterGui",starter)?;
+
+            let context=make_instance(&lua,"ContextActionService","ContextActionService")?;let bind_actions=bound_actions.clone();context.raw_set("BindAction",lua.create_function(move |_,args:Variadic<Value>|{let name=match args.get(1){Some(Value::String(value))=>value.to_str()?.to_string(),_=>return Err(LuaError::runtime("BindAction requires an action name"))};let callback=match args.get(2){Some(Value::Function(value))=>value.clone(),_=>return Err(LuaError::runtime("BindAction requires a callback"))};let keys=args.iter().skip(4).filter_map(|value|match value{Value::Table(value)=>value.raw_get::<String>("Name").ok(),Value::String(value)=>value.to_str().ok().map(|value|value.to_string()),_=>None}).collect();bind_actions.borrow_mut().insert(name,(callback,keys));Ok(())})?)?;let unbind_actions=bound_actions.clone();context.raw_set("UnbindAction",lua.create_function(move |_,(_service,name):(Table,String)|{unbind_actions.borrow_mut().remove(&name);Ok(())})?)?;let info_actions=bound_actions.clone();context.raw_set("GetAllBoundActionInfo",lua.create_function(move |lua,_service:Table|{let result=lua.create_table();for(name,(_,keys))in info_actions.borrow().iter(){let info=lua.create_table();let input_types=lua.create_table();for(index,key)in keys.iter().enumerate(){input_types.raw_set(index+1,key.as_str())?;}info.set("inputTypes",input_types)?;result.raw_set(name.as_str(),info)?;}Ok(result)})?)?;game.raw_set("ContextActionService",context.clone())?;lua.globals().set("ContextActionService",context)?;
+
+            game.raw_set("GuiService",gui_service.clone())?;lua.globals().set("GuiService",gui_service.clone())?;
+
+            let localization=make_instance(&lua,"LocalizationService","LocalizationService")?;localization.raw_set("RobloxLocaleId","en-us")?;localization.raw_set("SystemLocaleId","en-us")?;localization.raw_set("GetTranslatorForPlayerAsync",lua.create_function(|lua,(_service,_player):(Table,Table)|{let translator=lua.create_table();translator.set("FormatByKey",lua.create_function(|_,(_translator,key,_args):(Table,String,Option<Table>)|Ok(key))?)?;Ok(translator)})?)?;game.raw_set("LocalizationService",localization.clone())?;lua.globals().set("LocalizationService",localization)?;
+            let game_table=game.clone();
+            game.set("GetService",lua.create_function(move |lua,(_game,name):(Table,String)|{
+                game_table.raw_get::<Value>(&name).or_else(|_|Ok(Value::Table(make_instance(lua,&name,&name)?)))
+            })?)?;
+        }
+        // Build the client-side Players.LocalPlayer.PlayerGui view and clone
+        // StarterGui's ScreenGuis into it. The retained tables keep their DOM
+        // referents so viewport events still dispatch to the correct callbacks.
+        let players=dom.root().children().iter().find_map(|referent|dom.get_by_ref(*referent)
+            .filter(|instance|instance.class=="Players").and_then(|_|instances.get(referent).cloned()))
+            .unwrap_or(make_instance(&lua,"Players","Players")?);
+        let local_player=make_instance(&lua,"Player","LocalPlayer")?;
+        let respawn_flag=respawn_requested.clone();
+        local_player.raw_set("LoadCharacter",lua.create_function(move |_,_player:Table|{respawn_flag.set(true);Ok(())})?)?;
+        let player_gui=instances.iter().find_map(|(referent,table)|dom.get_by_ref(*referent)
+            .filter(|instance|instance.class=="PlayerGui").map(|_|table.clone()))
+            .unwrap_or(make_instance(&lua,"PlayerGui","PlayerGui")?);
+        players.raw_set("LocalPlayer",local_player.clone())?;
+        local_player.raw_set("Parent",players.clone())?;
+        local_player.raw_set("PlayerGui",player_gui.clone())?;
+        player_gui.raw_set("Parent",local_player.clone())?;
+        if let Some(starter_ref)=dom.root().children().iter().find(|referent|dom.get_by_ref(**referent).is_some_and(|instance|instance.class=="StarterGui")) {
+            if let Some(starter)=dom.get_by_ref(*starter_ref) {
+                for child in starter.children() {
+                    if let (Some(instance),Some(table))=(dom.get_by_ref(*child),instances.get(child)) {
+                        player_gui.raw_set(instance.name.as_str(),table.clone())?;
+                        table.raw_set("Parent",player_gui.clone())?;
+                    }
+                }
+            }
+        }
+        if let Some(game)=instances.get(&dom.root_ref()) { game.raw_set("Players",players.clone())?; }
+        let runtime_instance=lua.create_table();
+        let creation_queue=pending_instances.clone();let destruction_queue=pending_destructions.clone();
+        runtime_instance.set("new",lua.create_function(move |lua,(class,parent):(String,Option<Table>)|{
+            let table=make_instance(lua,&class,&class)?;
+            let destroy_table=table.clone();let destroy_queue=destruction_queue.clone();
+            table.raw_set("Destroy",lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())})?)?;
+            let clone_table=table.clone();let clone_queue=creation_queue.clone();
+            table.raw_set("Clone",lua.create_function(move |lua,_this:Table|clone_runtime_instance(lua,&clone_table,clone_queue.clone(),None))?)?;
+            if let Some(parent)=parent { table.raw_set("Parent",parent.clone())?; parent.raw_set(class.as_str(),table.clone())?; }
+            creation_queue.borrow_mut().push(table.clone()); Ok(table)
+        })?)?;
+        lua.globals().set("Instance",runtime_instance)?;
+        lua.load(r#"
+            local waiting = {}
+            local function schedule(thread, delay, args, started)
+                table.insert(waiting, {thread=thread, remaining=math.max(tonumber(delay) or 0, 0), elapsed=0, args=args, started=started or false})
+                return thread
+            end
+            local function resumeTask(record)
+                if record.cancelled then return end
+                local ok, delay
+                if record.started then ok, delay = coroutine.resume(record.thread, record.elapsed)
+                else record.started=true; ok, delay = coroutine.resume(record.thread, table.unpack(record.args, 1, record.args.n)) end
+                if not ok then warn(delay); return end
+                if coroutine.status(record.thread) ~= "dead" then schedule(record.thread, delay, table.pack(), true) end
+            end
+            task = {}
+            function task.spawn(callback, ...)
+                local record={thread=coroutine.create(callback),remaining=0,elapsed=0,args=table.pack(...),started=false}
+                resumeTask(record); return record.thread
+            end
+            function task.defer(callback, ...) return schedule(coroutine.create(callback), 0, table.pack(...)) end
+            function task.delay(duration, callback, ...) return schedule(coroutine.create(callback), duration, table.pack(...)) end
+            function task.wait(duration) return coroutine.yield(math.max(tonumber(duration) or 0, 0)) end
+            function task.cancel(thread) for _,record in ipairs(waiting) do if record.thread==thread then record.cancelled=true end end end
+            function _arena_step_tasks(delta)
+                local ready = {}
+                local remove = {}
+                for index, record in ipairs(waiting) do
+                    record.remaining -= delta
+                    record.elapsed += delta
+                    if record.cancelled then table.insert(remove, index)
+                    elseif record.remaining <= 0 then table.insert(remove, index); table.insert(ready, record) end
+                end
+                for index=#remove,1,-1 do table.remove(waiting, remove[index]) end
+                -- Resume in insertion order. New waits created by these
+                -- callbacks remain queued until the next scheduler step.
+                for _, record in ipairs(ready) do resumeTask(record) end
+            end
+            function _arena_resume_task(thread, ...)
+                task.cancel(thread)
+                local ok, delay = coroutine.resume(thread, ...)
+                if not ok then warn(delay); return end
+                if coroutine.status(thread) ~= "dead" then schedule(thread, delay, table.pack(), true) end
+            end
+            function _arena_signal_wait(signal)
+                local thread = coroutine.running()
+                local connection
+                connection = signal:Connect(function(...)
+                    connection:Disconnect()
+                    _arena_resume_task(thread, ...)
+                end)
+                return coroutine.yield(math.huge)
+            end
+            function _arena_install_instance_wait(instance)
+                instance.WaitForChild = function(self, name, timeout)
+                    local child = rawget(self, name)
+                    if child ~= nil then return child end
+                    local elapsed = 0
+                    while timeout == nil or elapsed < timeout do
+                        elapsed += task.wait()
+                        child = rawget(self, name)
+                        if child ~= nil then return child end
+                    end
+                    return nil
+                end
+            end
+        "#).exec()?;
+        let install_wait:Function=lua.globals().get("_arena_install_instance_wait")?;
+        for table in instances.values(){install_wait.call::<()>(table.clone())?;}
+        let scheduler_step:Function=lua.globals().get("_arena_step_tasks")?;
+        let signal_wait:Function=lua.globals().get("_arena_signal_wait")?;
+        let upgrade_signals=|table:&Table|->LuaResult<()>{for pair in table.clone().pairs::<Value,Value>(){let(_,value)=pair?;if let Value::Table(candidate)=value{if candidate.raw_get::<Function>("Connect").is_ok()&&candidate.raw_get::<Function>("Fire").is_ok(){candidate.raw_set("Wait",signal_wait.clone())?;}}}Ok(())};
+        for table in instances.values(){upgrade_signals(table)?;}upgrade_signals(&run_service)?;upgrade_signals(&user_input_service)?;upgrade_signals(&players)?;upgrade_signals(&local_player)?;upgrade_signals(&player_gui)?;
+
+        // Roblox ModuleScript require with one-time result caching. Module
+        // environments are isolated like LocalScripts while sharing _G.
+        let module_sources:std::collections::HashMap<DomRef,String>=instances.keys().filter_map(|referent|dom.get_by_ref(*referent).filter(|instance|instance.class=="ModuleScript").and_then(|instance|match instance.properties.get(&rbx_dom_weak::ustr("Source")){Some(DomVariant::String(source))=>Some((*referent,source.clone())),_=>None})).collect();
+        let require_instances=instances.clone();
+        let module_cache:Rc<RefCell<std::collections::HashMap<DomRef,Value>>>=Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let require_cache=module_cache.clone();
+        let loading_modules:Rc<RefCell<std::collections::HashSet<DomRef>>>=Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let require_loading=loading_modules;
+        lua.globals().set("require",lua.create_function(move |lua,module:Value|{
+            let Value::Table(module)=module else{return Err(LuaError::runtime("require expects a ModuleScript"));};
+            let Some(referent)=table_to_ref(&module)? else{return Err(LuaError::runtime("require expects a retained ModuleScript"));};
+            if let Some(value)=require_cache.borrow().get(&referent){return Ok(value.clone());}
+            if !require_loading.borrow_mut().insert(referent){return Err(LuaError::runtime("ModuleScript requested recursively"));}
+            let source=module_sources.get(&referent).cloned().or_else(||module.raw_get::<String>("Source").ok());
+            let Some(source)=source else{require_loading.borrow_mut().remove(&referent);return Err(LuaError::runtime("required Instance is not a ModuleScript"));};
+            let environment=lua.create_table();environment.raw_set("script",require_instances.get(&referent).cloned().unwrap_or(module))?;environment.raw_set("_G",lua.globals())?;
+            let metatable=lua.create_table();metatable.raw_set("__index",lua.globals())?;environment.set_metatable(Some(metatable))?;
+            let result=lua.load(&source).set_name("ModuleScript").set_environment(environment).eval::<Value>();
+            require_loading.borrow_mut().remove(&referent);
+            let value=result?;if matches!(value,Value::Nil){return Err(LuaError::runtime("ModuleScript did not return exactly one value"));}require_cache.borrow_mut().insert(referent,value.clone());Ok(value)
+        })?)?;
+
+        // Execute LocalScripts once. Their signal connections remain retained by
+        // these Instance tables and are fired from viewport events every frame.
+        for (referent,table) in &instances {
+            let Some(instance)=dom.get_by_ref(*referent) else{continue;};
+            if instance.class!="LocalScript"{continue;}
+            let Some(DomVariant::String(source))=instance.properties.get(&rbx_dom_weak::ustr("Source")) else{continue;};
+            let environment=lua.create_table();
+            environment.raw_set("script",table.clone())?;
+            environment.raw_set("_G",lua.globals())?;
+            let metatable=lua.create_table();
+            metatable.raw_set("__index",lua.globals())?;
+            environment.set_metatable(Some(metatable))?;
+            match lua.load(source).set_name(instance.name.as_str()).set_environment(environment).into_function() {
+                Ok(function)=>{let task:Table=lua.globals().get("task")?;let spawn:Function=task.get("spawn")?;if let Err(error)=spawn.call::<()>(function){with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)}));}},
+                Err(error)=>with_log(|log|log.push(OutputLine{level:Level::Error,text:format!("{}: {error}",instance.name)})),
+            }
+        }
+        let synchronized_properties=instances.keys().map(|referent|{
+            let mut names:Vec<String>=dom.get_by_ref(*referent).map(|instance|instance.properties.keys().map(|key|key.as_str().to_string()).collect()).unwrap_or_default();
+            for name in GUI_SYNC_PROPERTIES {if !names.iter().any(|existing|existing==name){names.push((*name).to_string());}}
+            (*referent,names)
+        }).collect();
+        let mut respawn_properties=std::collections::HashMap::new();
+        fn snapshot_tree(dom:&WeakDom,referent:DomRef,out:&mut std::collections::HashMap<DomRef,Vec<(rbx_dom_weak::Ustr,DomVariant)>>){if let Some(instance)=dom.get_by_ref(referent){out.insert(referent,instance.properties.iter().map(|(key,value)|(key.clone(),value.clone())).collect());for child in instance.children(){snapshot_tree(dom,*child,out);}}}
+        if let Some(starter)=dom.root().children().iter().find_map(|referent|dom.get_by_ref(*referent).filter(|instance|instance.class=="StarterGui")) {for child in starter.children(){if dom.get_by_ref(*child).is_some_and(|instance|instance.class=="ScreenGui"&&instance.properties.get(&rbx_dom_weak::ustr("ResetOnSpawn")).map(|value|!matches!(value,DomVariant::Bool(false))).unwrap_or(true)){snapshot_tree(dom,*child,&mut respawn_properties);}}}
+        Ok(Self{lua,instances,synchronized_properties,active_tweens,pending_instances,pending_destructions,scheduler_step,run_service,user_input_service,gui_service,respawn_requested,respawn_properties,pointer_position,pressed_keys,bound_actions,last_tick:std::time::Instant::now()})
+    }
+
+    pub fn take_respawn_request(&self)->bool{self.respawn_requested.replace(false)}
+
+    pub fn restore_for_respawn(&self,dom:&mut WeakDom){
+        let roots:Vec<DomRef>=self.respawn_properties.keys().copied().filter(|referent|dom.get_by_ref(*referent).is_some_and(|instance|instance.class=="ScreenGui")).collect();
+        let mut remove=Vec::new();for root in roots{let mut stack=dom.get_by_ref(root).map(|instance|instance.children().to_vec()).unwrap_or_default();while let Some(child)=stack.pop(){if self.respawn_properties.contains_key(&child){if let Some(instance)=dom.get_by_ref(child){stack.extend_from_slice(instance.children());}}else{remove.push(child);}}}for referent in remove{if dom.get_by_ref(referent).is_some(){dom.destroy(referent);}}
+        for (referent,properties) in &self.respawn_properties{if let Some(instance)=dom.get_by_ref_mut(*referent){instance.properties.clear();for (key,value) in properties{instance.properties.insert(key.clone(),value.clone());}}}
+    }
+
+    pub fn tick(&mut self)->Result<(),String>{
+        let now=std::time::Instant::now();let delta=(now-self.last_tick).as_secs_f32().min(0.1);self.last_tick=now;
+        for event in ["RenderStepped","Stepped","Heartbeat"] {if let Ok(signal)=self.run_service.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,delta as f64)).map_err(|error|error.to_string())?;}}
+        self.scheduler_step.call::<()>(delta as f64).map_err(|error|error.to_string())?;
+        let mut completed=Vec::new();
+        {
+            let mut tweens=self.active_tweens.borrow_mut();
+            for tween in tweens.iter_mut(){
+                if tween.control.get()==2{completed.push((tween.completed.clone(),"Cancelled"));continue;}if tween.control.get()!=0{continue;}tween.elapsed+=delta;if tween.elapsed<0.0{continue;}
+                let iteration_duration=tween.duration.max(0.0001)*if tween.reverses{2.0}else{1.0};
+                let total_duration=if tween.repeat_count<0{f32::INFINITY}else{iteration_duration*(tween.repeat_count+1)as f32};
+                let finished=tween.elapsed>=total_duration;let within=tween.elapsed%iteration_duration;
+                let mut linear=if tween.duration<=0.0{1.0}else{(within/tween.duration).clamp(0.0,1.0)};
+                if tween.reverses&&within>=tween.duration{linear=1.0-((within-tween.duration)/tween.duration.max(0.0001)).clamp(0.0,1.0);}if finished{linear=if tween.reverses{0.0}else{1.0};}
+                let amount=ease_gui_tween(linear,&tween.easing_style,&tween.easing_direction);
+                for(key,start,end)in &tween.goals{let value=interpolate_gui_value(&self.lua,start,end,amount).map_err(|error|error.to_string())?;tween.target.raw_set(key.as_str(),value).map_err(|error|error.to_string())?;fire_instance_signal(&tween.target,"Changed",vec![Value::String(self.lua.create_string(key))]).map_err(|error|error.to_string())?;fire_instance_signal(&tween.target,&format!("_property_signal_{key}"),Vec::new()).map_err(|error|error.to_string())?;}
+                if finished{completed.push((tween.completed.clone(),"Completed"));tween.control.set(2);}
+            }
+            tweens.retain(|tween|tween.control.get()!=2);
+        }
+        for(signal,state_name)in completed{let state=self.lua.create_table();state.set("Name",state_name).map_err(|error|error.to_string())?;let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,state)).map_err(|error|error.to_string())?;}
+        Ok(())
+    }
+
+    pub fn fire_keyboard_input(&self,key_name:&str,began:bool,processed:bool)->Result<(),String>{
+        let input=self.lua.create_table();
+        let input_type=self.lua.create_table();input_type.set("Name","Keyboard").map_err(|error|error.to_string())?;
+        let key_code=self.lua.create_table();key_code.set("Name",key_name).map_err(|error|error.to_string())?;
+        let state=self.lua.create_table();state.set("Name",if began{"Begin"}else{"End"}).map_err(|error|error.to_string())?;
+        input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("KeyCode",key_code).map_err(|error|error.to_string())?;input.set("UserInputState",state.clone()).map_err(|error|error.to_string())?;
+        if began{self.pressed_keys.borrow_mut().insert(key_name.to_string());}else{self.pressed_keys.borrow_mut().remove(key_name);}
+        let actions:Vec<(String,Function)>=self.bound_actions.borrow().iter().filter(|(_,(_,keys))|keys.iter().any(|key|key.eq_ignore_ascii_case(key_name))).map(|(name,(callback,_))|(name.clone(),callback.clone())).collect();
+        if let Ok(task)=self.lua.globals().get::<Table>("task"){if let Ok(spawn)=task.get::<Function>("spawn"){for(name,callback)in actions{spawn.call::<()>((callback,name,state.clone(),input.clone())).map_err(|error|error.to_string())?;}}}
+        let event=if began{"InputBegan"}else{"InputEnded"};
+        if let Ok(signal)=self.user_input_service.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,processed)).map_err(|error|error.to_string())?;}Ok(())
+    }
+
+    pub fn fire_pointer_changed(&self,referent:DomRef,screen_position:[f32;2],delta:[f32;2])->Result<(),String>{
+        self.pointer_position.set(screen_position);
+        let input=self.lua.create_table();
+        let input_name=if cfg!(target_os="android"){"Touch"}else{"MouseMovement"};
+        let input_type=self.lua.create_table();input_type.set("Name",input_name).map_err(|error|error.to_string())?;
+        let state=self.lua.create_table();state.set("Name","Change").map_err(|error|error.to_string())?;
+        let position=self.lua.create_table();position.set("X",screen_position[0]).map_err(|error|error.to_string())?;position.set("Y",screen_position[1]).map_err(|error|error.to_string())?;position.set("Z",0.0).map_err(|error|error.to_string())?;
+        let delta_value=self.lua.create_table();delta_value.set("X",delta[0]).map_err(|error|error.to_string())?;delta_value.set("Y",delta[1]).map_err(|error|error.to_string())?;delta_value.set("Z",0.0).map_err(|error|error.to_string())?;
+        input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("UserInputState",state).map_err(|error|error.to_string())?;input.set("Position",position).map_err(|error|error.to_string())?;input.set("Delta",delta_value).map_err(|error|error.to_string())?;
+        if let Some(instance)=self.instances.get(&referent){if let Ok(signal)=instance.raw_get::<Table>("InputChanged"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone())).map_err(|error|error.to_string())?;}}
+        if let Ok(signal)=self.user_input_service.raw_get::<Table>("InputChanged"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone(),false)).map_err(|error|error.to_string())?;}
+        if input_name=="Touch" {if let Ok(signal)=self.user_input_service.raw_get::<Table>("TouchMoved"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,false)).map_err(|error|error.to_string())?;}}
+        Ok(())
+    }
+
+    pub fn fire_pointer_input(&self,referent:DomRef,began:bool,screen_position:[f32;2])->Result<(),String>{
+        self.pointer_position.set(screen_position);
+        let input=self.lua.create_table();
+        let input_name=if cfg!(target_os="android"){"Touch"}else{"MouseButton1"};
+        let input_type=self.lua.create_table();input_type.set("Name",input_name).map_err(|error|error.to_string())?;
+        let state=self.lua.create_table();state.set("Name",if began{"Begin"}else{"End"}).map_err(|error|error.to_string())?;
+        let position=self.lua.create_table();position.set("X",screen_position[0]).map_err(|error|error.to_string())?;position.set("Y",screen_position[1]).map_err(|error|error.to_string())?;position.set("Z",0.0).map_err(|error|error.to_string())?;
+        input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("UserInputState",state).map_err(|error|error.to_string())?;input.set("Position",position).map_err(|error|error.to_string())?;
+        let event=if began{"InputBegan"}else{"InputEnded"};
+        if let Some(instance)=self.instances.get(&referent){if let Ok(signal)=instance.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone())).map_err(|error|error.to_string())?;}}
+        if let Ok(signal)=self.user_input_service.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input.clone(),false)).map_err(|error|error.to_string())?;}
+        if input_name=="Touch" {let touch_event=if began{"TouchStarted"}else{"TouchEnded"};if let Ok(signal)=self.user_input_service.raw_get::<Table>(touch_event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,false)).map_err(|error|error.to_string())?;}}
+        Ok(())
+    }
+
+    pub fn fire_activated(&self,referent:DomRef,screen_position:[f32;2],keyboard:bool)->Result<(),String>{
+        let Some(instance)=self.instances.get(&referent) else{return Ok(());};
+        let input=self.lua.create_table();
+        let input_type=self.lua.create_table();input_type.set("Name",if keyboard{"Keyboard"}else if cfg!(target_os="android"){"Touch"}else{"MouseButton1"}).map_err(|error|error.to_string())?;
+        let key_code=self.lua.create_table();key_code.set("Name",if keyboard{"Return"}else{"Unknown"}).map_err(|error|error.to_string())?;
+        let position=self.lua.create_table();position.set("X",screen_position[0]).map_err(|error|error.to_string())?;position.set("Y",screen_position[1]).map_err(|error|error.to_string())?;position.set("Z",0.0).map_err(|error|error.to_string())?;
+        input.set("UserInputType",input_type).map_err(|error|error.to_string())?;input.set("KeyCode",key_code).map_err(|error|error.to_string())?;input.set("Position",position).map_err(|error|error.to_string())?;
+        if let Ok(signal)=instance.raw_get::<Table>("Activated"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,input,1i64)).map_err(|error|error.to_string())?;}Ok(())
+    }
+
+    pub fn selected_gui_object(&self)->Option<DomRef>{self.gui_service.raw_get::<Table>("SelectedObject").ok().and_then(|table|table_to_ref(&table).ok().flatten())}
+    pub fn set_selected_gui_object(&self,referent:Option<DomRef>)->Result<(),String>{let value=referent.and_then(|referent|self.instances.get(&referent).cloned()).map(Value::Table).unwrap_or(Value::Nil);self.gui_service.raw_set("SelectedObject",value).map_err(|error|error.to_string())}
+
+    pub fn fire(&self,referent:DomRef,event:&str)->Result<(),String>{
+        let Some(instance)=self.instances.get(&referent) else{return Ok(());};
+        if let Ok(signal)=instance.raw_get::<Table>(event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}
+        let service_event=match event{"Focused"=>Some("TextBoxFocused"),"FocusLost"=>Some("TextBoxFocusReleased"),_=>None};
+        if let Some(service_event)=service_event{if let Ok(signal)=self.user_input_service.raw_get::<Table>(service_event){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,instance.clone())).map_err(|error|error.to_string())?;}}
+        Ok(())
+    }
+
+    pub fn set_absolute_layout(&self,referent:DomRef,position:[f32;2],size:[f32;2])->Result<(),String>{
+        let Some(instance)=self.instances.get(&referent) else{return Ok(());};
+        let changed=|name:&str,value:[f32;2]|instance.raw_get::<Table>(name).ok().map(|old|(old.raw_get::<f64>("X").unwrap_or(f64::NAN)-value[0] as f64).abs()>0.01||(old.raw_get::<f64>("Y").unwrap_or(f64::NAN)-value[1] as f64).abs()>0.01).unwrap_or(true);
+        let position_changed=changed("AbsolutePosition",position);let size_changed=changed("AbsoluteSize",size);
+        let position_value=variant_to_value(&self.lua,&DomVariant::Vector2(ty::Vector2::new(position[0],position[1]))).map_err(|error|error.to_string())?;
+        let size_value=variant_to_value(&self.lua,&DomVariant::Vector2(ty::Vector2::new(size[0],size[1]))).map_err(|error|error.to_string())?;
+        instance.raw_set("AbsolutePosition",position_value).map_err(|error|error.to_string())?;
+        instance.raw_set("AbsoluteSize",size_value).map_err(|error|error.to_string())?;
+        for (name,did_change) in [("AbsolutePosition",position_changed),("AbsoluteSize",size_changed)] {if did_change{fire_instance_signal(instance,"Changed",vec![Value::String(self.lua.create_string(name))]).map_err(|error|error.to_string())?;fire_instance_signal(instance,&format!("_property_signal_{name}"),Vec::new()).map_err(|error|error.to_string())?;}}
+        Ok(())
+    }
+
+    pub fn set_text(&self,referent:DomRef,text:&str)->Result<(),String>{
+        let Some(instance)=self.instances.get(&referent) else{return Ok(());};
+        instance.raw_set("Text",text).map_err(|error|error.to_string())?;
+        if let Ok(signal)=instance.raw_get::<Table>("Changed") { let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,"Text")).map_err(|error|error.to_string())?; }
+        if let Ok(signal)=instance.raw_get::<Table>("_property_signal_Text") { let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,)).map_err(|error|error.to_string())?; }
+        Ok(())
+    }
+
+    pub fn synchronize_to_dom(&mut self,dom:&mut WeakDom)->Result<usize,String>{
+        let pending:Vec<Table>=self.pending_instances.borrow_mut().drain(..).collect();
+        let mut created=0usize;
+        for table in pending {
+            let parent_table=table.raw_get::<Table>("Parent").ok();
+            let parent_ref=parent_table.as_ref().and_then(|parent|table_to_ref(parent).ok().flatten()).unwrap_or_else(||dom.root_ref());
+            let class=table.raw_get::<String>("ClassName").unwrap_or_else(|_|"Frame".into());
+            let name=table.raw_get::<String>("Name").unwrap_or_else(|_|class.clone());
+            let referent=dom.insert(parent_ref,InstanceBuilder::new(class.clone()).with_name(name.clone()));
+            table.raw_set("_ref",ref_to_i64(referent)).map_err(|error|error.to_string())?;
+            let destroy_table=table.clone();let destroy_queue=self.pending_destructions.clone();
+            table.raw_set("Destroy",self.lua.create_function(move |_,_this:Table|{if let Ok(signal)=destroy_table.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire")?;fire.call::<()>((signal,Variadic::<Value>::new()))?;}destroy_queue.borrow_mut().push(destroy_table.clone());Ok(())}).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+            let clone_table=table.clone();let clone_queue=self.pending_instances.clone();
+            table.raw_set("Clone",self.lua.create_function(move |lua,_this:Table|clone_runtime_instance(lua,&clone_table,clone_queue.clone(),None)).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+            if let Some(parent)=self.instances.get(&parent_ref){parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;if name!=class{parent.raw_set(class.as_str(),Value::Nil).map_err(|error|error.to_string())?;}fire_instance_signal(parent,"ChildAdded",vec![Value::Table(table.clone())]).map_err(|error|error.to_string())?;let mut ancestor=Some(parent.clone());while let Some(current)=ancestor{fire_instance_signal(&current,"DescendantAdded",vec![Value::Table(table.clone())]).map_err(|error|error.to_string())?;ancestor=current.raw_get::<Table>("Parent").ok();}}
+            self.instances.insert(referent,table.clone());
+            self.synchronized_properties.insert(referent,GUI_SYNC_PROPERTIES.iter().map(|name|(*name).to_string()).collect());
+            if class=="LocalScript" {
+                if let Ok(source)=table.raw_get::<String>("Source") {let environment=self.lua.create_table();environment.raw_set("script",table.clone()).map_err(|error|error.to_string())?;environment.raw_set("_G",self.lua.globals()).map_err(|error|error.to_string())?;let metatable=self.lua.create_table();metatable.raw_set("__index",self.lua.globals()).map_err(|error|error.to_string())?;environment.set_metatable(Some(metatable)).map_err(|error|error.to_string())?;let function=self.lua.load(&source).set_name(name.as_str()).set_environment(environment).into_function().map_err(|error|error.to_string())?;let task:Table=self.lua.globals().get("task").map_err(|error|error.to_string())?;let spawn:Function=task.get("spawn").map_err(|error|error.to_string())?;spawn.call::<()>(function).map_err(|error|error.to_string())?;}
+            }
+            created+=1;
+        }
+        let destructions:Vec<Table>=self.pending_destructions.borrow_mut().drain(..).collect();
+        let mut destroyed=0usize;
+        for table in destructions {
+            if let Some(referent)=table_to_ref(&table).map_err(|error|error.to_string())? {
+                if referent!=dom.root_ref() {
+                    if let Some(instance)=dom.get_by_ref(referent){if let Some(parent)=self.instances.get(&instance.parent()){parent.raw_set(instance.name.as_str(),Value::Nil).map_err(|error|error.to_string())?;}}
+                    if dom.get_by_ref(referent).is_some(){
+                        let mut stack=vec![referent];let mut subtree=Vec::new();while let Some(item)=stack.pop(){if let Some(instance)=dom.get_by_ref(item){stack.extend_from_slice(instance.children());subtree.push(item);}}
+                        if let Some(root_runtime)=self.instances.get(&referent){let mut ancestor=root_runtime.raw_get::<Table>("Parent").ok();if let Some(parent)=ancestor.as_ref(){fire_instance_signal(parent,"ChildRemoved",vec![Value::Table(root_runtime.clone())]).map_err(|error|error.to_string())?;}while let Some(current)=ancestor{for item in &subtree{if let Some(runtime)=self.instances.get(item){fire_instance_signal(&current,"DescendantRemoving",vec![Value::Table(runtime.clone())]).map_err(|error|error.to_string())?;}}ancestor=current.raw_get::<Table>("Parent").ok();}}
+                        dom.destroy(referent);destroyed+=subtree.len();
+                        for item in subtree {if let Some(runtime)=self.instances.remove(&item){if item!=referent{if let Ok(signal)=runtime.raw_get::<Table>("Destroying"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,Variadic::<Value>::new())).map_err(|error|error.to_string())?;}}runtime.raw_set("Parent",Value::Nil).map_err(|error|error.to_string())?;runtime.raw_set("_destroyed",true).map_err(|error|error.to_string())?;}self.synchronized_properties.remove(&item);}
+                    }
+                }
+                table.raw_set("Parent",Value::Nil).map_err(|error|error.to_string())?;
+                self.instances.remove(&referent);self.synchronized_properties.remove(&referent);
+            }
+        }
+        let hierarchy:Vec<(DomRef,String,Option<DomRef>)>=self.instances.iter().filter_map(|(referent,table)|{
+            let name=table.raw_get::<String>("Name").ok()?;
+            let parent=table.raw_get::<Table>("Parent").ok().and_then(|parent|table_to_ref(&parent).ok().flatten());
+            Some((*referent,name,parent))
+        }).collect();
+        for (referent,name,parent) in hierarchy {
+            if referent==dom.root_ref(){continue;}
+            let current=dom.get_by_ref(referent).map(|instance|(instance.parent(),instance.name.clone()));
+            let Some((current_parent,old_name))=current else{continue;};
+            let renamed=old_name!=name;let mut moved=false;
+            if renamed {if let Some(instance)=dom.get_by_ref_mut(referent){instance.name=name.clone();}}
+            if let Some(parent)=parent {if current_parent!=parent&&dom.get_by_ref(parent).is_some(){dom.transfer_within(referent,parent);moved=true;}}
+            if let Some(table)=self.instances.get(&referent) {
+                if renamed||moved {
+                    let mut moved_runtime=vec![table.clone()];let mut stack=instance_children(table).map_err(|error|error.to_string())?;while let Some(child)=stack.pop(){stack.extend(instance_children(&child).map_err(|error|error.to_string())?);moved_runtime.push(child);}
+                    if let Some(old_parent)=self.instances.get(&current_parent){old_parent.raw_set(old_name.as_str(),Value::Nil).map_err(|error|error.to_string())?;if moved{fire_instance_signal(old_parent,"ChildRemoved",vec![Value::Table(table.clone())]).map_err(|error|error.to_string())?;let mut ancestor=Some(old_parent.clone());while let Some(current)=ancestor{for descendant in &moved_runtime{fire_instance_signal(&current,"DescendantRemoving",vec![Value::Table(descendant.clone())]).map_err(|error|error.to_string())?;}ancestor=current.raw_get::<Table>("Parent").ok();}}}
+                    let effective_parent=parent.unwrap_or(current_parent);
+                    if let Some(new_parent)=self.instances.get(&effective_parent){new_parent.raw_set(name.as_str(),table.clone()).map_err(|error|error.to_string())?;table.raw_set("Parent",new_parent.clone()).map_err(|error|error.to_string())?;if moved{fire_instance_signal(new_parent,"ChildAdded",vec![Value::Table(table.clone())]).map_err(|error|error.to_string())?;let mut ancestor=Some(new_parent.clone());while let Some(current)=ancestor{for descendant in &moved_runtime{fire_instance_signal(&current,"DescendantAdded",vec![Value::Table(descendant.clone())]).map_err(|error|error.to_string())?;}ancestor=current.raw_get::<Table>("Parent").ok();}}}
+                }
+                if renamed {if let Ok(signal)=table.raw_get::<Table>("Changed"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,"Name")).map_err(|error|error.to_string())?;}}
+                if moved {if let Ok(signal)=table.raw_get::<Table>("AncestryChanged"){let fire:Function=signal.get("Fire").map_err(|error|error.to_string())?;fire.call::<()>((signal,table.clone(),table.raw_get::<Value>("Parent").unwrap_or(Value::Nil))).map_err(|error|error.to_string())?;}}
+            }
+        }
+        let mut updates=Vec::new();
+        for (referent,names) in &self.synchronized_properties {
+            let Some(table)=self.instances.get(referent) else{continue;};
+            for name in names {
+                let Ok(value)=table.raw_get::<Value>(name.as_str()) else{continue;};
+                if value.is_nil(){continue;}
+                if let Some(value)=value_to_variant(&self.lua,&value).map_err(|error|error.to_string())? {
+                    let existing=dom.get_by_ref(*referent).and_then(|instance|instance.properties.get(&rbx_dom_weak::Ustr::from(name.as_str())));
+                    let value=preserve_variant_type(existing,value);
+                    let changed=existing.map(|existing|existing!=&value).unwrap_or(true);
+                    if changed{updates.push((*referent,name.clone(),value));}
+                }
+            }
+        }
+        let count=updates.len()+created+destroyed;
+        for (referent,name,value) in updates {if let Some(instance)=dom.get_by_ref_mut(referent){instance.properties.insert(rbx_dom_weak::Ustr::from(name.as_str()),value);}}
+        Ok(count)
+    }
+
+    pub fn synchronize_from_dom(&self,dom:&WeakDom)->Result<(),String>{
+        for (referent,names) in &self.synchronized_properties {
+            let (Some(table),Some(instance))=(self.instances.get(referent),dom.get_by_ref(*referent)) else{continue;};
+            for name in names {if let Some(value)=instance.properties.get(&rbx_dom_weak::Ustr::from(name.as_str())) { let value=if let DomVariant::Ref(target)=value{self.instances.get(target).cloned().map(Value::Table).unwrap_or(Value::Nil)}else{variant_to_value(&self.lua,value).map_err(|error|error.to_string())?};table.raw_set(name.as_str(),value).map_err(|error|error.to_string())?; }}
+        }
+        Ok(())
+    }
+
+    pub fn drain_output(&self)->Vec<OutputLine>{let _=&self.lua;take_log()}
+}
+
 /// Summary returned by the command bar so the editor can refresh explorer/3D.
 #[derive(Debug, Clone, Default)]
 pub struct CommandOutcome {
@@ -722,6 +1379,15 @@ thread_local! {
 /// property get/set, `:Clone()`, `:Destroy()`, `:FindFirstChild()`, and
 /// `:GetChildren()`.
 pub fn run_command(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Result<CommandOutcome, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(||run_command_inner(dom_rc,source,name)))
+        .unwrap_or_else(|panic| {
+            let detail=panic.downcast_ref::<&str>().map(|value|(*value).to_string())
+                .or_else(||panic.downcast_ref::<String>().cloned()).unwrap_or_else(||"unknown VM panic".into());
+            Err(format!("Luau command recovered from an internal error: {detail}"))
+        })
+}
+
+fn run_command_inner(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Result<CommandOutcome, String> {
     LOG.with(|c| c.borrow_mut().clear());
     COMMAND_OUTCOME.with(|c| *c.borrow_mut() = CommandOutcome::default());
 
@@ -1011,34 +1677,30 @@ fn make_instance_metatable(
             if let Some(f) = method_for(lua, dom.clone(), cache.clone(), mt_handle.borrow().as_ref().unwrap().clone(), &key)? {
                 return Ok(Value::Function(f));
             }
+            if is_instance_signal(&key) {
+                if let Ok(existing)=this.raw_get::<Table>(&key){return Ok(Value::Table(existing));}
+                let signal=make_signal(lua)?; this.raw_set(&key,signal.clone())?;
+                return Ok(Value::Table(signal));
+            }
             let Some(r) = table_to_ref(&this)? else { return Ok(Value::Nil) };
-            let d = dom.borrow();
-            let Some(inst) = d.get_by_ref(r) else { return Ok(Value::Nil) };
-            let v = match key.as_str() {
-                "Name" => Value::String(lua.create_string(&inst.name)),
-                "ClassName" => Value::String(lua.create_string(&inst.class)),
-                "Parent" => {
-                    let p = inst.parent();
-                    if p.is_none() { Value::Nil } else {
-                        Value::Table(ref_to_table(lua, dom.clone(), cache.clone(), mt_handle.borrow().as_ref().unwrap().clone(), p)?)
-                    }
-                },
-                _ => {
-                    if let Some(prop) = inst.properties.get(&rbx_dom_weak::Ustr::from(key.as_str())) {
-                        variant_to_value(lua, prop)?
-                    } else {
-                        let mut found = None;
-                        for &c in inst.children() {
-                            if d.get_by_ref(c).is_some_and(|i| i.name == key) { found = Some(c); break; }
-                        }
-                        match found {
-                            Some(c) => Value::Table(ref_to_table(lua, dom.clone(), cache.clone(), mt_handle.borrow().as_ref().unwrap().clone(), c)?),
-                            None => Value::Nil,
-                        }
-                    }
+            enum Resolved { Text(String), Property(DomVariant), Instance(DomRef), Nil }
+            let resolved={
+                let d=dom.borrow();
+                let Some(inst)=d.get_by_ref(r) else{return Ok(Value::Nil);};
+                match key.as_str(){
+                    "Name"=>Resolved::Text(inst.name.clone()),
+                    "ClassName"=>Resolved::Text(inst.class.to_string()),
+                    "Parent"=>if inst.parent().is_none(){Resolved::Nil}else{Resolved::Instance(inst.parent())},
+                    _=>if let Some(property)=inst.properties.get(&rbx_dom_weak::Ustr::from(key.as_str())){Resolved::Property(property.clone())}
+                        else{inst.children().iter().copied().find(|child|d.get_by_ref(*child).is_some_and(|instance|instance.name==key)).map(Resolved::Instance).unwrap_or(Resolved::Nil)},
                 }
             };
-            Ok(v)
+            Ok(match resolved {
+                Resolved::Text(value)=>Value::String(lua.create_string(&value)),
+                Resolved::Property(value)=>variant_to_value(lua,&value)?,
+                Resolved::Instance(value)=>Value::Table(ref_to_table(lua,dom.clone(),cache.clone(),mt_handle.borrow().as_ref().unwrap().clone(),value)?),
+                Resolved::Nil=>Value::Nil,
+            })
         })?
     };
     mt.set("__index", index)?;
@@ -1048,9 +1710,10 @@ fn make_instance_metatable(
         let dom = dom.clone();
         lua.create_function(move |lua, (this, key, value): (Table, String, Value)| {
             let Some(r) = table_to_ref(&this)? else { return Ok(()) };
+            let mut changed=false;
             match key.as_str() {
                 "Name" => if let Value::String(s) = value {
-                    if let Ok(mut d) = dom.try_borrow_mut() { if let Some(i) = d.get_by_ref_mut(r) { i.name = s.to_str()?; } }
+                    if let Ok(mut d) = dom.try_borrow_mut() { if let Some(i) = d.get_by_ref_mut(r) { i.name = s.to_str()?; changed=true; } }
                 },
                 "ClassName" => {} // read-only
                 "Parent" => {
@@ -1059,16 +1722,22 @@ fn make_instance_metatable(
                         Value::Nil => dom.borrow().root_ref(),
                         _ => return Err(LuaError::runtime("Parent must be an Instance or nil")),
                     };
-                    dom.borrow_mut().transfer_within(r, new_parent);
+                    dom.borrow_mut().transfer_within(r, new_parent); changed=true;
                 }
                 _ => if let Some(variant) = value_to_variant(lua, &value)? {
                     if let Ok(mut d) = dom.try_borrow_mut() {
                         if let Some(i) = d.get_by_ref_mut(r) {
                             i.properties.insert(rbx_dom_weak::Ustr::from(&key), variant);
+                            changed=true;
                             COMMAND_OUTCOME.with(|o| o.borrow_mut().mutated += 1);
                         }
                     }
                 }
+            }
+            if changed {
+                if let Ok(signal)=this.raw_get::<Table>("Changed") { let fire:Function=signal.get("Fire")?; fire.call::<()>((signal,key.clone()))?; }
+                let cache_key=format!("_property_signal_{key}");
+                if let Ok(signal)=this.raw_get::<Table>(&cache_key) { let fire:Function=signal.get("Fire")?; fire.call::<()>((signal,))?; }
             }
             Ok(())
         })?
@@ -1097,6 +1766,73 @@ fn method_for(
     let d = dom.clone();
     let c = cache.clone();
     let f = match name {
+        "GetPropertyChangedSignal" => Some(lua.create_function(|lua,(this,property):(Table,String)|{
+            let cache_key=format!("_property_signal_{property}");
+            if let Ok(signal)=this.raw_get::<Table>(&cache_key){return Ok(signal);}
+            let signal=make_signal(lua)?; this.raw_set(cache_key,signal.clone())?; Ok(signal)
+        })?),
+        "JumpTo" => Some(lua.create_function(move |_,(layout,page):(Table,Table)|{
+            let Some(layout_ref)=table_to_ref(&layout)? else{return Ok(());};
+            let Some(page_ref)=table_to_ref(&page)? else{return Ok(());};
+            if let Some(instance)=d.borrow_mut().get_by_ref_mut(layout_ref){instance.properties.insert(rbx_dom_weak::Ustr::from("CurrentPage"),DomVariant::Ref(page_ref));COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);} Ok(())
+        })?),
+        "JumpToIndex" => Some(lua.create_function(move |_,(layout,index):(Table,i64)|{
+            let Some(layout_ref)=table_to_ref(&layout)? else{return Ok(());};
+            let page={let dom=d.borrow();let Some(layout_instance)=dom.get_by_ref(layout_ref)else{return Ok(());};let Some(parent)=dom.get_by_ref(layout_instance.parent())else{return Ok(());};let mut pages:Vec<DomRef>=parent.children().iter().copied().filter(|child|*child!=layout_ref).collect();pages.sort_by_key(|child|dom.get_by_ref(*child).and_then(|instance|instance.properties.get(&rbx_dom_weak::ustr("LayoutOrder"))).and_then(|value|match value{DomVariant::Int32(value)=>Some(*value),DomVariant::Int64(value)=>Some(*value as i32),_=>None}).unwrap_or(0));pages.get(index.max(0) as usize).copied()};
+            if let Some(page)=page{if let Some(instance)=d.borrow_mut().get_by_ref_mut(layout_ref){instance.properties.insert(rbx_dom_weak::Ustr::from("CurrentPage"),DomVariant::Ref(page));COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);}} Ok(())
+        })?),
+        "Next" | "Previous" => {
+            let step=if name=="Next"{1isize}else{-1isize};
+            Some(lua.create_function(move |_,layout:Table|{
+                let Some(layout_ref)=table_to_ref(&layout)? else{return Ok(());};
+                let page={let dom=d.borrow();let Some(layout_instance)=dom.get_by_ref(layout_ref)else{return Ok(());};let current=match layout_instance.properties.get(&rbx_dom_weak::ustr("CurrentPage")){Some(DomVariant::Ref(value))=>Some(*value),_=>None};let Some(parent)=dom.get_by_ref(layout_instance.parent())else{return Ok(());};let mut pages:Vec<DomRef>=parent.children().iter().copied().filter(|child|*child!=layout_ref).collect();pages.sort_by_key(|child|dom.get_by_ref(*child).and_then(|instance|instance.properties.get(&rbx_dom_weak::ustr("LayoutOrder"))).and_then(|value|match value{DomVariant::Int32(value)=>Some(*value),DomVariant::Int64(value)=>Some(*value as i32),_=>None}).unwrap_or(0));if pages.is_empty(){None}else{let current_index=current.and_then(|value|pages.iter().position(|page|*page==value)).unwrap_or(0)as isize;Some(pages[(current_index+step).clamp(0,pages.len()as isize-1)as usize])}};
+                if let Some(page)=page{if let Some(instance)=d.borrow_mut().get_by_ref_mut(layout_ref){instance.properties.insert(rbx_dom_weak::Ustr::from("CurrentPage"),DomVariant::Ref(page));COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);}} Ok(())
+            })?)
+        },
+        "TweenPosition" | "TweenSize" => {
+            let property=if name=="TweenPosition"{"Position"}else{"Size"}.to_string();
+            Some(lua.create_function(move |lua,(this,args):(Table,Variadic<Value>)|{
+                let Some(referent)=table_to_ref(&this)? else{return Ok(false);};
+                let Some(first)=args.first() else{return Ok(false);};
+                let Some(value)=value_to_variant(lua,first)? else{return Ok(false);};
+                if let Some(instance)=d.borrow_mut().get_by_ref_mut(referent){instance.properties.insert(rbx_dom_weak::Ustr::from(property.as_str()),value);COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);}
+                if let Some(Value::Function(callback))=args.last(){callback.call::<()>(())?;} Ok(true)
+            })?)
+        },
+        "TweenSizeAndPosition" => Some(lua.create_function(move |lua,(this,args):(Table,Variadic<Value>)|{
+            let Some(referent)=table_to_ref(&this)? else{return Ok(false);};
+            let size=args.first().map(|value|value_to_variant(lua,value)).transpose()?.flatten();
+            let position=args.get(1).map(|value|value_to_variant(lua,value)).transpose()?.flatten();
+            if let Some(instance)=d.borrow_mut().get_by_ref_mut(referent){if let Some(value)=size{instance.properties.insert(rbx_dom_weak::Ustr::from("Size"),value);}if let Some(value)=position{instance.properties.insert(rbx_dom_weak::Ustr::from("Position"),value);}COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1);}
+            if let Some(Value::Function(callback))=args.last(){callback.call::<()>(())?;} Ok(true)
+        })?),
+        "Create" => Some(lua.create_function(move |lua, (service, target, _info, goals): (Table, Table, Value, Table)| {
+            let class:String=service.raw_get("_class").unwrap_or_default();
+            if class!="TweenService" { return Err(LuaError::runtime("Create is only available on TweenService")); }
+            let target_ref=table_to_ref(&target)?;
+            let tween=lua.create_table();
+            let completed=make_signal(lua)?;
+            tween.set("Completed",completed.clone())?;
+            let play_dom=d.clone(); let play_goals=goals.clone();
+            let play_completed=completed.clone();
+            tween.set("Play",lua.create_function(move |lua,_tween:Table|{
+                if let Some(referent)=target_ref {
+                    let mut updates=Vec::new();
+                    for pair in play_goals.clone().pairs::<Value,Value>() {
+                        let (key,value)=pair?;
+                        if let Value::String(key)=key { if let Some(value)=value_to_variant(lua,&value)? { updates.push((key.to_str()?,value)); } }
+                    }
+                    if let Some(instance)=play_dom.borrow_mut().get_by_ref_mut(referent) {
+                        for (key,value) in updates { instance.properties.insert(rbx_dom_weak::Ustr::from(key.as_str()),value); COMMAND_OUTCOME.with(|outcome|outcome.borrow_mut().mutated+=1); }
+                    }
+                }
+                let fire:Function=play_completed.get("Fire")?;
+                fire.call::<()>((play_completed.clone(),Variadic::<Value>::new()))
+            })?)?;
+            tween.set("Pause",lua.create_function(|_,_tween:Table|Ok(()))?)?;
+            tween.set("Cancel",lua.create_function(|_,_tween:Table|Ok(()))?)?;
+            Ok(tween)
+        })?),
         "GetService" => Some(lua.create_function(move |lua, (_this, name): (Table, String)| {
             // Virtual (non-DOM) services are exposed as globals.
             match name.as_str() {
@@ -1275,10 +2011,20 @@ fn variant_to_value(lua: &Lua, v: &DomVariant) -> LuaResult<Value> {
         Variant::Float64(n) => Value::Number(*n),
         Variant::Int32(n) => Value::Number(*n as f64),
         Variant::Int64(n) => Value::Number(*n as f64),
+        Variant::CFrame(cf)=>{let t=lua.create_table();t.set("X",cf.position.x)?;t.set("Y",cf.position.y)?;t.set("Z",cf.position.z)?;for(name,value)in [("R00",cf.orientation.x.x),("R01",cf.orientation.y.x),("R02",cf.orientation.z.x),("R10",cf.orientation.x.y),("R11",cf.orientation.y.y),("R12",cf.orientation.z.y),("R20",cf.orientation.x.z),("R21",cf.orientation.y.z),("R22",cf.orientation.z.z)]{t.set(name,value)?;}let position=lua.create_table();position.set("X",cf.position.x)?;position.set("Y",cf.position.y)?;position.set("Z",cf.position.z)?;t.set("Position",position)?;t.set_metatable(Some(typed_metatable(lua,"CFrame")?));Value::Table(t)}
         Variant::Vector3(v) => {
             let t = lua.create_table();
             t.set("X", v.x as f64)?; t.set("Y", v.y as f64)?; t.set("Z", v.z as f64)?;
             Value::Table(t)
+        }
+        Variant::Vector2(v) => {
+            let t=lua.create_table();t.set("X",v.x as f64)?;t.set("Y",v.y as f64)?;Value::Table(t)
+        }
+        Variant::UDim(v) => {
+            let t=lua.create_table();t.set("Scale",v.scale as f64)?;t.set("Offset",v.offset as i64)?;Value::Table(t)
+        }
+        Variant::UDim2(v) => {
+            let t=lua.create_table();t.set("XScale",v.x.scale as f64)?;t.set("XOffset",v.x.offset as i64)?;t.set("YScale",v.y.scale as f64)?;t.set("YOffset",v.y.offset as i64)?;Value::Table(t)
         }
         Variant::Color3(c) => {
             let t = lua.create_table();
@@ -1286,12 +2032,15 @@ fn variant_to_value(lua: &Lua, v: &DomVariant) -> LuaResult<Value> {
             Value::Table(t)
         }
         Variant::Enum(e) => Value::Number(e.to_u32() as f64),
+        Variant::ColorSequence(sequence)=>{let result=lua.create_table();let points=lua.create_table();for(index,point)in sequence.keypoints.iter().enumerate(){let item=lua.create_table();item.set("Time",point.time)?;let value=lua.create_table();value.set("R",point.color.r)?;value.set("G",point.color.g)?;value.set("B",point.color.b)?;item.set("Value",value)?;points.raw_set(index+1,item)?;}result.set("Keypoints",points)?;Value::Table(result)}
+        Variant::NumberSequence(sequence)=>{let result=lua.create_table();let points=lua.create_table();for(index,point)in sequence.keypoints.iter().enumerate(){let item=lua.create_table();item.set("Time",point.time)?;item.set("Value",point.value)?;item.set("Envelope",point.envelope)?;points.raw_set(index+1,item)?;}result.set("Keypoints",points)?;Value::Table(result)}
+        Variant::NumberRange(range)=>{let result=lua.create_table();result.set("Min",range.min)?;result.set("Max",range.max)?;Value::Table(result)}
+        Variant::Rect(rect)=>{let result=lua.create_table();let min=lua.create_table();min.set("X",rect.min.x)?;min.set("Y",rect.min.y)?;let max=lua.create_table();max.set("X",rect.max.x)?;max.set("Y",rect.max.y)?;result.set("Min",min)?;result.set("Max",max)?;Value::Table(result)}
         _ => Value::Nil,
     })
 }
 
 fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
-    use rbx_dom_weak::types as ty;
     Ok(match v {
         Value::String(s) => Some(DomVariant::String(s.to_str()?.to_string())),
         Value::Boolean(b) => Some(DomVariant::Bool(*b)),
@@ -1299,7 +2048,23 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
         Value::Number(n) => Some(DomVariant::Float64(*n)),
         Value::Table(t) => {
             let has = |k: &str| t.get::<Value>(k).is_ok();
-            if has("R") && has("G") && has("B") {
+            if let Some(referent)=table_to_ref(t)? {Some(DomVariant::Ref(referent))}
+            else if has("R00")&&has("R22") {Some(DomVariant::CFrame(ty::CFrame{position:ty::Vector3::new(t.get::<f64>("X")? as f32,t.get::<f64>("Y")? as f32,t.get::<f64>("Z")? as f32),orientation:ty::Matrix3{x:ty::Vector3::new(t.get::<f64>("R00")? as f32,t.get::<f64>("R10")? as f32,t.get::<f64>("R20")? as f32),y:ty::Vector3::new(t.get::<f64>("R01")? as f32,t.get::<f64>("R11")? as f32,t.get::<f64>("R21")? as f32),z:ty::Vector3::new(t.get::<f64>("R02")? as f32,t.get::<f64>("R12")? as f32,t.get::<f64>("R22")? as f32)}}))}
+            else if has("Keypoints") {
+                let points=t.get::<Table>("Keypoints")?;let first=points.raw_get::<Table>(1).ok();let color=first.as_ref().and_then(|point|point.raw_get::<Table>("Value").ok()).is_some();
+                if color{let mut keypoints=Vec::new();for point in points.sequence_values::<Table>(){let point=point?;let value=point.get::<Table>("Value")?;keypoints.push(ty::ColorSequenceKeypoint::new(point.get::<f64>("Time")? as f32,ty::Color3::new(value.get::<f64>("R")? as f32,value.get::<f64>("G")? as f32,value.get::<f64>("B")? as f32)));}Some(DomVariant::ColorSequence(ty::ColorSequence{keypoints}))}
+                else{let mut keypoints=Vec::new();for point in points.sequence_values::<Table>(){let point=point?;keypoints.push(ty::NumberSequenceKeypoint::new(point.get::<f64>("Time")? as f32,point.get::<f64>("Value")? as f32,point.get::<f64>("Envelope").unwrap_or(0.0) as f32));}Some(DomVariant::NumberSequence(ty::NumberSequence{keypoints}))}
+            } else if has("Min")&&has("Max") {
+                match (t.get::<Value>("Min")?,t.get::<Value>("Max")?){(Value::Table(min),Value::Table(max))=>Some(DomVariant::Rect(ty::Rect::new(ty::Vector2::new(min.get::<f64>("X")? as f32,min.get::<f64>("Y")? as f32),ty::Vector2::new(max.get::<f64>("X")? as f32,max.get::<f64>("Y")? as f32)))),(min,max)=>{let number=|value:Value|match value{Value::Number(value)=>Some(value as f32),Value::Integer(value)=>Some(value as f32),_=>None};match(number(min),number(max)){(Some(min),Some(max))=>Some(DomVariant::NumberRange(ty::NumberRange::new(min,max))),_=>None}}}
+            } else if has("XScale") && has("XOffset") && has("YScale") && has("YOffset") {
+                Some(DomVariant::UDim2(ty::UDim2::new(
+                    ty::UDim::new(t.get::<f64>("XScale")? as f32,t.get::<i64>("XOffset")? as i32),
+                    ty::UDim::new(t.get::<f64>("YScale")? as f32,t.get::<i64>("YOffset")? as i32))))
+            } else if has("Scale") && has("Offset") {
+                Some(DomVariant::UDim(ty::UDim::new(t.get::<f64>("Scale")? as f32,t.get::<i64>("Offset")? as i32)))
+            } else if has("EnumType") && has("Value") {
+                Some(DomVariant::Enum(ty::Enum::from_u32(t.get::<i64>("Value")?.max(0) as u32)))
+            } else if has("R") && has("G") && has("B") {
                 Some(DomVariant::Color3(ty::Color3::new(
                     t.get::<f64>("R")? as f32,
                     t.get::<f64>("G")? as f32,
@@ -1311,6 +2076,8 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
                     t.get::<f64>("Y")? as f32,
                     t.get::<f64>("Z")? as f32,
                 )))
+            } else if has("X") && has("Y") {
+                Some(DomVariant::Vector2(ty::Vector2::new(t.get::<f64>("X")? as f32,t.get::<f64>("Y")? as f32)))
             } else {
                 None
             }

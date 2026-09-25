@@ -22,6 +22,7 @@ pub struct MeshData {
     pub face_count: usize,
     pub vertices: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
+    pub colors: Vec<[f32; 4]>,
     pub uvs: Vec<[f32; 2]>,
     pub faces: Vec<[u32; 3]>,
     pub aabb_min: [f32; 3],
@@ -708,11 +709,78 @@ pub fn parse_roblox_mesh(bytes: &[u8]) -> Option<MeshData> {
 
     if bytes.starts_with(b"version 1.00") || bytes.starts_with(b"version 1.01") {
         parse_ascii_mesh(bytes)
-    } else if bytes.starts_with(b"version 2.00") || bytes.starts_with(b"version 3.00") {
+    } else if bytes.starts_with(b"version 2.00") || bytes.starts_with(b"version 3.00")
+        || bytes.starts_with(b"version 3.01") {
         parse_binary_mesh_v2_v3(bytes)
+    } else if bytes.starts_with(b"version 4.00") || bytes.starts_with(b"version 4.01")
+        || bytes.starts_with(b"version 5.00") {
+        parse_modern_mesh(bytes)
     } else {
         None
     }
+}
+
+/// Decode current Roblox v4/v5 meshes. These formats add LODs, bones and FACS
+/// data around the familiar vertex/face streams. Flat viewport rendering uses
+/// the highest-detail static bind-pose geometry; animation data remains cached
+/// in the source asset for future skinned rendering.
+fn parse_modern_mesh(bytes: &[u8]) -> Option<MeshData> {
+    use rbx_mesh::mesh::Mesh;
+    let parsed = rbx_mesh::read_mesh_versioned(std::io::Cursor::new(bytes)).ok()?;
+    let (version, source_vertices, source_faces, lods) = match parsed {
+        Mesh::V4(mesh) => ("version 4.x".to_string(), mesh.vertices, mesh.faces, mesh.lods),
+        Mesh::V5(mesh) => ("version 5.00".to_string(), mesh.vertices, mesh.faces, mesh.lods),
+        _ => return None,
+    };
+    if source_vertices.is_empty() || source_vertices.len() > 2_000_000 {
+        return None;
+    }
+
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut vertices = Vec::with_capacity(source_vertices.len());
+    let mut normals = Vec::with_capacity(source_vertices.len());
+    let mut colors = Vec::with_capacity(source_vertices.len());
+    let mut uvs = Vec::with_capacity(source_vertices.len());
+    for vertex in source_vertices {
+        if !vertex.pos.iter().chain(vertex.norm.iter()).all(|value| value.is_finite()) {
+            return None;
+        }
+        for axis in 0..3 {
+            min[axis] = min[axis].min(vertex.pos[axis]);
+            max[axis] = max[axis].max(vertex.pos[axis]);
+        }
+        vertices.push(vertex.pos);
+        normals.push(vertex.norm);
+        colors.push(vertex.color.map(|channel| channel as f32 / 255.0));
+        uvs.push([vertex.tex[0], 1.0 - vertex.tex[1]]);
+    }
+
+    // LOD offsets delimit independent face ranges. The first range is the
+    // highest-detail mesh; rendering every range at once creates overlapping
+    // duplicate geometry and severe z-fighting.
+    let start = lods.first().map(|lod| lod.0 as usize).unwrap_or(0);
+    let end = lods.get(1).map(|lod| lod.0 as usize).unwrap_or(source_faces.len());
+    let mut faces = Vec::with_capacity(end.saturating_sub(start));
+    for face in source_faces.get(start..end.min(source_faces.len()))? {
+        let indices = [face.0[0].0, face.0[1].0, face.0[2].0];
+        if indices.iter().all(|index| (*index as usize) < vertices.len()) {
+            faces.push(indices);
+        }
+    }
+    if faces.is_empty() { return None; }
+    Some(MeshData {
+        version,
+        vertex_count: vertices.len(),
+        face_count: faces.len(),
+        vertices,
+        normals,
+        colors,
+        uvs,
+        faces,
+        aabb_min: min,
+        aabb_max: max,
+    })
 }
 
 fn parse_ascii_mesh(bytes: &[u8]) -> Option<MeshData> {
@@ -726,6 +794,7 @@ fn parse_ascii_mesh(bytes: &[u8]) -> Option<MeshData> {
 
     let mut vertices = Vec::new();
     let mut normals = Vec::new();
+    let mut colors = Vec::new();
     let mut uvs = Vec::new();
     let mut faces = Vec::new();
 
@@ -761,6 +830,7 @@ fn parse_ascii_mesh(bytes: &[u8]) -> Option<MeshData> {
 
                 vertices.push([px, py, pz]);
                 normals.push([nums[off + 3], nums[off + 4], nums[off + 5]]);
+                colors.push([1.0; 4]);
                 uvs.push([nums[off + 6], 1.0 - nums[off + 7]]);
             }
             faces.push([vert_idx, vert_idx + 1, vert_idx + 2]);
@@ -774,6 +844,7 @@ fn parse_ascii_mesh(bytes: &[u8]) -> Option<MeshData> {
         face_count: faces.len().max(num_faces),
         vertices,
         normals,
+        colors,
         uvs,
         faces,
         aabb_min: min,
@@ -814,6 +885,7 @@ fn parse_binary_mesh_v2_v3(bytes: &[u8]) -> Option<MeshData> {
 
     let mut vertices = Vec::with_capacity(num_verts);
     let mut normals = Vec::with_capacity(num_verts);
+    let mut colors = Vec::with_capacity(num_verts);
     let mut uvs = Vec::with_capacity(num_verts);
 
     let mut min = [f32::INFINITY, f32::INFINITY, f32::INFINITY];
@@ -845,6 +917,10 @@ fn parse_binary_mesh_v2_v3(bytes: &[u8]) -> Option<MeshData> {
 
         vertices.push([px, py, pz]);
         normals.push([nx, ny, nz]);
+        colors.push(if sizeof_vertex >= 40 {
+            [bytes[cursor + 36] as f32 / 255.0, bytes[cursor + 37] as f32 / 255.0,
+             bytes[cursor + 38] as f32 / 255.0, bytes[cursor + 39] as f32 / 255.0]
+        } else { [1.0; 4] });
         uvs.push([u, 1.0 - v]);
 
         cursor += sizeof_vertex;
@@ -875,6 +951,7 @@ fn parse_binary_mesh_v2_v3(bytes: &[u8]) -> Option<MeshData> {
         face_count: faces.len(),
         vertices,
         normals,
+        colors,
         uvs,
         faces,
         aabb_min: min,
@@ -894,8 +971,15 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
             for (key, val) in &inst.properties {
                 let key_str = key.as_str();
                 let asset_type = match key_str {
-                    "MeshId" | "MeshID" => Some("Mesh"),
-                    "TextureId" | "TextureID" | "Texture" => Some("Texture"),
+                    "MeshId" | "MeshID" | "MeshContent" => Some("Mesh"),
+                    "TextureId" | "TextureID" | "Texture" | "TextureContent"
+                    | "ColorMap" | "ColorMapContent" | "BaseTextureId"
+                    | "BaseTextureContent" | "OverlayTextureId"
+                    | "OverlayTextureContent" | "ShirtTemplate"
+                    | "PantsTemplate" | "Graphic" | "Image" | "ImageContent"
+                    | "HoverImage" | "PressedImage"
+                    | "TopImage" | "MidImage" | "BottomImage"
+                    | "TopImageContent" | "MidImageContent" | "BottomImageContent" => Some("Texture"),
                     "SoundId" | "SoundID" => Some("Sound"),
                     "AnimationId" => Some("Animation"),
                     _ => None,
@@ -916,12 +1000,18 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
                             ContentType::Uri(s) if !s.is_empty() => Some(s.clone()),
                             _ => None,
                         },
+                        // CharacterMesh's legacy IDs are integer properties.
+                        Variant::Int64(id) if *id > 0 => Some(id.to_string()),
+                        Variant::Int32(id) if *id > 0 => Some(id.to_string()),
                         _ => None,
                     };
                     if let Some(s) = found {
                         if let Some(id) = extract_asset_id(&s) {
-                            if !seen_ids.contains(&id) {
-                                seen_ids.insert(id.clone());
+                            // The same numeric ID can legally be referenced by
+                            // different content properties; deduplicate within
+                            // an asset kind without suppressing another kind.
+                            let dedup_key = format!("{ty}:{id}");
+                            if seen_ids.insert(dedup_key) {
                                 out.push(DiscoveredAsset {
                                     asset_id: id,
                                     asset_type: ty,
@@ -939,4 +1029,42 @@ pub fn scan_place_assets(dom: &WeakDom) -> Vec<DiscoveredAsset> {
     }
 
     out
+}
+
+/// AssetDelivery occasionally returns an RBXM/XML wrapper (Decal, MeshPart,
+/// CharacterMesh) instead of raw image/mesh bytes. Resolve the real content ID
+/// from that wrapper so the downloader can follow it once.
+pub fn wrapped_asset_target(bytes: &[u8], kind: &str, original_id: &str) -> Option<String> {
+    let dom = crate::rbxl::load_place(bytes.to_vec()).ok()?;
+    let wanted: &[&str] = if kind == "mesh" {
+        &["MeshId", "MeshID", "MeshContent"]
+    } else {
+        &["Texture", "TextureId", "TextureID", "TextureContent", "ColorMap",
+          "ColorMapContent", "BaseTextureId", "BaseTextureContent",
+          "OverlayTextureId", "OverlayTextureContent", "ShirtTemplate",
+          "PantsTemplate", "Graphic"]
+    };
+    let mut stack = dom.root().children().to_vec();
+    while let Some(referent) = stack.pop() {
+        let instance = dom.get_by_ref(referent)?;
+        stack.extend(instance.children());
+        for property in wanted {
+            let Some(value) = instance.properties.get(&rbx_dom_weak::ustr(property)) else { continue; };
+            let raw = match value {
+                Variant::String(value) => Some(value.clone()),
+                Variant::ContentId(value) => Some(value.as_str().to_string()),
+                Variant::Content(value) => match value.value() {
+                    ContentType::Uri(uri) => Some(uri.clone()),
+                    _ => None,
+                },
+                Variant::Int64(value) if *value > 0 => Some(value.to_string()),
+                Variant::Int32(value) if *value > 0 => Some(value.to_string()),
+                _ => None,
+            };
+            if let Some(id) = raw.as_deref().and_then(extract_asset_id) {
+                if id != original_id { return Some(id); }
+            }
+        }
+    }
+    None
 }

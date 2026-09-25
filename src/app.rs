@@ -132,7 +132,14 @@ enum PluginAction {
     OpenScript(String, String),
 }
 
-#[derive(bevy::prelude::Resource)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ViewportGizmoMode {
+    #[default]
+    Move,
+    Rotate,
+    Scale,
+}
+
 pub struct EditorApp {
     dom: Option<WeakDom>,
     selected: Option<Ref>,
@@ -188,6 +195,22 @@ pub struct EditorApp {
     editor_word_wrap: bool,
     editor_focus_mode: bool,
     show_stats: bool,
+    /// Whether StarterGui/BillboardGui/SurfaceGui previews are drawn over the viewport.
+    show_gui_preview: bool,
+    /// Hide all editor chrome and dedicate the window to the 3D viewport.
+    viewport_fullscreen: bool,
+    roblox_fonts_installed: bool,
+    /// GPU textures retained by the StarterGui preview.
+    gui_textures: HashMap<String, egui::TextureHandle>,
+    /// Editor-preview scroll positions, keyed by ScrollingFrame referent.
+    gui_scroll_offsets: HashMap<Ref, egui::Vec2>,
+    /// Editable preview state for Roblox TextBox controls.
+    gui_text_inputs: HashMap<Ref, String>,
+    /// Retained pointer state and events for the persistent GUI play-session bridge.
+    gui_hovered: std::collections::HashSet<Ref>,
+    gui_runtime_events: Vec<crate::gui_render::GuiRuntimeEvent>,
+    gui_navigation_selected: Option<Ref>,
+    gui_play_session: Option<crate::lua_runtime::GuiPlaySession>,
     rename_buffer: String,
     project_name: String,
     show_quick_open: bool,
@@ -246,12 +269,18 @@ pub struct EditorApp {
 
     // 3D viewport camera move speed (studs/step for Up/Down/pan).
     cam_move_speed: f32,
+    /// World axis currently captured by the transform gizmo (X/Y/Z = 0/1/2).
+    viewport_gizmo_axis: Option<usize>,
+    viewport_gizmo_mode: ViewportGizmoMode,
 
     // When Some, drain_events() will flip needs_3d_rebuild back on once this
     // deadline passes, so meshes/textures that finished downloading in the
     // background (see auto_download_place_assets) actually get pulled into
     // the scene instead of only ever showing on the NEXT manual reopen.
     pending_asset_refresh_at: Option<std::time::Instant>,
+    /// Number of mesh/texture requests in the current automatic place batch.
+    /// The expensive full scene rebuild runs once when this reaches zero.
+    viewport_assets_pending: usize,
 
     // Command bar: a one-line Luau prompt that runs against the embedded
     // luaur VM with a tiny `game`/`workspace`/`script`-style surface so users
@@ -356,6 +385,16 @@ impl Default for EditorApp {
             editor_word_wrap: saved_settings.editor_word_wrap,
             editor_focus_mode: false,
             show_stats: false,
+            show_gui_preview: true,
+            viewport_fullscreen: false,
+            roblox_fonts_installed: false,
+            gui_textures: HashMap::new(),
+            gui_scroll_offsets: HashMap::new(),
+            gui_text_inputs: HashMap::new(),
+            gui_hovered: std::collections::HashSet::new(),
+            gui_runtime_events: Vec::new(),
+            gui_navigation_selected: None,
+            gui_play_session: None,
             rename_buffer: String::new(),
             project_name: "RobloxProject".into(),
             show_quick_open: false,
@@ -395,7 +434,10 @@ impl Default for EditorApp {
             native_editor_initial_cursor: None,
             needs_3d_rebuild: false,
             cam_move_speed: 4.0,
+            viewport_gizmo_axis: None,
+            viewport_gizmo_mode: ViewportGizmoMode::Move,
             pending_asset_refresh_at: None,
+            viewport_assets_pending: 0,
             command_input: String::new(),
             command_history: Vec::new(),
             command_history_idx: 0,
@@ -447,13 +489,26 @@ impl EditorApp {
         self.dom.as_ref()
     }
 
+    pub fn selected_ref(&self) -> Option<Ref> {
+        self.selected
+    }
+
     /// Load a place from raw file bytes (used at startup / desktop validation).
     pub fn load_from_bytes(&mut self, bytes: Vec<u8>) {
         self.place_format = rbxl::PlaceFormat::detect(&bytes);
         match rbxl::load_place(bytes) {
             Ok(dom) => {
+                self.gui_play_session = match lua_runtime::GuiPlaySession::new(&dom) {
+                    Ok(session)=>Some(session),
+                    Err(error)=>{log::error!("GUI play session: {error}");None}
+                };
                 self.dom = Some(dom);
                 self.selected = None;
+                self.gui_textures.clear();
+                self.gui_scroll_offsets.clear();
+                self.gui_text_inputs.clear();
+                self.gui_hovered.clear();
+                self.gui_runtime_events.clear();
                 self.needs_3d_rebuild = true;
                 self.status = format!("Loaded ({})", self.place_format.label());
                 // New document → fresh undo history.
@@ -482,27 +537,27 @@ impl EditorApp {
             return;
         }
         let cookie = if self.roblosecurity_cookie.is_empty() { None } else { Some(self.roblosecurity_cookie.clone()) };
-        self.log_info(format!("Auto-downloading {} referenced assets in the background", assets.len()));
-        std::thread::spawn(move || {
-            for asset in assets {
-                let id = format!("rbxassetid://{}", asset.asset_id);
-                match asset.asset_type {
-                    "Mesh" => roblox_api::fetch_and_cache_mesh_async(id, cookie.clone()),
-                    "Texture" => roblox_api::fetch_and_cache_image_async(id, cookie.clone()),
-                    "Sound" => roblox_api::fetch_and_cache_audio_async(id, cookie.clone()),
-                    // Animations are rbxm model files, not raw binaries;
-                    // they'll be fetched on demand when inserted.
-                    "Animation" => {}
-                    _ => {}
-                }
+        self.viewport_assets_pending = assets.iter()
+            .filter(|asset| matches!(asset.asset_type, "Mesh" | "Texture"))
+            .count();
+        self.log_info(format!(
+            "Loading {} viewport assets in the background",
+            self.viewport_assets_pending,
+        ));
+        let mut viewport_assets = Vec::with_capacity(self.viewport_assets_pending);
+        for asset in assets {
+            let id = format!("rbxassetid://{}", asset.asset_id);
+            match asset.asset_type {
+                "Mesh" => viewport_assets.push((id, "mesh")),
+                "Texture" => viewport_assets.push((id, "texture")),
+                "Sound" => roblox_api::fetch_and_cache_audio_async(id, cookie.clone()),
+                // Animations are model assets and are fetched on demand.
+                _ => {}
             }
-        });
-        // fetch_and_cache_*_async are fire-and-forget background threads with
-        // no completion signal, so we can't know exactly when they're done.
-        // 4s is a rough guess generous enough for a city-sized place over
-        // typical mobile data; bump this (or add a real completion channel,
-        // like the existing search_channel pattern) if your assets are bigger.
-        self.pending_asset_refresh_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        }
+        roblox_api::fetch_viewport_asset_batch_async(viewport_assets, cookie);
+        // Completion events debounce scene rebuilds in drain_events; no fixed
+        // timer is needed (and a timer cannot predict mobile download speed).
     }
 
     fn log_info(&mut self, msg: impl Into<String>) {
@@ -526,7 +581,8 @@ impl EditorApp {
     /// Render the whole editor UI into the bevy_egui `egui::Context`. `orbit`
     /// is the Bevy viewport camera, steered by the 3D tab. Runs each frame from
     /// a Bevy system.
-    pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam) {
+    pub fn draw_editor(&mut self, ctx: &egui::Context, orbit: &mut OrbitCam, viewport_scene: &crate::bevy_render::ViewportScene) {
+        if !self.roblox_fonts_installed {crate::gui_render::install_roblox_fonts(ctx);self.roblox_fonts_installed=true;}
         self.drain_events();
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
             self.show_quick_open = true;
@@ -555,6 +611,29 @@ impl EditorApp {
 
         let style = ctx.style();
         let compact = self.compact_toolbar || ctx.available_rect().width() < 720.0;
+
+        // Viewport fullscreen is deliberately separate from script-editor focus
+        // mode: it removes every editor panel while retaining the live Bevy
+        // scene, GUI preview, selection, and camera interaction.
+        if self.viewport_fullscreen && self.active_tab == ActiveTab::Viewport3D {
+            if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.viewport_fullscreen = false;
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
+                .show(ctx, |ui| self.show_viewport_drag(ui, orbit, viewport_scene));
+            egui::Area::new(egui::Id::new("viewport_fullscreen_exit"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        if ui.button("✕ Exit Fullscreen").clicked() {
+                            self.viewport_fullscreen = false;
+                        }
+                    });
+                });
+            return;
+        }
 
         let top_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
             top: if compact { 6 } else { 48 },
@@ -605,6 +684,9 @@ impl EditorApp {
                             if ui.button("📊 Stats").clicked() {
                                 self.show_stats = !self.show_stats; ui.close();
                             }
+                            if ui.button(if self.show_gui_preview { "🙈 Hide GUI Preview" } else { "👁 Show GUI Preview" }).clicked() {
+                                self.show_gui_preview = !self.show_gui_preview; ui.close();
+                            }
                             if ui.button("⚙ Settings").clicked() {
                                 self.active_tab = ActiveTab::Settings; ui.close();
                             }
@@ -630,6 +712,9 @@ impl EditorApp {
                         }
                         if ui.button("📊 Stats").clicked() {
                             self.show_stats = !self.show_stats;
+                        }
+                        if ui.button(if self.show_gui_preview { "🙈 GUI" } else { "👁 GUI" }).on_hover_text("Toggle GUI preview overlays").clicked() {
+                            self.show_gui_preview = !self.show_gui_preview;
                         }
                     }
                     if ui.button(format!("🖥️ Output ({})", self.output_logs.len())).clicked() {
@@ -743,22 +828,22 @@ impl EditorApp {
             // presets, distance/zoom, speed, up/down.
             egui::TopBottomPanel::top("viewport_controls")
                 .show(ctx, |ui| {
-                    self.show_viewport_controls(ui, orbit);
+                    self.show_viewport_controls(ui, orbit, viewport_scene);
                 });
             // Transparent central panel: the Bevy 3D scene shows through and
             // this region senses drag/scroll to orbit the camera.
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                 .show(ctx, |ui| {
-                    self.show_viewport_drag(ui, orbit);
+                    self.show_viewport_drag(ui, orbit, viewport_scene);
                 });
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
                 match self.active_tab {
                     ActiveTab::Explorer => self.show_explorer_ui(ui),
                     ActiveTab::Viewport3D => {
-                        self.show_viewport_controls(ui, orbit);
-                        self.show_viewport_drag(ui, orbit);
+                        self.show_viewport_controls(ui, orbit, viewport_scene);
+                        self.show_viewport_drag(ui, orbit, viewport_scene);
                     }
                     ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
                     ActiveTab::Properties => self.show_properties_ui(ui),
@@ -899,32 +984,39 @@ impl EditorApp {
 
     /// Camera control bar (always drawn on a solid panel so it's visible over
     /// the 3D). Steers the Bevy `OrbitCam`.
-    fn show_viewport_controls(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
+    fn show_viewport_controls(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam, viewport_scene: &crate::bevy_render::ViewportScene) {
         // Row 1 (scrollable): label, presets, focus, reset, distance, speed.
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
             ui.label(RichText::new("🧊 3D (Bevy)").strong().color(Color32::from_rgb(0, 230, 255)));
+            if ui.button("⛶ Fullscreen").on_hover_text("Fill the window with the 3D viewport").clicked() {
+                self.viewport_fullscreen = true;
+            }
+            ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Move, "↔ Move");
+            ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Rotate, "⟳ Rotate");
+            ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Scale, "⤢ Scale");
 
             if ui.button("📐 Iso").clicked() { orbit.yaw = 0.785; orbit.pitch = 0.45; }
             if ui.button("📐 Top").clicked() { orbit.yaw = 0.0; orbit.pitch = 1.54; }
             if ui.button("📐 Front").clicked() { orbit.yaw = 0.0; orbit.pitch = 0.15; }
             if ui.button("📐 Side").clicked() { orbit.yaw = std::f32::consts::PI * 0.5; orbit.pitch = 0.15; }
             if ui.button("🎯 Focus Sel").clicked() {
-                if let (Some(dom), Some(r)) = (&self.dom, self.selected) {
-                    if let Some(inst) = dom.get_by_ref(r) {
-                        if let Some(Variant::Vector3(v)) = inst.properties.get(&rbx_dom_weak::ustr("Position")) {
-                            orbit.target = [v.x, v.y, v.z];
-                        }
-                    }
+                if !viewport_scene.frame(orbit, self.selected) {
+                    self.status = "Select a visible part to focus it".into();
+                }
+            }
+            if ui.button("▣ Frame All").clicked() {
+                if !viewport_scene.frame(orbit, None) {
+                    self.status = "No visible Workspace parts to frame".into();
                 }
             }
             if ui.button("🔄 Reset").clicked() { *orbit = crate::bevy_render::OrbitCam::default(); }
 
             ui.separator();
-            ui.label("📏 Dist:");
+            ui.label("📏 Dist (studs):");
             if ui.button("−").clicked() { orbit.dist = (orbit.dist * 0.85).max(2.0); }
-            ui.add(egui::Slider::new(&mut orbit.dist, 2.0..=2000.0).show_value(false));
-            if ui.button("+").clicked() { orbit.dist = (orbit.dist * 1.15).min(2000.0); }
+            ui.add(egui::Slider::new(&mut orbit.dist, 2.0..=50_000.0).show_value(false));
+            if ui.button("+").clicked() { orbit.dist = (orbit.dist * 1.15).min(50_000.0); }
 
             ui.separator();
             let mut speed = self.cam_move_speed;
@@ -941,24 +1033,248 @@ impl EditorApp {
         });
     }
 
+    fn apply_gizmo_axis(&mut self, axis: usize, delta: f32) {
+        if !delta.is_finite() || delta.abs() < 1e-5 { return; }
+        let mode = self.viewport_gizmo_mode;
+        let (Some(referent), Some(dom)) = (self.selected, self.dom.as_mut()) else { return; };
+        let Some(instance) = dom.get_by_ref(referent) else { return; };
+        let (property, value, action) = match mode {
+            ViewportGizmoMode::Scale => {
+                let mut size = match instance.properties.get(&rbx_dom_weak::ustr("Size")) {
+                    Some(Variant::Vector3(size)) => *size,
+                    _ => return,
+                };
+                match axis {
+                    0 => size.x = (size.x + delta).max(0.05),
+                    1 => size.y = (size.y + delta).max(0.05),
+                    _ => size.z = (size.z + delta).max(0.05),
+                }
+                ("Size", Variant::Vector3(size), "Scaled")
+            }
+            ViewportGizmoMode::Rotate => {
+                let Some(Variant::CFrame(frame)) = instance.properties.get(&rbx_dom_weak::ustr("CFrame"))
+                    .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("CoordinateFrame"))) else { return; };
+                let angle = delta * 0.08;
+                let (c, s) = (angle.cos(), angle.sin());
+                let rotation = match axis {
+                    0 => [[1.0,0.0,0.0], [0.0,c,-s], [0.0,s,c]],
+                    1 => [[c,0.0,s], [0.0,1.0,0.0], [-s,0.0,c]],
+                    _ => [[c,-s,0.0], [s,c,0.0], [0.0,0.0,1.0]],
+                };
+                let m = &frame.orientation;
+                let old = [[m.x.x,m.x.y,m.x.z], [m.y.x,m.y.y,m.y.z], [m.z.x,m.z.y,m.z.z]];
+                let mut out = [[0.0_f32; 3]; 3];
+                for row in 0..3 { for column in 0..3 {
+                    out[row][column] = (0..3).map(|k| rotation[row][k] * old[k][column]).sum();
+                }}
+                let matrix = rbx_dom_weak::types::Matrix3::new(
+                    Vector3::new(out[0][0],out[0][1],out[0][2]),
+                    Vector3::new(out[1][0],out[1][1],out[1][2]),
+                    Vector3::new(out[2][0],out[2][1],out[2][2]),
+                );
+                ("CFrame", Variant::CFrame(rbx_dom_weak::types::CFrame::new(frame.position, matrix)), "Rotated")
+            }
+            ViewportGizmoMode::Move => {
+                let (property, value) = match instance.properties.get(&rbx_dom_weak::ustr("CFrame"))
+                    .or_else(|| instance.properties.get(&rbx_dom_weak::ustr("CoordinateFrame"))) {
+                    Some(Variant::CFrame(frame)) => {
+                        let mut position = frame.position;
+                        match axis { 0 => position.x += delta, 1 => position.y += delta, _ => position.z += delta }
+                        ("CFrame", Variant::CFrame(rbx_dom_weak::types::CFrame::new(position, frame.orientation)))
+                    }
+                    _ => {
+                        let mut position = match instance.properties.get(&rbx_dom_weak::ustr("Position")) {
+                            Some(Variant::Vector3(position)) => *position,
+                            _ => Vector3::new(0.0, 0.0, 0.0),
+                        };
+                        match axis { 0 => position.x += delta, 1 => position.y += delta, _ => position.z += delta }
+                        ("Position", Variant::Vector3(position))
+                    }
+                };
+                (property, value, "Moved")
+            }
+        };
+        if rbxl::set_property(dom, referent, property, value).is_ok() {
+            self.needs_3d_rebuild = true;
+            self.status = format!("{action} selected part on {} axis", ["X", "Y", "Z"][axis.min(2)]);
+        }
+    }
+
     /// Transparent drag area over the Bevy 3D scene: drag to orbit, scroll to
     /// zoom.
-    fn show_viewport_drag(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam) {
+    fn show_viewport_drag(&mut self, ui: &mut egui::Ui, orbit: &mut crate::bevy_render::OrbitCam, viewport_scene: &crate::bevy_render::ViewportScene) {
         let (rect, response) = ui.allocate_exact_size(
             ui.available_size().max(egui::vec2(220.0, 300.0)),
             egui::Sense::drag(),
         );
-        if response.dragged() {
-            let d = response.drag_delta();
-            orbit.yaw -= d.x * 0.008;
-            orbit.pitch = (orbit.pitch + d.y * 0.008).clamp(-1.5, 1.5);
+        let aspect = rect.width() / rect.height().max(1.0);
+        let gizmo_projection = self.selected.and_then(|selected|
+            crate::bevy_render::gizmo_screen_axes(viewport_scene, selected, orbit, aspect));
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            if let (Some(pointer), Some((center, ends))) = (response.interact_pointer_pos(), gizmo_projection) {
+                let point = egui::pos2(
+                    (pointer.x - rect.left()) / rect.width(),
+                    (pointer.y - rect.top()) / rect.height(),
+                );
+                let center = egui::pos2(center[0], center[1]);
+                self.viewport_gizmo_axis = ends.iter().enumerate()
+                    .filter_map(|(axis, end)| {
+                        let end = egui::pos2(end[0], end[1]);
+                        let line = end - center;
+                        let t = ((point-center).dot(line) / line.length_sq().max(1e-8)).clamp(0.0, 1.0);
+                        let distance_px = (point - (center + line*t)).length() * rect.width();
+                        (distance_px <= 18.0).then_some((distance_px, axis))
+                    })
+                    .min_by(|a,b| a.0.total_cmp(&b.0)).map(|(_,axis)| axis);
+            }
+        }
+        if response.clicked_by(egui::PointerButton::Primary) && self.viewport_gizmo_axis.is_none() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let screen = [
+                    ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+                    ((pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+                ];
+                self.selected = crate::bevy_render::pick_part(
+                    viewport_scene,
+                    orbit,
+                    screen,
+                    rect.width() / rect.height().max(1.0),
+                );
+            }
+        }
+        if response.dragged_by(egui::PointerButton::Primary) {
+            let d = ui.input(|input| input.pointer.delta());
+            if let (Some(axis), Some((center, ends))) = (self.viewport_gizmo_axis, gizmo_projection) {
+                let screen_axis = egui::vec2(ends[axis][0]-center[0], ends[axis][1]-center[1]).normalized();
+                let pixels = egui::vec2(d.x / rect.width(), d.y / rect.height()).dot(screen_axis) * rect.width();
+                let studs_per_pixel = orbit.dist * (60.0_f32.to_radians()*0.5).tan() * 2.0 / rect.height();
+                self.apply_gizmo_axis(axis, pixels * studs_per_pixel);
+            } else {
+                orbit.yaw -= d.x * 0.008;
+                orbit.pitch = (orbit.pitch + d.y * 0.008).clamp(-1.5, 1.5);
+            }
+        }
+        if !ui.input(|input| input.pointer.primary_down()) {
+            self.viewport_gizmo_axis = None;
+        }
+        // Studio-style secondary drag pans the target in the camera plane.
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            let d = ui.input(|input| input.pointer.delta());
+            let scale = orbit.dist * 0.0015;
+            let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
+            orbit.target[0] += (-d.x * cos_yaw - d.y * sin_yaw) * scale;
+            orbit.target[2] += (d.x * sin_yaw - d.y * cos_yaw) * scale;
+        }
+        // Keyboard navigation only applies while the viewport is hovered, so
+        // WASD remains available when editing scripts and property text.
+        if response.hovered() {
+            let step = self.cam_move_speed * 0.12;
+            let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
+            ui.input(|input| {
+                let held = |key| if input.key_down(key) { 1.0_f32 } else { 0.0_f32 };
+                let forward = held(egui::Key::W) - held(egui::Key::S);
+                let right = held(egui::Key::D) - held(egui::Key::A);
+                orbit.target[0] += (forward * sin_yaw + right * cos_yaw) * step;
+                orbit.target[2] += (forward * cos_yaw - right * sin_yaw) * step;
+                orbit.target[1] += (held(egui::Key::E) - held(egui::Key::Q)) * step;
+            });
         }
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.0 {
-            orbit.dist = (orbit.dist - scroll * 0.1).clamp(2.0, 2000.0);
+            orbit.dist = (orbit.dist - scroll * 0.1).clamp(2.0, 50_000.0);
         }
         // Subtle border so the user can see the drag area.
         ui.painter().rect_stroke(rect, 0.0_f32, egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(120, 180, 255, 90)), egui::StrokeKind::Inside);
+
+        // StarterGui is previewed as a real screen-space hierarchy over the 3D
+        // scene. Clicking a GUI object synchronizes selection with Explorer.
+        if let Some(session)=self.gui_play_session.as_ref(){let selected=session.selected_gui_object();if selected!=self.gui_navigation_selected{if let Some(previous)=self.gui_navigation_selected{if let Err(error)=session.fire(previous,"SelectionLost"){log::error!("GuiService SelectionLost: {error}");}}if let Some(current)=selected{if let Err(error)=session.fire(current,"SelectionGained"){log::error!("GuiService SelectionGained: {error}");}}self.gui_navigation_selected=selected;}}
+        let gui_selected=if self.gui_play_session.is_some(){self.gui_navigation_selected}else{self.selected};
+        let clicked_gui = if self.show_gui_preview {
+            if let Some(dom) = self.dom.as_ref() {
+                crate::gui_render::draw_starter_gui(ui, rect, dom, &mut self.gui_textures,
+                    &mut self.gui_scroll_offsets, &mut self.gui_text_inputs,
+                    &mut self.gui_hovered, &mut self.gui_runtime_events,
+                    gui_selected, orbit, viewport_scene)
+            } else { None }
+        } else {
+            self.gui_hovered.clear(); self.gui_runtime_events.clear(); None
+        };
+        if let Some(session)=self.gui_play_session.as_mut() { if let Err(error)=session.tick(){log::error!("GUI tween tick: {error}");} }
+        let keyboard_events:Vec<(String,bool)>=ui.input(|input|input.events.iter().filter_map(|event|match event {egui::Event::Key{key,pressed,repeat,..} if !*repeat=>Some((format!("{key:?}"),*pressed)),_=>None}).collect());
+        let keyboard_processed=ui.ctx().wants_keyboard_input();
+        if let Some(session)=self.gui_play_session.as_ref() {
+            for (key,pressed) in keyboard_events {if let Err(error)=session.fire_keyboard_input(&key,pressed,keyboard_processed){log::error!("Keyboard input dispatch: {error}");}}
+        }
+        if let Some(session)=self.gui_play_session.as_ref() {
+            for event in &self.gui_runtime_events {
+                if event.kind==crate::gui_render::GuiRuntimeEventKind::Layout {
+                    if let Err(error)=session.set_absolute_layout(event.referent,event.position,event.delta){log::error!("GUI absolute layout update: {error}");}
+                    continue;
+                }
+                if event.kind==crate::gui_render::GuiRuntimeEventKind::TextChanged {
+                    if let Some(text)=self.gui_text_inputs.get(&event.referent) { if let Err(error)=session.set_text(event.referent,text){log::error!("TextBox runtime update: {error}");} }
+                    continue;
+                }
+                if event.kind==crate::gui_render::GuiRuntimeEventKind::InputChanged {
+                    if let Err(error)=session.fire_pointer_changed(event.referent,event.position,event.delta){log::error!("GUI pointer movement: {error}");}
+                    continue;
+                }
+                if matches!(event.kind,crate::gui_render::GuiRuntimeEventKind::Activated|crate::gui_render::GuiRuntimeEventKind::ActivatedKeyboard) {
+                    if let Err(error)=session.fire_activated(event.referent,event.position,event.kind==crate::gui_render::GuiRuntimeEventKind::ActivatedKeyboard){log::error!("GUI activation dispatch: {error}");}
+                    continue;
+                }
+                if matches!(event.kind,crate::gui_render::GuiRuntimeEventKind::MouseButton1Down|crate::gui_render::GuiRuntimeEventKind::MouseButton1Up) {
+                    if let Err(error)=session.fire_pointer_input(event.referent,event.kind==crate::gui_render::GuiRuntimeEventKind::MouseButton1Down,event.position){log::error!("GUI input dispatch: {error}");}
+                }
+                let name=match event.kind {
+                    crate::gui_render::GuiRuntimeEventKind::Layout=>unreachable!(),
+                    crate::gui_render::GuiRuntimeEventKind::MouseEnter=>"MouseEnter",
+                    crate::gui_render::GuiRuntimeEventKind::MouseLeave=>"MouseLeave",
+                    crate::gui_render::GuiRuntimeEventKind::MouseButton1Down=>"MouseButton1Down",
+                    crate::gui_render::GuiRuntimeEventKind::MouseButton1Up=>"MouseButton1Up",
+                    crate::gui_render::GuiRuntimeEventKind::MouseButton1Click=>"MouseButton1Click",
+                    crate::gui_render::GuiRuntimeEventKind::Activated=>unreachable!(),
+                    crate::gui_render::GuiRuntimeEventKind::ActivatedKeyboard=>unreachable!(),
+                    crate::gui_render::GuiRuntimeEventKind::InputChanged=>unreachable!(),
+                    crate::gui_render::GuiRuntimeEventKind::Focused=>"Focused",
+                    crate::gui_render::GuiRuntimeEventKind::FocusLost=>"FocusLost",
+                    crate::gui_render::GuiRuntimeEventKind::SelectionGained=>"SelectionGained",
+                    crate::gui_render::GuiRuntimeEventKind::SelectionLost=>"SelectionLost",
+                    crate::gui_render::GuiRuntimeEventKind::TextChanged=>unreachable!(),
+                };
+                if let Err(error)=session.fire(event.referent,name){log::error!("GUI event {name}: {error}");}
+            }
+        }
+        if let (Some(session),Some(dom))=(self.gui_play_session.as_mut(),self.dom.as_mut()) {
+            match session.synchronize_to_dom(dom) { Ok(changed) if changed>0=>self.needs_3d_rebuild=true,Err(error)=>log::error!("GUI property sync: {error}"),_=>{} }
+            if let Err(error)=session.synchronize_from_dom(dom){log::error!("GUI reverse property sync: {error}");}
+        }
+        let play_output=self.gui_play_session.as_ref().map(|session|session.drain_output()).unwrap_or_default();
+        for line in play_output { match line.level { lua_runtime::Level::Error=>self.log_error(line.text), _=>self.log_info(line.text) } }
+        let respawn=self.gui_play_session.as_ref().is_some_and(|session|session.take_respawn_request());
+        if respawn {
+            if let (Some(session),Some(dom))=(self.gui_play_session.as_ref(),self.dom.as_mut()){session.restore_for_respawn(dom);}
+            self.gui_play_session=self.dom.as_ref().and_then(|dom|lua_runtime::GuiPlaySession::new(dom).map_err(|error|log::error!("GUI respawn: {error}")).ok());
+            self.gui_hovered.clear();self.gui_runtime_events.clear();self.gui_text_inputs.clear();self.needs_3d_rebuild=true;
+        }
+        if let Some(clicked) = clicked_gui {
+            self.selected = Some(clicked);self.gui_navigation_selected=Some(clicked);
+            if let Some(session)=self.gui_play_session.as_ref(){if let Err(error)=session.set_selected_gui_object(Some(clicked)){log::error!("GuiService selection: {error}");}}
+            self.status = if let Some(dom)=self.dom.as_ref() {
+                let mut path=Vec::new();let mut current=clicked;let mut detail=String::new();
+                while !current.is_none() {
+                    let Some(instance)=dom.get_by_ref(current) else{break;};
+                    if current==clicked {
+                        for property in ["Image","Texture","TextureID"] {
+                            if let Some(value)=instance.properties.get(&rbx_dom_weak::ustr(property)) { detail=format!(" • {property}={value:?}");break; }
+                        }
+                    }
+                    path.push(format!("{} ({})",instance.name,instance.class));current=instance.parent();
+                }
+                path.reverse();format!("Selected {}{}",path.join(" > "),detail)
+            } else { "Selected GUI object from viewport".into() };
+        }
 
         if self.dom.is_none() {
             ui.centered_and_justified(|ui| {
@@ -3542,6 +3858,32 @@ ui.label("Place ID:");
         self.pump_plugin_logs();
         self.pump_plugin_thumbnails();
 
+        // Rebuild as each viewport asset actually completes. The previous
+        // fixed four-second refresh missed slow/mobile downloads permanently.
+        while let Some(ready) = roblox_api::try_recv_viewport_asset_ready() {
+            let in_place_batch = self.viewport_assets_pending > 0;
+            if in_place_batch {
+                self.viewport_assets_pending -= 1;
+            }
+            match ready.result {
+                Ok(()) => self.log_info(format!("Viewport {} ready: {}", ready.kind, ready.id)),
+                Err(error) => self.log_error(format!(
+                    "Viewport {} failed ({}): {}", ready.kind, ready.id, error,
+                )),
+            }
+            if in_place_batch && self.viewport_assets_pending == 0 {
+                // One GPU upload after the complete batch, rather than a full
+                // scene rebuild for each individual mesh.
+                self.needs_3d_rebuild = true;
+                self.status = "✅ All viewport meshes and textures loaded".into();
+            } else if !in_place_batch {
+                // Manual/single downloads still appear automatically.
+                self.pending_asset_refresh_at = Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(450),
+                );
+            }
+        }
+
         // Auto-play (and notify) when a sound the user pressed Play on finishes
         // downloading, instead of leaving them to press Play again.
         while let Some(ready) = roblox_api::try_recv_audio_ready() {
@@ -3613,10 +3955,9 @@ ui.label("Place ID:");
             }
         }
 
-        // If a background asset download was started, flip needs_3d_rebuild
-        // back on once its rough deadline passes so downloaded meshes/textures
-        // actually appear in the viewport without the user having to reopen
-        // the file.
+        // Rebuild once after a burst of completed viewport downloads. Every
+        // new completion pushes this deadline out, coalescing many assets into
+        // one GPU upload rather than one full rebuild per asset.
         if let Some(at) = self.pending_asset_refresh_at {
             if std::time::Instant::now() >= at {
                 self.needs_3d_rebuild = true;

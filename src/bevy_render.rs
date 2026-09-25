@@ -21,6 +21,11 @@ use rbx_dom_weak::{types::Variant, WeakDom};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+/// Roblox Studio's physical scale: one stud represents 0.28 metres. Bevy world
+/// coordinates are metres throughout the render and picking pipelines; editor
+/// camera controls remain expressed in familiar studs.
+pub const STUD_TO_METER: f32 = 0.28;
+
 // ----------------------------------------------------------------------------
 // FlatMaterial — a custom material with a trivial shader.
 //
@@ -65,6 +70,9 @@ pub struct FlatMaterial {
     /// textures — Roblox doesn't tint these by the part's Color).
     #[uniform(5)]
     pub tint_texture: u32,
+    /// Texture alpha interpretation. See `Tri::texture_mode`.
+    #[uniform(6)]
+    pub texture_mode: u32,
     /// Whether to use alpha blending (transparent parts).
     pub transparent: bool,
     /// Small depth bias to separate coincident/overlapping faces and stop
@@ -161,6 +169,9 @@ fn content_str(v: &Variant) -> Option<String> {
             rbx_dom_weak::types::ContentType::Uri(s) if !s.is_empty() => Some(s.clone()),
             _ => None,
         },
+        // CharacterMesh stores legacy asset references as int64 IDs.
+        Variant::Int64(id) if *id > 0 => Some(format!("rbxassetid://{id}")),
+        Variant::Int32(id) if *id > 0 => Some(format!("rbxassetid://{id}")),
         _ => None,
     }
 }
@@ -191,7 +202,11 @@ pub fn spawn_sky_dome(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<SkyMaterial>,
 ) {
-    let dome = Mesh::from(bevy::math::primitives::Sphere::new(500.0).mesh().ico(8).unwrap());
+    // Keep the dome just inside the far plane. A 500-metre dome occluded large
+    // Roblox maps after adopting the real 0.28 m/stud scale.
+    let dome = Mesh::from(
+        bevy::math::primitives::Sphere::new(25_000.0).mesh().ico(8).unwrap(),
+    );
     let mesh_handle = meshes.add(dome);
     // Same sRGB-as-linear bug as FlatMaterial's color, applied to the sky
     // dome: these authored 0..1 numbers are sRGB, and were being passed to
@@ -348,10 +363,10 @@ fn extract_cframe(inst: &rbx_dom_weak::Instance) -> CFrame {
 
 // S -> Bevy world (Z flip).
 fn s2b(p: Vec3) -> [f32; 3] {
-    // Render in Roblox's native coordinate space. Negating Z here was a mirror
-    // reflection that flipped parts left-right (the "reversed colors"). Bevy
-    // camera + geometry are kept in the same space, so no flip is needed.
-    [p.x, p.y, p.z]
+    // Preserve Roblox axis orientation, but convert authored studs to Bevy's
+    // metre-scale world. Applying this once at the world boundary keeps mesh
+    // decoding, CFrames and property editing in native Roblox units.
+    [p.x * STUD_TO_METER, p.y * STUD_TO_METER, p.z * STUD_TO_METER]
 }
 fn tp(cf: &CFrame, p: Vec3) -> [f32; 3] {
     let w = cf.transform_point(p);
@@ -372,13 +387,75 @@ struct Tri {
     normal: [f32; 3],
     uv: [f32; 2],
     tex: Option<String>,
+    /// Per-surface opacity (Decal/Texture transparency), multiplied by the part opacity.
+    opacity: f32,
+    /// Procedural and mesh textures are tinted by the part Color; decals are not.
+    tint: bool,
+    /// SurfaceAppearance alpha behavior: 0=transparency, 1=overlay,
+    /// 2=tint-mask, 3=opaque.
+    texture_mode: u32,
+    /// Decal/Texture Color3 override. Mesh and procedural surfaces use the
+    /// owning part color instead.
+    color_override: Option<[f32; 3]>,
+    /// Decal/Texture overlays must disappear while their image is unavailable;
+    /// rendering their fallback material creates blank layered planes.
+    hide_without_texture: bool,
+    /// Authored mesh vertex color (white for ordinary primitives).
+    vertex_color: [f32; 4],
 }
 
 #[derive(Clone)]
 struct PartGeo {
+    referent: rbx_dom_weak::types::Ref,
     color: [f32; 3],
     alpha: f32,
     tris: Vec<Tri>,
+}
+
+/// Lightweight picking data retained independently from render batching.
+#[derive(Clone, Debug)]
+pub struct SelectablePart {
+    pub referent: rbx_dom_weak::types::Ref,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    /// Exact rendered triangles used after the inexpensive AABB broad phase.
+    /// This prevents selecting empty corners of rotated and wedge-shaped parts.
+    triangles: Vec<[[f32; 3]; 3]>,
+}
+
+#[derive(Resource, Default)]
+pub struct ViewportScene {
+    pub parts: Vec<SelectablePart>,
+}
+
+impl ViewportScene {
+    /// Aim the orbit camera so the requested object, or the entire place when
+    /// `selected` is None, fits in the 60-degree viewport.
+    pub fn frame(&self, camera: &mut OrbitCam, selected: Option<rbx_dom_weak::types::Ref>) -> bool {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        let mut found = false;
+        for part in self.parts.iter().filter(|part| selected.map_or(true, |id| part.referent == id)) {
+            found = true;
+            for axis in 0..3 {
+                min[axis] = min[axis].min(part.min[axis]);
+                max[axis] = max[axis].max(part.max[axis]);
+            }
+        }
+        if !found { return false; }
+        camera.target = [
+            (min[0] + max[0]) * 0.5 / STUD_TO_METER,
+            (min[1] + max[1]) * 0.5 / STUD_TO_METER,
+            (min[2] + max[2]) * 0.5 / STUD_TO_METER,
+        ];
+        let diagonal_metres = BVec3::new(
+            max[0]-min[0], max[1]-min[1], max[2]-min[2],
+        ).length();
+        // Orbit distance is stored in studs even though bounds are GPU metres.
+        let diagonal_studs = diagonal_metres / STUD_TO_METER;
+        camera.dist = (diagonal_studs * 1.15).clamp(2.0, 50_000.0);
+        true
+    }
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -396,24 +473,30 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 }
 
 fn push_quad(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3, uv: [[f32; 2]; 4], tex: Option<String>) {
+    push_quad_surface(tris, cf, p, n, uv, tex.clone(), 1.0,
+        tex.as_deref().is_some_and(|key| key.starts_with("__")), None, false);
+}
+
+fn push_quad_surface(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 4], n: Vec3,
+                     uv: [[f32; 2]; 4], tex: Option<String>, opacity: f32, tint: bool,
+                     color_override: Option<[f32; 3]>, hide_without_texture: bool) {
     let a = tp(cf, p[0]);
     let b = tp(cf, p[1]);
     let c = tp(cf, p[2]);
     let d = tp(cf, p[3]);
     let nrm = tn(cf, n);
-    tris.push(Tri { pos: a, normal: nrm, uv: uv[0], tex: tex.clone() });
-    tris.push(Tri { pos: b, normal: nrm, uv: uv[1], tex: tex.clone() });
-    tris.push(Tri { pos: c, normal: nrm, uv: uv[2], tex: tex.clone() });
-    tris.push(Tri { pos: a, normal: nrm, uv: uv[0], tex: tex.clone() });
-    tris.push(Tri { pos: c, normal: nrm, uv: uv[2], tex: tex.clone() });
-    tris.push(Tri { pos: d, normal: nrm, uv: uv[3], tex });
+    for (pos, uv) in [(a, uv[0]), (b, uv[1]), (c, uv[2]),
+                      (a, uv[0]), (c, uv[2]), (d, uv[3])] {
+        tris.push(Tri { pos, normal: nrm, uv, tex: tex.clone(), opacity, tint, texture_mode: 0, color_override, hide_without_texture, vertex_color: [1.0; 4] });
+    }
 }
 
 fn push_tri(tris: &mut Vec<Tri>, cf: &CFrame, p: [Vec3; 3], n: Vec3, uv: [[f32; 2]; 3], tex: Option<String>) {
     let nrm = tn(cf, n);
-    tris.push(Tri { pos: tp(cf, p[0]), normal: nrm, uv: uv[0], tex: tex.clone() });
-    tris.push(Tri { pos: tp(cf, p[1]), normal: nrm, uv: uv[1], tex: tex.clone() });
-    tris.push(Tri { pos: tp(cf, p[2]), normal: nrm, uv: uv[2], tex });
+    let tint = tex.as_deref().is_some_and(|key| key.starts_with("__"));
+    for i in 0..3 {
+        tris.push(Tri { pos: tp(cf, p[i]), normal: nrm, uv: uv[i], tex: tex.clone(), opacity: 1.0, tint, texture_mode: 0, color_override: None, hide_without_texture: false, vertex_color: [1.0; 4] });
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -449,7 +532,7 @@ fn extract_geometry(dom: &WeakDom) -> Vec<PartGeo> {
             "Part" | "WedgePart" | "CornerWedgePart" | "TrussPart" | "SpawnLocation" | "MeshPart" | "Seat" | "VehicleSeat" | "UnionOperation"
         );
         if is_3d {
-            if let Some(mut g) = extract_part(dom, inst) {
+            if let Some(mut g) = extract_part(dom, inst, r) {
                 // Classic Roblox builds routinely have parts that genuinely
                 // interpenetrate on purpose — a wall sunk slightly into a
                 // floor, a pillar through a decorative ball, stacked blocks
@@ -488,7 +571,8 @@ fn extract_geometry(dom: &WeakDom) -> Vec<PartGeo> {
                     std::hash::Hash::hash(&c.to_bits(), &mut hasher);
                 }
                 let hv = std::hash::Hasher::finish(&hasher);
-                let eps = 0.0003 + (hv % 997) as f32 / 997.0 * 0.0007; // ~0.0003..0.001 studs
+                let eps = (0.0003 + (hv % 997) as f32 / 997.0 * 0.0007)
+                    * STUD_TO_METER; // ~0.0003..0.001 studs, converted to metres
                 for t in &mut g.tris {
                     t.pos[0] += t.normal[0] * eps;
                     t.pos[1] += t.normal[1] * eps;
@@ -501,7 +585,7 @@ fn extract_geometry(dom: &WeakDom) -> Vec<PartGeo> {
     out
 }
 
-fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo> {
+fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_weak::types::Ref) -> Option<PartGeo> {
     let cf = extract_cframe(inst);
     let size = match inst.properties.get(&rbx_dom_weak::ustr("Size")) {
         Some(Variant::Vector3(v)) => Vec3::new(v.x.max(0.1), v.y.max(0.1), v.z.max(0.1)),
@@ -511,7 +595,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
         Some(Variant::Color3(c)) => [c.r as f32, c.g as f32, c.b as f32],
         Some(Variant::Color3uint8(c)) => [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0],
         _ => match inst.properties.get(&rbx_dom_weak::ustr("BrickColor")) {
-            Some(Variant::BrickColor(bc)) => brick_color_rgb(*bc as u32),
+            Some(Variant::BrickColor(bc)) => brick_color_value_rgb(*bc),
             Some(Variant::Int32(bc)) => brick_color_rgb(*bc as u32),
             Some(Variant::Int64(bc)) => brick_color_rgb(*bc as u32),
             _ => brick_color_rgb(194), // Roblox default "Medium stone grey"
@@ -523,6 +607,12 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
         _ => 0.0,
     };
     let alpha = (1.0 - transparency).clamp(0.0, 1.0);
+    // Roblox treats Transparency=1 as not rendered. Keeping invisible geometry
+    // in a blended mesh wastes substantial fill rate on mobile and can still
+    // interfere with transparent draw ordering.
+    if alpha <= 0.001 {
+        return None;
+    }
     // `Material` deserializes as `Variant::Enum` (a raw u32 index) from a
     // compiled .rbxl, NEVER as `Variant::String` — that arm only ever matched
     // hand-built XML doms. Every part was silently defaulting to "Plastic",
@@ -537,15 +627,24 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     // MeshPart / SpecialMesh
     let mut mesh_id: Option<String> = None;
     let mut mesh_tex: Option<String> = None;
+    let mut mesh_overlay_tex: Option<String> = None;
+    // Legacy mesh textures use their alpha as transparency. SurfaceAppearance
+    // can explicitly select a different alpha interpretation.
+    let mut mesh_texture_mode = 0u32;
+    let mut mesh_texture_tint = true;
     let mut mesh_type: Option<String> = None;
     let mut scale = Vec3::new(1.0, 1.0, 1.0);
     let mut offset = Vec3::new(0.0, 0.0, 0.0);
     if inst.class == "MeshPart" {
-        if let Some(m) = inst.properties.get(&rbx_dom_weak::ustr("MeshId")).and_then(content_str) {
+        if let Some(m) = inst.properties.get(&rbx_dom_weak::ustr("MeshId"))
+            .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("MeshContent")))
+            .and_then(content_str)
+        {
             mesh_id = Some(m);
         }
         if let Some(t) = inst.properties.get(&rbx_dom_weak::ustr("TextureID"))
             .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("TextureId")))
+            .or_else(|| inst.properties.get(&rbx_dom_weak::ustr("TextureContent")))
             .and_then(content_str)
         {
             mesh_tex = Some(t);
@@ -553,7 +652,33 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     }
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
-        if ch.class == "SpecialMesh" || ch.class == "BlockMesh" {
+        if ch.class == "SurfaceAppearance" {
+            // Flat mode intentionally ignores normal/roughness/metalness maps,
+            // but ColorMap is the visible albedo and must override the legacy
+            // MeshPart.TextureID just as it does in Studio.
+            if let Some(texture) = ch.properties.get(&rbx_dom_weak::ustr("ColorMap"))
+                .or_else(|| ch.properties.get(&rbx_dom_weak::ustr("ColorMapContent")))
+                .and_then(content_str)
+            {
+                mesh_tex = Some(texture);
+            }
+            mesh_texture_mode = match ch.properties.get(&rbx_dom_weak::ustr("AlphaMode")) {
+                Some(Variant::Enum(value)) => match value.clone().to_u32() {
+                    0 => 1, // Overlay
+                    1 => 0, // Transparency
+                    2 => 2, // TintMask
+                    3 => 3, // Opaque
+                    _ => 1,
+                },
+                Some(Variant::String(value)) => match value.as_str() {
+                    "Transparency" => 0,
+                    "TintMask" => 2,
+                    "Opaque" => 3,
+                    _ => 1,
+                },
+                _ => 1, // Roblox SurfaceAppearance default: Overlay
+            };
+        } else if ch.class == "SpecialMesh" || ch.class == "BlockMesh" {
             if let Some(m) = ch.properties.get(&rbx_dom_weak::ustr("MeshId")).and_then(content_str) {
                 mesh_id = Some(m);
             }
@@ -574,8 +699,99 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
         }
     }
 
+    // R6 packages commonly replace body geometry through CharacterMesh
+    // siblings. The body Part itself has no MeshId, which previously made
+    // these characters render as blocks/eggs even after all assets downloaded.
+    if let Some(parent) = dom.get_by_ref(inst.parent()) {
+        let body_name = inst.name.to_ascii_lowercase().replace(' ', "");
+        let body_part_index = match body_name.as_str() {
+            "head" => Some(0), "torso" => Some(1), "leftarm" => Some(2),
+            "rightarm" => Some(3), "leftleg" => Some(4), "rightleg" => Some(5),
+            _ => None,
+        };
+        if let Some(expected) = body_part_index {
+            for child_ref in parent.children() {
+                let Some(character_mesh) = dom.get_by_ref(*child_ref) else { continue; };
+                if character_mesh.class != "CharacterMesh" { continue; }
+                let actual = match character_mesh.properties.get(&rbx_dom_weak::ustr("BodyPart")) {
+                    Some(Variant::Enum(value)) => value.clone().to_u32(),
+                    Some(Variant::Int32(value)) => *value as u32,
+                    Some(Variant::Int64(value)) => *value as u32,
+                    _ => u32::MAX,
+                };
+                if actual != expected { continue; }
+                mesh_id = character_mesh.properties.get(&rbx_dom_weak::ustr("MeshContent"))
+                    .or_else(|| character_mesh.properties.get(&rbx_dom_weak::ustr("MeshId")))
+                    .and_then(content_str).or(mesh_id);
+                mesh_tex = character_mesh.properties.get(&rbx_dom_weak::ustr("BaseTextureContent"))
+                    .or_else(|| character_mesh.properties.get(&rbx_dom_weak::ustr("BaseTextureId")))
+                    .and_then(content_str).or(mesh_tex);
+                mesh_overlay_tex = character_mesh.properties.get(&rbx_dom_weak::ustr("OverlayTextureContent"))
+                    .or_else(|| character_mesh.properties.get(&rbx_dom_weak::ustr("OverlayTextureId")))
+                    .and_then(content_str);
+                break;
+            }
+        }
+    }
+
+    // Classic Shirt/Pants instances live beside body parts under the character
+    // Model, not inside each MeshPart. Roblox body meshes have clothing-atlas
+    // UVs, so route the appropriate template onto each body segment.
+    if let Some(parent) = dom.get_by_ref(inst.parent()) {
+        let body_name = inst.name.to_ascii_lowercase().replace(' ', "");
+        let shirt_body = body_name.contains("torso") || body_name.contains("arm")
+            || body_name.contains("hand");
+        let pants_body = body_name.contains("leg") || body_name.contains("foot")
+            || body_name.contains("lowertorso");
+        let graphic_body = body_name == "torso" || body_name == "uppertorso";
+        let mut clothing_texture = None;
+        for child_ref in parent.children() {
+            let Some(clothing) = dom.get_by_ref(*child_ref) else { continue; };
+            let property = match clothing.class.as_str() {
+                "Shirt" if shirt_body => Some("ShirtTemplate"),
+                "Pants" if pants_body => Some("PantsTemplate"),
+                "ShirtGraphic" if graphic_body => Some("Graphic"),
+                _ => None,
+            };
+            if let Some(texture) = property
+                .and_then(|name| clothing.properties.get(&rbx_dom_weak::ustr(name)))
+                .and_then(content_str)
+            {
+                clothing_texture = Some(texture);
+            }
+        }
+        if clothing_texture.is_some() {
+            mesh_overlay_tex = clothing_texture;
+        }
+    }
+
+    // Legacy Roblox face surfaces. Studs and inlets are visible patterns and
+    // can be assigned independently to any of the six BasePart faces.
+    let mut surface_patterns: HashMap<&'static str, String> = HashMap::new();
+    for (face, property) in [
+        ("Top", "TopSurface"), ("Bottom", "BottomSurface"),
+        ("Front", "FrontSurface"), ("Back", "BackSurface"),
+        ("Left", "LeftSurface"), ("Right", "RightSurface"),
+    ] {
+        let pattern = match inst.properties.get(&rbx_dom_weak::ustr(property)) {
+            Some(Variant::Enum(value)) => match value.clone().to_u32() {
+                3 => Some("__studs"),
+                4 => Some("__inlets"),
+                _ => None,
+            },
+            Some(Variant::String(value)) if value == "Studs" => Some("__studs"),
+            Some(Variant::String(value)) if value == "Inlet" => Some("__inlets"),
+            _ => None,
+        };
+        if let Some(pattern) = pattern {
+            surface_patterns.insert(face, pattern.into());
+        }
+    }
+
     // Decals
-    let mut decals: HashMap<&'static str, String> = HashMap::new();
+    // Keep every overlay on a face. A HashMap<String> used previously meant
+    // that the last Decal silently deleted all earlier decals/textures.
+    let mut decals: HashMap<&'static str, Vec<FaceOverlay>> = HashMap::new();
     for child_ref in inst.children() {
         let Some(ch) = dom.get_by_ref(*child_ref) else { continue };
         if ch.class == "Decal" || ch.class == "Texture" {
@@ -595,7 +811,36 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
                 _ => "Front",
             };
             if let Some(t) = ch.properties.get(&rbx_dom_weak::ustr("Texture")).and_then(content_str) {
-                decals.insert(face, t);
+                let transparency = match ch.properties.get(&rbx_dom_weak::ustr("Transparency")) {
+                    Some(Variant::Float32(value)) => *value,
+                    Some(Variant::Float64(value)) => *value as f32,
+                    _ => 0.0,
+                };
+                let opacity = (1.0 - transparency).clamp(0.0, 1.0);
+                if opacity > 0.001 {
+                    let tile = if ch.class == "Texture" {
+                        let number = |name: &str, fallback: f32| match ch.properties.get(&rbx_dom_weak::ustr(name)) {
+                            Some(Variant::Float32(value)) => *value,
+                            Some(Variant::Float64(value)) => *value as f32,
+                            _ => fallback,
+                        };
+                        Some((number("StudsPerTileU", 2.0).max(0.01),
+                              number("StudsPerTileV", 2.0).max(0.01),
+                              number("OffsetStudsU", 0.0),
+                              number("OffsetStudsV", 0.0)))
+                    } else {
+                        None
+                    };
+                    let color = match ch.properties.get(&rbx_dom_weak::ustr("Color3"))
+                        .or_else(|| ch.properties.get(&rbx_dom_weak::ustr("Color"))) {
+                        Some(Variant::Color3(value)) => [value.r as f32, value.g as f32, value.b as f32],
+                        Some(Variant::Color3uint8(value)) => [value.r as f32 / 255.0, value.g as f32 / 255.0, value.b as f32 / 255.0],
+                        _ => [1.0, 1.0, 1.0],
+                    };
+                    decals.entry(face).or_default().push(FaceOverlay {
+                        texture: t, opacity, tile, color,
+                    });
+                }
             }
         }
     }
@@ -626,20 +871,53 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
                     let pa = tp(&cf2, Vec3::new(a[0] * sx, a[1] * sy, a[2] * sz));
                     let pb = tp(&cf2, Vec3::new(b[0] * sx, b[1] * sy, b[2] * sz));
                     let pc = tp(&cf2, Vec3::new(c[0] * sx, c[1] * sy, c[2] * sz));
-                    let n = cross(sub3(pb, pa), sub3(pc, pa));
+                    let face_normal = cross(sub3(pb, pa), sub3(pc, pa));
+                    let vertex_normal = |index: u32| {
+                        md.normals.get(index as usize).and_then(|normal| {
+                            let local = Vec3::new(normal[0] / sx, normal[1] / sy, normal[2] / sz);
+                            let valid = local.x.is_finite() && local.y.is_finite() && local.z.is_finite()
+                                && local.length() > 1e-5;
+                            valid.then(|| tn(&cf2, local))
+                        }).unwrap_or(face_normal)
+                    };
+                    let na = vertex_normal(f[0]);
+                    let nb = vertex_normal(f[1]);
+                    let nc = vertex_normal(f[2]);
                     let ua = md.uvs.get(f[0] as usize).copied().unwrap_or([0.0, 0.0]);
                     let ub = md.uvs.get(f[1] as usize).copied().unwrap_or([1.0, 0.0]);
                     let uc = md.uvs.get(f[2] as usize).copied().unwrap_or([0.0, 1.0]);
+                    let ca = md.colors.get(f[0] as usize).copied().unwrap_or([1.0; 4]);
+                    let cb = md.colors.get(f[1] as usize).copied().unwrap_or([1.0; 4]);
+                    let cc = md.colors.get(f[2] as usize).copied().unwrap_or([1.0; 4]);
                     let t = tex_key.clone();
-                    tris.push(Tri { pos: pa, normal: n, uv: ua, tex: t.clone() });
-                    tris.push(Tri { pos: pb, normal: n, uv: ub, tex: t.clone() });
-                    tris.push(Tri { pos: pc, normal: n, uv: uc, tex: t });
+                    // Roblox mesh textures and vertex colors are both
+                    // modulated by MeshPart.Color.
+                    tris.push(Tri { pos: pa, normal: na, uv: ua, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false, vertex_color: ca });
+                    tris.push(Tri { pos: pb, normal: nb, uv: ub, tex: t.clone(), opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false, vertex_color: cb });
+                    tris.push(Tri { pos: pc, normal: nc, uv: uc, tex: t, opacity: 1.0, tint: mesh_texture_tint, texture_mode: mesh_texture_mode, color_override: None, hide_without_texture: false, vertex_color: cc });
+                }
+            }
+            // CharacterMesh overlay textures and Shirt/Pants templates are a
+            // second skin over the base body mesh. Keep both passes so alpha
+            // holes reveal the base texture instead of the sky/body fallback.
+            if let Some(overlay) = mesh_overlay_tex {
+                let base_vertices = tris.len();
+                for index in 0..base_vertices {
+                    let mut vertex = tris[index].clone();
+                    for axis in 0..3 {
+                        vertex.pos[axis] += vertex.normal[axis] * 0.0004 * STUD_TO_METER;
+                    }
+                    vertex.tex = Some(overlay.clone());
+                    vertex.tint = false;
+                    vertex.texture_mode = 0;
+                    vertex.hide_without_texture = true;
+                    tris.push(vertex);
                 }
             }
             if tris.is_empty() {
                 return None;
             }
-            return Some(PartGeo { color, alpha, tris });
+            return Some(PartGeo { referent, color, alpha, tris });
         }
         // A mesh part whose mesh isn't available should be SKIPPED, not rendered
         // as a generic Block. Rendering it as a Block produced a wrong-shape
@@ -654,27 +932,32 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
     }
 
     let shape = match mesh_type.as_deref() {
-        Some("Sphere") | Some("Head") => "Ball",
+        Some("Sphere") => "Ball",
+        // MeshType.Head with no file mesh is Roblox's classic bevelled block
+        // head. Treating the 2x1x1 Head part as an ellipsoid produced the
+        // sideways-egg appearance. Explicit/custom head MeshIds still take
+        // the real mesh path above.
+        Some("Head") => "Block",
         Some("Cylinder") => "Cylinder",
         Some("Wedge") => "Wedge",
         _ => match inst.class.as_str() {
             "WedgePart" => "Wedge",
             "CornerWedgePart" => "CornerWedge",
             "TrussPart" => "Truss",
-            _ => {
-                if inst.name.to_lowercase().contains("ball") || inst.name.to_lowercase().contains("sphere") {
-                    "Ball"
-                } else if let Some(Variant::String(s)) = inst.properties.get(&rbx_dom_weak::ustr("Shape")) {
-                    match s.as_str() {
-                        "Ball" => "Ball",
-                        "Cylinder" => "Cylinder",
-                        "Block" => "Block",
-                        "Wedge" => "Wedge",
-                        _ => "Block",
-                    }
-                } else {
-                    "Block"
-                }
+            _ => match inst.properties.get(&rbx_dom_weak::ustr("Shape")) {
+                Some(Variant::Enum(value)) => match value.clone().to_u32() {
+                    0 => "Ball",
+                    2 => "Cylinder",
+                    3 => "Wedge",
+                    _ => "Block",
+                },
+                Some(Variant::String(value)) => match value.as_str() {
+                    "Ball" => "Ball",
+                    "Cylinder" => "Cylinder",
+                    "Wedge" => "Wedge",
+                    _ => "Block",
+                },
+                _ => "Block",
             }
         },
     };
@@ -685,40 +968,36 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance) -> Option<PartGeo>
         "Wedge" => build_wedge(&mut tris, &cf2, half),
         "CornerWedge" => build_corner_wedge(&mut tris, &cf2, half),
         "Truss" => build_truss(&mut tris, &cf2, half),
-        _ => build_block(&mut tris, &cf2, half, material_str.as_str(), &decals),
+        _ => build_block(&mut tris, &cf2, half, material_str.as_str(), &surface_patterns, &decals),
     }
 
     if tris.is_empty() {
         return None;
     }
-    Some(PartGeo { color, alpha, tris })
+    Some(PartGeo { referent, color, alpha, tris })
 }
 
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-/// Map a Roblox BrickColor number to RGB (0..1). Covers the common colors plus
-/// a default grey; used when a part stores its color as a BrickColor.
+/// Convert the palette value using rbx_types' canonical 208-color table.
+/// This avoids a hand-maintained subset silently turning uncommon colors grey.
+fn brick_color_value_rgb(color: rbx_dom_weak::types::BrickColor) -> [f32; 3] {
+    let value = color.to_color3uint8();
+    [value.r as f32 / 255.0, value.g as f32 / 255.0, value.b as f32 / 255.0]
+}
+
+/// Legacy/synthetic DOMs can encode BrickColor as an integer instead of the
+/// typed variant. Resolve those through the same complete canonical palette.
 fn brick_color_rgb(code: u32) -> [f32; 3] {
-    let c = match code {
-        21 => [196.0, 40.0, 28.0],   // Bright red
-        24 => [98.0, 71.0, 50.0],    // Medium brown
-        26 => [75.0, 105.0, 47.0],   // Dark green
-        28 => [194.0, 218.0, 184.0], // Dark green (light)
-        45 => [200.0, 190.0, 170.0], // Pastel brown
-        100 => [252.0, 251.0, 247.0], // White
-        102 => [251.0, 249.0, 240.0], // White
-        104 => [248.0, 244.0, 225.0], // Pastel yellow
-        107 => [214.0, 199.0, 128.0], // Gold
-        119 => [196.0, 140.0, 40.0],  // Bright orange
-        135 => [255.0, 34.0, 14.0],   // Bright red-orange
-        194 => [163.0, 162.0, 165.0], // Medium stone grey
-        199 => [184.0, 184.0, 0.0],   // Dark yellow
-        208 => [53.0, 53.0, 53.0],    // Dark stone grey
-        _ => [163.0, 162.0, 165.0],
-    };
-    [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]
+    rbx_dom_weak::types::BrickColor::from_number(code as u16)
+        .map(brick_color_value_rgb)
+        .unwrap_or_else(|| {
+            let fallback = rbx_dom_weak::types::BrickColor::from_number(194)
+                .expect("Roblox BrickColor 194 must exist");
+            brick_color_value_rgb(fallback)
+        })
 }
 
 /// Map the numeric value of a Roblox `Material` EnumItem to its name.
@@ -731,12 +1010,28 @@ fn material_name_from_enum(value: u32) -> String {
     match value {
         512 => "Wood",
         528 => "WoodPlanks",
+        784 => "Marble",
         800 => "Slate",
         816 => "Concrete",
+        832 => "Granite",
         848 => "Brick",
+        864 => "Pebble",
+        880 => "Cobblestone",
+        1040 => "CorrodedMetal",
+        1056 => "DiamondPlate",
+        1072 => "Foil",
+        1088 => "Metal",
         1280 => "Grass",
         1284 => "LeafyGrass",
+        1296 => "Sand",
+        1312 => "Fabric",
+        1328 => "Snow",
+        1344 => "Mud",
+        1360 => "Ground",
         1376 => "Asphalt",
+        1384 => "Salt",
+        1392 => "Limestone",
+        1408 => "Pavement",
         _ => "Plastic",
     }
     .into()
@@ -758,7 +1053,22 @@ fn normal_id_name(value: u32) -> &'static str {
 
 // --- primitive builders (same shapes as the Android app / OpenRBLX) ---
 
-fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, decals: &HashMap<&'static str, String>) {
+struct FaceOverlay {
+    texture: String,
+    opacity: f32,
+    /// Texture tile U/V and offset U/V. None means a face-filling Decal.
+    tile: Option<(f32, f32, f32, f32)>,
+    color: [f32; 3],
+}
+
+fn build_block(
+    tris: &mut Vec<Tri>,
+    cf: &CFrame,
+    half: Vec3,
+    material: &str,
+    surface_patterns: &HashMap<&'static str, String>,
+    decals: &HashMap<&'static str, Vec<FaceOverlay>>,
+) {
     let h = half;
     let v = [
         Vec3::new(-h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, -h.z), Vec3::new(h.x, -h.y, h.z), Vec3::new(-h.x, -h.y, h.z),
@@ -767,58 +1077,119 @@ fn build_block(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3, material: &str, dec
     let mat_tex = match material {
         "Brick" => Some("__brick".into()),
         "Wood" | "WoodPlanks" => Some("__wood_planks".into()),
-        "Concrete" | "Slate" => Some("__concrete".into()),
-        "Grass" => Some("__grass".into()),
+        "Cobblestone" => Some("__cobblestone".into()),
+        "DiamondPlate" => Some("__diamond_plate".into()),
+        "Grass" | "LeafyGrass" => Some("__grass".into()),
+        "Concrete" | "Slate" | "Marble" | "Granite" | "Pebble"
+        | "CorrodedMetal" | "Foil" | "Metal" | "Sand" | "Fabric"
+        | "Snow" | "Mud" | "Ground" | "Asphalt" | "Salt"
+        | "Limestone" | "Pavement" => Some("__concrete".into()),
         _ => None,
     };
-    let faces: [(&str, [usize; 4], Vec3, bool); 6] = [
-        ("Top", [4, 5, 6, 7], Vec3::new(0.0, 1.0, 0.0), true),
-        ("Bottom", [0, 3, 2, 1], Vec3::new(0.0, -1.0, 0.0), false),
-        ("Front", [3, 2, 6, 7], Vec3::new(0.0, 0.0, 1.0), false),
-        ("Back", [1, 0, 4, 5], Vec3::new(0.0, 0.0, -1.0), false),
-        ("Right", [2, 1, 5, 6], Vec3::new(1.0, 0.0, 0.0), false),
-        ("Left", [0, 3, 7, 4], Vec3::new(-1.0, 0.0, 0.0), false),
+    // Last pair is the physical U/V span of the face in studs, used by
+    // Texture. Decal ignores it and always covers the face once.
+    let faces: [(&str, [usize; 4], Vec3, (f32, f32)); 6] = [
+        ("Top", [4, 5, 6, 7], Vec3::new(0.0, 1.0, 0.0), (h.x * 2.0, h.z * 2.0)),
+        ("Bottom", [0, 3, 2, 1], Vec3::new(0.0, -1.0, 0.0), (h.x * 2.0, h.z * 2.0)),
+        ("Front", [3, 2, 6, 7], Vec3::new(0.0, 0.0, 1.0), (h.x * 2.0, h.y * 2.0)),
+        ("Back", [1, 0, 4, 5], Vec3::new(0.0, 0.0, -1.0), (h.x * 2.0, h.y * 2.0)),
+        ("Right", [2, 1, 5, 6], Vec3::new(1.0, 0.0, 0.0), (h.z * 2.0, h.y * 2.0)),
+        ("Left", [0, 3, 7, 4], Vec3::new(-1.0, 0.0, 0.0), (h.z * 2.0, h.y * 2.0)),
     ];
-    for (face, idx, n, is_top) in faces {
-        let tex = if let Some(d) = decals.get(face) {
-            Some(d.clone())
-        } else if is_top {
-            mat_tex.clone()
+    for (face, idx, n, face_span) in faces {
+        let points = [v[idx[0]], v[idx[1]], v[idx[2]], v[idx[3]]];
+        let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        // A decal is a second surface over the part, not a replacement for the
+        // part face. Keeping the base face means transparent PNG pixels reveal
+        // the underlying BrickColor/material exactly as they do in Studio.
+        // A face SurfaceType takes visual priority over the broad material
+        // pattern, just like classic Roblox studs/inlets over Plastic/Wood.
+        let face_texture = surface_patterns.get(face).cloned().or_else(|| mat_tex.clone());
+        let tile_studs = if surface_patterns.contains_key(face) { 1.0 } else { 4.0 };
+        let material_uv = if face_texture.is_some() {
+            // Studs/inlets repeat once per stud; broader material patterns use
+            // a four-stud tile to avoid excessive high-frequency detail.
+            [[0.0, 0.0], [face_span.0 / tile_studs, 0.0],
+             [face_span.0 / tile_studs, face_span.1 / tile_studs], [0.0, face_span.1 / tile_studs]]
         } else {
-            mat_tex.clone()
+            uv
         };
-        push_quad(tris, cf, [v[idx[0]], v[idx[1]], v[idx[2]], v[idx[3]]], n, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], tex);
+        push_quad(tris, cf, points, n, material_uv, face_texture);
+        if let Some(overlays) = decals.get(face) {
+            for (layer, surface) in overlays.iter().enumerate() {
+                // Texture repeats according to studs-per-tile; Decal occupies
+                // the face once. UV wrapping is handled in the shader.
+                let overlay_uv = surface.tile.map(|(u, v, offset_u, offset_v)| {
+                    let start_u = -offset_u / u;
+                    let start_v = -offset_v / v;
+                    [
+                        [start_u, start_v], [start_u + face_span.0 / u, start_v],
+                        [start_u + face_span.0 / u, start_v + face_span.1 / v],
+                        [start_u, start_v + face_span.1 / v],
+                    ]
+                }).unwrap_or(uv);
+                // Give every overlay layer a deterministic separation.
+                let offset = n.mul(0.0015 * (layer + 1) as f32);
+                let overlay = points.map(|point| point.add(&offset));
+                push_quad_surface(tris, cf, overlay, n, overlay_uv,
+                    Some(surface.texture.clone()), surface.opacity, true,
+                    Some(surface.color), true);
+            }
+        }
     }
 }
 
 fn build_ball(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
-    let lats = 8;
-    let lons = 12;
-    let r = half.x.min(half.y).min(half.z);
+    // Roblox Ball parts fill Size on every axis: a non-uniform Size is an
+    // ellipsoid, not a sphere using the smallest dimension. Use enough rings
+    // to remain round on tablets while keeping the mobile vertex count modest.
+    let lats = 12;
+    let lons = 20;
+    let point = |latitude: f32, longitude: f32| {
+        let ring = latitude.cos();
+        Vec3::new(
+            longitude.cos() * ring * half.x,
+            latitude.sin() * half.y,
+            longitude.sin() * ring * half.z,
+        )
+    };
+    let normal = |latitude: f32, longitude: f32| {
+        // The normal of a scaled sphere uses inverse scale. Computing it this
+        // way prevents stretched balls from having visibly incorrect shading
+        // if a lit viewport mode is added later.
+        Vec3::new(
+            longitude.cos() * latitude.cos() / half.x.max(0.001),
+            latitude.sin() / half.y.max(0.001),
+            longitude.sin() * latitude.cos() / half.z.max(0.001),
+        ).normalize()
+    };
     for i in 0..lats {
-        let la0 = std::f32::consts::PI * (-0.5 + i as f32 / lats as f32);
-        let la1 = std::f32::consts::PI * (-0.5 + (i + 1) as f32 / lats as f32);
-        let z0 = la0.sin() * r;
-        let z1 = la1.sin() * r;
-        let r0 = la0.cos() * r;
-        let r1 = la1.cos() * r;
+        let lat0 = std::f32::consts::PI * (-0.5 + i as f32 / lats as f32);
+        let lat1 = std::f32::consts::PI * (-0.5 + (i + 1) as f32 / lats as f32);
         for j in 0..lons {
-            let a0 = 2.0 * std::f32::consts::PI * j as f32 / lons as f32;
-            let a1 = 2.0 * std::f32::consts::PI * (j + 1) as f32 / lons as f32;
-            let x0 = a0.cos();
-            let y0 = a0.sin();
-            let x1 = a1.cos();
-            let y1 = a1.sin();
-            let n = Vec3::new((x0 + x1) * 0.5 * (r0 + r1) * 0.5, (y0 + y1) * 0.5 * (r0 + r1) * 0.5, (z0 + z1) * 0.5).normalize();
-            push_tri(tris, cf, [Vec3::new(x0 * r0, y0 * r0, z0), Vec3::new(x1 * r0, y1 * r0, z0), Vec3::new(x1 * r1, y1 * r1, z1)], n, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], None);
-            push_tri(tris, cf, [Vec3::new(x0 * r0, y0 * r0, z0), Vec3::new(x1 * r1, y1 * r1, z1), Vec3::new(x0 * r1, y0 * r1, z1)], n, [[0.0, 0.0], [1.0, 1.0], [0.0, 1.0]], None);
+            let lon0 = 2.0 * std::f32::consts::PI * j as f32 / lons as f32;
+            let lon1 = 2.0 * std::f32::consts::PI * (j + 1) as f32 / lons as f32;
+            let p00 = point(lat0, lon0);
+            let p01 = point(lat0, lon1);
+            let p11 = point(lat1, lon1);
+            let p10 = point(lat1, lon0);
+            let n = normal((lat0 + lat1) * 0.5, (lon0 + lon1) * 0.5);
+            push_tri(tris, cf, [p00, p01, p11], n,
+                [[j as f32 / lons as f32, i as f32 / lats as f32],
+                 [(j + 1) as f32 / lons as f32, i as f32 / lats as f32],
+                 [(j + 1) as f32 / lons as f32, (i + 1) as f32 / lats as f32]], None);
+            push_tri(tris, cf, [p00, p11, p10], n,
+                [[j as f32 / lons as f32, i as f32 / lats as f32],
+                 [(j + 1) as f32 / lons as f32, (i + 1) as f32 / lats as f32],
+                 [j as f32 / lons as f32, (i + 1) as f32 / lats as f32]], None);
         }
     }
 }
 
 fn build_cylinder(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
-    let segments = 12;
-    let r = half.y.min(half.z);
+    // Roblox cylinders run along local X. Y and Z can differ, producing an
+    // elliptical cross-section that must still occupy the full declared Size.
+    let segments = 20;
     let mut front = Vec::new();
     let mut back = Vec::new();
     for i in 0..segments {
@@ -826,10 +1197,19 @@ fn build_cylinder(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
         let t2 = (i + 1) as f32 / segments as f32 * 2.0 * std::f32::consts::PI;
         let (sy1, sz1) = t.sin_cos();
         let (sy2, sz2) = t2.sin_cos();
-        let n = Vec3::new(0.0, (sy1 + sy2) * 0.5, (sz1 + sz2) * 0.5).normalize();
-        push_quad(tris, cf, [Vec3::new(-half.x, sy1 * r, sz1 * r), Vec3::new(half.x, sy1 * r, sz1 * r), Vec3::new(half.x, sy2 * r, sz2 * r), Vec3::new(-half.x, sy2 * r, sz2 * r)], n, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], None);
-        front.push(Vec3::new(half.x, sy1 * r, sz1 * r));
-        back.push(Vec3::new(-half.x, sy1 * r, sz1 * r));
+        let n = Vec3::new(
+            0.0,
+            (sy1 + sy2) * 0.5 / half.y.max(0.001),
+            (sz1 + sz2) * 0.5 / half.z.max(0.001),
+        ).normalize();
+        push_quad(tris, cf, [
+            Vec3::new(-half.x, sy1 * half.y, sz1 * half.z),
+            Vec3::new(half.x, sy1 * half.y, sz1 * half.z),
+            Vec3::new(half.x, sy2 * half.y, sz2 * half.z),
+            Vec3::new(-half.x, sy2 * half.y, sz2 * half.z),
+        ], n, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], None);
+        front.push(Vec3::new(half.x, sy1 * half.y, sz1 * half.z));
+        back.push(Vec3::new(-half.x, sy1 * half.y, sz1 * half.z));
     }
     let fc = Vec3::new(half.x, 0.0, 0.0);
     let bc = Vec3::new(-half.x, 0.0, 0.0);
@@ -896,6 +1276,8 @@ fn build_truss(tris: &mut Vec<Tri>, cf: &CFrame, half: Vec3) {
 
 struct MeshData {
     vertices: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
     uvs: Vec<[f32; 2]>,
     faces: Vec<[u32; 3]>,
     aabb_min: [f32; 3],
@@ -980,6 +1362,8 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     if let Some(cached) = crate::asset_downloader::get_cached_mesh(id_or_path) {
         return Some(MeshData {
             vertices: cached.vertices,
+            normals: cached.normals,
+            colors: cached.colors,
             uvs: cached.uvs,
             faces: cached.faces,
             aabb_min: cached.aabb_min,
@@ -1034,6 +1418,8 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     }
 
     let mut vertices = Vec::with_capacity(vertex_count);
+    let mut normals = Vec::with_capacity(vertex_count);
+    let mut colors = Vec::with_capacity(vertex_count);
     let mut uvs = Vec::with_capacity(vertex_count);
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
@@ -1042,6 +1428,9 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
         let px = f32::from_le_bytes(bytes[o..o + 4].try_into().ok()?);
         let py = f32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?);
         let pz = f32::from_le_bytes(bytes[o + 8..o + 12].try_into().ok()?);
+        let nx = f32::from_le_bytes(bytes[o + 12..o + 16].try_into().ok()?);
+        let ny = f32::from_le_bytes(bytes[o + 16..o + 20].try_into().ok()?);
+        let nz = f32::from_le_bytes(bytes[o + 20..o + 24].try_into().ok()?);
         let u = f32::from_le_bytes(bytes[o + 24..o + 28].try_into().ok()?);
         let v = f32::from_le_bytes(bytes[o + 28..o + 32].try_into().ok()?);
         // Skip NaN/inf vertices (would create spikes).
@@ -1055,6 +1444,8 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
         max[1] = max[1].max(py);
         max[2] = max[2].max(pz);
         vertices.push([px, py, pz]);
+        normals.push([nx, ny, nz]);
+        colors.push([1.0; 4]);
         uvs.push([u, 1.0 - v]);
     }
     cursor += vertex_count * VERTEX_STRIDE;
@@ -1081,9 +1472,9 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
             )
         } else {
             (
-                u32::from_le_bytes(bytes[o..o + 2].try_into().ok()?),
-                u32::from_le_bytes(bytes[o + 2..o + 4].try_into().ok()?),
-                u32::from_le_bytes(bytes[o + 4..o + 6].try_into().ok()?),
+                u16::from_le_bytes(bytes[o..o + 2].try_into().ok()?) as u32,
+                u16::from_le_bytes(bytes[o + 2..o + 4].try_into().ok()?) as u32,
+                u16::from_le_bytes(bytes[o + 4..o + 6].try_into().ok()?) as u32,
             )
         };
         // Skip faces referencing out-of-range vertices (would create spikes).
@@ -1095,7 +1486,7 @@ fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     if faces.is_empty() {
         return None;
     }
-    Some(MeshData { vertices, uvs, faces, aabb_min: min, aabb_max: max })
+    Some(MeshData { vertices, normals, colors, uvs, faces, aabb_min: min, aabb_max: max })
 }
 
 // ----------------------------------------------------------------------------
@@ -1149,13 +1540,11 @@ pub fn spawn_camera_and_light(commands: &mut Commands) {
         // see the whole place, and a small near plane means you can go right up
         // to / inside a part without the geometry vanishing.
         Projection::Perspective(PerspectiveProjection {
-            // near/far tuned for large maps: far enough to see the whole place
-            // (parts beyond the far plane pop in/out = flicker), while keeping
-            // the near/far ratio reasonable for depth precision. Far=20000 was
-            // too large (z-fighting); far=800 was too small (distant parts
-            // clipped). 2000 balances both.
-            near: 0.1,
-            far: 2000.0,
+            // Bevy/wgpu uses reverse-Z depth, so a large far plane does not
+            // cause the precision collapse of a traditional projection. Keep
+            // large Roblox worlds visible when Frame All zooms beyond 2k studs.
+            near: 0.1 * STUD_TO_METER,
+            far: 100_000.0 * STUD_TO_METER,
             fov: 60f32.to_radians(),
             ..default()
         }),
@@ -1183,9 +1572,9 @@ pub fn orbit_eye_target(cam: &OrbitCam) -> (BVec3, BVec3) {
         cam.target[1] + cam.dist * sp,
         cam.target[2] + cam.dist * cp * cy,
     ];
-    // No Z-flip (consistent with geometry rendered in Roblox space).
-    let eye = BVec3::new(eye_s[0], eye_s[1], eye_s[2]);
-    let target = BVec3::new(cam.target[0], cam.target[1], cam.target[2]);
+    // Orbit state is presented to the editor in studs; the GPU world is metres.
+    let eye = BVec3::new(eye_s[0], eye_s[1], eye_s[2]) * STUD_TO_METER;
+    let target = BVec3::new(cam.target[0], cam.target[1], cam.target[2]) * STUD_TO_METER;
     (eye, target)
 }
 
@@ -1199,6 +1588,23 @@ pub fn rebuild_scene(
     dom: &WeakDom,
 ) {
     let parts = extract_geometry(dom);
+    let selectable = parts.iter().filter_map(|part| {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for vertex in &part.tris {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(vertex.pos[axis]);
+                max[axis] = max[axis].max(vertex.pos[axis]);
+            }
+        }
+        let triangles = part.tris.chunks_exact(3)
+            .map(|vertices| [vertices[0].pos, vertices[1].pos, vertices[2].pos])
+            .collect();
+        min[0].is_finite().then_some(SelectablePart {
+            referent: part.referent, min, max, triangles,
+        })
+    }).collect();
+    commands.insert_resource(ViewportScene { parts: selectable });
 
     let root = commands.spawn(RbxSceneRoot).id();
 
@@ -1206,21 +1612,31 @@ pub fn rebuild_scene(
     // decals, studs). Keys like "rbxassetid://123" are resolved to the local
     // asset/<id>.png file and uploaded as Bevy Images.
     let mut tex_cache: HashMap<String, Handle<Image>> = HashMap::new();
+    // Keep whether an image actually contains alpha. Texture alpha must select
+    // Bevy's transparent render phase even when BasePart.Transparency is zero;
+    // otherwise PNG cut-outs are incorrectly rendered as opaque rectangles.
+    let mut texture_has_alpha: HashMap<String, bool> = HashMap::new();
     let mut texture_ids: HashMap<String, (u32, u32, Vec<u8>)> = HashMap::new();
     for p in &parts {
         for t in &p.tris {
-            if let Some(ref k) = t.tex {
-                if let Some(id) = extract_asset_id(k) {
-                    if !texture_ids.contains_key(k) {
-                        if let Some(img) = load_image_rgba(&id) {
-                            texture_ids.insert(k.clone(), img);
-                        }
+            if let Some(ref key) = t.tex {
+                if !texture_ids.contains_key(key) {
+                    // Procedural material keys (`__brick`, `__grass`, …) are
+                    // intentionally not Roblox asset IDs. The old asset-ID
+                    // gate rejected them before `get_cached_image` could
+                    // generate their pixels, so every material stayed flat.
+                    // Real content URIs are normalized to their numeric ID;
+                    // procedural keys pass through unchanged.
+                    let lookup = extract_asset_id(key).unwrap_or_else(|| key.clone());
+                    if let Some(img) = load_image_rgba(&lookup) {
+                        texture_ids.insert(key.clone(), img);
                     }
                 }
             }
         }
     }
     for (k, (w, h, rgba)) in &texture_ids {
+        texture_has_alpha.insert(k.clone(), rgba.chunks_exact(4).any(|pixel| pixel[3] < 255));
         let bevy_img = Image::new(
             Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
             TextureDimension::D2,
@@ -1245,39 +1661,81 @@ pub fn rebuild_scene(
     // Semi-transparent surfaces (glass, alpha decals) blend back-to-front
     // and were affected the same way. BTreeMap always iterates in sorted key
     // order, so the same file now produces the same draw order every time.
-    type Key = ([u8; 3], u8, Option<String>);
+    // Transparent geometry gets one bucket per source part. Bevy sorts
+    // transparent *entities*, not triangles inside a merged mesh; merging all
+    // glass with the same color made distant panes draw over nearby panes.
+    // Opaque surfaces remain aggressively batched for Android performance.
+    type Key = ([u8; 3], u8, Option<String>, bool, u32, Option<usize>);
     let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
-    for p in &parts {
-        let ck = [
-            (p.color[0] * 255.0).round() as u8,
-            (p.color[1] * 255.0).round() as u8,
-            (p.color[2] * 255.0).round() as u8,
-        ];
-        let ak = (p.alpha * 255.0).round() as u8;
+    for (part_index, p) in parts.iter().enumerate() {
         for t in &p.tris {
-            buckets.entry((ck, ak, t.tex.clone())).or_default().push(t.clone());
+            if t.hide_without_texture
+                && t.tex.as_ref().map_or(true, |key| !tex_cache.contains_key(key))
+            {
+                continue;
+            }
+            let surface_color = t.color_override.unwrap_or(p.color);
+            let ck = [
+                (surface_color[0] * 255.0).round() as u8,
+                (surface_color[1] * 255.0).round() as u8,
+                (surface_color[2] * 255.0).round() as u8,
+            ];
+            let ak = (p.alpha * t.opacity * 255.0).round() as u8;
+            if ak > 0 {
+                let image_alpha = t.tex.as_ref()
+                    .and_then(|key| texture_has_alpha.get(key))
+                    .copied().unwrap_or(false);
+                let uses_texture_alpha = t.texture_mode == 0;
+                let sort_part = (ak < 255 || (image_alpha && uses_texture_alpha)).then_some(part_index);
+                buckets.entry((ck, ak, t.tex.clone(), t.tint, t.texture_mode, sort_part)).or_default().push(t.clone());
+            }
         }
     }
     let draw_call_count = buckets.len();
 
-    for ((ck, ak, tex_key), tris) in buckets {
+    for ((ck, ak, tex_key, tint, texture_mode, sort_part), tris) in buckets {
+        // Put each transparent entity's origin at its geometric center so
+        // Bevy's back-to-front phase has a meaningful distance to sort. Opaque
+        // merged buckets stay in world space at the origin.
+        let center = if sort_part.is_some() && !tris.is_empty() {
+            let sum = tris.iter().fold([0.0; 3], |mut sum, vertex| {
+                sum[0] += vertex.pos[0];
+                sum[1] += vertex.pos[1];
+                sum[2] += vertex.pos[2];
+                sum
+            });
+            let count = tris.len() as f32;
+            [sum[0] / count, sum[1] / count, sum[2] / count]
+        } else {
+            [0.0; 3]
+        };
         let mut positions = Vec::new();
         let mut normals = Vec::new();
+        let mut colors = Vec::new();
         let mut uvs = Vec::new();
-        let mut indices = Vec::new();
-        let mut idx = 0u32;
-        for t in &tris {
-            positions.push(t.pos);
+        let mut indices = Vec::with_capacity(tris.len());
+        for (idx, t) in tris.iter().enumerate() {
+            positions.push([
+                t.pos[0] - center[0],
+                t.pos[1] - center[1],
+                t.pos[2] - center[2],
+            ]);
             normals.push(t.normal);
+            colors.push(t.vertex_color);
             uvs.push(t.uv);
-            indices.push(idx);
-            indices.push(idx + 1);
-            indices.push(idx + 2);
-            idx += 3;
+            indices.push(idx as u32);
         }
+        // Geometry extraction stores one Tri record per vertex, in groups of
+        // three. The old code emitted *three indices for every one vertex*
+        // (0,1,2 then 3,4,5 while only vertices 0 and 1 existed), producing an
+        // out-of-bounds index buffer. Depending on the Android GPU/driver this
+        // dropped meshes, connected unrelated faces, or read arbitrary vertex
+        // data — the main reason the viewport appeared fundamentally broken.
+        debug_assert_eq!(indices.len() % 3, 0);
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
         mesh.insert_indices(Indices::U32(indices));
         let mh = meshes.add(mesh);
@@ -1311,17 +1769,17 @@ pub fn rebuild_scene(
         // get_cached_image — those should tint. Anything else (a real
         // rbxassetid/content-id key) is a downloaded Decal/MeshPart texture
         // and should render as-is.
-        let tint_texture: u32 = match &tex_key {
-            Some(k) if k.starts_with("__") => 1,
-            _ => 0,
-        };
+        let tint_texture: u32 = u32::from(tint);
         let mth = materials.add(FlatMaterial {
             color,
             light_dir: Vec4::new(60.0, 90.0, 40.0, 0.0),
             has_texture,
             texture,
             tint_texture,
-            transparent: alpha < 0.99,
+            texture_mode,
+            transparent: alpha < 0.999
+                || (texture_mode == 0
+                    && tex_key.as_ref().and_then(|key| texture_has_alpha.get(key)).copied().unwrap_or(false)),
             // Was a flat `1.0` for every material. That pushes ALL surfaces
             // toward the camera by the same amount, so two coincident/
             // overlapping parts (a decal-carrying part stacked directly on
@@ -1338,7 +1796,11 @@ pub fn rebuild_scene(
         });
 
         commands.entity(root).with_children(|parent| {
-            parent.spawn((Mesh3d(mh), MeshMaterial3d(mth), Transform::IDENTITY));
+            parent.spawn((
+                Mesh3d(mh),
+                MeshMaterial3d(mth),
+                Transform::from_xyz(center[0], center[1], center[2]),
+            ));
         });
     }
 
@@ -1351,4 +1813,203 @@ pub fn update_camera(mut q: Query<&mut Transform, With<RbxCamera>>, cam: Res<Orb
     for mut t in &mut q {
         *t = Transform::from_translation(eye_b).looking_at(target_b, BVec3::Y);
     }
+}
+
+/// Convert a camera-relative Roblox offset (right, up, camera-back) into a
+/// world-space stud vector for BillboardGui StudsOffset/ExtentsOffset.
+pub fn camera_relative_offset(cam: &OrbitCam, offset: [f32; 3]) -> [f32; 3] {
+    let (eye, target) = orbit_eye_target(cam);
+    let forward = (target - eye).normalize_or_zero();
+    let right = forward.cross(BVec3::Y).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let world = right * offset[0] + up * offset[1] - forward * offset[2];
+    world.to_array()
+}
+
+/// Project a Roblox world point into normalized viewport coordinates. Returns
+/// `(x, y, camera_distance)` and rejects points behind the camera.
+pub fn project_world_point(cam: &OrbitCam, point_studs: [f32; 3], aspect: f32)
+    -> Option<[f32; 3]>
+{
+    let (eye, target) = orbit_eye_target(cam);
+    let point = BVec3::new(point_studs[0], point_studs[1], point_studs[2]) * STUD_TO_METER;
+    let forward = (target - eye).normalize_or_zero();
+    let right = forward.cross(BVec3::Y).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let relative = point - eye;
+    let depth = relative.dot(forward);
+    if depth <= 0.1 * STUD_TO_METER { return None; }
+    let tan_half_fov = (60.0_f32.to_radians() * 0.5).tan();
+    let ndc_x = relative.dot(right) / (depth * tan_half_fov * aspect.max(0.001));
+    let ndc_y = relative.dot(up) / (depth * tan_half_fov);
+    Some([(ndc_x + 1.0) * 0.5, (1.0 - ndc_y) * 0.5, depth / STUD_TO_METER])
+}
+
+/// Ray-cast a screen point against selectable part bounds. `screen` is in
+/// normalized viewport coordinates (0..1, top-left origin).
+pub fn pick_part(scene: &ViewportScene, cam: &OrbitCam, screen: [f32; 2], aspect: f32)
+    -> Option<rbx_dom_weak::types::Ref>
+{
+    let (eye, target) = orbit_eye_target(cam);
+    let forward = (target - eye).normalize_or_zero();
+    let right = forward.cross(BVec3::Y).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let tan_half_fov = (60.0_f32.to_radians() * 0.5).tan();
+    let x = (screen[0] * 2.0 - 1.0) * aspect * tan_half_fov;
+    let y = (1.0 - screen[1] * 2.0) * tan_half_fov;
+    let direction = (forward + right * x + up * y).normalize_or_zero();
+
+    let origin = eye.to_array();
+    let direction = direction.to_array();
+    scene.parts.iter().filter_map(|part| {
+        // Broad phase rejects almost every part without touching its triangles.
+        ray_aabb(origin, direction, part.min, part.max)?;
+        let distance = part.triangles.iter()
+            .filter_map(|triangle| ray_triangle(origin, direction, *triangle))
+            .min_by(f32::total_cmp)?;
+        Some((distance, part.referent))
+    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, referent)| referent)
+}
+
+/// Two-sided Möller–Trumbore ray/triangle intersection. Roblox parts and
+/// imported meshes can contain reversed winding, so backface culling would
+/// make visible surfaces impossible to select.
+fn ray_triangle(origin: [f32; 3], direction: [f32; 3], triangle: [[f32; 3]; 3]) -> Option<f32> {
+    let o = BVec3::from_array(origin);
+    let d = BVec3::from_array(direction);
+    let a = BVec3::from_array(triangle[0]);
+    let edge_1 = BVec3::from_array(triangle[1]) - a;
+    let edge_2 = BVec3::from_array(triangle[2]) - a;
+    let p = d.cross(edge_2);
+    let determinant = edge_1.dot(p);
+    if determinant.abs() < 1e-7 { return None; }
+    let inverse = 1.0 / determinant;
+    let t = o - a;
+    let u = t.dot(p) * inverse;
+    if !(0.0..=1.0).contains(&u) { return None; }
+    let q = t.cross(edge_1);
+    let v = d.dot(q) * inverse;
+    if v < 0.0 || u + v > 1.0 { return None; }
+    let distance = edge_2.dot(q) * inverse;
+    (distance >= 0.0).then_some(distance)
+}
+
+fn ray_aabb(origin: [f32; 3], direction: [f32; 3], min: [f32; 3], max: [f32; 3]) -> Option<f32> {
+    let mut near: f32 = 0.0;
+    let mut far = f32::INFINITY;
+    for axis in 0..3 {
+        if direction[axis].abs() < 1e-7 {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] { return None; }
+        } else {
+            let inverse = 1.0 / direction[axis];
+            let mut a = (min[axis] - origin[axis]) * inverse;
+            let mut b = (max[axis] - origin[axis]) * inverse;
+            if a > b { std::mem::swap(&mut a, &mut b); }
+            near = near.max(a);
+            far = far.min(b);
+            if near > far { return None; }
+        }
+    }
+    (far >= 0.0).then_some(near.max(0.0))
+}
+
+#[derive(Component)]
+pub struct SelectionVisual;
+
+/// Rebuild the selected-part outline and XYZ move gizmo when selection changes.
+pub fn update_selection_visual(
+    mut commands: Commands,
+    editor: NonSend<crate::app::EditorApp>,
+    scene: Res<ViewportScene>,
+    mut previous: Local<Option<rbx_dom_weak::types::Ref>>,
+    old: Query<Entity, With<SelectionVisual>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<FlatMaterial>>,
+) {
+    let selected = editor.selected_ref();
+    if *previous == selected && !scene.is_changed() { return; }
+    *previous = selected;
+    for entity in &old { commands.entity(entity).despawn(); }
+    let Some(bounds) = selected.and_then(|selected| scene.parts.iter().find(|part| part.referent == selected)) else { return; };
+
+    let min = bounds.min;
+    let max = bounds.max;
+    let corners = [
+        [min[0], min[1], min[2]], [max[0], min[1], min[2]],
+        [max[0], max[1], min[2]], [min[0], max[1], min[2]],
+        [min[0], min[1], max[2]], [max[0], min[1], max[2]],
+        [max[0], max[1], max[2]], [min[0], max[1], max[2]],
+    ];
+    let edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)];
+    let outline: Vec<_> = edges.into_iter().flat_map(|(a,b)| [corners[a], corners[b]]).collect();
+    spawn_lines(&mut commands, &mut meshes, &mut materials, outline, [0.1, 0.75, 1.0]);
+
+    let center = [(min[0]+max[0])*0.5, (min[1]+max[1])*0.5, (min[2]+max[2])*0.5];
+    let extent = (max[0]-min[0]).max(max[1]-min[1]).max(max[2]-min[2]);
+    let length = (extent * 0.65).clamp(2.0 * STUD_TO_METER, 16.0 * STUD_TO_METER);
+    for (axis_index, axis, color) in [
+        (0, [length,0.0,0.0], [1.0,0.15,0.15]),
+        (1, [0.0,length,0.0], [0.15,1.0,0.25]),
+        (2, [0.0,0.0,length], [0.2,0.45,1.0]),
+    ] {
+        let end = [center[0]+axis[0], center[1]+axis[1], center[2]+axis[2]];
+        let wing = length * 0.12;
+        let mut left = end;
+        let mut right = end;
+        left[axis_index] -= wing;
+        right[axis_index] -= wing;
+        left[(axis_index + 1) % 3] -= wing * 0.55;
+        right[(axis_index + 1) % 3] += wing * 0.55;
+        spawn_lines(&mut commands, &mut meshes, &mut materials,
+            vec![center, end, end, left, end, right], color);
+    }
+}
+
+fn spawn_lines(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<FlatMaterial>, positions: Vec<[f32;3]>, rgb: [f32;3]) {
+    let count = positions.len() as u32;
+    let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; count as usize]);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0, 0.0]; count as usize]);
+    mesh.insert_indices(Indices::U32((0..count).collect()));
+    let material = materials.add(FlatMaterial {
+        color: Color::srgba(rgb[0], rgb[1], rgb[2], 1.0).to_linear(),
+        light_dir: Vec4::ZERO, has_texture: 0, texture: None, tint_texture: 0,
+        texture_mode: 0, transparent: false, depth_bias: 8.0,
+    });
+    commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), Transform::IDENTITY, SelectionVisual));
+}
+
+/// Project the selected object's gizmo center and axis ends into normalized
+/// viewport coordinates. Used by egui to hit-test interactive axis handles.
+pub fn gizmo_screen_axes(scene: &ViewportScene, selected: rbx_dom_weak::types::Ref, cam: &OrbitCam, aspect: f32)
+    -> Option<([f32; 2], [[f32; 2]; 3])>
+{
+    let bounds = scene.parts.iter().find(|part| part.referent == selected)?;
+    let center = BVec3::new(
+        (bounds.min[0] + bounds.max[0]) * 0.5,
+        (bounds.min[1] + bounds.max[1]) * 0.5,
+        (bounds.min[2] + bounds.max[2]) * 0.5,
+    );
+    let extent = (bounds.max[0]-bounds.min[0]).max(bounds.max[1]-bounds.min[1]).max(bounds.max[2]-bounds.min[2]);
+    let length = (extent * 0.65).clamp(2.0 * STUD_TO_METER, 16.0 * STUD_TO_METER);
+    let project = |point: BVec3| -> Option<[f32; 2]> {
+        let (eye, target) = orbit_eye_target(cam);
+        let forward = (target-eye).normalize_or_zero();
+        let right = forward.cross(BVec3::Y).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let relative = point-eye;
+        let depth = relative.dot(forward);
+        if depth <= 0.01 { return None; }
+        let scale = (60.0_f32.to_radians()*0.5).tan();
+        Some([
+            0.5 + relative.dot(right) / (depth * scale * aspect) * 0.5,
+            0.5 - relative.dot(up) / (depth * scale) * 0.5,
+        ])
+    };
+    Some((project(center)?, [
+        project(center + BVec3::X * length)?,
+        project(center + BVec3::Y * length)?,
+        project(center + BVec3::Z * length)?,
+    ]))
 }

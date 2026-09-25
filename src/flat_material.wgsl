@@ -11,6 +11,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var tex_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var<uniform> tint_texture: u32;
+@group(#{MATERIAL_BIND_GROUP}) @binding(6) var<uniform> texture_mode: u32;
 
 @fragment
 fn fragment(
@@ -20,7 +21,9 @@ fn fragment(
     var out_alpha = material_color.a;
 
     if (has_texture == 1u) {
-        var tex_col = textureSample(tex, tex_sampler, mesh.uv);
+        // Roblox Texture and mesh UVs wrap outside 0..1. `fract` provides
+        // repeat sampling even when a mobile backend creates a clamp sampler.
+        var tex_col = textureSample(tex, tex_sampler, fract(mesh.uv));
         // Procedural material patterns (studs/brick/grass/etc., generated in
         // asset_downloader.rs) are deliberately greyscale/neutral and MEANT
         // to be multiplied by the part's BrickColor — that's how a red brick
@@ -32,28 +35,40 @@ fn fragment(
         // had — invisible before the texture finished downloading (nothing
         // to multiply against yet), then a visible muddy/grey tint the
         // moment it landed a few seconds later.
-        if (tint_texture == 1u) {
-            out_rgb = out_rgb * tex_col.rgb;
+        if (texture_mode == 1u) {
+            // SurfaceAppearance Overlay: image alpha reveals the underlying
+            // MeshPart color; it does not make the object itself transparent.
+            let textured = select(tex_col.rgb, out_rgb * tex_col.rgb, tint_texture == 1u);
+            out_rgb = mix(out_rgb, textured, tex_col.a);
+            out_alpha = material_color.a;
+        } else if (texture_mode == 2u) {
+            // TintMask: alpha chooses where MeshPart.Color tints the ColorMap.
+            out_rgb = tex_col.rgb * mix(vec3<f32>(1.0), out_rgb, tex_col.a);
+            out_alpha = material_color.a;
         } else {
-            out_rgb = tex_col.rgb;
+            if (tint_texture == 1u) {
+                out_rgb = out_rgb * tex_col.rgb;
+            } else {
+                out_rgb = tex_col.rgb;
+            }
+            // Opaque ignores image alpha; mode 0 is regular transparency.
+            out_alpha = select(tex_col.a * material_color.a, material_color.a, texture_mode == 3u);
         }
-        out_alpha = tex_col.a * material_color.a;
     }
 
-    // Flat/Lambert-style face shading. `light_dir` was declared and populated
-    // from Rust (FlatMaterial::light_dir) but never actually read here, so
-    // every face of every part rendered at identical brightness no matter
-    // which way it faced. That's why boxy geometry (curbs, planters, building
-    // masses) read as flat undifferentiated blobs instead of legible 3D
-    // shapes — there was nothing to tell a top face from a side face apart
-    // except their base color, and most parts only have one base color.
-    let n = normalize(mesh.world_normal);
-    let l = normalize(light_dir.xyz);
-    let ndotl = clamp(dot(n, l), 0.0, 1.0);
-    // Ambient floor (0.55) so shaded faces stay readable instead of going
-    // black, plus a Lambert term (0.45) for the lit/shaded contrast.
-    let lighting = 0.55 + 0.45 * ndotl;
-    out_rgb = out_rgb * lighting;
+    // Modern Roblox meshes can author color directly per vertex without any
+    // texture. Bevy exposes ATTRIBUTE_COLOR through the default mesh vertex
+    // stage when VERTEX_COLORS is specialized for this mesh.
+#ifdef VERTEX_COLORS
+    out_rgb = out_rgb * mesh.color.rgb;
+    out_alpha = out_alpha * mesh.color.a;
+#endif
 
+    // Deliberately unlit. This is the viewport's mobile-safe "Flat" mode:
+    // Color3 and texture pixels reach the framebuffer without directional
+    // lighting darkening them by as much as 45%. That lighting multiplication
+    // made correctly decoded Roblox colors look like entirely different
+    // BrickColors depending on face direction. Tonemapping is disabled on the
+    // camera as well, so this is a predictable sRGB-authored color pipeline.
     return vec4<f32>(out_rgb, out_alpha);
 }

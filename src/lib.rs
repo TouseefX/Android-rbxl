@@ -24,6 +24,7 @@ mod asset_downloader;
 mod audio;
 mod bevy_render;
 mod explorer;
+mod gui_render;
 mod jni_bridge;
 mod lua_syntax;
 mod luau_intelligence;
@@ -60,15 +61,16 @@ fn setup_3d(
 /// Draw the egui editor UI each frame (toolbar, tabs, panels) and steer the
 /// Bevy viewport camera from the 3D tab.
 fn draw_editor_ui(
-    mut app: ResMut<EditorApp>,
+    mut app: NonSendMut<EditorApp>,
     mut orbit: ResMut<bevy_render::OrbitCam>,
     mut contexts: EguiContexts,
+    viewport_scene: Res<bevy_render::ViewportScene>,
 ) {
     if let Ok(ctx) = contexts.ctx_mut() {
         // Feed anything the Android IME produced since last frame into egui
         // BEFORE the widgets are built, so the focused TextEdit sees it.
         android_ime::begin_frame(ctx);
-        app.draw_editor(ctx, &mut orbit);
+        app.draw_editor(ctx, &mut orbit, &viewport_scene);
         // Show/hide the soft keyboard to match egui's focus and flush egui's
         // clipboard writes to Android.
         android_ime::end_frame(ctx);
@@ -79,7 +81,7 @@ fn draw_editor_ui(
 /// place was opened (`needs_3d_rebuild`).
 fn rebuild_scene_system(
     mut commands: Commands,
-    mut app: ResMut<EditorApp>,
+    mut app: NonSendMut<EditorApp>,
     mut meshes: ResMut<Assets<bevy::mesh::Mesh>>,
     mut materials: ResMut<Assets<bevy_render::FlatMaterial>>,
     mut images: ResMut<Assets<bevy::image::Image>>,
@@ -131,8 +133,9 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
     // which renders magenta on this device's Adreno GPU).
     bevy_app.add_plugins(bevy_render::FlatMaterialPlugin);
 
-    bevy_app.insert_resource(editor);
+    bevy_app.insert_non_send_resource(editor);
     bevy_app.insert_resource(bevy_render::OrbitCam::default());
+    bevy_app.insert_resource(bevy_render::ViewportScene::default());
     bevy_app.insert_resource(bevy::light::AmbientLight {
         color: Color::WHITE,
         brightness: 400.0,
@@ -143,7 +146,12 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
 
     bevy_app.add_systems(Startup, setup_3d);
     // Scene rebuild + camera sync run on the main Update schedule.
-    bevy_app.add_systems(Update, (rebuild_scene_system, bevy_render::update_camera, bevy_render::update_sky_dome));
+    bevy_app.add_systems(Update, (
+        rebuild_scene_system,
+        bevy_render::update_camera,
+        bevy_render::update_sky_dome,
+        bevy_render::update_selection_visual,
+    ));
     // IMPORTANT: the egui UI must run in bevy_egui's `EguiPrimaryContextPass`
     // schedule, NOT `Update`. bevy_egui loads its fonts when it begins its
     // frame; running the UI in `Update` (before begin-pass) panics with
