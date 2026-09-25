@@ -197,6 +197,8 @@ pub struct EditorApp {
     show_stats: bool,
     /// Whether StarterGui/BillboardGui/SurfaceGui previews are drawn over the viewport.
     show_gui_preview: bool,
+    /// Hide all editor chrome and dedicate the window to the 3D viewport.
+    viewport_fullscreen: bool,
     roblox_fonts_installed: bool,
     /// GPU textures retained by the StarterGui preview.
     gui_textures: HashMap<String, egui::TextureHandle>,
@@ -384,6 +386,7 @@ impl Default for EditorApp {
             editor_focus_mode: false,
             show_stats: false,
             show_gui_preview: true,
+            viewport_fullscreen: false,
             roblox_fonts_installed: false,
             gui_textures: HashMap::new(),
             gui_scroll_offsets: HashMap::new(),
@@ -608,6 +611,29 @@ impl EditorApp {
 
         let style = ctx.style();
         let compact = self.compact_toolbar || ctx.available_rect().width() < 720.0;
+
+        // Viewport fullscreen is deliberately separate from script-editor focus
+        // mode: it removes every editor panel while retaining the live Bevy
+        // scene, GUI preview, selection, and camera interaction.
+        if self.viewport_fullscreen && self.active_tab == ActiveTab::Viewport3D {
+            if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.viewport_fullscreen = false;
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
+                .show(ctx, |ui| self.show_viewport_drag(ui, orbit, viewport_scene));
+            egui::Area::new(egui::Id::new("viewport_fullscreen_exit"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        if ui.button("✕ Exit Fullscreen").clicked() {
+                            self.viewport_fullscreen = false;
+                        }
+                    });
+                });
+            return;
+        }
 
         let top_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
             top: if compact { 6 } else { 48 },
@@ -963,6 +989,9 @@ impl EditorApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
             ui.label(RichText::new("🧊 3D (Bevy)").strong().color(Color32::from_rgb(0, 230, 255)));
+            if ui.button("⛶ Fullscreen").on_hover_text("Fill the window with the 3D viewport").clicked() {
+                self.viewport_fullscreen = true;
+            }
             ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Move, "↔ Move");
             ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Rotate, "⟳ Rotate");
             ui.selectable_value(&mut self.viewport_gizmo_mode, ViewportGizmoMode::Scale, "⤢ Scale");
