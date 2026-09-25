@@ -1910,10 +1910,19 @@ pub fn draw_starter_gui(
     let mut overrides = std::collections::HashMap::new();
     let layout_painter = ui.painter().clone();
 
-    // BillboardGui uses the same 2D layout/render tree after projecting its
-    // Adornee (or parent Part) through the Bevy orbit camera.
+    // World-space GUI is only live when it belongs to Workspace. Searching the
+    // whole DataModel incorrectly previews templates kept in ReplicatedStorage,
+    // ServerStorage, StarterPack, and similar services.
+    let workspace = dom.root().children().iter().find_map(|referent| {
+        dom.get_by_ref(*referent).filter(|instance| instance.class == "Workspace").map(|_| *referent)
+    });
+
+    // BillboardGui uses the same layout result after its world Adornee (or
+    // parent Part/Attachment) is projected through the Bevy camera. Painter is
+    // only the final screen-facing composition step; its placement, distance
+    // scaling, and occlusion remain world-space.
     let mut billboards = Vec::new();
-    gather_class(dom, dom.root_ref(), "BillboardGui", &mut billboards);
+    if let Some(workspace) = workspace { gather_class(dom, workspace, "BillboardGui", &mut billboards); }
     let aspect = viewport.width() / viewport.height().max(1.0);
     for (billboard_order, referent) in billboards.into_iter().enumerate() {
         let Some(billboard) = dom.get_by_ref(referent) else { continue; };
@@ -1922,19 +1931,36 @@ pub fn draw_starter_gui(
             Some(Variant::Ref(value)) if !value.is_none() => *value,
             _ => billboard.parent(),
         };
-        let Some(part) = dom.get_by_ref(adornee) else { continue; };
-        let mut point = match part.properties.get(&rbx_dom_weak::ustr("WorldPosition"))
-            .or_else(|| part.properties.get(&rbx_dom_weak::ustr("Position")))
-        {
-            Some(Variant::Vector3(position)) => [position.x, position.y, position.z],
-            _ => match part.properties.get(&rbx_dom_weak::ustr("CFrame")) {
-                Some(Variant::CFrame(cframe)) => [cframe.position.x, cframe.position.y, cframe.position.z],
+        let Some(anchor) = dom.get_by_ref(adornee) else { continue; };
+        // Attachment.Position is local to its parent BasePart. Treating that
+        // local vector as a world coordinate pins many billboards near the
+        // screen origin and makes them look like ordinary 2D ScreenGuis.
+        let (part, mut point) = if anchor.class == "Attachment" {
+            let Some(parent_part) = dom.get_by_ref(anchor.parent()) else { continue; };
+            let local = match anchor.properties.get(&rbx_dom_weak::ustr("Position")) {
+                Some(Variant::Vector3(value)) => [value.x, value.y, value.z], _ => [0.0; 3],
+            };
+            let world = match parent_part.properties.get(&rbx_dom_weak::ustr("CFrame")) {
+                Some(Variant::CFrame(cframe)) => [
+                    cframe.position.x + cframe.orientation.x.x*local[0] + cframe.orientation.x.y*local[1] + cframe.orientation.x.z*local[2],
+                    cframe.position.y + cframe.orientation.y.x*local[0] + cframe.orientation.y.y*local[1] + cframe.orientation.y.z*local[2],
+                    cframe.position.z + cframe.orientation.z.x*local[0] + cframe.orientation.z.y*local[1] + cframe.orientation.z.z*local[2],
+                ],
                 _ => continue,
-            },
+            };
+            (parent_part, world)
+        } else {
+            let world = match anchor.properties.get(&rbx_dom_weak::ustr("WorldPosition"))
+                .or_else(|| anchor.properties.get(&rbx_dom_weak::ustr("Position"))) {
+                Some(Variant::Vector3(position)) => [position.x, position.y, position.z],
+                _ => match anchor.properties.get(&rbx_dom_weak::ustr("CFrame")) {
+                    Some(Variant::CFrame(cframe)) => [cframe.position.x, cframe.position.y, cframe.position.z], _ => continue,
+                },
+            };
+            (anchor, world)
         };
         let part_size = match part.properties.get(&rbx_dom_weak::ustr("Size")) {
-            Some(Variant::Vector3(size)) => [size.x, size.y, size.z],
-            _ => [0.0, 0.0, 0.0],
+            Some(Variant::Vector3(size)) => [size.x, size.y, size.z], _ => [0.0; 3],
         };
         let mut camera_offset = [0.0; 3];
         let mut world_offset = [0.0; 3];
@@ -1962,7 +1988,7 @@ pub fn draw_starter_gui(
         let always_on_top = bool_value(billboard.properties.get(&rbx_dom_weak::ustr("AlwaysOnTop")), false);
         if !always_on_top {
             if let Some(hit) = crate::bevy_render::pick_part(viewport_scene, orbit, [projected[0], projected[1]], aspect) {
-                let occlusion_target = if part.class == "Attachment" { part.parent() } else { adornee };
+                let occlusion_target = if anchor.class == "Attachment" { anchor.parent() } else { adornee };
                 if hit != occlusion_target { continue; }
             }
         }
@@ -1997,7 +2023,7 @@ pub fn draw_starter_gui(
     // SurfaceGui shares the layout engine. Its part face is projected to a
     // screen rectangle; Bevy depth picking provides normal occlusion.
     let mut surfaces = Vec::new();
-    gather_class(dom, dom.root_ref(), "SurfaceGui", &mut surfaces);
+    if let Some(workspace) = workspace { gather_class(dom, workspace, "SurfaceGui", &mut surfaces); }
     for (surface_order, referent) in surfaces.into_iter().enumerate() {
         let Some(surface) = dom.get_by_ref(referent) else { continue; };
         if matches!(surface.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
@@ -2104,9 +2130,11 @@ pub fn draw_starter_gui(
         }
     }
 
+    // Editor preview intentionally mirrors StarterGui only. PlayerGui is a
+    // runtime container and may contain cloned StarterGui descendants; drawing
+    // both produces duplicates and also exposes unrelated saved runtime state.
     let mut gui_roots=Vec::new();
     if let Some(starter)=starter { gui_roots.push(starter); }
-    gather_class(dom,dom.root_ref(),"PlayerGui",&mut gui_roots);
     let mut screen_order=0usize;
     for root in gui_roots {
         let Some(container)=dom.get_by_ref(root) else {continue;};
