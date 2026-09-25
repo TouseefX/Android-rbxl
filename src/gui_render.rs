@@ -1967,28 +1967,38 @@ pub fn draw_starter_gui(
         let part_size = match part.properties.get(&rbx_dom_weak::ustr("Size")) {
             Some(Variant::Vector3(size)) => [size.x, size.y, size.z], _ => [0.0; 3],
         };
-        let mut camera_offset = [0.0; 3];
+        let mut local_offset = [0.0; 3];
         let mut world_offset = [0.0; 3];
         if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr("StudsOffset")) {
-            camera_offset[0] += offset.x; camera_offset[1] += offset.y; camera_offset[2] += offset.z;
+            local_offset[0] += offset.x; local_offset[1] += offset.y; local_offset[2] += offset.z;
         }
         if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr("StudsOffsetWorldSpace")) {
             world_offset[0] += offset.x; world_offset[1] += offset.y; world_offset[2] += offset.z;
         }
         if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr("ExtentsOffset")) {
-            camera_offset[0] += offset.x*part_size[0]*0.5;
-            camera_offset[1] += offset.y*part_size[1]*0.5;
-            camera_offset[2] += offset.z*part_size[2]*0.5;
+            local_offset[0] += offset.x*part_size[0]*0.5;
+            local_offset[1] += offset.y*part_size[1]*0.5;
+            local_offset[2] += offset.z*part_size[2]*0.5;
         }
         if let Some(Variant::Vector3(offset)) = billboard.properties.get(&rbx_dom_weak::ustr("ExtentsOffsetWorldSpace")) {
             world_offset[0] += offset.x*part_size[0]*0.5;
             world_offset[1] += offset.y*part_size[1]*0.5;
             world_offset[2] += offset.z*part_size[2]*0.5;
         }
-        let camera_world = crate::bevy_render::camera_relative_offset(orbit, camera_offset);
-        for axis in 0..3 { point[axis] += camera_world[axis] + world_offset[axis]; }
+        // StudsOffset/ExtentsOffset are adornee-relative. Their WorldSpace
+        // counterparts bypass the part orientation.
+        let local_world = match part.properties.get(&rbx_dom_weak::ustr("CFrame")) {
+            Some(Variant::CFrame(frame)) => [
+                frame.orientation.x.x*local_offset[0]+frame.orientation.x.y*local_offset[1]+frame.orientation.x.z*local_offset[2],
+                frame.orientation.y.x*local_offset[0]+frame.orientation.y.y*local_offset[1]+frame.orientation.y.z*local_offset[2],
+                frame.orientation.z.x*local_offset[0]+frame.orientation.z.y*local_offset[1]+frame.orientation.z.z*local_offset[2],
+            ], _ => local_offset,
+        };
+        for axis in 0..3 { point[axis] += local_world[axis] + world_offset[axis]; }
         let Some(projected) = crate::bevy_render::project_world_point(orbit, point, aspect) else { continue; };
-        let max_distance = number(billboard.properties.get(&rbx_dom_weak::ustr("MaxDistance")), 0.0);
+        // The native billboard projection rejects depths outside (0, 1000].
+        if projected[2] > 1000.0 { continue; }
+        let max_distance = number(billboard.properties.get(&rbx_dom_weak::ustr("MaxDistance")), f32::INFINITY);
         if max_distance > 0.0 && projected[2] > max_distance { continue; }
         let always_on_top = bool_value(billboard.properties.get(&rbx_dom_weak::ustr("AlwaysOnTop")), false);
         if !always_on_top {
@@ -2017,7 +2027,10 @@ pub fn draw_starter_gui(
         let center = Pos2::new(viewport.left()+projected[0]*viewport.width(), viewport.top()+projected[1]*viewport.height())
             + Vec2::new(size_offset.x*size.x, -size_offset.y*size.y);
         let billboard_rect = Rect::from_center_size(center, size);
-        let path = vec![(-1, billboard_order)];
+        // Far billboards are submitted first and near billboards last, while
+        // preserving discovery order at effectively equal depths.
+        let depth_order=((1000.0-projected[2]).max(0.0)*1000.0) as usize;
+        let path = vec![(-1, depth_order.saturating_mul(1_000_000).saturating_add(billboard_order))];
         for child in billboard.children() {
             collect(dom, &layout_painter, *child, billboard_rect, viewport, -1_000_000,
                 true, 1.0, 1.0, Color32::WHITE, &path, None, &mut overrides,
