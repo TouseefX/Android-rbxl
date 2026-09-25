@@ -1261,7 +1261,19 @@ impl EditorApp {
         if let Some(clicked) = clicked_gui {
             self.selected = Some(clicked);self.gui_navigation_selected=Some(clicked);
             if let Some(session)=self.gui_play_session.as_ref(){if let Err(error)=session.set_selected_gui_object(Some(clicked)){log::error!("GuiService selection: {error}");}}
-            self.status = "Selected GUI object from viewport".into();
+            self.status = if let Some(dom)=self.dom.as_ref() {
+                let mut path=Vec::new();let mut current=clicked;let mut detail=String::new();
+                while !current.is_none() {
+                    let Some(instance)=dom.get_by_ref(current) else{break;};
+                    if current==clicked {
+                        for property in ["Image","Texture","TextureID"] {
+                            if let Some(value)=instance.properties.get(&rbx_dom_weak::ustr(property)) { detail=format!(" • {property}={value:?}");break; }
+                        }
+                    }
+                    path.push(format!("{} ({})",instance.name,instance.class));current=instance.parent();
+                }
+                path.reverse();format!("Selected {}{}",path.join(" > "),detail)
+            } else { "Selected GUI object from viewport".into() };
         }
 
         if self.dom.is_none() {

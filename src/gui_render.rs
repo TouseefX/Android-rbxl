@@ -2261,6 +2261,11 @@ pub fn draw_starter_gui(
             own_shape && inherited_shape && node.clip.contains(point)
         }).unwrap_or(false);
         if pointer_inside && node.interactable { current_hovered.insert(node.referent); }
+        // Studio selection is independent of Roblox input interactivity: an
+        // ImageLabel, Frame, or inactive object must still be inspectable from
+        // the viewport. Nodes are visited back-to-front, so the last matching
+        // click is the visually topmost exact instance.
+        if response.clicked() && pointer_inside { clicked=Some(node.referent); }
         let is_button=matches!(node.class.as_str(),"TextButton"|"ImageButton");
         if is_button && node.interactable && response.clicked() && pointer_inside {
             for kind in [GuiRuntimeEventKind::MouseButton1Down,GuiRuntimeEventKind::MouseButton1Up,GuiRuntimeEventKind::MouseButton1Click,GuiRuntimeEventKind::Activated] {
