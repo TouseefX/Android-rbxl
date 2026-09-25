@@ -550,11 +550,11 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
            nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
-    // A world LayerCollector starts a separate rendering context. Never recurse
-    // into BillboardGui/SurfaceGui through a ScreenGui, otherwise its GuiObject
-    // descendants are laid out against the screen and appear as unrelated
-    // fullscreen 2D UI. World collectors are entered explicitly after projection.
-    if matches!(instance.class.as_str(), "BillboardGui" | "SurfaceGui") { return; }
+    // Every LayerCollector starts a separate rendering context. Never recurse
+    // through one collector while laying out another: each eligible ScreenGui
+    // is entered from StarterGui, while world collectors are entered only after
+    // camera projection. This prevents duplicate/fullscreen descendant draws.
+    if matches!(instance.class.as_str(), "ScreenGui" | "BillboardGui" | "SurfaceGui") { return; }
     // Roblox only flattens CanvasGroup under Sibling ZIndexBehavior. Under
     // Global it behaves as an ordinary clipping GuiObject.
     let composited_group = instance.class == "CanvasGroup" && !global_z;
@@ -2138,14 +2138,12 @@ pub fn draw_starter_gui(
     // Editor preview intentionally mirrors StarterGui only. PlayerGui is a
     // runtime container and may contain cloned StarterGui descendants; drawing
     // both produces duplicates and also exposes unrelated saved runtime state.
-    let mut gui_roots=Vec::new();
-    if let Some(starter)=starter { gui_roots.push(starter); }
+    let mut screen_guis=Vec::new();
+    if let Some(starter)=starter { gather_class(dom,starter,"ScreenGui",&mut screen_guis); }
     let mut screen_order=0usize;
-    for root in gui_roots {
-        let Some(container)=dom.get_by_ref(root) else {continue;};
-        for child in container.children() {
-            let Some(gui) = dom.get_by_ref(*child) else { continue; };
-            if gui.class != "ScreenGui" || matches!(gui.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
+    for screen_ref in screen_guis {
+            let Some(gui) = dom.get_by_ref(screen_ref) else { continue; };
+            if matches!(gui.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
             let display_order = enum_value(gui.properties.get(&rbx_dom_weak::ustr("DisplayOrder")), 0);
             let global_z = enum_value(gui.properties.get(&rbx_dom_weak::ustr("ZIndexBehavior")), 1) == 0;
             // ScreenInsets.None=0, DeviceSafeInsets=1, CoreUISafeInsets=2,
@@ -2159,12 +2157,13 @@ pub fn draw_starter_gui(
             let clip_to_safe=bool_value(gui.properties.get(&rbx_dom_weak::ustr("ClipToDeviceSafeArea")),true)&&screen_insets!=0;
             let root_clip=if clip_to_safe{root_rect}else{viewport};
             let root_path = vec![(0, screen_order)]; screen_order+=1;let first_node=nodes.len();
-            collect(dom, &layout_painter, *child, root_rect, root_clip, display_order,
-                global_z, 1.0, 1.0, Color32::WHITE, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
+            for child in gui.children() {
+                collect(dom, &layout_painter, *child, root_rect, root_clip, display_order,
+                    global_z, 1.0, 1.0, Color32::WHITE, &root_path, None, &mut overrides, scroll_offsets, &mut sequence, &mut nodes);
+            }
             if enum_value(gui.properties.get(&rbx_dom_weak::ustr("SafeAreaCompatibility")),1)==1&&screen_insets!=0 {
                 for node in &mut nodes[first_node..] {if node.rect.left()<=root_rect.left()+0.5&&node.rect.right()>=root_rect.right()-0.5&&node.rect.top()<=root_rect.top()+0.5&&node.rect.bottom()>=root_rect.bottom()-0.5{node.background_rect=viewport;}}
             }
-        }
     }
     // Resolve rounded ClipsDescendants masks after all containers have their
     // final screen transforms (including SurfaceGui orientation).
