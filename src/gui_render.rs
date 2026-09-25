@@ -550,6 +550,11 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
            nodes: &mut Vec<GuiNode>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if !visible(instance) { return; }
+    // A world LayerCollector starts a separate rendering context. Never recurse
+    // into BillboardGui/SurfaceGui through a ScreenGui, otherwise its GuiObject
+    // descendants are laid out against the screen and appear as unrelated
+    // fullscreen 2D UI. World collectors are entered explicitly after projection.
+    if matches!(instance.class.as_str(), "BillboardGui" | "SurfaceGui") { return; }
     // Roblox only flattens CanvasGroup under Sibling ZIndexBehavior. Under
     // Global it behaves as an ordinary clipping GuiObject.
     let composited_group = instance.class == "CanvasGroup" && !global_z;
