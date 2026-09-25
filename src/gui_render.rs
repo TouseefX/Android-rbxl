@@ -2186,13 +2186,18 @@ pub fn draw_starter_gui(
         }
     }
     nodes.sort_by(|left, right| {
-        left.display_order.cmp(&right.display_order).then_with(|| {
-            if left.global_z && right.global_z {
-                left.z.cmp(&right.z).then(left.order.cmp(&right.order))
-            } else {
-                left.sort_path.cmp(&right.sort_path).then(left.order.cmp(&right.order))
-            }
-        })
+        // DisplayOrder sorts whole LayerCollectors, not a flattened mixture of
+        // all objects sharing that value. Stable collector traversal decides
+        // ties; only then does ZIndexBehavior order objects inside that layer.
+        left.display_order.cmp(&right.display_order)
+            .then_with(|| left.sort_path.first().cmp(&right.sort_path.first()))
+            .then_with(|| {
+                if left.global_z && right.global_z {
+                    left.z.cmp(&right.z).then(left.order.cmp(&right.order))
+                } else {
+                    left.sort_path.cmp(&right.sort_path).then(left.order.cmp(&right.order))
+                }
+            })
     });
     let keyboard_selection = if ui.input(|input|input.key_pressed(egui::Key::Tab)) {
         let reverse=ui.input(|input|input.modifiers.shift);
