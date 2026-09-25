@@ -1069,7 +1069,7 @@ impl GuiPlaySession {
         for table in instances.values(){install_wait.call::<()>(table.clone())?;}
         let scheduler_step:Function=lua.globals().get("_arena_step_tasks")?;
         let signal_wait:Function=lua.globals().get("_arena_signal_wait")?;
-        let upgrade_signals=|table:&Table|->Result<(),String>{for pair in table.clone().pairs::<Value,Value>(){let(_,value)=pair?;if let Value::Table(candidate)=value{if candidate.raw_get::<Function>("Connect").is_ok()&&candidate.raw_get::<Function>("Fire").is_ok(){candidate.raw_set("Wait",signal_wait.clone())?;}}}Ok(())};
+        let upgrade_signals=|table:&Table|->LuaResult<()>{for pair in table.clone().pairs::<Value,Value>(){let(_,value)=pair?;if let Value::Table(candidate)=value{if candidate.raw_get::<Function>("Connect").is_ok()&&candidate.raw_get::<Function>("Fire").is_ok(){candidate.raw_set("Wait",signal_wait.clone())?;}}}Ok(())};
         for table in instances.values(){upgrade_signals(table)?;}upgrade_signals(&run_service)?;upgrade_signals(&user_input_service)?;upgrade_signals(&players)?;upgrade_signals(&local_player)?;upgrade_signals(&player_gui)?;
 
         // Roblox ModuleScript require with one-time result caching. Module
