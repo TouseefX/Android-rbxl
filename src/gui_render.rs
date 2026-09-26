@@ -81,6 +81,7 @@ struct GuiNode {
     background: Color32,
     border: Color32,
     border_size: f32,
+    border_mode: i32,
     corner_radius: f32,
     rotation: f32,
     ui_stroke: Option<(f32, Color32, f32, egui::StrokeKind)>,
@@ -571,9 +572,13 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
         .unwrap_or(1.0);
     let scale = inherited_scale * local_scale;
-    let is_screen = instance.class == "ScreenGui";
+    let is_gui = is_gui_object(&instance.class);
+    // Only GuiObjects own geometry. Non-GuiObject containers reached during
+    // the descendant walk (Folder, Configuration, Model, ...) are transparent
+    // to layout: their children resolve against the same parent rectangle.
+    // Computing gui_rect for them would fabricate a default 100x100 box.
     let rect = forced_rect.or_else(|| overrides.get(&referent).copied()).unwrap_or_else(|| {
-        if is_screen { parent_rect } else { gui_rect(dom, painter, instance, parent_rect, scale) }
+        if is_gui { gui_rect(dom, painter, instance, parent_rect, scale) } else { parent_rect }
     });
     // CanvasGroup's backing texture is exactly its AbsoluteSize, therefore it
     // always clips regardless of the serialized ClipsDescendants value.
@@ -589,7 +594,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     sort_path.push((z, current_order));
     let mut content_rect = padded_rect(dom, instance, rect, scale);
 
-    if is_gui_object(&instance.class) {
+    if is_gui {
         let transparency = number(instance.properties.get(&rbx_dom_weak::ustr("BackgroundTransparency")), 0.0).clamp(0.0, 1.0);
         let alpha = ((1.0 - transparency) * 255.0).round() as u8;
         let background = multiply_color(
@@ -686,6 +691,11 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             }
         }
         let scroll_bar_transparency = number(instance.properties.get(&rbx_dom_weak::ustr("ScrollBarImageTransparency")), 0.0).clamp(0.0, 1.0);
+        let rich_text = bool_value(instance.properties.get(&rbx_dom_weak::ustr("RichText")), false);
+        // updateMaxVisibleGraphemes(): -1 disables the crop; otherwise only
+        // the first N visible graphemes render. Rich-text markup is
+        // structural and never consumes any of the budget.
+        let max_visible_graphemes = enum_value(instance.properties.get(&rbx_dom_weak::ustr("MaxVisibleGraphemes")), -1);
         let order = *sequence;
         *sequence += 1;
         nodes.push(GuiNode {
@@ -695,7 +705,11 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             background_rect:rect,
             content_rect,
             gui_scale: scale,
-            clip: parent_clip.intersect(rect),
+            // firstAncestorClipping(): the element is clipped ONLY by the
+            // cached clip rect of its nearest clipping ancestor — never by its
+            // own rect. Text overflow, BorderMode.Outline chrome and rotated
+            // corners all legitimately paint outside AbsoluteSize.
+            clip: parent_clip,
             rounded_clips: Vec::new(),
             surface_warp: None,
             display_order,
@@ -706,6 +720,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             background,
             border: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("BorderColor3")), 255, [27,42,53]), modulation),
             border_size: number(instance.properties.get(&rbx_dom_weak::ustr("BorderSizePixel")), 1.0).max(0.0) * scale,
+            border_mode: enum_value(instance.properties.get(&rbx_dom_weak::ustr("BorderMode")), 0),
             corner_radius,
             rotation: number(instance.properties.get(&rbx_dom_weak::ustr("Rotation")), 0.0),
             ui_stroke,
@@ -713,7 +728,10 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             gradient,
             gradient_rect: rect,
             group_gradients: Vec::new(),
-            text: match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() },
+            text: {
+                let raw = match instance.properties.get(&rbx_dom_weak::ustr("Text")) { Some(Variant::String(v)) => v.clone(), _ => String::new() };
+                if max_visible_graphemes >= 0 { crop_graphemes(&raw, rich_text, max_visible_graphemes as usize) } else { raw }
+            },
             text_color: multiply_color(color(instance.properties.get(&rbx_dom_weak::ustr("TextColor3")), ((1.0-text_transparency)*255.0) as u8, [0,0,0]), modulation),
             text_size: (number(instance.properties.get(&rbx_dom_weak::ustr("TextSize")), 14.0) * scale).clamp(1.0, 400.0),
             text_x_alignment: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextXAlignment")), 1),
@@ -721,7 +739,7 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             text_wrapped: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextWrapped")), false),
             text_scaled: bool_value(instance.properties.get(&rbx_dom_weak::ustr("TextScaled")), false),
             text_truncate: enum_value(instance.properties.get(&rbx_dom_weak::ustr("TextTruncate")), 0),
-            rich_text: bool_value(instance.properties.get(&rbx_dom_weak::ustr("RichText")), false),
+            rich_text,
             line_height: number(instance.properties.get(&rbx_dom_weak::ustr("LineHeight")), 1.0).max(0.1),
             font_monospace,
             font_extended,
@@ -917,6 +935,14 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
                 global_z, scale, opacity, tint, &sort_path, Some(Rect::from_min_size(Pos2::new(x, y), natural.size())), overrides, scroll_offsets, sequence, nodes);
         }
+        // UILayouts only arrange sibling GuiObjects; non-GuiObject children
+        // (Folder, ...) are ignored by the layout but their descendants still
+        // render, resolved against the container rectangle.
+        for child in instance.children() {
+            if dom.get_by_ref(*child).map(|candidate| is_gui_object(&candidate.class)).unwrap_or(false) { continue; }
+            collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
+                global_z, scale, opacity, tint, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
+        }
     } else if let Some(layout) = child_of_class(dom, instance, "UIGridLayout") {
         let (cxs, cxo, cys, cyo) = udim2_tuple(layout.properties.get(&rbx_dom_weak::ustr("CellSize")))
             .unwrap_or((0.0, 100.0, 0.0, 100.0));
@@ -977,6 +1003,13 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             let min = origin + Vec2::new(column as f32 * (cell.x + gap.x), row as f32 * (cell.y + gap.y));
             collect(dom, painter, child, child_parent_rect, child_clip, display_order,
                 global_z, scale, opacity, tint, &sort_path, Some(Rect::from_min_size(min, cell)), overrides, scroll_offsets, sequence, nodes);
+        }
+        // Non-GuiObject children are transparent to the grid: recurse them
+        // against the container rectangle so their descendants still render.
+        for child in instance.children() {
+            if dom.get_by_ref(*child).map(|candidate| is_gui_object(&candidate.class)).unwrap_or(false) { continue; }
+            collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
+                global_z, scale, opacity, tint, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
         }
     } else if let Some(layout) = child_of_class(dom, instance, "UIListLayout") {
         let horizontal = enum_value(layout.properties.get(&rbx_dom_weak::ustr("FillDirection")), 1) == 0;
@@ -1139,6 +1172,13 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             cursor += (if horizontal { natural.width() } else { natural.height() }) + effective_padding;
         }
         }
+        // Non-GuiObject children are transparent to the list layout: recurse
+        // them against the container rectangle so descendants still render.
+        for child in instance.children() {
+            if dom.get_by_ref(*child).map(|candidate| is_gui_object(&candidate.class)).unwrap_or(false) { continue; }
+            collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
+                global_z, scale, opacity, tint, &sort_path, None, overrides, scroll_offsets, sequence, nodes);
+        }
     } else {
         for child in instance.children() {
             collect(dom, painter, *child, child_parent_rect, child_clip, display_order,
@@ -1243,6 +1283,44 @@ fn rich_attribute(tag: &str, name: &str) -> Option<String> {
     } else {
         Some(rest.split_whitespace().next().unwrap_or_default().trim_end_matches('/').to_string())
     }
+}
+
+/// MaxVisibleGraphemes crop (GuiTextMixin::updateMaxVisibleGraphemes): keep
+/// the first `maximum` visible grapheme clusters. In rich text, markup tags
+/// are copied through untouched (so formatting stays balanced) and character
+/// entities count as a single grapheme.
+fn crop_graphemes(text: &str, rich: bool, maximum: usize) -> String {
+    let mut output = String::new();
+    let mut remaining = maximum;
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if rich && character == '<' {
+            output.push(character);
+            for tag_character in characters.by_ref() {
+                output.push(tag_character);
+                if tag_character == '>' { break; }
+            }
+            continue;
+        }
+        if remaining == 0 {
+            if rich { continue; }
+            break;
+        }
+        if rich && character == '&' {
+            output.push(character);
+            while let Some(next) = characters.peek().copied() {
+                if next == '<' { break; }
+                output.push(next);
+                characters.next();
+                if next == ';' { break; }
+            }
+            remaining -= 1;
+            continue;
+        }
+        output.push(character);
+        remaining -= 1;
+    }
+    output
 }
 
 fn rich_layout_job(node: &GuiNode, font_size: f32, base_color: Color32,
@@ -1889,6 +1967,10 @@ fn ensure_gui_texture(ui: &egui::Ui, textures: &mut std::collections::HashMap<St
 fn gather_class(dom: &WeakDom, referent: Ref, class: &str, output: &mut Vec<Ref>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if instance.class == class { output.push(referent); }
+    // BillboardGui::stepLayouts and SurfaceGuiBase::process both bail when the
+    // collector lives inside a ViewportFrame, and GUI instances parented under
+    // a ViewportFrame are never promoted to live collectors of any kind.
+    if instance.class == "ViewportFrame" { return; }
     for child in instance.children() { gather_class(dom, *child, class, output); }
 }
 
@@ -1910,6 +1992,14 @@ pub fn draw_starter_gui(
     let starter = dom.root().children().iter().find_map(|referent| {
         dom.get_by_ref(*referent).filter(|instance| instance.class == "StarterGui").map(|_| *referent)
     });
+    // StarterGuiService::render2d is literally `if (showGui) render2d(...)`:
+    // StarterGui.ShowDevelopmentGui hides the entire edit-mode preview,
+    // including the 3D adornables owned by the service container.
+    let show_development_gui = starter
+        .and_then(|referent| dom.get_by_ref(referent))
+        .map(|instance| bool_value(instance.properties.get(&rbx_dom_weak::ustr("ShowDevelopmentGui")), true))
+        .unwrap_or(true);
+    let starter_visible = starter.filter(|_| show_development_gui);
     let mut nodes = Vec::new();
     let mut sequence = 0;
     let mut overrides = std::collections::HashMap::new();
@@ -1928,14 +2018,32 @@ pub fn draw_starter_gui(
     // scaling, and occlusion remain world-space.
     let mut billboards = Vec::new();
     if let Some(workspace) = workspace { gather_class(dom, workspace, "BillboardGui", &mut billboards); }
+    // StarterGuiService::render3dAdorn renders 3D adornables owned by the
+    // service container in edit mode; they still need a resolvable Adornee.
+    if let Some(starter) = starter_visible { gather_class(dom, starter, "BillboardGui", &mut billboards); }
     let aspect = viewport.width() / viewport.height().max(1.0);
     for (billboard_order, referent) in billboards.into_iter().enumerate() {
         let Some(billboard) = dom.get_by_ref(referent) else { continue; };
         if matches!(billboard.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
+        // getPart(): explicit Adornee weak ref, else the FIRST adornable
+        // ancestor of the gui (BasePart / Model / Attachment) — not merely
+        // the direct parent. A billboard kept under a Folder or a service
+        // with no adornable ancestor is not eligible and never renders.
         let adornee = match billboard.properties.get(&rbx_dom_weak::ustr("Adornee")) {
             Some(Variant::Ref(value)) if !value.is_none() => *value,
-            _ => billboard.parent(),
+            _ => {
+                let mut cursor = billboard.parent();
+                loop {
+                    let Some(ancestor) = dom.get_by_ref(cursor) else { break Ref::none(); };
+                    if ancestor.class == "Attachment" || ancestor.class == "Model"
+                        || matches!(ancestor.properties.get(&rbx_dom_weak::ustr("CFrame")), Some(Variant::CFrame(_))) {
+                        break cursor;
+                    }
+                    cursor = ancestor.parent();
+                }
+            }
         };
+        if adornee.is_none() { continue; }
         let Some(anchor) = dom.get_by_ref(adornee) else { continue; };
         // Attachment.Position is local to its parent BasePart. Treating that
         // local vector as a world coordinate pins many billboards near the
@@ -1955,10 +2063,14 @@ pub fn draw_starter_gui(
             };
             (parent_part, world)
         } else {
+            // Models anchor at their pivot (calculateModelCFrame); parts use
+            // Position/CFrame directly.
             let world = match anchor.properties.get(&rbx_dom_weak::ustr("WorldPosition"))
                 .or_else(|| anchor.properties.get(&rbx_dom_weak::ustr("Position"))) {
                 Some(Variant::Vector3(position)) => [position.x, position.y, position.z],
-                _ => match anchor.properties.get(&rbx_dom_weak::ustr("CFrame")) {
+                _ => match anchor.properties.get(&rbx_dom_weak::ustr("CFrame"))
+                    .or_else(|| anchor.properties.get(&rbx_dom_weak::ustr("WorldPivot")))
+                    .or_else(|| anchor.properties.get(&rbx_dom_weak::ustr("WorldPivotData"))) {
                     Some(Variant::CFrame(cframe)) => [cframe.position.x, cframe.position.y, cframe.position.z], _ => continue,
                 },
             };
@@ -2031,8 +2143,12 @@ pub fn draw_starter_gui(
         // preserving discovery order at effectively equal depths.
         let depth_order=((1000.0-projected[2]).max(0.0)*1000.0) as usize;
         let path = vec![(-1, depth_order.saturating_mul(1_000_000).saturating_add(billboard_order))];
+        // DisplayOrderComparator: sortOrder = 1 + (AlwaysOnTop ? 1 : 0), so
+        // AlwaysOnTop adorns paint above ordinary ones yet always below
+        // ScreenGuis (sortOrder 3+).
+        let billboard_band = if always_on_top { -900_000 } else { -1_000_000 };
         for child in billboard.children() {
-            collect(dom, &layout_painter, *child, billboard_rect, viewport, -1_000_000,
+            collect(dom, &layout_painter, *child, billboard_rect, viewport, billboard_band,
                 true, 1.0, 1.0, Color32::WHITE, &path, None, &mut overrides,
                 scroll_offsets, &mut sequence, &mut nodes);
         }
@@ -2042,13 +2158,24 @@ pub fn draw_starter_gui(
     // screen rectangle; Bevy depth picking provides normal occlusion.
     let mut surfaces = Vec::new();
     if let Some(workspace) = workspace { gather_class(dom, workspace, "SurfaceGui", &mut surfaces); }
+    if let Some(starter) = starter_visible { gather_class(dom, starter, "SurfaceGui", &mut surfaces); }
     for (surface_order, referent) in surfaces.into_iter().enumerate() {
         let Some(surface) = dom.get_by_ref(referent) else { continue; };
         if matches!(surface.properties.get(&rbx_dom_weak::ustr("Enabled")), Some(Variant::Bool(false))) { continue; }
+        // Explicit Adornee, else the first BasePart ancestor. A SurfaceGui
+        // with no part to live on has no face and is never drawn.
         let adornee = match surface.properties.get(&rbx_dom_weak::ustr("Adornee")) {
             Some(Variant::Ref(value)) if !value.is_none() => *value,
-            _ => surface.parent(),
+            _ => {
+                let mut cursor = surface.parent();
+                loop {
+                    let Some(ancestor) = dom.get_by_ref(cursor) else { break Ref::none(); };
+                    if matches!(ancestor.properties.get(&rbx_dom_weak::ustr("CFrame")), Some(Variant::CFrame(_))) { break cursor; }
+                    cursor = ancestor.parent();
+                }
+            }
         };
+        if adornee.is_none() { continue; }
         let Some(part) = dom.get_by_ref(adornee) else { continue; };
         let Some(Variant::CFrame(cframe)) = part.properties.get(&rbx_dom_weak::ustr("CFrame")) else { continue; };
         let size = match part.properties.get(&rbx_dom_weak::ustr("Size")) {
@@ -2122,8 +2249,11 @@ pub fn draw_starter_gui(
         let screen_scale = (surface_rect.width()/canvas.x.max(1.0)).min(surface_rect.height()/canvas.y.max(1.0));
         let path = vec![(-2, surface_order)];
         let first_surface_node = nodes.len();
+        // Same DisplayOrderComparator banding as billboards: AlwaysOnTop
+        // adorns paint above ordinary adorns, below every ScreenGui.
+        let surface_band = if always_on_top { -900_000 } else { -1_000_000 };
         for child in surface.children() {
-            collect(dom, &layout_painter, *child, surface_rect, viewport, -900_000,
+            collect(dom, &layout_painter, *child, surface_rect, viewport, surface_band,
                 true, screen_scale, 1.0, Color32::WHITE, &path, None, &mut overrides,
                 scroll_offsets, &mut sequence, &mut nodes);
         }
@@ -2152,7 +2282,7 @@ pub fn draw_starter_gui(
     // runtime container and may contain cloned StarterGui descendants; drawing
     // both produces duplicates and also exposes unrelated saved runtime state.
     let mut screen_guis=Vec::new();
-    if let Some(starter)=starter { gather_class(dom,starter,"ScreenGui",&mut screen_guis); }
+    if let Some(starter)=starter_visible { gather_class(dom,starter,"ScreenGui",&mut screen_guis); }
     let mut screen_order=0usize;
     for screen_ref in screen_guis {
             let Some(gui) = dom.get_by_ref(screen_ref) else { continue; };
@@ -2349,6 +2479,14 @@ pub fn draw_starter_gui(
         let button_factor = if node.auto_button_color && pressed { 0.72 }
             else if node.auto_button_color && hovered { 0.88 } else { 1.0 };
         let background_painter=if node.background_rect!=node.rect{ui.painter().with_clip_rect(viewport)}else{painter.clone()};
+        // render2dImpl: when the render alpha is <= 0 both the background
+        // fill AND the legacy border are skipped — but UIStroke still
+        // renders (border strokes are not gated on background alpha).
+        let background_visible = node.background.a() > 0;
+        // The legacy border only draws when BorderSizePixel > 0 AND no
+        // UICorner is active: a corner radius > 0 suppresses it entirely.
+        let legacy_border = background_visible && node.border_size > 0.0 && node.corner_radius <= 0.0;
+        if background_visible {
         if node.gradient.is_none()&&node.group_gradients.is_empty() {
         if !node.rounded_clips.is_empty() || node.surface_warp.is_some() {
             paint_masked_solid(&background_painter,node.background_rect,shade_color(node.background,button_factor),node.corner_radius,node.rotation,&node.rounded_clips,node.surface_warp);
@@ -2365,9 +2503,18 @@ pub fn draw_starter_gui(
             paint_gradient(&background_painter.with_clip_rect(rotated_bounds(node.background_rect,node.rotation).intersect(if node.background_rect!=node.rect{viewport}else{node.clip})),node.background_rect,node.gradient_rect,
                 shade_color(node.background,button_factor),node.gradient.as_ref(),&node.group_gradients,node.rotation,node.corner_radius,&node.rounded_clips,node.surface_warp);
         }
+        }
         if node.rotation.abs() < 0.001 {
-            if node.border_size > 0.0 {
-                painter.rect_stroke(node.rect, node.corner_radius, Stroke::new(node.border_size, node.border), egui::StrokeKind::Inside);
+            if legacy_border {
+                // BorderMode adjusts where the border ring sits relative to
+                // the element rect: Outline (default) grows outward, Middle
+                // straddles the edge, Inset eats into the fill.
+                let stroke_kind = match node.border_mode {
+                    2 => egui::StrokeKind::Inside,
+                    1 => egui::StrokeKind::Middle,
+                    _ => egui::StrokeKind::Outside,
+                };
+                painter.rect_stroke(node.rect, 0.0, Stroke::new(node.border_size, node.border), stroke_kind);
             }
             if let Some((thickness, color, offset, position)) = node.ui_stroke {
                 painter.rect_stroke(node.rect.expand(offset), node.corner_radius + offset.max(0.0),
@@ -2383,7 +2530,16 @@ pub fn draw_starter_gui(
                     }).collect();
                 corners.push(corners[0]); corners
             };
-            if node.border_size > 0.0 { painter.line(outline(node.rect), Stroke::new(node.border_size, node.border)); }
+            if legacy_border {
+                // egui polylines are centered on the path, so shift the path
+                // by half a border to emulate each BorderMode placement.
+                let adjust = match node.border_mode {
+                    2 => -node.border_size * 0.5,
+                    1 => 0.0,
+                    _ => node.border_size * 0.5,
+                };
+                painter.line(outline(node.rect.expand(adjust)), Stroke::new(node.border_size, node.border));
+            }
             if let Some((thickness, color, offset, _)) = node.ui_stroke {
                 painter.line(outline(node.rect.expand(offset)), Stroke::new(thickness, color));
             }
