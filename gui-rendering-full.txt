@@ -1,0 +1,937 @@
+================================================================================
+ROBLOX 2022 GUI RENDERING — COMPLETE INTERNALS
+================================================================================
+
+SOURCE
+------
+Everything below was read from the decompile tree shipped as
+"2022-full.tar.xz". Per its SOURCE.md the tree is one single binary
+identified as "2022 Studio + full PDB" (IDA tier-3 decompile). Every
+address cited is an address in THAT build. When only the file is given,
+the function exists but its exact address was not re-noted. File paths
+given like v8datamodel/X.c / rbx/X.c are the per-class decompile files.
+
+Class lineage (verified from ClassDescriptor bases / vtables):
+  Instance -> GuiBase -> GuiBase2d -> GuiLayerCollector ->
+      { ScreenGui, BillboardGui }
+    GuiLayerCollector -> SurfaceGuiBase -> { SurfaceGui, AdGui }
+    GuiBase2d -> GuiObject ->
+      { GuiLabel -> TextLabel, GuiButton -> TextButton/ImageButton,
+        Frame, ImageLabel, CanvasGroup, ViewportFrame, ScrollingFrame,
+        TextBox, VideoFrame, ... }
+
+================================================================================
+1. BIG PICTURE — WHERE GUI PAINTING PLUGS INTO A FRAME
+================================================================================
+
+There are TWO passes that produce GUI pixels:
+
+  A. The 3D adorn pass (world space) — Workspace::render3dAdorn
+     (gate on GuiService->guiVisibilityByType[3], 0x1412dc570) renders
+     BillboardGui / SurfaceGui collectors placed in the world
+     (i.e. GUIs that float in 3D).
+
+  B. The 2D pass — DataModel::renderPass2d @ 0x1412bc9e0.
+     This is the master screen-space GUI pass for everything else.
+
+renderPass2d body, in order:
+  1. Bail unless the DataModel is initialized and an Adorn + graphics
+     metric exist.
+  2. Unless FFlag::ScreenGuiUpdateViewportBeforeRender2d, copy the
+     GuiService global GUI inset (topbar/safe-area rectangle) into
+     adorn->userGuiInset.
+  3. Hand the Adorn to Workspace for its 2D adornables (virtual call).
+  4. If the "render user GUIs" flag on GuiService is set:
+       - If Players::findConstLocalPlayer returns nothing, OR this is a
+         Team Create / CloudEdit session  -> render StarterGui DIRECTLY
+         via StarterGuiService::render2d @ 0x141489b90.
+         (THIS is the Studio edit-mode path — see section 14.)
+       - Otherwise: iterate the local player's children; every child
+         that is-a PlayerGui is rendered with
+         BasePlayerGui::render2d @ 0x141488fc0.
+  5. If the "render CoreGui" flag is set:
+       - BasePlayerGui::render2d on coreGuiService (the built-in CoreGui
+         is itself a BasePlayerGui subclass).
+       - If MouseService->isShowingWorkspaceCursor, draw constraint
+         gizmos (Constraints::GizmoManager::render2dAdorn).
+       - MouseService::updateCursorImageAndRenderSoftwareCursor
+         (software mouse cursor, VR cursor etc.).
+
+There is also a legacy top-level container:
+  DataModel::renderGuiRoot @ 0x1412bc980 calls
+  GuiRoot::render2d @ 0x141c10860, which just loops its children and
+  calls child->render2d(adorn, position) on each. GuiRoot is the
+  ancient pre-ScreenGui container; normal 2022 content paints through
+  BasePlayerGui/CoreGuiService instead.
+
+IMPORTANT FRAMING FOR EVERYTHING BELOW:
+Nothing in the GUI system draws "immediately". Painting is a two-step
+RECORD -> PLAYBACK protocol:
+  - Each LayerCollector owns one RBX::GfxGui command buffer.
+  - While marked dirty, the collector RE-RECORDS the command buffer
+    by walking its descendants (this is where all the render2d code
+    below runs).
+  - Every single frame, regardless of dirtiness, the recorded buffer
+    is re-issued to the graphics backend (playback is cheap; recording
+    is what dirtying bumps).
+
+================================================================================
+2. THE RECORDING MACHINERY — GfxGui, Adorn, DrawItems
+================================================================================
+
+2.1 The GfxGui object (rbx/GfxGui.c)
+------------------------------------
+GuiLayerCollector's ctor creates one GfxGui, sized 0x100 bytes, with:
+  identity transform, brightness 1.0, dirty = true,
+  glyph/rect/border/rt item counters, a current GuiEffect pointer,
+  an updatePriority, an effect cache, and a texture-proxy cache.
+
+GfxGui::beginRecording @ 0x1422101e0 resets the recorder for a fresh
+pass:
+    dirty = false;  guiEffect = nullptr;
+    glyphItemCount = rectItemCount = borderItemCount = rtItemCount = 0;
+
+So GfxGui has FOUR item buckets, driven by the Adorn draw calls made
+during recording:
+  rect   — filled quads (background boxes, images, composited textures)
+  border — outlined quads (legacy borders, stroke rings)
+  glyph  — font glyph runs (text)
+  rt     — render-target child buffers (CanvasGroup etc.)
+
+GfxGui::rect2d @ 0x142210770 is the recorder for one textured/
+colored quad — parameters (rect, clippingRect, tex-ul, tex-br,
+Color4 tint, Rotation2D). It converts the rotation into the quad's
+per-vertex rotation (2D quaternion out of cos/sin), copies the current
+GuiEffect pointer onto the item, and appends a DrawItem. Same idea for
+the border/glyph buckets.
+
+2.2 What the Adorn adds
+-----------------------
+RBX::Adorn is the recording facade. Calls observed throughout the GUI
+code (real names, addresses inline elsewhere):
+  Adorn::roundRect(...)        — rounded-corner context for a rect
+  Adorn::rect2d                — record a filled rect
+  Adorn::outlineRect2d         — record a rect outline (legacy borders)
+  Adorn::drawFont2D            — record a glyph run (text)
+  Adorn::setGuiEffect          — push/pop the current GuiEffect chain
+  Adorn::setTexture            — bind a texture proxy
+  Adorn::requestOrUpdateUIRT   — create/resize an offscreen UI render
+                                 target (CanvasGroup)
+  Adorn::setRenderTarget       — retarget recording into that RT
+  Adorn::beginRecordingGfxGui / finishRecordingGfxGui
+  Adorn::drawGfxGui            — SUBMIT one GfxGui to the current pass
+  Adorn::createTextureProxy    — get a GuiObject's render-target texture
+                                 (ViewportFrame uses this)
+The collector's per-frame entry (next section) always ends in
+Adorn::drawGfxGui(gui) — playback is unconditional.
+
+2.3 Screen-space vs world-space submission
+------------------------------------------
+GfxGui::setToScreenSpace()  — plain 2D overlay (normal GUIs).
+GfxGui::setToWorldCFrame(cframe, sortPosition, normal) — the buffer is
+  a camera-facing/part-facing plane in world space (BillboardGui,
+  SurfaceGui, and the VR ScreenGui path). Flags: alwaysOnTop,
+  depthOffset, lightInfluence, onTopOfCoreBlur, isRobloxGui.
+GfxGui::brightness is modulated per billboard (Brightness property).
+
+================================================================================
+3. GuiLayerCollector — THE BRIDGE BETWEEN UI AND RENDERER
+================================================================================
+
+Every top-level GUI container (ScreenGui etc.) is a GuiLayerCollector.
+Per frame the engine calls the virtual IAdornable entry:
+
+  GuiLayerCollector::render2dContext @ 0x14162eed0
+
+Body, in order:
+  1. Via vtable slot +672 it asks the subclass to updateGfxGui(adorn)
+     — this is where each collector class computes where in the frame
+     its GfxGui sits this frame (screen-space rect, 3D plane, VR plane,
+     3D-adornee plane).
+  2. ONLY IF gfxGui.dirty:
+       (under FFlag AdaptiveUILayoutSupportsRendering: first ensure
+        a collector exists/update via ensureLayerCollectorForUpdate)
+       - Adorn::beginRecordingGfxGui(gui); gui->setIsRobloxGui(...);
+       - loadZVectors() — rebuild the Z-ordered render vector (below);
+       - Walk the sorted item vector stored on the UIQuadTree:
+             item->preRender2d(adorn)
+             item->IAdornable::render2dContext(adorn, context)
+             item->postRender2d(adorn)
+         For GuiObjects, render2dContext ultimately records that
+         element's background/border/text/image commands (section 8).
+         Under FFlag RouteGfxGuiRecordingForCanvasGroup2 there is an
+         alternate recursive route through a free "updateCaches"
+         function that walks the Z vectors and handles render-target
+         nesting for CanvasGroups.
+       - GuiService::tryRenderSelectionFrame is invoked if the
+         GuiService's selectedGuiObject lives inside THIS collector —
+         the gamepad selection highlight is recorded as part of the
+         gui items.
+       - Adorn::finishRecordingGfxGui(gui) — buffer sealed.
+  3. Adorn::drawGfxGui(gui) — ALWAYS, dirty or not.
+
+So: "dirty" controls recording; drawing happens every frame.
+Dirtiness is raised by property changes walking up to the collector
+(GuiLayerCollector::markAppearanceDirty does the appearance bump;
+GuiButton::shouldGuiStateMarkGfxGuiDirty governs whether button-state
+changes dirty it, gated by FFlag::ReduceGuiStateGfxGuiInvalidation).
+
+3.1 Z-order construction (rebuild happens inside the dirty pass)
+---------------------------------------------------------------
+GuiLayerCollector::loadZVectors @ 0x14162c290 (only when
+rebuildGuiVector is set): clears UIQuadTree + the renderOrder map,
+rebuilds guiVector, then rebuilds the quadtree with bounds =
+viewport + GuiService inset and maxDepth 3. The rebuild is
+microprofiled with a token literally named "Rebuild Z-order list".
+
+Z-order depends on the collector's ZIndexBehavior:
+
+  Global  — loadDescendantsGlobalStructured @ 0x14162b9e0:
+       depth-first pre-order walk using
+       getReplicatedInsertionOrderSortedChildren; every GuiBase
+       descendant goes into ONE flat vector; the whole vector then gets
+       a single std::stable_sort with CompareOnlyZIndex.
+
+  Sibling — loadDescendantsSiblingStructured @ 0x14162bbb0:
+       per-generation: gather direct GuiBase children, stable_sort THAT
+       generation by ZIndex, append, then recurse into each child in
+       that order. A sibling's entire subtree stays contiguous.
+
+  CompareOnlyZIndex compares getZIndex() ONLY (inlined in insertion
+  sort @ 0x141624660). Ties resolve by pre-sort order (insertion order)
+  because the sort is stable.
+
+Under the recording walk, the per-item order = that vector, i.e.
+Z-order == paint order == input order (section 13).
+
+3.2 The viewport
+----------------
+Each collector caches a viewport rectangle (GuiLayerCollector::setViewport /
+updateViewport). What it is depends on the class:
+
+  ScreenGui::updateViewport @ 0x1417d08c0:
+    - New ScreenInsets enum (FFlag
+      ScreenGuiUseScreenInsetsTypeAsSourceOfTruthForIgnoreGuiInset):
+        value 0 (None)             -> full screen viewport
+        value 1 (DeviceSafeInsets) -> fullscreen viewport inset by
+                                      hardwareSafeAreaInset
+        value 2 (CoreUISafeInsets) -> inset by hardwareSafeAreaInset
+                                      + coreUIInset
+    - Legacy fallback: DEPRECATED_ignoreGuiInset (IgnoreGuiInset) true
+      -> full screen; else fullscreen inset by coreUIInset.
+    -> GuiLayerCollector::setViewport.
+
+  SurfaceGuiBase::updateViewport @ 0x141c2abc0:
+    PixelsPerStud mode: viewport pixel size = the face's physical 2D
+    extent * pixelsPerStud (X face -> (size.z, size.y); Y -> (size.z,
+    size.x); Z -> (size.x, size.y)). Fixed mode: canvasSize used
+    directly, then setViewport.
+
+  BillboardGui::stepLayouts @ 0x1416793f0 recomputes the projected
+    screen rect EVERY frame (when the billboard is enabled and not
+    inside a ViewportFrame) via getBillboardCFrame, then setViewport.
+
+Movement of the viewport marks the contents dirty (that's the
+mechanism moving/resizing GUIs re-record).
+
+3.3 ScreenGui's GfxGui placement — updateGfxGui
+-----------------------------------------------
+ScreenGui::updateGfxGui @ 0x1417d0420 chooses among 3 render modes:
+
+  (a) 3D-in-world user GUIs (ScreenGui::isUserGuiRenderIn3dEnabled,
+      includeCoreGui=false): if CoreGuiService's userGuiAdornee is a
+      BasePart, GfxGui::setToWorldCFrame(bufferedSurfaceCFrame *
+      bufferedProjectionCFrame, sortPosition, normalized normal);
+      lightInfluence = 0; depthOffset toggled per
+      FFlag::UserFlagEnableVRUpdate2; alwaysOnTop = true.
+
+  (b) VR (adorn->vr with a camera): a world-space plane
+      headScale*3 studs in front of the camera rendering CFrame,
+      half-extent = that distance * tan(~25deg); setToWorldCFrame;
+      alwaysOnTop = true; lightInfluence = 0.
+
+  (c) Normal 2D: GfxGui::setToScreenSpace(), and
+      onTopOfCoreBlur = screenGui->onTopOfCoreBlur.
+
+3.4 ScreenGui::render2d @ 0x1417cfc70
+-------------------------------------
+Simply: if NOT user-gui-in-3D mode, proceed with the base
+render2dContext flow (section 3). Screen-space GUIs go through the
+ordinary 2D pipeline.
+
+================================================================================
+4. BILLBOARDGUI — 3D SCREENSPACE GUIS
+====================================================================
+All cites: v8datamodel/BillboardGui.c.
+
+Eligibility / projection (recomputed per-frame)
+  stepLayouts @ 0x1416793f0 (Stepped each frame): when enabled and
+  not inside a ViewportFrame, calls getBillboardCFrame; on success sets
+  visibleAndValid and updates the collector viewport.
+
+  getBillboardCFrame @ 0x1416768e0 returns false unless ALL hold:
+    1. getPart @ 0x1416778e0 resolves an adornee (explicit Adornee weak
+       ref, else an ancestor instance of the gui);
+    2. the anchor depends on the adornee class:
+         BasePart   -> getCoordinateFrame + getPhysicalSize
+         Model      -> calculateModelCFrame/calculateModelSize
+         Attachment -> getFrameInWorld
+         other      -> identity CFrame with zero extents
+    3. a Workspace exists and the camera has a rendering CFrame;
+    4. MaxDistance check: SKIPPED when maxDistance <= 0 (ctor default
+       INFINITY); otherwise the camera-space depth must satisfy
+       -maxDistance <= depth;
+    5. after Camera::project, projected z must be in (0, 1000] — behind
+       camera or > 1000 studs away = not eligible (VR bypasses this and
+       uses z = 20.0).
+  Billboard center: center = lerp(extentMin, extentMax,
+    (ExtentsOffset.axis + 1)*0.5) + StudsOffset — ExtentsOffset is in
+    [-1,1] mapped onto part extents; StudsOffsetWorldSpace /
+    ExtentsOffsetWorldSpace are added in camera space afterwards.
+  Pixel size = billboardSize (UDim2) * projectedZ, going through
+  RoundToScreenScale (the 3D-to-2D scale factor).
+
+  VR handling: if UserInputService.VREnabled, the camera frame is
+  rebuilt with CoordinateFrame::lookAt mirrored across the camera
+  position (further split by FFlag::UserFlagEnableNewVRSystem).
+
+3D-adorn render gate (this controls actual drawing)
+  shouldRender3dAdorn @ 0x141679310: part + DataModel + no active
+  adorn recording + GuiService; then:
+    - if GuiService->guiVisibilityByType[2] (custom billboards
+      visible) -> render;
+    - else render only if NOT adorned to a player:
+      calculateIsAdornedToPlayer @ 0x141676540 walks every connected
+      player's character and tests whether the adornee (or the gui's
+      own parent) is inside it.
+
+  render3dAdorn @ 0x141678970: if the stored playerToHideFrom is the
+  local player (play mode) the whole billboard is skipped;
+  otherwise the 2D scene is recorded into the 3D adorn with
+  adorn->currentSmoothScaling = true (the billboard text/image samples
+  with smooth scaling).
+
+Defaults (ctor @ 0x141676130): maxDistance = INFINITY,
+  distanceUpperLimit = -1, distanceLowerLimit = 0, currentDistance = 0,
+  alwaysOnTop = false, clipping = false, visibleAndValid = false.
+
+Input: process @ 0x141678280 bails unless enabled && active &&
+visibleAndValid && !inside ViewportFrame; converts 2D screen picks into
+camera world-rays (VR: a ray from the GUI input user CFrame under
+FFlag::UserFlagEnableVRUpdate2); getInputPositionOffset /
+getScreenPositionOffset convert pointer positions into billboard
+space; getGuiObjectsAtPosition forwards them. getScreenSpaceBounds
+@ 0x141677dd0 THROWS "Can't get screen bounds because no adornee or
+workspace" unless currently valid.
+
+Studio property hiding (isPropertyHiddenInStudio @ 0x141678150):
+  Brightness hidden unless FFlag::GuiBrightness && !alwaysOnTop &&
+  lightInfluence != 1.0; the four Distance* properties are always
+  hidden in Studio.
+
+================================================================================
+5. SURFACEGUI (and SurfaceGuiBase / AdGui)
+================================================================================
+Files: v8datamodel/SurfaceGui.c, rbx/SurfaceGuiBase.c, rbx/AdGui.c.
+
+Viewport: see 3.2 (PixelsPerStud vs Fixed canvasSize).
+
+Face projection matrix: GuiBase2d::buildProjectedGuiMatrix
+@ 0x14161cec0 — part CFrame + getVisualSize (RENDER size, not physical
+size), a yaw/pitch rotation table indexed by NormalId, scaled by
+1/canvasSize, recentered by (-0.5, 0.5, 0.5), multiplied by part size.
+Used both to place the GfxGui plane in the world when rendering and
+to inverse-map pointer rays during input. Fails => the gui isn't drawn
+(face frustum check).
+
+Input: SurfaceGuiBase::process @ 0x141c29c70:
+  gamepad events are routed to plain 2D processing
+  (GuiLayerCollector::process) directly. Otherwise: enabled gate,
+  requires workspace + camera; BasePart::getPlaneByFaceNormal(faceID,
+  useRenderCFrame = true), Camera::worldRay from the pointer,
+  Ray::intersectionPlane; NaN hit = no response; else
+  process3d(point, ignoreMaxDistance=false).
+
+  process3d @ 0x141c296e0:
+    - enabled && active && viewportFrame == nullptr
+    - buildProjectedGuiMatrix fail => resolveInputOver(empty) —
+      hover is actively CLEARED
+    - ToolPunchThroughDistance: find local character root; if
+      toolPunchThroughDistance > 0 and the hit is farther than that
+      from the character => input refused (play-mode only; there is
+      no local character in edit mode)
+    - input types: mouse, touch (gamepad via FFlag::UserFlagEnableVRUpdate2)
+    - invert the projection matrix (FFlag::FixSmallSurfaceGuiMouseInput
+      swaps inverse tolerance between 0.0 and 1e-6), map the hit to a
+      2D pixel point, TEMPORARILY rewrite InputObject::positionOffset
+      to that surface-space point, run
+      GuiLayerCollector::processWithMouseOverOption(sinkIfMouseOver=false),
+      then restore the original position. Children see the pointer
+      already in SurfaceGui space.
+
+AdGui (rbx/AdGui.c) is a SurfaceGuiBase subclass adding the
+immersive-ad lifecycle: validate, hasOtherSurfaceGuiOnPartFace,
+checkAndMarkVisible, fetchAd/disableFetch, onNoFill, onReceiveAdData,
+onHeartbeat.
+
+================================================================================
+6. CONTAINERS: PlayerGui, CoreGuiService, StarterGuiService
+================================================================================
+
+BasePlayerGui (rbx/BasePlayerGui.c)
+-----------------------------------
+BasePlayerGui::render2d @ 0x141488fc0 walks the PlayerGui's ordered
+children and paints each collector through render2dContext +
+Adorn::drawGfxGui — this is the 2D painting loop the whole 2D pass
+fans into. (Also draws perf/stat string overlays.)
+
+The cross-collector ordering list:
+  doRebuildRenderAndInputLists @ 0x141484c40 — stable_sort of the
+    PlayerGui's direct children with DisplayOrderComparator, rebuilt
+    whenever descendants relevant to ordering change.
+
+  DisplayOrderComparator::createSortKey @ 0x141483720 builds tuple keys
+    <sortOrder, displayOrder, depth>:
+      ScreenGui    -> sortOrder = 3 + (OnTopOfCoreBlur ? 1 : 0)
+      BillboardGui -> sortOrder = 1 + (AlwaysOnTop ? 1 : 0),
+                      depth = -camera dot adornee position
+
+  BasePlayerGui::process @ 0x141487df0 walks that list REVERSED
+  (topmost first); first SUNK wins (section 13).
+  So paint order = list order; input order = reverse list order.
+
+CoreGuiService
+--------------
+The built-in CoreGui is itself a BasePlayerGui subclass — exactly the
+same machinery; renderPass2d calls BasePlayerGui::render2d on it AFTER
+the player guis when core-gui rendering is enabled (so Roblox core
+interface paints over player interface).
+
+StarterGuiService
+-----------------
+StarterGuiService::render2d @ 0x141489b90 is only:
+    if ( this->showGui ) BasePlayerGui::render2d(this, adorn);
+There is NO special paint path — in edit mode / team create / any
+session with no local player, the StarterGui itself IS the rendered
+collector root; in play mode the run-time copy under PlayerGui paints
+through the identical pipeline. A "showGui" flag exists to hide it.
+(Its render3dAdorn exists in the same file for 3D adornables owned by
+the service container.)
+
+================================================================================
+7. THE BASE 2D ELEMENT — GuiObject / GuiBase2d PAINTING
+================================================================================
+Files: v8datamodel/GuiObject.c, v8datamodel/GuiBase2d.c, rbx/GuiDrawImage.c.
+
+7.1 GuiObject::render2d @ 0x14166c3c0
+-------------------------------------
+- Builds the render color via getRenderBackgroundColor4 @ 0x1416689d0:
+      color = BackgroundColor3;
+      alpha = clamp01(1.0 - BackgroundTransparency)
+  (Note: NO parent-transparency cascade here — each element's alpha is
+  its own. Group compositing belongs to CanvasGroup/RT flow.)
+- Calls render2dImpl(borderOnly = false)
+- Then calls the subclass' extra-content paint through the vtable
+  (text via GuiTextMixin, image via GuiImageMixin, button chrome,
+  scrollbar chrome, viewport blit, video, etc.).
+
+render2dBorder @ 0x14166c460 = render2dImpl(borderOnly = true) — used
+e.g. by CanvasGroup to draw only the chrome.
+
+7.2 GuiObject::render2dImpl @ 0x14166d180 (the rect itself)
+-----------------------------------------------------------
+  1. RBX::Adorn::roundRect(getRect2DUnitTest) — a rounded-corner rect
+     context; the radius comes from the derived `roundCornerRadius`
+     (pixels — set by the UICorner component, section 12).
+  2. If the render alpha <= 0, the background fill AND legacy border
+     are skipped — but UIStroke STILL RENDERS (border strokes are not
+     gated on background alpha).
+  3. Border thickness: borderSizePixel multiplied by
+     GuiBase2d::getTotalGroupScale (the accumulated UIScale through the
+     ancestor chain).
+  4. BorderMode adjustment of the working rectangle:
+       Inset  — shrink each edge by borderSizePixel (components clamped
+                so the rect never flips)
+       Middle — shrink by half the border size
+       Outline(default) — no adjustment
+  5. Legacy border is only drawn when borderSizePixel > 0 AND
+     roundCornerRadius <= 0 — a UICorner suppresses the legacy border
+     entirely (you need UIStroke for a border on rounded rects).
+  6. Fill/border draw:
+       if firstAncestorClipping() != nullptr && element is NOT rotated
+         -> Adorn::rect2d(rect, color, clipRect) and
+            Adorn::outlineRect2d(rect, thickness, color, clipRect)
+       else -> rect2d/outlineRect2d with rotation = absoluteRotation
+       (rotation is about absoluteRotation.center,consistently used for
+        bg, border, text, image).
+  7. Stroke: if the border-stroke component (UIStroke with
+     ApplyStrokeMode Border) is enabled and Thickness > 0 ->
+     UIStroke::renderBorderStroke(adorn, parent, clippingObject).
+
+7.3 UIStroke rendering — rbx/IStroke.c
+--------------------------------------
+UIStroke::renderBorderStroke @ 0x141d0f520:
+  - Effective thickness = Thickness * totalGroupScale.
+  - Rounded rect for the parent (roundCornerRadius respected), expanded
+    outward by the thickness on every side (the stroke ring sits
+    OUTSIDE the element edge for ApplyStrokeMode Border).
+  - Builds its own GuiEffect (strokeEffect) so gradients applied to
+    the UIStroke itself (child UIGradient) work independently of the
+    parent's effect; uses the stroke's own Color/Transparency.
+  - Clipped against the same ancestor clip rect.
+ApplyStrokeMode Contextual strokes are recorded with the element's
+content (the "updateUITextStroke/add|removeStrokeComponent" family in
+GuiTextMixin handles text strokes).
+
+7.4 GuiEffect hook for EVERY element — gradients & corner radius
+----------------------------------------------------------------
+GuiBase2d::preRender2d @ 0x14161fc50 = setAdornGuiEffect;
+postRender2d @ 0x14161fc40 = Adorn::setGuiEffect(nullptr).
+
+GuiBase2d::setAdornGuiEffect @ 0x141620370 runs BEFORE the element
+records its draw items and pushes a GuiEffect composed from the
+element's UI components:
+  - child UIGradient -> builds the gradient buffer + rotation math
+    (Gradient with color/alpha sequences, Rotation, Offset resolved
+    against absolute size);
+  - child UICorner   -> resolves the CornerRadius UDim against
+    absoluteSize (offset + scale*size clamped), giving the
+    roundCornerRadius in pixels consumed by Adorn::roundRect.
+The current effect pointer is copied onto every DrawItem recorded
+(GfxGui::rect2d line), so a UIGradient under a GuiObject tints every
+quad/glyph of exactly that element and is popped when recording moves
+on — the effect chain is per-element, not global state.
+
+7.5 Clipping and padding
+------------------------
+GuiBase2d::firstAncestorClipping @ 0x14161e260 walks ancestors until a
+GuiBase2d whose "clipping" virtual (mislabeled by the decompiler as
+getPropertyStatusInStudio) reports enabled — a ClipsDescendants
+ancestor, an unconditionally-clipping CanvasGroup, or a 3D-gui clip
+root — that ancestor's cached clip rect clips this element.
+getClippedRect @ 0x14161e8b0 returns the CACHED clip rect written
+during layout/cache update (setClippedRect @ 0x141620af0; it raises
+prop_ClippedRect only for internal callers).
+
+GuiBase2d::calculateInset @ 0x14161d2c0 folds a child UIPadding's four
+UDims (L/T/R/B) against absoluteSize/parentSize into the inset used
+for both layout and inner content rectangles (text/image use
+`innerRect`).
+
+7.6 UIScale
+-----------
+getTotalGroupScale multiplies through all ancestor UIScales; as shown
+above it scales border thickness, UIStroke thickness, and the
+ScrollingFrame scrollbar thickness. Layout sizes are computed with the
+scale applied upstream of rendering.
+
+================================================================================
+8. TEXT RENDERING — GuiTextMixin + TextLayout (typesetter)
+================================================================================
+Instantiation cited: GuiTextMixin<GuiTextButton, ...>::render2dText
+@ 0x14151d130 (rbx/GuiTextMixin.c — TextLabel/TextBox/TextButton use
+their own instantiations of the same template; behavior is shared).
+
+Flow per paint:
+  1. updateMaxVisibleGraphemes() — MaxVisibleGraphemes crop.
+  2. RichText enabled && displayRichText:
+       - With FFlag::UseSingleLayoutForRichText4: one persistent
+         TextLayout `richTextLayout`; updateTextRenderProps fills it
+         (font, size, colors, alignment, wrapping, stroke, etc.),
+         setSmoothScale(adorn->smoothScaling mode), setPositionInRect(
+         innerRect — the box rect minus padding/border inset),
+         setRotation(absoluteRotation), setClipRect(getClippedRect()).
+       - Otherwise: mapModifiersToLayouts fans rich-text runs out to a
+         per-modifier layout vector; each non-trivial layout (base
+         color alpha > 0) is drawn similarly.
+     Call: RBX::Adorn::drawFont2D(adorn, layout) — the layout's glyph
+     run is recorded as glyph items into the GfxGui.
+  3. Non-rich path: same props on the plain `textLayout`, guarded by
+     TextLayout::shouldRender (no glyphs/layout-hidden -> skip), then
+     drawFont2D.
+
+Layout state is maintained outside paint: layoutRichText /
+layoutNonRichText build the layout when properties change (font,
+text bounds, TextScaled etc.); updateTextLayoutProps /
+updateTextRenderProps / checkForOutdatedFonts keep it current; the
+typesetter (typesetter/TextLayout.c) is the actual glyph shaping/
+line-breaking engine driving Adorn::drawFont2D. So "text rendering" =
+CPU-side glyph layout recorded as glyph quads, not a draw-time
+rasterize. TextStrokeTransparency/Color are handled through the
+UITextStroke stroke component family (updateUITextStroke,
+addStrokeComponent/removeStrokeComponent/onStrokeComponentListChanged)
+in the same mixin. setTextAvailableSpace feeds TextScaled fit
+calculations.
+
+================================================================================
+9. IMAGE RENDERING — GuiImageMixin / GuiDrawImage
+================================================================================
+GuiImageMixin<GuiImageButton,...>::renderImage @ 0x141687580
+(rbx/GuiImageMixin.c; ImageLabel uses the same template).
+
+  RBX::GuiDrawImage::setSamplerFlag(SamplerFlag_Point,
+    enabled = imageResampleMode == 1) — ResampleMode Pixelated(1)
+    switches the sampler to point filtering.
+
+  Dispatch on imageScale (ScaleType enum):
+    0 Stretch  -> simple stretch over the element rect
+    1 Slice    -> scale-9 (GuiDrawImage::render2dScale9 with a
+                  Scale9Options struct built from SliceCenter, slice
+                  scale, and the element rect)
+    2 Tile     -> renderTiled (computeUVTiled — TileSize repeats the
+                  uv space)
+    3 Fit      -> renderFit(fill=false) — contain/letterbox
+    4 Crop     -> renderFit(fill=true)  — cover
+  ImageRectOffset/ImageRectSize adjust the uv window (computeUV/
+  computeUVTiled in rbx/GuiDrawImage.c); tint = ImageColor3 with
+  alpha = 1 - ImageTransparency. Rotation + clip rect are honored the
+  same way the bg rect is (render2dClipped / render2dRotated are the
+  specialized entry points in GuiDrawImage).
+
+Buttons: GuiImageButton::render2d @ 0x141690da0:
+  GuiButton::render2dButtonImpl first (background chrome), then:
+    if guiState == 1 (Hover)  and HoverImage valid -> renderImage with
+       the hover GuiDrawImage buffer
+    elif guiState == 2 (Press) and PressedImage valid -> pressed buffer
+    else default Image
+  (three separate GuiDrawImage texture buffers are setImage'd as
+  needed; each marks a load dependency via "Image" property deltas.)
+
+GuiButton::render2dButtonImpl @ 0x14166c470 (rbx/GuiButton.c):
+  - Style != Custom: draws the legacy button sprite via static
+    TextureIds, e.g. "rbxasset://textures/ui/btn_greyTransp.png" and
+    "rbxasset://textures/ui/btn_grey.png" (both initialized as statics
+    inside the function) — classic scale-9 chrome per Style.
+  - AutoButtonColor: the state machine (Idle=0 / Hover=1 / Press=2 —
+    see processMouseEventInternal @ 0x14166b6a0) modulates the render
+    color when AutoButtonColor = true; state transitions dirty the
+    ancestor collector under FFlag::ReduceGuiStateGfxGuiInvalidation
+    (shouldGuiStateMarkGfxGuiDirty).
+
+================================================================================
+10. SCROLLINGFRAME
+================================================================================
+v8datamodel/ScrollingFrame.c (render) + rbx/P8ScrollingFrame.c
+(layout) + rbx/Scrollable.c (input/inertia).
+
+ScrollingFrame::render2d @ 0x14167e700:
+  1. GuiObject::render2d (bg+border) first.
+  2. Scrollbar fade:
+       base alpha = clamp01(1 - (t*5 - 1.5)), where t = group-scaled
+         ScrollBarThickness divided by a stored extent value (the
+         scroll range; IDA's field name here is uncertain): alpha = 0
+         when t >= 0.5 and 1 when t <= 0.3, so bars auto-hide when the
+         overflow range is small relative to the bar thickness and
+         fade in smoothly as it grows;
+       on touch devices — if UserInputService.LastInputType is Touch —
+         the bars are hidden 1.5 s after the last scroll interaction
+         and fade out between 1.0–1.5 s (2x linear); after that render
+         returns early (no scrollbar quads at all).
+  3. renderScrollbarLines + renderVerticalScrollBar /
+     renderHorizontalScrollBar pass that alpha; bar chrome is drawn
+     with the Top/Mid/Bottom images (prop_topImage/midImage/bottomImage
+     initializers in the same file) as scalable sections
+     (renderScrollbarSection), scaled by ScrollBarImageColor3 /
+     ScrollBarImageTransparency; thickness = ScrollBarThickness *
+     getTotalGroupScale, clamped to >= 1 px (UIScale applies to bars).
+
+Layout side (P8ScrollingFrame.c): layoutScrollBars, layoutWindow,
+layoutSetCanvasPosition, calculateCanvasPositionClamped,
+getVisibleCanvasRect, AutomaticCanvasSize (setAutomaticCanvasSize gets
+canvasSize from content), scrollToTop, ElasticBehavior spring stepping
+(stepElasticVelocitySpring, updateElasticBounding). Input/inertia
+(the touch-drag/mouse wheel path) lives in rbx/Scrollable.c —
+doProcessTouchScrollEvent, doProcessGamepadScrollEvent,
+stepScrollInertia, setScrollVelocity, inertial decel against window
+bounds.
+
+Rendering CONTENT: children are ordinary GuiObjects recorded into the
+same collector GfxGui; the scroll window is just layout — children are
+positioned at canvas coordinates minus CanvasPosition, and the
+frame's clip rect (it clips via the clipping mechanism of section
+7.5) hides overflow.
+
+================================================================================
+11. CANVASGROUP (render-to-texture compositing)
+================================================================================
+rbx/CanvasGroup.c — render2d @ 0x141898880, gated on
+FFlag::RenderCanvasGroupToTexture:
+  1. Background: getRenderBackgroundColor4 premultiplied by
+     1 - GroupTransparency ("gtAppliedBgColor"), border via
+     GuiObject::render2dBorder with that color.
+  2. If GroupTransparency < 1.0: take the screen-rect (RoundToScreenScale
+     on corners), Adorn::requestOrUpdateUIRT(guiRTCache,
+     RenderTargetConfiguration{rect, px size, ...}),
+     Adorn::setRenderTarget(rtId) — descendants then RECORD INTO THAT
+     offscreen RT — then the group texture is blitted with
+     Adorn::rect2d(rect, uv 0..1, color = GroupColor3 * alpha
+     (1 - GroupTransparency)).
+  3. The blit is clipped by firstAncestorClipping()->getClippedRect().
+
+  => GroupTransparency / GroupColor apply UNIFORMLY to the whole group
+  as one texture (not per-element alpha).
+
+Studio: isPropertyHiddenInStudio @ 0x1418982d0 — the Clipping
+(ClipsDescendants) property is always hidden for CanvasGroup: clipping
+is unconditional (setClippingInternal). getOverrideInstances
+@ 0x141898220 flags GroupColor/GroupTransparency as unsupported when
+the ancestor collector's ZIndexBehavior is Global (they require the
+Sibling containment to composite; override status 2 set otherwise).
+
+================================================================================
+12. VIEWPORTFRAME (offscreen 3D scene composited as a texture)
+==============================================================
+v8datamodel/ViewportFrame.c — render2d @ 0x141989110:
+  - UNLESS FFlag::ViewportFrameUseRender2dBorder2, draws the legacy
+    border itself with outlineRect2d (thickness = borderSizePixel *
+    totalGroupScale, using the render bg color; respects the ancestor
+    clip rect when unrotated).
+  - Mirroring (DFFlag::ViewportFrameEnableMirroring): IsMirrored flips
+    the texture uv X (uvtl.x = mirrored ? 1 : 0; uvbr.x inverted).
+  - Content: adorn->createTextureProxy(this GuiObject) — the proxy of
+    the offscreen RT the viewport world (PVInstance children +
+    CurrentCamera) is rendered into — then Adorn::setTexture,
+    Adorn::rect2d(rect, uv 0..1, color = ImageColor3 with alpha =
+    1 - ImageTransparency, clipRect), then texture reset.
+  - World ambilight/camera are pure data (Ambient/LightColor/
+    LightDirection; setCurrentCamera @ 0x141989650 re-hooks camera
+    property connections). The 3D world->RT work happens outside the
+    2D painter; the painter only blits.
+  - Property set this build: Ambient, CameraCFrame, CameraFieldOfView,
+    CurrentCamera, ImageColor3, ImageTransparency, IsMirrored,
+    LightColor, LightDirection. NOTE: no WorldModel references in this
+    build's ViewportFrame.c.
+
+INPUT: being inside a ViewportFrame disables GUI picking for 3D guis
+(viewportFrame != nullptr is a hard bailout in BillboardGui::process/
+stepLayouts/getScreenSpaceBounds and SurfaceGuiBase::process/process3d;
+the ancestor lookup is findFirstAncestorOfType<ViewportFrame>
+@ 0x140c5cfa0).
+
+================================================================================
+13. OTHER CONCRETE CLASSES — RENDER NUTSHELLS
+================================================================================
+Frame            — plain GuiObject chrome (bg rect + border); nothing
+                   extra recorded (v8datamodel/Frame.c).
+TextLabel        — sections 7 (chrome) + 8 (text). v8datamodel/TextLabel.c.
+TextButton       — GuiButton chrome + text mixin. rbx/GuiTextButton.c.
+TextBox          — GuiTextMixin instantiation plus caret/placeholder
+                   and IME-focused handling (rbx/P8TextBox.c); painting
+                   flows through the same render2dText route.
+ImageLabel       — section 9, without button chrome. v8datamodel/ImageLabel.c.
+ImageButton      — section 9 with hover/pressed textures + chrome.
+                   rbx/GuiImageButton.c.
+VideoFrame       — render2d override + renderImage feeding the GuiDrawImage
+                   path with GuiDrawImage::setVideo in place of a static
+                   TextureId (v8datamodel/VideoFrame.c, rbx/GuiDrawImage.c).
+SelectionBox     — GuiObject that paints the legacy selection box outline
+                   around a surface gui (v8datamodel/SelectionBox.c).
+GuiRoot          — legacy container; render2d @ 0x141c10860 loops children
+                   and forwards prior-paint coordinates.
+
+SELECTION/HIGHLIGHT ADORN (gamepad): GuiService::tryRenderSelectionFrame
+is invoked per collector during the recording pass (context = nearest
+BasePlayerGui ancestor) when the collected gui tree contains the
+GuiService's selectedGuiObject — i.e. the "selected object" rectangle
+is recorded with (in front of) that collector's items.
+
+================================================================================
+14. INPUT ORDERING — THE OTHER HALF OF "RENDER ORDER"
+================================================================================
+Cross-collector, at the PlayerGui level:
+  BasePlayerGui::process @ 0x141487df0 iterates the ordered children
+  list (section 6) BACKWARDS (topmost first); the first child whose
+  process() answers SUNK wins and stops the loop. Render order and
+  input order are two ends of the same DisplayOrder-sorted list.
+  getOrderedChildList @ 0x141487070 re-sorts billboard guis using the
+  camera CFrame for the input pass under FFlag::SortBillboardGuisForInput.
+
+Inside one collector:
+  GuiLayerCollector::process @ 0x14162d4b0 ->
+  processWithMouseOverOption(event, sinkIfMouseOver = true) ->
+  processDescendants @ 0x14162d5a0:
+    - mouse/touch: UIQuadTree::query(position) gives the hit vector,
+      walked BACKWARDS (topmost Z first) via processItem until SUNK;
+      every object whose isOver(event) is true joins newElementsOverSet
+      with an inputWasSunk flag; afterwards resolveInputOver
+      @ 0x14162f910 diffs against oldInputOverObjectsMap (keyed by
+      InputObject) to fire MouseEnter/MouseLeave.
+    - keyboard: Enter goes directly to GuiService::selectedGuiObject;
+      other keys are fanned to the hit vector backwards with
+      InputBegan/InputEnded fired directly.
+    - gamepad/non-positional: iterates the full renderVector instead
+      of a point query.
+
+Per-GuiObject eligibility:
+  canProcessMeAndDescendants @ 0x141662f40 == return getVisible();
+    Visible = false skips the WHOLE SUBTREE for input (checked first in
+    processItem @ 0x14162e990, which also short-circuits once SUNK
+    arrives).
+  processTouchEvent @ 0x14166c070: isOver && active => SUNK+finished.
+  processMouseEventInternal @ 0x14166b6a0: isOver gates everything;
+    fires mouseMoved/mouseWheel signals; drives the guiState machine
+    (Idle/Hover/Press); dragging requires active && draggable &&
+    MouseEnabled && !TouchEnabled; touch-originated input checks the
+    nearest ScrollingFrame ancestor and suppresses press-states during
+    touch/inertial scroll; final answer: if !active -> NOT_SUNK + not
+    mouse-over; else NOT_SUNK + MOUSE_OVER with target = self (base
+    GuiObjects never SINK mouse input themselves — GuiButton subclasses
+    override process to sink clicks).
+
+================================================================================
+15. UI COMPONENTS — WHERE EACH ONE BITES THE PIPELINE
+================================================================================
+UICorner        — resolved into roundCornerRadius (px) in
+                  setAdornGuiEffect; consumed by Adorn::roundRect;
+                  suppresses the legacy border when radius > 0.
+UIGradient      — converted to a GuiEffect (gradient buffer,
+                  rotation, offset) pushed pre-record and popped post-
+                  record; copied onto every DrawItem of that element
+                  (and separately composited for UIStroke if parented
+                  there).
+UIStroke        — rendered after bg/border in render2dImpl /
+                  render2dText stroke-component path; own color/
+                  transparency/gradient; scales with UIScale; thickness
+                  ring OUTSIDE the element for ApplyStrokeMode Border.
+UIScale         — contributes to getTotalGroupScale: scales border /
+                  stroke / scrollbar thickness and layout itself.
+UIPadding       — consumed by calculateInset (section 7.5) to shrink
+                  inner rect (text/image boxes) and layout.
+UILayout family — layout engine only (layout/LayoutDefault, Grid, List,
+                  Page, Table): they recompute child position/size and
+                  mark collectors dirty; they never record draw items.
+UISizeConstraint / UIAspectRatioConstraint / UITextSizeConstraint —
+                  clamp size/aspect/text-size during layout; no paint.
+GuiService inset — GuiService's global inset feeds renderPass2d's
+                   adorn->userGuiInset plus the topbar area reused by
+                   ScreenGui::updateViewport (section 3.2).
+
+================================================================================
+16. EDIT MODE vs PLAY MODE — EXACTLY WHAT CHANGES
+================================================================================
+SAME pipeline, different container roots (the actual rendering code is
+shared — that is the single most important fact):
+
+  EDIT MODE (or Team Create with no local player session):
+    renderPass2d takes "StarterGuiService::render2d" branch — the
+    ScreenGuis in StarterGui paint on screen, live, through the same
+    BasePlayerGui::render2d. The StarterGuiService is also gated by its
+    own showGui flag.
+    CoreGui: DataModel::startCoreScriptsOrIfInStudioBuildGui
+    @ 0x1412c1fb0 -> DataModel::startCoreScripts builds the Studio core
+    gui (skipped for network-server launch intents).
+
+  PLAY MODE:
+    renderPass2d walks the local player's children and renders each
+    PlayerGui; the StarterGui branch is skipped entirely (it's the run
+    copy that paints).
+
+  3D adorns: identical in both modes — BillboardGui/SurfaceGui
+  render3dAdorn flows from Workspace::render3dAdorn in edit mode too.
+
+Observable differences caused by that branching:
+  1. Billboard 3D-adorn suppression by "adorned to player" never fires
+     in edit mode (no characters to match) — billboards show in edit
+     where play mode would hide them (calculateIsAdornedToPlayer).
+  2. PlayerToHideFrom requires the local player: in edit mode it never
+     matches → billboard always renders in Studio viewport.
+  3. SurfaceGui ToolPunchThroughDistance requires the local character →
+     the gate is never applied in edit mode.
+  4. Studio-only selection chrome: GuiObject::renderStudioSelectionBox
+     @ 0x14166da10 forwards to a Studio-provided callback
+     (studioSelectionCallbackGuiBase2d set by the Qt shell via
+     setStudioSelectionCallbackGuiBase2d) — no callback, no box; this
+     painting exists only in Studio.
+  5. Property pane hiding is Studio-compiled (isPropertyHiddenInStudio
+     rules — GuiBase2d @ 0x14161f080, BillboardGui @ 0x141678150,
+     CanvasGroup @ 0x1418982d0, SurfaceGui @ 0x141681c10).
+  6. stepLayout/Heartbeat machinery (billboard projection etc.) runs
+     identically in both modes — that's why billboards track their
+     adornees live in Studio.
+  7. GuiService per-type visibility toggles (guiVisibilityByType[4],
+     default 0x01010101 — [0]=Custom 2D, [1]=RobloxGui, [2]=custom
+     billboards, [3]=Roblox billboards; getGuiIsVisible @ 0x1412ada60,
+     toggles @ 0x1414bb770 / 0x1414bb930) apply the same in both modes.
+
+================================================================================
+17. QUICK REFERENCE — KEY FUNCTIONS
+================================================================================
+  (all addresses in "2022 Studio + full PDB")
+  DataModel::renderPass2d                              0x1412bc9e0
+  DataModel::renderGuiRoot (legacy GuiRoot pass)       0x1412bc980
+  DataModel::startCoreScriptsOrIfInStudioBuildGui      0x1412c1fb0
+  GuiRoot::render2d                                    0x141c10860
+  BasePlayerGui::render2d                              0x141488fc0
+  StarterGuiService::render2d                          0x141489b90
+  ScreenGui::render2d                                  0x1417cfc70
+  ScreenGui::updateGfxGui                              0x1417d0420
+  ScreenGui::updateViewport                            0x1417d08c0
+  GuiLayerCollector::render2dContext                   0x14162eed0
+  GuiLayerCollector::loadZVectors                      0x14162c290
+  loadDescendantsGlobalStructured                      0x14162b9e0
+  loadDescendantsSiblingStructured                     0x14162bbb0
+  CompareOnlyZIndex insertion sort                     0x141624660
+  GfxGui::beginRecording                               0x1422101e0
+  GfxGui::rect2d                                       0x142210770
+  GuiObject::render2d                                  0x14166c3c0
+  GuiObject::render2dImpl                              0x14166d180
+  GuiObject::render2dBorder                            0x14166c460
+  GuiObject::getRenderBackgroundColor4                 0x1416689d0
+  GuiObject::renderStudioSelectionBox                  0x14166da10
+  GuiBase2d::setAdornGuiEffect (preRender2d)           0x141620370
+  GuiBase2d::preRender2d / postRender2d                0x14161fc50 / _40
+  GuiBase2d::firstAncestorClipping                     0x14161e260
+  GuiBase2d::getClippedRect / setClippedRect           0x14161e8b0 / _af0
+  GuiBase2d::calculateInset                            0x14161d2c0
+  GuiBase2d::buildProjectedGuiMatrix                   0x14161cec0
+  GuiTextMixin<GuiTextButton>::render2dText            0x14151d130
+  GuiImageMixin<GuiImageButton>::renderImage           0x141687580
+  GuiButton::render2dButtonImpl                        0x14166c470
+  GuiImageButton::render2d                             0x141690da0
+  ScrollingFrame::render2d                             0x14167e700
+  CanvasGroup::render2d                                0x141898880
+  ViewportFrame::render2d                              0x141989110
+  ViewportFrame::setCurrentCamera                      0x141989650
+  UIStroke::renderBorderStroke                         0x141d0f520
+  BillboardGui::getBillboardCFrame                     0x1416768e0
+  BillboardGui::stepLayouts                            0x1416793f0
+  BillboardGui::shouldRender3dAdorn                    0x141679310
+  BillboardGui::render3dAdorn                          0x141678970
+  SurfaceGuiBase::updateViewport                       0x141c2abc0
+  SurfaceGuiBase::process / process3d                  0x141c29c70 / _6e0
+  GuiLayerCollector::process/processDescendants        0x14162d4b0 / _5a0
+  GuiLayerCollector::resolveInputOver                  0x14162f910
+  BasePlayerGui::process                               0x141487df0
+  BasePlayerGui::doRebuildRenderAndInputLists          0x141484c40
+  DisplayOrderComparator::createSortKey                0x141483720
+  GuiObject::processItem                               0x14162e990
+  GuiObject::processMouseEventInternal                 0x14166b6a0
+  GuiObject::processTouchEvent                         0x14166c070
+  GuiObject::canProcessMeAndDescendants                0x141662f40
+  GuiBase2d::isPropertyHiddenInStudio                  0x14161f080
+
+================================================================================
+18. FFLAGS OBSERVED IN THESE PATHS
+================================================================================
+  ScreenGuiUpdateViewportBeforeRender2d,
+  ScreenGuiUseScreenInsetsTypeAsSourceOfTruthForIgnoreGuiInset,
+  AdaptiveUILayoutSupportsRendering, RouteGfxGuiRecordingForCanvasGroup2,
+  ReduceGuiStateGfxGuiInvalidation, UseSingleLayoutForRichText4,
+  RenderCanvasGroupToTexture, ViewportFrameUseRender2dBorder2,
+  ViewportFrameEnableMirroring (DF), SortBillboardGuisForInput,
+  FixSmallSurfaceGuiMouseInput, AvoidUnnecessaryQuadtreeLock,
+  UserFlagEnableNewVRSystem, UserFlagEnableVRUpdate2,
+  VRUsePointerForTextBoxPreprocessing, GuiBrightness, g_flagsLoaded /
+  DebugTraceCreatableCounts3.
+
+================================================================================
+CAVEATS
+================================================================================
+- Field NAMES come from the PDB, but IDA occasionally assigns a correct-
+  offset/wrong-name field (noted inline where suspected, e.g. the
+  SurfaceGuiBase process gate labeled `alwaysOnTop`, GuiLayerCollector's
+  "clipping" virtual surfaced as getPropertyStatusInStudio).
+- Template-instantiated code (GuiTextMixin/GuiImageMixin) is cited by
+  ONE instantiation; sibling instantiations behave identically.
+- Functions whose address was not needed are referenced by file only.
+================================================================================
