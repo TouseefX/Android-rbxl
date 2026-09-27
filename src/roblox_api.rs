@@ -210,6 +210,30 @@ pub fn try_recv_model_result() -> Option<ModelUploadResult> {
     rx.lock().ok().and_then(|r| r.try_recv().ok())
 }
 
+/// Auth for the Assets API, in either flavor: Open Cloud (`x-api-key`) or
+/// user-auth (`.ROBLOSECURITY` cookie + `X-CSRF-TOKEN`).
+#[derive(Clone)]
+struct AssetsAuth {
+    api_key: Option<String>,
+    cookie: Option<String>,
+    csrf: Option<String>,
+}
+
+impl AssetsAuth {
+    fn apply(&self, mut req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+        if let Some(key) = &self.api_key {
+            req = req.header("x-api-key", key);
+        }
+        if let Some(cookie) = &self.cookie {
+            req = req.header("Cookie", format!(".ROBLOSECURITY={cookie}"));
+        }
+        if let Some(token) = &self.csrf {
+            req = req.header("X-CSRF-TOKEN", token);
+        }
+        req
+    }
+}
+
 /// Minimal percent-encoding for URL query values (RFC 3986 unreserved set
 /// passes through, everything else becomes %XX).
 fn urlencode(s: &str) -> String {
@@ -296,9 +320,7 @@ impl RobloxApiClient {
         Self::upload_asset_open_cloud(api_key, creator_id, is_group, "Model", name, rbxm_bytes)
     }
 
-    /// Shared Open Cloud Assets API upload: create the asset, poll the
-    /// operation, return the new asset id. `asset_type` is the Open Cloud
-    /// asset type string ("Animation", "Model", …).
+    /// Open Cloud (`x-api-key`) flavor of the Assets API upload.
     fn upload_asset_open_cloud(
         api_key: &str,
         creator_id: &str,
@@ -308,12 +330,96 @@ impl RobloxApiClient {
         rbxm_bytes: &[u8],
     ) -> Result<u64, String> {
         let key = api_key.trim();
-        let creator = creator_id.trim().trim_matches('"');
         if key.is_empty() {
             return Err(
                 "An Open Cloud API key (asset Read+Write) is required. Set it in the Open Cloud tab.".into(),
             );
         }
+        let auth = AssetsAuth { api_key: Some(key.to_string()), cookie: None, csrf: None };
+        Self::upload_asset_via_assets_api(
+            "https://apis.roblox.com/assets/v1",
+            &auth,
+            creator_id,
+            is_group,
+            asset_type,
+            name,
+            rbxm_bytes,
+        )
+    }
+
+    /// Cookie (`user-auth`) flavor of the Assets API upload — the same
+    /// endpoint shape as Open Cloud but authenticated with the account's
+    /// `.ROBLOSECURITY` cookie + X-CSRF-TOKEN (the path Rojo uses; see
+    /// roblox-cookie-upload-endpoints.md §2). No API key needed.
+    fn upload_asset_user_auth(
+        cookie: &str,
+        creator_id: &str,
+        is_group: bool,
+        asset_type: &str,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        if cookie.trim().is_empty() {
+            return Err("A .ROBLOSECURITY cookie is required.".into());
+        }
+        // Pre-fetch a CSRF token via the standard logout handshake; if it's
+        // stale the create call's own 403-retry refreshes it anyway.
+        let csrf = Self::fetch_csrf_token(cookie).ok();
+        let auth = AssetsAuth {
+            api_key: None,
+            cookie: Some(cookie.trim().to_string()),
+            csrf,
+        };
+        Self::upload_asset_via_assets_api(
+            "https://apis.roblox.com/assets/user-auth/v1",
+            &auth,
+            creator_id,
+            is_group,
+            asset_type,
+            name,
+            rbxm_bytes,
+        )
+    }
+
+    /// Standard CSRF handshake: POST auth.roblox.com/v2/logout with the
+    /// cookie, read the fresh token from the 403 response's x-csrf-token
+    /// header (roblox-cookie-upload-endpoints.md §0).
+    fn fetch_csrf_token(cookie: &str) -> Result<String, String> {
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("rbxl-editor")
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
+        let resp = http
+            .post("https://auth.roblox.com/v2/logout")
+            .header("Cookie", format!(".ROBLOSECURITY={}", cookie.trim()))
+            .header("Content-Length", "0")
+            .send()
+            .map_err(|e| format!("CSRF handshake error: {e}"))?;
+        resp.headers()
+            .get("x-csrf-token")
+            .and_then(|t| t.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| "No x-csrf-token header in handshake response".into())
+    }
+
+    /// Shared Assets API upload used by BOTH auth flavors (see
+    /// roblox-cookie-upload-endpoints.md §2): create the asset, poll the
+    /// operation, return the new asset id. `asset_type` is the asset type
+    /// string ("Animation", "Model", …).
+    ///
+    /// - Open Cloud:  base `assets/v1`,        auth = `x-api-key`
+    /// - user-auth:   base `assets/user-auth/v1`, auth = cookie + X-CSRF-TOKEN
+    fn upload_asset_via_assets_api(
+        base_url: &str,
+        auth: &AssetsAuth,
+        creator_id: &str,
+        is_group: bool,
+        asset_type: &str,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        let creator = creator_id.trim().trim_matches('"');
         if creator.is_empty() || creator.parse::<u64>().is_err() {
             return Err("Enter a valid numeric Creator User ID (or Group ID).".into());
         }
@@ -339,18 +445,35 @@ impl RobloxApiClient {
         let body = build_assets_multipart(boundary, &request_json, rbxm_bytes);
 
         // 1) Create the asset -> returns {"path":"operations/{opId}"}.
-        let resp = http
-            .post("https://apis.roblox.com/assets/v1/assets")
-            .header("x-api-key", key)
-            .header(
-                "Content-Type",
-                format!("multipart/form-data; boundary={boundary}"),
-            )
-            .body(body)
-            .send()
-            .map_err(|e| format!("Upload network error: {e}"))?;
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
+        // With cookie auth Roblox may answer 403 + a fresh x-csrf-token
+        // header (the standard CSRF challenge) — retry once with it.
+        let mut auth = auth.clone();
+        let mut attempt = 0;
+        let (status, text) = loop {
+            attempt += 1;
+            let resp = auth
+                .apply(http.post(format!("{base_url}/assets")))
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body.clone())
+                .send()
+                .map_err(|e| format!("Upload network error: {e}"))?;
+            let status = resp.status();
+            if attempt == 1 && auth.cookie.is_some() && !status.is_success() {
+                if let Some(token) = resp
+                    .headers()
+                    .get("x-csrf-token")
+                    .and_then(|t| t.to_str().ok())
+                {
+                    auth.csrf = Some(token.to_string());
+                    continue;
+                }
+            }
+            let text = resp.text().unwrap_or_default();
+            break (status, text);
+        };
         if !status.is_success() {
             let msg = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
@@ -373,11 +496,11 @@ impl RobloxApiClient {
         }
 
         // 2) Poll the operation until done, then read response.assetId.
-        let op_url = format!("https://apis.roblox.com/assets/v1/operations/{op_id}");
+        let op_url = format!("{base_url}/operations/{op_id}");
         let mut last = String::new();
         for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(750));
-            let resp = match http.get(&op_url).header("x-api-key", key).send() {
+            let resp = match auth.apply(http.get(&op_url)).send() {
                 Ok(r) => r,
                 Err(e) => return Err(format!("Operation poll error: {e}")),
             };
@@ -455,6 +578,7 @@ impl RobloxApiClient {
     pub fn upload_model_legacy(
         cookie: &str,
         name: &str,
+        group_id: Option<&str>,
         rbxm_bytes: &[u8],
     ) -> Result<u64, String> {
         if rbxm_bytes.is_empty() {
@@ -465,18 +589,25 @@ impl RobloxApiClient {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| format!("HTTP client build error: {e}"))?;
-        let url = format!(
-            "https://data.roblox.com/Data/Upload.ashx?assetid=0&type=Model&genreTypeId=1&name={}&description={}&ispublic=False&allowComments=False",
+        // json=1 -> {"id":...} JSON instead of a bare assetVersionId; groupId
+        // uploads the model into a group's inventory instead of the user's.
+        let mut url = format!(
+            "https://data.roblox.com/Data/Upload.ashx?json=1&assetid=0&type=Model&genreTypeId=1&name={}&description={}&ispublic=False&allowComments=False",
             urlencode(name),
             urlencode("Uploaded from Android rbxl editor"),
         );
+        if let Some(gid) = group_id {
+            if !gid.trim().is_empty() {
+                url.push_str(&format!("&groupId={}", urlencode(gid.trim())));
+            }
+        }
 
         let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
             let mut req = http
                 .post(&url)
                 .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
                 .header("Requester", "Client")
-                .header("Content-Type", "application/octet-stream")
+                .header("Content-Type", "application/xml")
                 .body(rbxm_bytes.to_vec());
             if let Some(token) = csrf {
                 req = req.header("X-CSRF-TOKEN", token);
@@ -484,8 +615,17 @@ impl RobloxApiClient {
             req.send().map_err(|e| format!("Upload network error: {e}"))
         };
 
-        let mut resp = send(None)?;
-        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        // First try with a pre-fetched token from the standard handshake;
+        // fall back to sending without one.
+        let mut resp = match Self::fetch_csrf_token(cookie) {
+            Ok(token) => send(Some(&token))?,
+            Err(_) => send(None)?,
+        };
+        // CSRF challenge: normally 403 + x-csrf-token header, but this
+        // endpoint's error page is broken and can answer HTTP 500 while
+        // STILL carrying the header — so retry on ANY failed status that
+        // hands us a token (roblox-cookie-upload-endpoints.md §1).
+        if !resp.status().is_success() {
             let token = resp
                 .headers()
                 .get("x-csrf-token")
@@ -503,9 +643,22 @@ impl RobloxApiClient {
                 snippet(&text)
             ));
         }
-        let id = text.trim().parse::<u64>().map_err(|_| {
-            format!("Legacy upload returned an unexpected response: {}", snippet(&text))
-        })?;
+        // json=1 -> {"id":...}; be liberal and also accept a bare number.
+        let id = serde_json::from_str::<serde_json::Value>(text.trim())
+            .ok()
+            .and_then(|v| {
+                v.get("id")
+                    .or_else(|| v.get("assetId"))
+                    .or_else(|| v.get("AssetId"))
+                    .and_then(|x| {
+                        x.as_u64()
+                            .or_else(|| x.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
+            })
+            .or_else(|| text.trim().parse::<u64>().ok())
+            .ok_or_else(|| {
+                format!("Legacy upload returned an unexpected response: {}", snippet(&text))
+            })?;
         if id == 0 {
             return Err("Legacy upload returned asset id 0.".into());
         }
@@ -529,25 +682,29 @@ impl RobloxApiClient {
         std::thread::spawn(move || {
             let mut errors: Vec<String> = Vec::new();
 
-            // 1) Open Cloud Assets API (preferred) when an API key is set.
+            // Resolve the creator id once: explicit entry wins, otherwise a
+            // group upload requires the Group ID, otherwise auto-detect the
+            // User ID from the cookie (whoami).
+            let creator: Result<String, String> = if !creator_id.trim().is_empty() {
+                Ok(creator_id.trim().to_string())
+            } else if is_group {
+                Err("Enter the Group ID for group uploads.".into())
+            } else if let Some(cookie) = cookie_opt.as_deref() {
+                WebClient::new(cookie)
+                    .and_then(|c| c.whoami())
+                    .map(|(uid, _)| uid.to_string())
+                    .map_err(|e| {
+                        format!("could not determine your User ID from the cookie: {e}")
+                    })
+            } else {
+                Err("enter a Creator User ID or set your .ROBLOSECURITY cookie".into())
+            };
+
+            // 1) Open Cloud Assets API (x-api-key) when an API key is set.
             if let Some(key) = api_key.as_deref() {
-                let creator: Result<String, String> = if !creator_id.trim().is_empty() {
-                    Ok(creator_id.trim().to_string())
-                } else if is_group {
-                    Err("Enter the Group ID for group uploads.".into())
-                } else if let Some(cookie) = cookie_opt.as_deref() {
-                    WebClient::new(cookie)
-                        .and_then(|c| c.whoami())
-                        .map(|(uid, _)| uid.to_string())
-                        .map_err(|e| {
-                            format!("could not determine your User ID from the cookie: {e}")
-                        })
-                } else {
-                    Err("enter a Creator User ID or set your .ROBLOSECURITY cookie".into())
-                };
-                match creator {
+                match &creator {
                     Ok(creator) => {
-                        match RobloxApiClient::upload_model(key, &creator, is_group, &name, &rbxm_bytes)
+                        match RobloxApiClient::upload_model(key, creator, is_group, &name, &rbxm_bytes)
                         {
                             Ok(id) => {
                                 let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
@@ -560,20 +717,35 @@ impl RobloxApiClient {
                 }
             }
 
-            // 2) Legacy cookie endpoint fallback (user uploads only).
-            if is_group {
-                if api_key.is_none() {
-                    errors.push(
-                        "Group uploads need an Open Cloud API key (Open Cloud tab).".into(),
-                    );
-                }
-            } else if let Some(cookie) = cookie_opt.as_deref() {
-                match RobloxApiClient::upload_model_legacy(cookie, &name, &rbxm_bytes) {
-                    Ok(id) => {
-                        let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
-                        return;
+            // 2) Cookie user-auth Assets API — same pipeline, no key needed.
+            if let Some(cookie) = cookie_opt.as_deref() {
+                match &creator {
+                    Ok(creator) => {
+                        match RobloxApiClient::upload_asset_user_auth(
+                            cookie, creator, is_group, "Model", &name, &rbxm_bytes,
+                        ) {
+                            Ok(id) => {
+                                let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
+                                return;
+                            }
+                            Err(e) => errors.push(format!("user-auth API: {e}")),
+                        }
                     }
-                    Err(e) => errors.push(format!("Legacy endpoint: {e}")),
+                    Err(e) => errors.push(format!("user-auth API: {e}")),
+                }
+
+                // 3) Last resort: the classic hidden Upload.ashx endpoint
+                //    (supports group uploads via &groupId=).
+                let group_id = if is_group { creator.as_deref().ok() } else { None };
+                if !is_group || group_id.is_some() {
+                    match RobloxApiClient::upload_model_legacy(cookie, &name, group_id, &rbxm_bytes)
+                    {
+                        Ok(id) => {
+                            let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
+                            return;
+                        }
+                        Err(e) => errors.push(format!("Upload.ashx: {e}")),
+                    }
                 }
             }
 
@@ -583,6 +755,7 @@ impl RobloxApiClient {
                         .into(),
                 );
             }
+            errors.dedup();
             let _ = tx.send(ModelUploadResult { name, result: Err(errors.join(" — also tried ")) });
         });
     }

@@ -4211,15 +4211,9 @@ ui.label("Place ID:");
                 "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first".into();
             return;
         }
-        if self.model_use_group {
-            if api_key.is_none() {
-                self.status = "Group uploads need an Open Cloud API key (Open Cloud tab)".into();
-                return;
-            }
-            if self.model_creator_id.trim().is_empty() {
-                self.status = "Enter the Group ID".into();
-                return;
-            }
+        if self.model_use_group && self.model_creator_id.trim().is_empty() {
+            self.status = "Enter the Group ID".into();
+            return;
         }
         let first_name = dom
             .get_by_ref(refs[0])
