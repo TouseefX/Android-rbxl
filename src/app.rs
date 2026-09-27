@@ -355,6 +355,8 @@ pub struct EditorApp {
     game_cfg_desc: String,
     game_cfg_max_players: String,
     game_cfg_response: String,
+    /// Output area of the Team Create session panel.
+    team_create_response: String,
 
     // Per-property text buffers so number properties (float/int, and vector
     // components) can be TYPED exactly like Studio instead of only dragged.
@@ -502,6 +504,7 @@ impl Default for EditorApp {
             game_cfg_desc: String::new(),
             game_cfg_max_players: String::new(),
             game_cfg_response: String::new(),
+            team_create_response: String::new(),
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
@@ -1726,6 +1729,114 @@ ui.label("Place ID:");
 
                     if !self.game_cfg_response.is_empty() {
                         ui.label(RichText::new(&self.game_cfg_response).monospace().color(Color32::from_rgb(255, 220, 180)));
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Section 2c: Team Create (cloud edit) session control plane —
+                // the REST routes Studio's ApiTeamCreateUrlConstruction builds
+                // (see team-create-sessions-explained.md §1a/§1b). The live
+                // replication client (UDP/RakNet) is a future stage.
+                ui.group(|ui| {
+                    ui.label(RichText::new("👥 Team Create Sessions").heading().color(Color32::from_rgb(120, 200, 255)));
+                    ui.label("Cookie-auth control plane: check/enable Team Create, see who's in the cloud-edit session, and negotiate a join (returns the session server's address). Uses the Universe/Place IDs above.");
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("🔄 Check Status").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.team_create_status(&self.open_cloud_universe_id)) {
+                                Ok(v) => {
+                                    let enabled = v.get("isEnabled").and_then(|b| b.as_bool()).unwrap_or(false);
+                                    self.team_create_response = format!(
+                                        "Team Create is {} for universe {}",
+                                        if enabled { "ENABLED ✅" } else { "disabled ❌" },
+                                        self.open_cloud_universe_id.trim()
+                                    );
+                                    self.status = "Team Create status fetched".into();
+                                }
+                                Err(e) => {
+                                    self.team_create_response = format!("Error: {e}");
+                                    self.log_error(format!("Team Create status: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("🟢 Enable").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.team_create_set_enabled(&self.open_cloud_universe_id, true)) {
+                                Ok(()) => {
+                                    self.team_create_response = "Team Create enabled".into();
+                                    self.status = "✅ Team Create enabled".into();
+                                    self.log_info("Team Create enabled");
+                                }
+                                Err(e) => {
+                                    self.team_create_response = format!("Error: {e}");
+                                    self.log_error(format!("Team Create enable: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("🔴 Disable").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.team_create_set_enabled(&self.open_cloud_universe_id, false)) {
+                                Ok(()) => {
+                                    self.team_create_response = "Team Create disabled".into();
+                                    self.status = "✅ Team Create disabled".into();
+                                    self.log_info("Team Create disabled");
+                                }
+                                Err(e) => {
+                                    self.team_create_response = format!("Error: {e}");
+                                    self.log_error(format!("Team Create disable: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("👥 Session Members").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.team_create_members(&self.open_cloud_place_id)) {
+                                Ok(v) => {
+                                    let names: Vec<String> = v
+                                        .get("data")
+                                        .and_then(|d| d.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .map(|m| {
+                                                    m.get("name")
+                                                        .or_else(|| m.get("displayName"))
+                                                        .and_then(|n| n.as_str())
+                                                        .map(str::to_string)
+                                                        .unwrap_or_else(|| {
+                                                            m.get("id").map(|i| i.to_string()).unwrap_or_default()
+                                                        })
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    self.team_create_response = if names.is_empty() {
+                                        "No one is in the cloud-edit session right now".into()
+                                    } else {
+                                        format!("In session ({}): {}", names.len(), names.join(", "))
+                                    };
+                                    self.status = "Session members fetched".into();
+                                }
+                                Err(e) => {
+                                    self.team_create_response = format!("Error: {e}");
+                                    self.log_error(format!("Team Create members: {e}"));
+                                }
+                            }
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("🎫 Negotiate Join").clicked() {
+                            self.team_create_negotiate(false);
+                        }
+                        if ui.button("⚡ Warm Up Server").clicked() {
+                            self.team_create_negotiate(true);
+                        }
+                    });
+
+                    if !self.team_create_response.is_empty() {
+                        egui::ScrollArea::vertical()
+                            .id_salt("team_create_response_scroll")
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(&self.team_create_response).monospace().color(Color32::from_rgb(170, 220, 255)));
+                            });
                     }
                 });
 
@@ -5543,6 +5654,59 @@ ui.label("Place ID:");
     }
 
     /// Build a read-only cookie Option for background threads.
+    /// Team Create join negotiation (or preemptive server warm-up): POST the
+    /// gamejoin request and summarize the returned server config — the
+    /// address/port the UDP replication client would connect to. Proves the
+    /// whole cookie → session → server pipeline works from this device.
+    fn team_create_negotiate(&mut self, preemptive: bool) {
+        let Some(cookie) = self.roblosecurity_cookie() else {
+            self.team_create_response =
+                "Set your .ROBLOSECURITY cookie in the Settings tab first".into();
+            return;
+        };
+        let label = if preemptive { "warm-up" } else { "join negotiation" };
+        self.log_info(format!("Team Create {label} for place {}", self.open_cloud_place_id.trim()));
+        match RobloxApiClient::team_create_join(&cookie, &self.open_cloud_place_id, preemptive) {
+            Ok(v) => {
+                let mut summary = if preemptive {
+                    String::from("Server warm-up request accepted")
+                } else {
+                    String::from("Join config received")
+                };
+                let addr = v.get("Address").and_then(|a| a.as_str());
+                let port = v
+                    .get("Port")
+                    .and_then(|p| p.as_u64())
+                    .or_else(|| v.get("ServerPort").and_then(|p| p.as_u64()));
+                if let Some(a) = addr {
+                    summary.push_str(&format!(" — server {a}"));
+                    if let Some(p) = port {
+                        summary.push_str(&format!(":{p}"));
+                    }
+                } else if let Some(p) = port {
+                    summary.push_str(&format!(" — server port {p}"));
+                }
+                if let Some(n) = v.get("UdmuxEndpoints").and_then(|u| u.as_array()).map(|a| a.len()) {
+                    if n > 0 {
+                        summary.push_str(&format!(" — {n} UDMUX endpoint(s)"));
+                    }
+                }
+                let mut raw: String = v.to_string().chars().take(700).collect();
+                if raw.len() < v.to_string().len() {
+                    raw.push('…');
+                }
+                self.team_create_response = format!("{summary}\n{raw}");
+                self.status = format!("✅ Team Create {label} succeeded");
+                self.log_info(format!("Team Create {label}: {summary}"));
+            }
+            Err(e) => {
+                self.team_create_response = format!("Error: {e}");
+                self.status = format!("Team Create {label} failed");
+                self.log_error(format!("Team Create {label}: {e}"));
+            }
+        }
+    }
+
     /// Cookie-authenticated web client for the game-configuration endpoints
     /// (develop.roblox.com / games.roblox.com).
     fn game_cfg_client(&self) -> Result<roblox_api::WebClient, String> {

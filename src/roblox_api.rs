@@ -234,6 +234,35 @@ impl AssetsAuth {
     }
 }
 
+/// Random-enough v4-shaped UUID for `gameJoinAttemptId` (a fresh one per
+/// join attempt, exactly like Studio's CloudEditConnectionModel) without
+/// pulling in a uuid crate: mixes the nanosecond clock through two rounds
+/// of splitmix64.
+fn pseudo_uuid() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut x = (nanos as u64) ^ ((nanos >> 64) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut mix = || {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    };
+    let a = mix();
+    let b = mix();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        (a >> 16) as u16,
+        (a as u16) & 0x0fff,
+        ((b >> 48) as u16 & 0x3fff) | 0x8000,
+        b & 0x0000_ffff_ffff_ffff,
+    )
+}
+
 /// Minimal percent-encoding for URL query values (RFC 3986 unreserved set
 /// passes through, everything else becomes %XX).
 fn urlencode(s: &str) -> String {
@@ -706,6 +735,80 @@ impl RobloxApiClient {
             ));
         }
         Ok(text)
+    }
+
+    /// Team Create join negotiation (team-create-sessions-explained.md §1b):
+    /// `POST gamejoin.roblox.com/v1/team-create` (or `…/team-create-preemptive`
+    /// to warm the cloud-edit server up early) with
+    /// `{placeId, gameJoinAttemptId}` — the same request Studio's
+    /// CloudEditConnectionModel::constructTeamCreateGameJoinRequest builds.
+    /// The response is the join CONFIG: either `Address`/`Port` or a
+    /// `ServerPort` + `UdmuxEndpoints` list — i.e. where the UDP replication
+    /// socket would connect. We return the raw JSON for inspection; actually
+    /// speaking the RakNet replication protocol is the (future) engine part.
+    pub fn team_create_join(
+        cookie: &str,
+        place_id: &str,
+        preemptive: bool,
+    ) -> Result<serde_json::Value, String> {
+        let pid = place_id.trim();
+        let pid_num = pid
+            .parse::<u64>()
+            .map_err(|_| "Enter a valid numeric Place ID first.".to_string())?;
+        let url = if preemptive {
+            "https://gamejoin.roblox.com/v1/team-create-preemptive"
+        } else {
+            "https://gamejoin.roblox.com/v1/team-create"
+        };
+        // gamejoin endpoints check the User-Agent — use the client one.
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("Roblox/WinInet")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
+        let attempt_id = pseudo_uuid();
+        let body = serde_json::json!({
+            "placeId": pid_num,
+            "gameJoinAttemptId": attempt_id,
+        });
+
+        let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
+            let mut req = http
+                .post(url)
+                .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .json(&body);
+            if let Some(token) = csrf {
+                req = req.header("X-CSRF-TOKEN", token);
+            }
+            req.send().map_err(|e| format!("gamejoin network error: {e}"))
+        };
+
+        let mut resp = match Self::fetch_csrf_token(cookie) {
+            Ok(token) => send(Some(&token))?,
+            Err(_) => send(None)?,
+        };
+        if !resp.status().is_success() {
+            let token = resp
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|t| t.to_str().ok())
+                .map(str::to_string);
+            if let Some(token) = token {
+                resp = send(Some(&token))?;
+            }
+        }
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "Join negotiation failed (HTTP {status}): {}",
+                snippet(&text)
+            ));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| format!("gamejoin returned non-JSON ({e}): {}", snippet(&text)))
     }
 
     /// Fire-and-forget background Creator Store upload. Tries the Open Cloud
@@ -3372,6 +3475,53 @@ impl WebClient {
             &serde_json::json!({}),
         )?;
         Ok(())
+    }
+
+    // ---- Team Create (cloud edit) REST control plane -------------------------
+    // These are the exact routes Studio's ApiTeamCreateUrlConstruction builds
+    // (team-create-sessions-explained.md §1a) — Stage 0 of a Team Create
+    // client: session status, membership, and the on/off switch.
+
+    /// Is Team Create enabled for this universe?
+    /// `GET develop.roblox.com/v1/universes/{id}/teamcreate` → {"isEnabled":bool}
+    pub fn team_create_status(&self, universe_id: &str) -> Result<serde_json::Value, String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        self.get_json(&format!(
+            "https://develop.roblox.com/v1/universes/{uid}/teamcreate"
+        ))
+    }
+
+    /// Turn Team Create on or off for a universe:
+    /// `PATCH develop.roblox.com/v1/universes/{id}/teamcreate` {"isEnabled":…}.
+    pub fn team_create_set_enabled(
+        &self,
+        universe_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        self.patch_json(
+            &format!("https://develop.roblox.com/v1/universes/{uid}/teamcreate"),
+            &serde_json::json!({ "isEnabled": enabled }),
+        )?;
+        Ok(())
+    }
+
+    /// Who is in the ACTIVE cloud-edit session of a place right now:
+    /// `GET develop.roblox.com/v1/places/{placeId}/teamcreate/active_session/members`.
+    pub fn team_create_members(&self, place_id: &str) -> Result<serde_json::Value, String> {
+        let pid = place_id.trim();
+        if pid.is_empty() || pid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Place ID first.".into());
+        }
+        self.get_json(&format!(
+            "https://develop.roblox.com/v1/places/{pid}/teamcreate/active_session/members"
+        ))
     }
 
     // ---- Avatar editing ----------------------------------------------------
