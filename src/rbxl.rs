@@ -555,8 +555,126 @@ pub fn save_place_as(dom: &WeakDom, format: PlaceFormat) -> Result<Vec<u8>> {
 /// into a fresh DataModel-rooted DOM (so the root's children serialize as the
 /// model's top-level instances) and write it as binary.
 pub fn export_subtree_rbxm(dom: &WeakDom, referent: Ref) -> Result<Vec<u8>> {
+    export_subtrees_rbxm(dom, &[referent])
+}
+
+/// Export SEVERAL instances (each with its whole child subtree) as one
+/// self-contained binary `.rbxm` model — the multi-select counterpart of
+/// `export_subtree_rbxm`. Every referent becomes a top-level instance of the
+/// resulting model, exactly like Studio's "Save Selection as Model".
+pub fn export_subtrees_rbxm(dom: &WeakDom, referents: &[Ref]) -> Result<Vec<u8>> {
+    if referents.is_empty() {
+        bail!("nothing selected to export");
+    }
     let mut export_dom = WeakDom::new(InstanceBuilder::new("DataModel"));
     let root = export_dom.root_ref();
-    insert_dom_subtree(&mut export_dom, root, dom, referent);
+    for &referent in referents {
+        if dom.get_by_ref(referent).is_none() {
+            continue;
+        }
+        insert_dom_subtree(&mut export_dom, root, dom, referent);
+    }
     save_place_as(&export_dom, PlaceFormat::Binary)
+}
+
+/// True when `other` is `ancestor` itself or one of its descendants.
+pub fn is_self_or_descendant(dom: &WeakDom, ancestor: Ref, other: Ref) -> bool {
+    let mut cur = other;
+    loop {
+        if cur == ancestor {
+            return true;
+        }
+        match dom.get_by_ref(cur) {
+            Some(inst) if inst.parent().is_some() => cur = inst.parent(),
+            _ => return false,
+        }
+    }
+}
+
+/// Move an instance (with its whole subtree) under a new parent, with the
+/// same safety rules Studio enforces: the place root can't be moved,
+/// top-level services can't be moved, and an instance can never be parented
+/// under itself or one of its own descendants (that would orphan the cycle).
+pub fn reparent_instance(dom: &mut WeakDom, referent: Ref, new_parent: Ref) -> Result<()> {
+    if referent == dom.root_ref() {
+        bail!("cannot move the place root");
+    }
+    if dom.get_by_ref(new_parent).is_none() {
+        bail!("the new parent no longer exists");
+    }
+    let (cur_parent, name) = {
+        let inst = dom.get_by_ref(referent).context("instance not found")?;
+        (inst.parent(), inst.name.clone())
+    };
+    if cur_parent == dom.root_ref() {
+        bail!("cannot move top-level service '{name}'");
+    }
+    if is_self_or_descendant(dom, referent, new_parent) {
+        bail!("cannot move '{name}' under itself or one of its own descendants");
+    }
+    if new_parent == cur_parent {
+        return Ok(()); // already there — nothing to do
+    }
+    dom.transfer_within(referent, new_parent);
+    Ok(())
+}
+
+/// Full dot-path of an instance from the place root, Studio-style:
+/// `game.Workspace.Model.Part`.
+pub fn instance_path(dom: &WeakDom, referent: Ref) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = referent;
+    while cur != dom.root_ref() {
+        let Some(inst) = dom.get_by_ref(cur) else { break };
+        parts.push(inst.name.clone());
+        cur = inst.parent();
+    }
+    parts.reverse();
+    if parts.is_empty() {
+        "game".to_string()
+    } else {
+        format!("game.{}", parts.join("."))
+    }
+}
+
+/// Resolve a Studio-style dot-path (`game.Workspace.Model.Part`, the leading
+/// `game.` is optional) back to an instance. Name matching is exact first,
+/// then case-insensitive as a fallback; the first matching child wins.
+pub fn resolve_path(dom: &WeakDom, path: &str) -> Option<Ref> {
+    let mut segments: Vec<&str> = path
+        .trim()
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Some(first) = segments.first() {
+        if first.eq_ignore_ascii_case("game") || first.eq_ignore_ascii_case("DataModel") {
+            segments.remove(0);
+        }
+    }
+    let mut cur = dom.root_ref();
+    for seg in segments {
+        let inst = dom.get_by_ref(cur)?;
+        let mut next: Option<Ref> = None;
+        for child in inst.children() {
+            if let Some(c) = dom.get_by_ref(*child) {
+                if c.name == seg {
+                    next = Some(*child);
+                    break;
+                }
+            }
+        }
+        if next.is_none() {
+            for child in inst.children() {
+                if let Some(c) = dom.get_by_ref(*child) {
+                    if c.name.eq_ignore_ascii_case(seg) {
+                        next = Some(*child);
+                        break;
+                    }
+                }
+            }
+        }
+        cur = next?;
+    }
+    Some(cur)
 }

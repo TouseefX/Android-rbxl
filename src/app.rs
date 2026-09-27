@@ -328,6 +328,27 @@ pub struct EditorApp {
     anim_creator_id: String,
     anim_use_group: bool,
 
+    // Multi-select, reparenting, and Creator Store upload state.
+    /// Extra selected instances (multi-select). `selected` stays the primary.
+    selected_multi: Vec<Ref>,
+    /// When on, taps in the Explorer toggle rows in/out of the selection set
+    /// (Android has no Ctrl key; on desktop Ctrl+click also works).
+    multi_select_mode: bool,
+    /// When on, Explorer rows can be dragged onto a new parent. Off by
+    /// default so touch-scrolling the tree keeps working.
+    drag_reparent_mode: bool,
+    /// "Move to…" mode: the next tap on an Explorer row reparents the current
+    /// selection under that row instead of selecting it.
+    reparent_pick_mode: bool,
+    /// Text buffer for the Properties tab "Parent" path editor.
+    parent_path_buffer: String,
+    /// Whether the Creator Store upload panel is open in the Explorer.
+    show_model_upload: bool,
+    model_upload_name: String,
+    model_creator_id: String,
+    model_use_group: bool,
+    is_uploading_model: bool,
+
     // Per-property text buffers so number properties (float/int, and vector
     // components) can be TYPED exactly like Studio instead of only dragged.
     // Keyed by property name (vector components use "Name.X"/".Y"/".Z").
@@ -460,6 +481,16 @@ impl Default for EditorApp {
             is_uploading_anim: false,
             anim_creator_id: String::new(),
             anim_use_group: false,
+            selected_multi: Vec::new(),
+            multi_select_mode: false,
+            drag_reparent_mode: false,
+            reparent_pick_mode: false,
+            parent_path_buffer: String::new(),
+            show_model_upload: false,
+            model_upload_name: String::new(),
+            model_creator_id: String::new(),
+            model_use_group: false,
+            is_uploading_model: false,
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
@@ -1706,12 +1737,67 @@ ui.label("Place ID:");
             }
         });
 
-        // Context actions for selected instance
+        // Selection / reparent mode toggles.
+        ui.horizontal_wrapped(|ui| {
+            let multi_resp = ui
+                .toggle_value(&mut self.multi_select_mode, "☑ Multi")
+                .on_hover_text("Multi-select: tap rows to add/remove them (Ctrl+click also works)");
+            if multi_resp.changed() {
+                if self.multi_select_mode {
+                    self.selected_multi = self.selected.into_iter().collect();
+                } else {
+                    self.selected_multi.clear();
+                }
+            }
+            ui.toggle_value(&mut self.drag_reparent_mode, "🖐 Drag")
+                .on_hover_text("Drag a row onto another row to reparent it");
+            if self.reparent_pick_mode {
+                ui.colored_label(
+                    Color32::from_rgb(255, 200, 100),
+                    "Tap the new parent in the tree…",
+                );
+                if ui.button("✖ Cancel").clicked() {
+                    self.reparent_pick_mode = false;
+                }
+            }
+        });
+
+        // Context actions for selected instance(s).
         let selected_info = self.dom.as_ref().and_then(|dom| {
             self.selected.and_then(|r| dom.get_by_ref(r)).map(|inst| (inst.name.clone(), inst.class.to_string()))
         });
+        let multi_count = if self.multi_select_mode { self.selected_multi.len() } else { 0 };
 
-        if let Some((name, class)) = selected_info {
+        if multi_count > 1 {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("Selected: {multi_count} instances"))
+                        .strong()
+                        .color(Color32::from_rgb(255, 210, 120)),
+                );
+                if ui.button("📋 Duplicate").clicked() {
+                    self.duplicate_selected();
+                }
+                if ui.button("🗑️ Delete").clicked() {
+                    self.delete_selected();
+                }
+                if ui.button("💾 Save .rbxm").clicked() {
+                    self.export_selected_rbxm();
+                }
+                if ui.button("☁ Creator Store").clicked() {
+                    self.show_model_upload = !self.show_model_upload;
+                }
+                if ui.button("📦 Move to…").clicked() {
+                    self.reparent_pick_mode = true;
+                    self.status = "Tap the new parent in the Explorer tree".into();
+                }
+                if ui.button("✖ Clear").clicked() {
+                    self.selected_multi.clear();
+                    self.selected = None;
+                }
+            });
+        } else if let Some((name, class)) = selected_info {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(format!("Selected: {name}")).strong().color(Color32::from_rgb(100, 200, 255)));
@@ -1743,34 +1829,162 @@ ui.label("Place ID:");
                 if ui.button("🗑️ Delete").clicked() {
                     self.delete_selected();
                 }
+                if ui.button("💾 Save .rbxm").clicked() {
+                    self.export_selected_rbxm();
+                }
+                if ui.button("☁ Creator Store").clicked() {
+                    self.show_model_upload = !self.show_model_upload;
+                }
+                if ui.button("📦 Move to…").clicked() {
+                    self.reparent_pick_mode = true;
+                    self.status = "Tap the new parent in the Explorer tree".into();
+                }
+            });
+        }
+
+        if self.show_model_upload {
+            ui.separator();
+            ui.label(
+                RichText::new("☁ Upload to Creator Store")
+                    .strong()
+                    .color(Color32::from_rgb(100, 200, 255)),
+            );
+            ui.label(
+                RichText::new(
+                    "Scripts, LocalScripts, ModuleScripts, Folders and Models only. \
+                     Uses your Open Cloud API key (Open Cloud tab) or .ROBLOSECURITY cookie (Settings).",
+                )
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.model_upload_name)
+                        .hint_text("defaults to instance name")
+                        .desired_width(160.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.model_use_group, "Group");
+                ui.label(if self.model_use_group { "Group ID:" } else { "Creator User ID:" });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.model_creator_id)
+                        .hint_text(if self.model_use_group { "e.g. 1234567" } else { "auto from cookie if empty" })
+                        .desired_width(140.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                if self.is_uploading_model {
+                    ui.spinner();
+                    ui.label("Uploading…");
+                } else if ui.button("⬆ Upload selection").clicked() {
+                    self.upload_selection_to_creator_store();
+                }
+                if ui.button("✖ Close").clicked() {
+                    self.show_model_upload = false;
+                }
             });
         }
 
         ui.separator();
 
+        let mut tree_actions: Vec<explorer::TreeAction> = Vec::new();
         egui::ScrollArea::both()
             .id_salt("explorer_tree_scroll")
             .show(ui, |ui| {
                 if let Some(dom) = &self.dom {
                     let root = dom.root_ref();
-                    let prev_selected = self.selected;
-                    explorer::show_tree_filtered(ui, dom, root, &mut self.selected, &self.explorer_search);
-                    if self.selected != prev_selected {
-                        if let Some(r) = self.selected {
-                            if let Some(inst) = dom.get_by_ref(r) {
-                                self.rename_buffer = inst.name.clone();
-                                if matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
-                                    || inst.properties.contains_key(&rbx_dom_weak::Ustr::from("Source"))
-                                {
-                                    self.open_script_tab(r);
-                                }
-                            }
-                        }
-                    }
+                    tree_actions = explorer::show_tree_filtered(
+                        ui,
+                        dom,
+                        root,
+                        self.selected,
+                        &self.selected_multi,
+                        self.multi_select_mode,
+                        self.drag_reparent_mode,
+                        &self.explorer_search,
+                    );
                 } else {
                     ui.label("Open a place file (.rbxl) using the toolbar above.");
                 }
             });
+        self.apply_tree_actions(tree_actions);
+    }
+
+    /// Apply the interactions collected while rendering the Explorer tree
+    /// (done after rendering so the DOM isn't borrowed during UI layout).
+    fn apply_tree_actions(&mut self, actions: Vec<explorer::TreeAction>) {
+        for action in actions {
+            match action {
+                explorer::TreeAction::Select(r) => {
+                    if self.reparent_pick_mode {
+                        self.reparent_pick_mode = false;
+                        self.reparent_selection_to(r);
+                        continue;
+                    }
+                    let changed = self.selected != Some(r);
+                    self.selected = Some(r);
+                    if self.multi_select_mode {
+                        self.selected_multi = vec![r];
+                    } else {
+                        self.selected_multi.clear();
+                    }
+                    if changed {
+                        self.on_explorer_selected(r);
+                    }
+                }
+                explorer::TreeAction::ToggleMulti(r) => {
+                    if self.reparent_pick_mode {
+                        self.reparent_pick_mode = false;
+                        self.reparent_selection_to(r);
+                        continue;
+                    }
+                    // Ctrl+click outside multi mode turns multi mode on so
+                    // the selection set stays visible and usable.
+                    if !self.multi_select_mode {
+                        self.multi_select_mode = true;
+                        self.selected_multi = self.selected.into_iter().collect();
+                    }
+                    if let Some(pos) = self.selected_multi.iter().position(|x| *x == r) {
+                        self.selected_multi.remove(pos);
+                        self.selected = self.selected_multi.last().copied();
+                    } else {
+                        self.selected_multi.push(r);
+                        let changed = self.selected != Some(r);
+                        self.selected = Some(r);
+                        if changed {
+                            self.on_explorer_selected(r);
+                        }
+                    }
+                }
+                explorer::TreeAction::Reparent { child, new_parent } => {
+                    // Dragging one row of a multi-selection moves the whole
+                    // selection; dragging an unselected row moves just it.
+                    let sel = self.selection_refs();
+                    if sel.len() > 1 && sel.contains(&child) {
+                        self.reparent_selection_to(new_parent);
+                    } else {
+                        self.reparent_refs_to(vec![child], new_parent);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Post-selection bookkeeping shared by all Explorer selection paths:
+    /// refresh the rename buffer and auto-open scripts in the editor.
+    fn on_explorer_selected(&mut self, r: Ref) {
+        let mut open_script = false;
+        if let Some(dom) = &self.dom {
+            if let Some(inst) = dom.get_by_ref(r) {
+                self.rename_buffer = inst.name.clone();
+                open_script = matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
+                    || inst.properties.contains_key(&rbx_dom_weak::Ustr::from("Source"));
+            }
+        }
+        if open_script {
+            self.open_script_tab(r);
+        }
     }
 
     fn open_script_tab(&mut self, referent: Ref) {
@@ -2873,12 +3087,14 @@ ui.label("Place ID:");
         if self.prop_num_sel != Some(r) {
             self.prop_num_buf.clear();
             self.prop_num_sel = Some(r);
+            // Seed the Parent path editor with the current parent's path.
+            self.parent_path_buffer = rbxl::instance_path(dom, inst.parent());
         }
 
         let inst_name = inst.name.clone();
         let inst_class = inst.class.to_string();
         let properties = inst.properties.clone();
-        let parent_str = format!("{}", inst.parent());
+        let parent_path = rbxl::instance_path(dom, inst.parent());
         let children_count = inst.children().len();
 
         ui.horizontal(|ui| {
@@ -2905,7 +3121,50 @@ ui.label("Place ID:");
                     }
                 });
 
-                ui.label(format!("Parent: {parent_str}"));
+                // Parent: editable path (type a new path and Set), or pick the
+                // new parent directly in the Explorer tree.
+                ui.horizontal(|ui| {
+                    ui.label("Parent:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.parent_path_buffer)
+                            .hint_text("game.Workspace.Model")
+                            .desired_width(200.0),
+                    );
+                    if ui.button("Set").clicked() {
+                        let path = self.parent_path_buffer.clone();
+                        let target = self
+                            .dom
+                            .as_ref()
+                            .and_then(|d| rbxl::resolve_path(d, &path));
+                        match target {
+                            Some(t) => {
+                                if let Some(dom) = self.dom.as_mut() {
+                                    match rbxl::reparent_instance(dom, r, t) {
+                                        Ok(()) => {
+                                            self.needs_3d_rebuild = true;
+                                            self.status =
+                                                format!("Moved {inst_name} under {path}");
+                                        }
+                                        Err(e) => self.status = format!("Move failed: {e}"),
+                                    }
+                                }
+                            }
+                            None => self.status = format!("No instance found at '{path}'"),
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Current: {parent_path}")).weak());
+                    if ui.button("🎯 Pick new parent in Explorer").clicked() {
+                        self.selected = Some(r);
+                        if self.multi_select_mode {
+                            self.selected_multi = vec![r];
+                        }
+                        self.reparent_pick_mode = true;
+                        self.active_tab = ActiveTab::Explorer;
+                        self.status = "Tap the new parent in the Explorer tree".into();
+                    }
+                });
                 ui.label(format!("Children: {children_count}"));
 
                 ui.separator();
@@ -3777,39 +4036,223 @@ ui.label("Place ID:");
         }
     }
 
+    /// The instances an action should apply to: the multi-selection set when
+    /// multi-select mode is active, otherwise just the primary selection.
+    /// Stale refs (already deleted) are filtered out.
+    fn selection_refs(&self) -> Vec<Ref> {
+        if self.multi_select_mode && !self.selected_multi.is_empty() {
+            let mut refs = self.selected_multi.clone();
+            if let Some(dom) = &self.dom {
+                refs.retain(|r| dom.get_by_ref(*r).is_some());
+            }
+            refs
+        } else {
+            self.selected.into_iter().collect()
+        }
+    }
+
+    /// `selection_refs`, minus any ref whose ancestor is also selected —
+    /// duplicating/deleting/exporting an ancestor already covers its
+    /// descendants, so acting on both would double them (or panic).
+    fn pruned_selection_refs(&self) -> Vec<Ref> {
+        let refs = self.selection_refs();
+        let Some(dom) = &self.dom else { return refs };
+        refs.iter()
+            .copied()
+            .filter(|r| {
+                !refs
+                    .iter()
+                    .any(|a| a != r && rbxl::is_self_or_descendant(dom, *a, *r))
+            })
+            .collect()
+    }
+
     fn duplicate_selected(&mut self) {
-        let (Some(dom), Some(r)) = (self.dom.as_mut(), self.selected) else {
+        let refs = self.pruned_selection_refs();
+        if refs.is_empty() || self.dom.is_none() {
             return;
-        };
-        match rbxl::duplicate_instance(dom, r) {
-            Ok(new_ref) => {
-                self.selected = Some(new_ref);
-                self.status = "Duplicated instance".into();
-                self.log_info("Duplicated instance");
+        }
+        let mut new_refs: Vec<Ref> = Vec::new();
+        let mut last_err: Option<String> = None;
+        for r in refs {
+            let Some(dom) = self.dom.as_mut() else { break };
+            match rbxl::duplicate_instance(dom, r) {
+                Ok(new_ref) => new_refs.push(new_ref),
+                Err(e) => last_err = Some(e.to_string()),
             }
-            Err(e) => {
-                self.status = format!("Duplicate failed: {e}");
-                self.log_error(format!("Duplicate failed: {e}"));
+        }
+        if let Some(&last) = new_refs.last() {
+            self.selected = Some(last);
+            if self.multi_select_mode {
+                self.selected_multi = new_refs.clone();
             }
+            self.needs_3d_rebuild = true;
+            self.status = format!("Duplicated {} instance(s)", new_refs.len());
+            self.log_info(format!("Duplicated {} instance(s)", new_refs.len()));
+        } else if let Some(e) = last_err {
+            self.status = format!("Duplicate failed: {e}");
+            self.log_error(format!("Duplicate failed: {e}"));
         }
     }
 
     fn delete_selected(&mut self) {
-        let (Some(dom), Some(r)) = (self.dom.as_mut(), self.selected) else {
+        let refs = self.pruned_selection_refs();
+        if refs.is_empty() || self.dom.is_none() {
             return;
-        };
-        match rbxl::delete_instance(dom, r) {
-            Ok(_) => {
-                self.open_tabs.retain(|t| t.referent != r);
-                self.selected = None;
-                self.status = "Deleted instance".into();
-                self.log_info("Deleted instance");
-            }
-            Err(e) => {
-                self.status = format!("Delete failed: {e}");
-                self.log_error(format!("Delete failed: {e}"));
+        }
+        let mut deleted = 0usize;
+        let mut last_err: Option<String> = None;
+        for r in &refs {
+            let Some(dom) = self.dom.as_mut() else { break };
+            match rbxl::delete_instance(dom, *r) {
+                Ok(_) => deleted += 1,
+                Err(e) => last_err = Some(e.to_string()),
             }
         }
+        // Close script tabs whose instance is gone (including descendants of
+        // the deleted subtrees).
+        if let Some(dom) = &self.dom {
+            self.open_tabs.retain(|t| dom.get_by_ref(t.referent).is_some());
+            if self.active_script_idx >= self.open_tabs.len() {
+                self.active_script_idx = self.open_tabs.len().saturating_sub(1);
+            }
+        }
+        self.selected = None;
+        self.selected_multi.clear();
+        if deleted > 0 {
+            self.needs_3d_rebuild = true;
+            self.status = format!("Deleted {deleted} instance(s)");
+            self.log_info(format!("Deleted {deleted} instance(s)"));
+        }
+        if let Some(e) = last_err {
+            if deleted == 0 {
+                self.status = format!("Delete failed: {e}");
+            }
+            self.log_error(format!("Delete failed: {e}"));
+        }
+    }
+
+    /// Move a set of instances under `new_parent`, with per-instance safety
+    /// checks (no cycles, no services, no place root) done in `rbxl`.
+    fn reparent_refs_to(&mut self, refs: Vec<Ref>, new_parent: Ref) {
+        let Some(dom) = self.dom.as_mut() else { return };
+        let target_name = dom
+            .get_by_ref(new_parent)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| "?".into());
+        let mut moved = 0usize;
+        let mut last_err: Option<String> = None;
+        for r in refs {
+            if r == new_parent {
+                continue;
+            }
+            match rbxl::reparent_instance(dom, r, new_parent) {
+                Ok(()) => moved += 1,
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if moved > 0 {
+            self.needs_3d_rebuild = true;
+            self.status = format!("Moved {moved} instance(s) under {target_name}");
+            self.log_info(format!("Moved {moved} instance(s) under {target_name}"));
+        }
+        if let Some(e) = last_err {
+            if moved == 0 {
+                self.status = format!("Move failed: {e}");
+            }
+            self.log_error(format!("Move failed: {e}"));
+        }
+    }
+
+    /// Move the current selection (multi-aware) under `new_parent`.
+    fn reparent_selection_to(&mut self, new_parent: Ref) {
+        let refs = self.pruned_selection_refs();
+        if refs.is_empty() {
+            self.status = "Nothing selected to move".into();
+            return;
+        }
+        self.reparent_refs_to(refs, new_parent);
+    }
+
+    /// Upload the current selection to the Creator Store as a Model asset.
+    /// Only Scripts, LocalScripts, ModuleScripts, Folders and Models may be
+    /// uploaded; the whole (pruned) selection is serialized into one .rbxm.
+    fn upload_selection_to_creator_store(&mut self) {
+        let refs = self.pruned_selection_refs();
+        let Some(dom) = &self.dom else {
+            self.status = "Open a place file first".into();
+            return;
+        };
+        if refs.is_empty() {
+            self.status = "Select something to upload first".into();
+            return;
+        }
+        for r in &refs {
+            if let Some(inst) = dom.get_by_ref(*r) {
+                if !matches!(
+                    inst.class.as_str(),
+                    "Script" | "LocalScript" | "ModuleScript" | "Folder" | "Model"
+                ) {
+                    self.status = format!(
+                        "'{}' is a {} — only Scripts, LocalScripts, ModuleScripts, Folders and Models can be uploaded",
+                        inst.name, inst.class
+                    );
+                    return;
+                }
+            }
+        }
+        let api_key = {
+            let k = self.open_cloud_api_key.trim();
+            if k.is_empty() { None } else { Some(k.to_string()) }
+        };
+        let cookie = self.roblosecurity_cookie();
+        if api_key.is_none() && cookie.is_none() {
+            self.status =
+                "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first".into();
+            return;
+        }
+        if self.model_use_group {
+            if api_key.is_none() {
+                self.status = "Group uploads need an Open Cloud API key (Open Cloud tab)".into();
+                return;
+            }
+            if self.model_creator_id.trim().is_empty() {
+                self.status = "Enter the Group ID".into();
+                return;
+            }
+        }
+        let first_name = dom
+            .get_by_ref(refs[0])
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| "Model".into());
+        let name = if self.model_upload_name.trim().is_empty() {
+            first_name
+        } else {
+            self.model_upload_name.trim().to_string()
+        };
+        let bytes = match rbxl::export_subtrees_rbxm(dom, &refs) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Serialize failed: {e}");
+                self.log_error(format!("Creator Store serialize: {e}"));
+                return;
+            }
+        };
+        self.is_uploading_model = true;
+        self.status = format!("Uploading '{name}' to the Creator Store…");
+        self.log_info(format!(
+            "Uploading {} instance(s) as '{name}' ({} bytes) to the Creator Store",
+            refs.len(),
+            bytes.len()
+        ));
+        RobloxApiClient::upload_model_async(
+            api_key,
+            self.model_creator_id.trim().to_string(),
+            self.model_use_group,
+            cookie,
+            name,
+            bytes,
+        );
     }
 
     fn is_script_selected(&self) -> bool {
@@ -3931,6 +4374,24 @@ ui.label("Place ID:");
                 Err(e) => {
                     self.status = format!("Animation upload failed: {e}");
                     self.log_error(format!("Animation upload failed: {e}"));
+                }
+            }
+        }
+
+        // Pick up finished Creator Store (model) uploads.
+        while let Some(res) = roblox_api::try_recv_model_result() {
+            self.is_uploading_model = false;
+            match res.result {
+                Ok(id) => {
+                    self.status = format!("✅ Uploaded to Creator Store! Asset ID: {id}");
+                    self.log_info(format!(
+                        "'{}' uploaded to the Creator Store — asset id {id} (https://create.roblox.com/store/asset/{id})",
+                        res.name
+                    ));
+                }
+                Err(e) => {
+                    self.status = format!("Creator Store upload failed: {e}");
+                    self.log_error(format!("Creator Store upload of '{}' failed: {e}", res.name));
                 }
             }
         }
@@ -5266,14 +5727,31 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         }
     }
 
+    /// Save the current selection (single instance or the whole multi-select
+    /// set) as one self-contained `.rbxm` model file.
     fn export_selected_rbxm(&mut self) {
-        let (Some(dom), Some(selected)) = (&self.dom, self.selected) else {
+        let refs = self.pruned_selection_refs();
+        let Some(dom) = &self.dom else {
             self.status = "Select a folder, item, script, or animation first".into();
             return;
         };
-        match rbxl::export_subtree_rbxm(dom, selected) {
+        if refs.is_empty() {
+            self.status = "Select a folder, item, script, or animation first".into();
+            return;
+        }
+        match rbxl::export_subtrees_rbxm(dom, &refs) {
             Ok(bytes) => {
-                let name = dom.get_by_ref(selected).map(|i| i.name.clone()).unwrap_or_else(|| "model".into());
+                let first = dom
+                    .get_by_ref(refs[0])
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| "model".into());
+                let mut name = if refs.len() == 1 {
+                    first
+                } else {
+                    format!("{first}_and_{}_more", refs.len() - 1)
+                };
+                // Keep the suggested filename filesystem-safe.
+                name = name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
                 self.pending_document_bytes = Some((bytes, name.clone()));
                 jni_bridge::trigger_create_document(&format!("{name}.rbxm"));
                 self.status = format!("Choose where to save {name}.rbxm");

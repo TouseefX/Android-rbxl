@@ -187,6 +187,44 @@ pub fn try_recv_anim_result() -> Option<AnimUploadResult> {
     rx.lock().ok().and_then(|r| r.try_recv().ok())
 }
 
+/// Result of a background `upload_model_async` (Creator Store) call.
+/// `result` is the new model asset id on success, or the error string.
+pub struct ModelUploadResult {
+    pub name: String,
+    pub result: Result<u64, String>,
+}
+
+static MODEL_CHANNEL: OnceLock<(Sender<ModelUploadResult>, Mutex<Receiver<ModelUploadResult>>)> =
+    OnceLock::new();
+
+fn model_channel() -> &'static (Sender<ModelUploadResult>, Mutex<Receiver<ModelUploadResult>>) {
+    MODEL_CHANNEL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+/// Poll for a finished Creator Store model upload (called from the UI thread).
+pub fn try_recv_model_result() -> Option<ModelUploadResult> {
+    let (_, rx) = model_channel();
+    rx.lock().ok().and_then(|r| r.try_recv().ok())
+}
+
+/// Minimal percent-encoding for URL query values (RFC 3986 unreserved set
+/// passes through, everything else becomes %XX).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Truncate a response body to a short snippet for error messages.
 fn snippet(s: &str) -> String {
     s.chars().take(400).collect::<String>()
@@ -242,6 +280,33 @@ impl RobloxApiClient {
         name: &str,
         rbxm_bytes: &[u8],
     ) -> Result<u64, String> {
+        Self::upload_asset_open_cloud(api_key, creator_id, is_group, "Animation", name, rbxm_bytes)
+    }
+
+    /// Upload a `.rbxm` model (any subtree — Scripts, ModuleScripts, Folders,
+    /// Models) to the Creator Store as a new Model asset via the Open Cloud
+    /// Assets API. Same flow as `upload_animation`, just `assetType:"Model"`.
+    pub fn upload_model(
+        api_key: &str,
+        creator_id: &str,
+        is_group: bool,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        Self::upload_asset_open_cloud(api_key, creator_id, is_group, "Model", name, rbxm_bytes)
+    }
+
+    /// Shared Open Cloud Assets API upload: create the asset, poll the
+    /// operation, return the new asset id. `asset_type` is the Open Cloud
+    /// asset type string ("Animation", "Model", …).
+    fn upload_asset_open_cloud(
+        api_key: &str,
+        creator_id: &str,
+        is_group: bool,
+        asset_type: &str,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
         let key = api_key.trim();
         let creator = creator_id.trim().trim_matches('"');
         if key.is_empty() {
@@ -253,7 +318,7 @@ impl RobloxApiClient {
             return Err("Enter a valid numeric Creator User ID (or Group ID).".into());
         }
         if rbxm_bytes.is_empty() {
-            return Err("Nothing to upload (empty animation data).".into());
+            return Err("Nothing to upload (empty asset data).".into());
         }
 
         let http = reqwest::blocking::Client::builder()
@@ -267,7 +332,7 @@ impl RobloxApiClient {
         let creator_key = if is_group { "groupId" } else { "userId" };
         let name_json = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());
         let request_json = format!(
-            "{{\"assetType\":\"Animation\",\"displayName\":{name_json},\"creationContext\":{{\"creator\":{{\"{creator_key}\":\"{creator}\"}}}}}}"
+            "{{\"assetType\":\"{asset_type}\",\"displayName\":{name_json},\"creationContext\":{{\"creator\":{{\"{creator_key}\":\"{creator}\"}}}}}}"
         );
 
         let boundary = "----rbxlEditorBoundary5b9f0c2e7d11";
@@ -340,7 +405,7 @@ impl RobloxApiClient {
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("unknown error");
-                return Err(format!("Roblox rejected the animation: {msg}"));
+                return Err(format!("Roblox rejected the {asset_type}: {msg}"));
             }
             let response = match v.get("response") {
                 Some(r) => r,
@@ -358,7 +423,7 @@ impl RobloxApiClient {
                 .and_then(|s| s.as_str())
             {
                 if state.contains("REJECTED") || state.contains("BANNED") {
-                    return Err(format!("Animation was moderated ({state}) and not published."));
+                    return Err(format!("{asset_type} was moderated ({state}) and not published."));
                 }
             }
             let id_str = response
@@ -376,9 +441,150 @@ impl RobloxApiClient {
             return Ok(id);
         }
         Err(format!(
-            "Animation upload timed out waiting for Roblox to finish processing. Last status: {}",
+            "{asset_type} upload timed out waiting for Roblox to finish processing. Last status: {}",
             snippet(&last)
         ))
+    }
+
+    /// Upload a `.rbxm` as a Model asset through the LEGACY cookie-based
+    /// endpoint (`data.roblox.com/Data/Upload.ashx`) — the same endpoint old
+    /// Studio plugins used. Needs only a `.ROBLOSECURITY` cookie (no Open
+    /// Cloud key) and handles Roblox's X-CSRF-TOKEN challenge: the first POST
+    /// gets a 403 carrying the token, then we retry once with it attached.
+    /// The response body on success is the new asset id.
+    pub fn upload_model_legacy(
+        cookie: &str,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        if rbxm_bytes.is_empty() {
+            return Err("Nothing to upload (empty asset data).".into());
+        }
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("Roblox/WinInet")
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
+        let url = format!(
+            "https://data.roblox.com/Data/Upload.ashx?assetid=0&type=Model&genreTypeId=1&name={}&description={}&ispublic=False&allowComments=False",
+            urlencode(name),
+            urlencode("Uploaded from Android rbxl editor"),
+        );
+
+        let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
+            let mut req = http
+                .post(&url)
+                .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
+                .header("Requester", "Client")
+                .header("Content-Type", "application/octet-stream")
+                .body(rbxm_bytes.to_vec());
+            if let Some(token) = csrf {
+                req = req.header("X-CSRF-TOKEN", token);
+            }
+            req.send().map_err(|e| format!("Upload network error: {e}"))
+        };
+
+        let mut resp = send(None)?;
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            let token = resp
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|t| t.to_str().ok())
+                .map(str::to_string);
+            if let Some(token) = token {
+                resp = send(Some(&token))?;
+            }
+        }
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "Legacy upload failed (HTTP {status}): {}",
+                snippet(&text)
+            ));
+        }
+        let id = text.trim().parse::<u64>().map_err(|_| {
+            format!("Legacy upload returned an unexpected response: {}", snippet(&text))
+        })?;
+        if id == 0 {
+            return Err("Legacy upload returned asset id 0.".into());
+        }
+        Ok(id)
+    }
+
+    /// Fire-and-forget background Creator Store upload. Tries the Open Cloud
+    /// Assets API first when an API key is configured (auto-resolving the
+    /// user id from the cookie if no creator id was entered), then falls back
+    /// to the legacy cookie-authenticated upload endpoint. The result is
+    /// delivered through the model channel and picked up in `drain_events`.
+    pub fn upload_model_async(
+        api_key: Option<String>,
+        creator_id: String,
+        is_group: bool,
+        cookie_opt: Option<String>,
+        name: String,
+        rbxm_bytes: Vec<u8>,
+    ) {
+        let tx = model_channel().0.clone();
+        std::thread::spawn(move || {
+            let mut errors: Vec<String> = Vec::new();
+
+            // 1) Open Cloud Assets API (preferred) when an API key is set.
+            if let Some(key) = api_key.as_deref() {
+                let creator: Result<String, String> = if !creator_id.trim().is_empty() {
+                    Ok(creator_id.trim().to_string())
+                } else if is_group {
+                    Err("Enter the Group ID for group uploads.".into())
+                } else if let Some(cookie) = cookie_opt.as_deref() {
+                    WebClient::new(cookie)
+                        .and_then(|c| c.whoami())
+                        .map(|(uid, _)| uid.to_string())
+                        .map_err(|e| {
+                            format!("could not determine your User ID from the cookie: {e}")
+                        })
+                } else {
+                    Err("enter a Creator User ID or set your .ROBLOSECURITY cookie".into())
+                };
+                match creator {
+                    Ok(creator) => {
+                        match RobloxApiClient::upload_model(key, &creator, is_group, &name, &rbxm_bytes)
+                        {
+                            Ok(id) => {
+                                let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
+                                return;
+                            }
+                            Err(e) => errors.push(format!("Open Cloud: {e}")),
+                        }
+                    }
+                    Err(e) => errors.push(format!("Open Cloud: {e}")),
+                }
+            }
+
+            // 2) Legacy cookie endpoint fallback (user uploads only).
+            if is_group {
+                if api_key.is_none() {
+                    errors.push(
+                        "Group uploads need an Open Cloud API key (Open Cloud tab).".into(),
+                    );
+                }
+            } else if let Some(cookie) = cookie_opt.as_deref() {
+                match RobloxApiClient::upload_model_legacy(cookie, &name, &rbxm_bytes) {
+                    Ok(id) => {
+                        let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
+                        return;
+                    }
+                    Err(e) => errors.push(format!("Legacy endpoint: {e}")),
+                }
+            }
+
+            if errors.is_empty() {
+                errors.push(
+                    "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first."
+                        .into(),
+                );
+            }
+            let _ = tx.send(ModelUploadResult { name, result: Err(errors.join(" — also tried ")) });
+        });
     }
 
     /// Fire-and-forget background wrapper around `upload_animation`. The
