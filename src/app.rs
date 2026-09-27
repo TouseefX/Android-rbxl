@@ -349,6 +349,13 @@ pub struct EditorApp {
     model_use_group: bool,
     is_uploading_model: bool,
 
+    // Game (experience) configuration editor state (Open Cloud tab; uses
+    // the cookie-authenticated develop.roblox.com endpoints).
+    game_cfg_name: String,
+    game_cfg_desc: String,
+    game_cfg_max_players: String,
+    game_cfg_response: String,
+
     // Per-property text buffers so number properties (float/int, and vector
     // components) can be TYPED exactly like Studio instead of only dragged.
     // Keyed by property name (vector components use "Name.X"/".Y"/".Z").
@@ -491,6 +498,10 @@ impl Default for EditorApp {
             model_creator_id: String::new(),
             model_use_group: false,
             is_uploading_model: false,
+            game_cfg_name: String::new(),
+            game_cfg_desc: String::new(),
+            game_cfg_max_players: String::new(),
+            game_cfg_response: String::new(),
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
@@ -1586,40 +1597,135 @@ ui.label("Place ID:");
                 // Section 2: Direct Place Publishing
                 ui.group(|ui| {
                     ui.label(RichText::new("🚀 Publish Active Place to Live Universe").heading().color(Color32::from_rgb(120, 255, 120)));
-                    ui.label("Serializes the active .rbxl in memory and streams it directly to Roblox Open Cloud API via memory pipe (no /tmp file).");
+                    ui.label("Serializes the active .rbxl in memory and streams it to Roblox. Uses the Open Cloud API when a key is set; otherwise (or if Open Cloud fails) it falls back to the cookie-authenticated Upload.ashx endpoint — only the Place ID is needed for that path.");
 
-                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published)");
+                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published; Upload.ashx fallback always goes live)");
 
                     if ui.button(RichText::new("⚡ Publish Place Now").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
-                        if let Some(dom) = &self.dom {
-                            match rbxl::save_place(dom) {
-                                Ok(bytes) => {
-                                    self.log_info("Serializing place in memory for Open Cloud publish...");
-                                    match RobloxApiClient::publish_place_open_cloud(
-                                        &self.open_cloud_api_key,
-                                        &self.open_cloud_universe_id,
-                                        &self.open_cloud_place_id,
-                                        &bytes,
-                                        self.open_cloud_publish_live,
-                                    ) {
-                                        Ok(res) => {
-                                            self.status = "✅ Place published successfully via Open Cloud!".into();
-                                            self.log_info(format!("Publish success: {res}"));
+                        self.publish_place_to_roblox();
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Section 2b: Game (experience) configuration via cookie.
+                ui.group(|ui| {
+                    ui.label(RichText::new("⚙️ Game Configuration").heading().color(Color32::from_rgb(255, 170, 120)));
+                    ui.label("Edit the live experience settings with your .ROBLOSECURITY cookie (Settings tab). Uses the Universe/Place IDs above.");
+
+                    ui.horizontal(|ui| {
+                        if ui.button("🔄 Load current").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.get_game_info(&self.open_cloud_universe_id)) {
+                                Ok(info) => {
+                                    self.game_cfg_name = info.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                                    self.game_cfg_desc = info.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                                    self.game_cfg_max_players = info
+                                        .get("maxPlayers")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|n| n.to_string())
+                                        .unwrap_or_default();
+                                    let playing = info.get("playing").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let visits = info.get("visits").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let creator = info
+                                        .get("creator")
+                                        .and_then(|c| c.get("name"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+                                    self.game_cfg_response = format!(
+                                        "Loaded. creator: {creator} — playing: {playing} — visits: {visits}"
+                                    );
+                                    self.status = "Game configuration loaded".into();
+                                }
+                                Err(e) => {
+                                    self.game_cfg_response = format!("Error: {e}");
+                                    self.log_error(format!("Game config load: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("🟢 Make Public").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.set_universe_active(&self.open_cloud_universe_id, true)) {
+                                Ok(()) => {
+                                    self.game_cfg_response = "Experience activated (public)".into();
+                                    self.status = "✅ Experience is now public".into();
+                                }
+                                Err(e) => {
+                                    self.game_cfg_response = format!("Error: {e}");
+                                    self.log_error(format!("Universe activate: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("🔴 Make Private").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.set_universe_active(&self.open_cloud_universe_id, false)) {
+                                Ok(()) => {
+                                    self.game_cfg_response = "Experience deactivated (private)".into();
+                                    self.status = "✅ Experience is now private".into();
+                                }
+                                Err(e) => {
+                                    self.game_cfg_response = format!("Error: {e}");
+                                    self.log_error(format!("Universe deactivate: {e}"));
+                                }
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.add(egui::TextEdit::singleline(&mut self.game_cfg_name).desired_width(220.0));
+                    });
+                    ui.label("Description:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.game_cfg_desc)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Max players (place):");
+                        ui.add(egui::TextEdit::singleline(&mut self.game_cfg_max_players).desired_width(60.0));
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 Save Name & Description").clicked() {
+                            let body = serde_json::json!({
+                                "name": self.game_cfg_name.trim(),
+                                "description": self.game_cfg_desc.trim(),
+                            });
+                            match self.game_cfg_client().and_then(|c| c.update_universe_configuration(&self.open_cloud_universe_id, &body)) {
+                                Ok(_) => {
+                                    self.game_cfg_response = "Universe name/description updated".into();
+                                    self.status = "✅ Game configuration saved".into();
+                                    self.log_info("Universe configuration updated");
+                                }
+                                Err(e) => {
+                                    self.game_cfg_response = format!("Error: {e}");
+                                    self.log_error(format!("Universe config save: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("💾 Save Max Players").clicked() {
+                            match self.game_cfg_max_players.trim().parse::<u64>() {
+                                Ok(n) if n > 0 => {
+                                    let body = serde_json::json!({ "maxPlayerCount": n });
+                                    match self.game_cfg_client().and_then(|c| c.update_place_configuration(&self.open_cloud_place_id, &body)) {
+                                        Ok(_) => {
+                                            self.game_cfg_response = format!("Place max players set to {n}");
+                                            self.status = "✅ Place configuration saved".into();
+                                            self.log_info(format!("Place maxPlayerCount set to {n}"));
                                         }
                                         Err(e) => {
-                                            self.status = format!("Publish error: {e}");
-                                            self.log_error(format!("Open Cloud publish error: {e}"));
+                                            self.game_cfg_response = format!("Error: {e}");
+                                            self.log_error(format!("Place config save: {e}"));
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    self.status = format!("Serialization error: {e}");
-                                    self.log_error(format!("Serialization error: {e}"));
+                                _ => {
+                                    self.game_cfg_response = "Enter a positive number for max players".into();
                                 }
                             }
-                        } else {
-                            self.status = "Open a place file first".into();
                         }
+                    });
+
+                    if !self.game_cfg_response.is_empty() {
+                        ui.label(RichText::new(&self.game_cfg_response).monospace().color(Color32::from_rgb(255, 220, 180)));
                     }
                 });
 
@@ -5437,6 +5543,15 @@ ui.label("Place ID:");
     }
 
     /// Build a read-only cookie Option for background threads.
+    /// Cookie-authenticated web client for the game-configuration endpoints
+    /// (develop.roblox.com / games.roblox.com).
+    fn game_cfg_client(&self) -> Result<roblox_api::WebClient, String> {
+        let cookie = self
+            .roblosecurity_cookie()
+            .ok_or_else(|| "Set your .ROBLOSECURITY cookie in the Settings tab first".to_string())?;
+        roblox_api::WebClient::new(cookie)
+    }
+
     fn roblosecurity_cookie(&self) -> Option<String> {
         let c = self.roblosecurity_cookie.trim();
         if c.is_empty() { None } else { Some(c.to_string()) }
@@ -5819,12 +5934,20 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             self.status = "Open a place first".into();
             return;
         };
-        if self.open_cloud_api_key.trim().is_empty() {
-            self.status = "Set your Open Cloud API key in the Open Cloud tab".into();
-            self.log_error("Publish requires an Open Cloud API key");
+        let api_key = self.open_cloud_api_key.trim().to_string();
+        let cookie = self.roblosecurity_cookie();
+        if api_key.is_empty() && cookie.is_none() {
+            self.status =
+                "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first".into();
+            self.log_error("Publish requires an Open Cloud API key or a cookie");
             return;
         }
-        // Open Cloud only accepts binary .rbxl; force binary serialization
+        let place = self.open_cloud_place_id.trim().to_string();
+        if place.is_empty() {
+            self.status = "Enter the Place ID in the Open Cloud tab first".into();
+            return;
+        }
+        // Both paths only accept binary .rbxl; force binary serialization
         // regardless of the on-disk format.
         let bytes = match rbxl::save_place(dom) {
             Ok(b) => b,
@@ -5834,26 +5957,52 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 return;
             }
         };
-        let api_key = self.open_cloud_api_key.trim().to_string();
         let universe = self.open_cloud_universe_id.trim().to_string();
-        let place = self.open_cloud_place_id.trim().to_string();
         let publish_live = self.open_cloud_publish_live;
-        self.status = "Publishing place via Open Cloud...".into();
+        self.status = "Publishing place…".into();
         self.log_info(format!(
-            "Publishing place {place} (universe {universe}) via Open Cloud"
+            "Publishing place {place} (universe {universe}) — Open Cloud{}",
+            if cookie.is_some() { ", falling back to cookie Upload.ashx" } else { "" }
         ));
         std::thread::spawn(move || {
-            let result = roblox_api::RobloxApiClient::publish_place_open_cloud(
-                &api_key,
-                &universe,
-                &place,
-                &bytes,
-                publish_live,
-            );
-            match result {
-                Ok(_msg) => jni_bridge::queue_publish_result(format!("place {place}"), Ok(())),
-                Err(e) => jni_bridge::queue_publish_result(format!("place {place}"), Err(e)),
+            let mut errors: Vec<String> = Vec::new();
+            // 1) Open Cloud place-publishing API when a key is configured.
+            if !api_key.is_empty() {
+                match roblox_api::RobloxApiClient::publish_place_open_cloud(
+                    &api_key,
+                    &universe,
+                    &place,
+                    &bytes,
+                    publish_live,
+                ) {
+                    Ok(_msg) => {
+                        jni_bridge::queue_publish_result(
+                            format!("place {place} (Open Cloud)"),
+                            Ok(()),
+                        );
+                        return;
+                    }
+                    Err(e) => errors.push(format!("Open Cloud: {e}")),
+                }
             }
+            // 2) Legacy cookie fallback: overwrite the place through the
+            //    hidden Data/Upload.ashx endpoint (§4 of the endpoints doc).
+            if let Some(cookie) = cookie.as_deref() {
+                match roblox_api::RobloxApiClient::publish_place_legacy(cookie, &place, &bytes) {
+                    Ok(_msg) => {
+                        jni_bridge::queue_publish_result(
+                            format!("place {place} (cookie Upload.ashx)"),
+                            Ok(()),
+                        );
+                        return;
+                    }
+                    Err(e) => errors.push(format!("Upload.ashx: {e}")),
+                }
+            }
+            jni_bridge::queue_publish_result(
+                format!("place {place}"),
+                Err(errors.join(" — also tried ")),
+            );
         });
     }
 

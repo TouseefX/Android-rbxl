@@ -581,14 +581,6 @@ impl RobloxApiClient {
         group_id: Option<&str>,
         rbxm_bytes: &[u8],
     ) -> Result<u64, String> {
-        if rbxm_bytes.is_empty() {
-            return Err("Nothing to upload (empty asset data).".into());
-        }
-        let http = reqwest::blocking::Client::builder()
-            .user_agent("Roblox/WinInet")
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|e| format!("HTTP client build error: {e}"))?;
         // json=1 -> {"id":...} JSON instead of a bare assetVersionId; groupId
         // uploads the model into a group's inventory instead of the user's.
         let mut url = format!(
@@ -601,48 +593,7 @@ impl RobloxApiClient {
                 url.push_str(&format!("&groupId={}", urlencode(gid.trim())));
             }
         }
-
-        let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
-            let mut req = http
-                .post(&url)
-                .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
-                .header("Requester", "Client")
-                .header("Content-Type", "application/xml")
-                .body(rbxm_bytes.to_vec());
-            if let Some(token) = csrf {
-                req = req.header("X-CSRF-TOKEN", token);
-            }
-            req.send().map_err(|e| format!("Upload network error: {e}"))
-        };
-
-        // First try with a pre-fetched token from the standard handshake;
-        // fall back to sending without one.
-        let mut resp = match Self::fetch_csrf_token(cookie) {
-            Ok(token) => send(Some(&token))?,
-            Err(_) => send(None)?,
-        };
-        // CSRF challenge: normally 403 + x-csrf-token header, but this
-        // endpoint's error page is broken and can answer HTTP 500 while
-        // STILL carrying the header — so retry on ANY failed status that
-        // hands us a token (roblox-cookie-upload-endpoints.md §1).
-        if !resp.status().is_success() {
-            let token = resp
-                .headers()
-                .get("x-csrf-token")
-                .and_then(|t| t.to_str().ok())
-                .map(str::to_string);
-            if let Some(token) = token {
-                resp = send(Some(&token))?;
-            }
-        }
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        if !status.is_success() {
-            return Err(format!(
-                "Legacy upload failed (HTTP {status}): {}",
-                snippet(&text)
-            ));
-        }
+        let text = Self::post_upload_ashx(cookie, &url, rbxm_bytes)?;
         // json=1 -> {"id":...}; be liberal and also accept a bare number.
         let id = serde_json::from_str::<serde_json::Value>(text.trim())
             .ok()
@@ -663,6 +614,98 @@ impl RobloxApiClient {
             return Err("Legacy upload returned asset id 0.".into());
         }
         Ok(id)
+    }
+
+    /// Publish (overwrite) an EXISTING place through the same hidden
+    /// endpoint: `Data/Upload.ashx?assetid={placeId}&type=Place` with the
+    /// raw `.rbxl` as the body — the way `rojo upload` and older bots pushed
+    /// places for years (roblox-cookie-upload-endpoints.md §4). Cookie-only:
+    /// no Open Cloud API key needed, but the account must have edit access
+    /// to the place. Returns a human-readable success message.
+    pub fn publish_place_legacy(
+        cookie: &str,
+        place_id: &str,
+        rbxl_bytes: &[u8],
+    ) -> Result<String, String> {
+        let pid = place_id.trim();
+        if pid.is_empty() || pid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Place ID first.".into());
+        }
+        let url = format!(
+            "https://data.roblox.com/Data/Upload.ashx?json=1&assetid={pid}&type=Place&genreTypeId=1"
+        );
+        let text = Self::post_upload_ashx(cookie, &url, rbxl_bytes)?;
+        // Success body is a version/asset id (bare or {"id":...}); any 2xx
+        // means the new version was accepted.
+        let version = serde_json::from_str::<serde_json::Value>(text.trim())
+            .ok()
+            .and_then(|v| v.get("id").and_then(|x| x.as_u64()))
+            .map(|id| format!(" (version id {id})"))
+            .unwrap_or_else(|| {
+                let t = text.trim();
+                if t.is_empty() || t.parse::<u64>().is_err() {
+                    String::new()
+                } else {
+                    format!(" (version id {t})")
+                }
+            });
+        Ok(format!("Place {pid} updated via Upload.ashx{version}"))
+    }
+
+    /// Shared POST to the hidden `Data/Upload.ashx` endpoint with full CSRF
+    /// handling: pre-fetch a token via the logout handshake, send the bytes
+    /// as `application/xml` (what Studio sends), and retry once on ANY
+    /// failed status that carries an `x-csrf-token` header — this endpoint's
+    /// error page is broken and can answer HTTP 500 instead of 403 while
+    /// still handing out the token (roblox-cookie-upload-endpoints.md §1).
+    fn post_upload_ashx(cookie: &str, url: &str, bytes: &[u8]) -> Result<String, String> {
+        if bytes.is_empty() {
+            return Err("Nothing to upload (empty data).".into());
+        }
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("Roblox/WinInet")
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
+
+        let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
+            let mut req = http
+                .post(url)
+                .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
+                .header("Requester", "Client")
+                .header("Content-Type", "application/xml")
+                .body(bytes.to_vec());
+            if let Some(token) = csrf {
+                req = req.header("X-CSRF-TOKEN", token);
+            }
+            req.send().map_err(|e| format!("Upload network error: {e}"))
+        };
+
+        // First try with a pre-fetched token from the standard handshake;
+        // fall back to sending without one.
+        let mut resp = match Self::fetch_csrf_token(cookie) {
+            Ok(token) => send(Some(&token))?,
+            Err(_) => send(None)?,
+        };
+        if !resp.status().is_success() {
+            let token = resp
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|t| t.to_str().ok())
+                .map(str::to_string);
+            if let Some(token) = token {
+                resp = send(Some(&token))?;
+            }
+        }
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "Upload.ashx failed (HTTP {status}): {}",
+                snippet(&text)
+            ));
+        }
+        Ok(text)
     }
 
     /// Fire-and-forget background Creator Store upload. Tries the Open Cloud
@@ -3230,6 +3273,11 @@ impl WebClient {
         if !status.is_success() {
             return Err(SendError::Http(format!("{method} {url} → {status}: {text}")));
         }
+        // Some develop endpoints (universe activate/deactivate) answer 200
+        // with an empty body — that's a success, not a JSON error.
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
         serde_json::from_str(&text)
             .map_err(|e| SendError::Http(format!("bad JSON from {url}: {e}")))
     }
@@ -3249,6 +3297,81 @@ impl WebClient {
     /// edit permission for the place.
     pub fn download_place(&self, place_id: u64) -> Result<Vec<u8>, String> {
         RobloxApiClient::fetch_asset_payload_sync(place_id, Some(&self.cookie))
+    }
+
+    // ---- Game (experience) configuration ------------------------------------
+
+    /// Public game info for a universe (name, description, playing, visits,
+    /// maxPlayers, …) — `games.roblox.com/v1/games?universeIds=`.
+    pub fn get_game_info(&self, universe_id: &str) -> Result<serde_json::Value, String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        let v = self.get_json(&format!(
+            "https://games.roblox.com/v1/games?universeIds={uid}"
+        ))?;
+        v.get("data")
+            .and_then(|d| d.get(0))
+            .cloned()
+            .ok_or_else(|| format!("Universe {uid} not found (empty games response)"))
+    }
+
+    /// Edit the universe (experience) configuration through the
+    /// cookie-authenticated develop API: `PATCH
+    /// develop.roblox.com/v2/universes/{id}/configuration`, falling back to
+    /// the older v1 route if v2 rejects the request. Only the fields present
+    /// in `body` are changed (e.g. {"name": "...", "description": "..."}).
+    pub fn update_universe_configuration(
+        &self,
+        universe_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        match self.patch_json(
+            &format!("https://develop.roblox.com/v2/universes/{uid}/configuration"),
+            body,
+        ) {
+            Ok(v) => Ok(v),
+            Err(e2) => self
+                .patch_json(
+                    &format!("https://develop.roblox.com/v1/universes/{uid}/configuration"),
+                    body,
+                )
+                .map_err(|e1| format!("v2: {e2} — v1 fallback: {e1}")),
+        }
+    }
+
+    /// Edit a place's configuration (name, description, maxPlayerCount,
+    /// allowCopying, …) via `PATCH develop.roblox.com/v2/places/{placeId}`.
+    pub fn update_place_configuration(
+        &self,
+        place_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let pid = place_id.trim();
+        if pid.is_empty() || pid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Place ID first.".into());
+        }
+        self.patch_json(&format!("https://develop.roblox.com/v2/places/{pid}"), body)
+    }
+
+    /// Make the experience public (activate) or private (deactivate):
+    /// `POST develop.roblox.com/v1/universes/{id}/activate|deactivate`.
+    pub fn set_universe_active(&self, universe_id: &str, active: bool) -> Result<(), String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        let action = if active { "activate" } else { "deactivate" };
+        self.post_json(
+            &format!("https://develop.roblox.com/v1/universes/{uid}/{action}"),
+            &serde_json::json!({}),
+        )?;
+        Ok(())
     }
 
     // ---- Avatar editing ----------------------------------------------------
