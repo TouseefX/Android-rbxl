@@ -556,6 +556,14 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
     // is entered from StarterGui, while world collectors are entered only after
     // camera projection. This prevents duplicate/fullscreen descendant draws.
     if matches!(instance.class.as_str(), "ScreenGui" | "BillboardGui" | "SurfaceGui") { return; }
+    // The Z-vector rebuild recurses GuiBase children plus transparent
+    // organizational Folders only. GuiObjects stored inside LocalScripts,
+    // ModuleScripts, Models or any other non-GUI instance never reach the
+    // render vector — parenting a template to its script is the standard
+    // Roblox idiom for keeping it off screen, so those subtrees must not
+    // be collected or laid out at all.
+    let is_gui = is_gui_object(&instance.class);
+    if !is_gui && !matches!(instance.class.as_str(), "Folder" | "Configuration") { return; }
     // Roblox only flattens CanvasGroup under Sibling ZIndexBehavior. Under
     // Global it behaves as an ordinary clipping GuiObject.
     let composited_group = instance.class == "CanvasGroup" && !global_z;
@@ -572,11 +580,9 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
         .map(|modifier| number(modifier.properties.get(&rbx_dom_weak::ustr("Scale")), 1.0).max(0.0))
         .unwrap_or(1.0);
     let scale = inherited_scale * local_scale;
-    let is_gui = is_gui_object(&instance.class);
-    // Only GuiObjects own geometry. Non-GuiObject containers reached during
-    // the descendant walk (Folder, Configuration, Model, ...) are transparent
-    // to layout: their children resolve against the same parent rectangle.
-    // Computing gui_rect for them would fabricate a default 100x100 box.
+    // Only GuiObjects own geometry. Folders are transparent to layout: their
+    // children resolve against the same parent rectangle. Computing gui_rect
+    // for them would fabricate a default 100x100 box.
     let rect = forced_rect.or_else(|| overrides.get(&referent).copied()).unwrap_or_else(|| {
         if is_gui { gui_rect(dom, painter, instance, parent_rect, scale) } else { parent_rect }
     });
