@@ -39,6 +39,7 @@ mod plugins;
 mod project;
 mod roblox_api_data;
 mod settings;
+mod team_create;
 mod templates;
 mod thumbnails;
 

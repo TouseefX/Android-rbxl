@@ -357,6 +357,9 @@ pub struct EditorApp {
     game_cfg_response: String,
     /// Output area of the Team Create session panel.
     team_create_response: String,
+    /// Last successful join config from gamejoin (has the server endpoints);
+    /// enables the UDP probe button.
+    team_create_join_config: Option<serde_json::Value>,
 
     // Per-property text buffers so number properties (float/int, and vector
     // components) can be TYPED exactly like Studio instead of only dragged.
@@ -505,6 +508,7 @@ impl Default for EditorApp {
             game_cfg_max_players: String::new(),
             game_cfg_response: String::new(),
             team_create_response: String::new(),
+            team_create_join_config: None,
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
@@ -1827,6 +1831,20 @@ ui.label("Place ID:");
                         }
                         if ui.button("⚡ Warm Up Server").clicked() {
                             self.team_create_negotiate(true);
+                        }
+                        if self.team_create_join_config.is_some()
+                            && ui
+                                .button("📡 Probe Server (UDP)")
+                                .on_hover_text("Sends a RakNet-style unconnected ping to the negotiated endpoints; blocks a few seconds")
+                                .clicked()
+                        {
+                            if let Some(cfg) = self.team_create_join_config.clone() {
+                                self.status = "Probing session server over UDP…".into();
+                                let report = crate::team_create::probe_join_config(&cfg, 3, 1200);
+                                self.log_info(format!("Team Create UDP probe:\n{report}"));
+                                self.team_create_response = report;
+                                self.status = "UDP probe finished — see panel output".into();
+                            }
                         }
                     });
 
@@ -5668,27 +5686,20 @@ ui.label("Place ID:");
         self.log_info(format!("Team Create {label} for place {}", self.open_cloud_place_id.trim()));
         match RobloxApiClient::team_create_join(&cookie, &self.open_cloud_place_id, preemptive) {
             Ok(v) => {
+                let endpoints = crate::team_create::parse_join_config(&v);
+                if !endpoints.is_empty() {
+                    // Keep the config so the UDP probe button can use it.
+                    self.team_create_join_config = Some(v.clone());
+                }
                 let mut summary = if preemptive {
                     String::from("Server warm-up request accepted")
                 } else {
                     String::from("Join config received")
                 };
-                let addr = v.get("Address").and_then(|a| a.as_str());
-                let port = v
-                    .get("Port")
-                    .and_then(|p| p.as_u64())
-                    .or_else(|| v.get("ServerPort").and_then(|p| p.as_u64()));
-                if let Some(a) = addr {
-                    summary.push_str(&format!(" — server {a}"));
-                    if let Some(p) = port {
-                        summary.push_str(&format!(":{p}"));
-                    }
-                } else if let Some(p) = port {
-                    summary.push_str(&format!(" — server port {p}"));
-                }
-                if let Some(n) = v.get("UdmuxEndpoints").and_then(|u| u.as_array()).map(|a| a.len()) {
-                    if n > 0 {
-                        summary.push_str(&format!(" — {n} UDMUX endpoint(s)"));
+                if let Some(first) = endpoints.first() {
+                    summary.push_str(&format!(" — server {}", first.label()));
+                    if endpoints.len() > 1 {
+                        summary.push_str(&format!(" (+{} more endpoint(s))", endpoints.len() - 1));
                     }
                 }
                 let mut raw: String = v.to_string().chars().take(700).collect();
