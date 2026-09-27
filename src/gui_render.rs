@@ -1964,6 +1964,20 @@ fn ensure_gui_texture(ui: &egui::Ui, textures: &mut std::collections::HashMap<St
     textures.get(uri).map(egui::TextureHandle::id)
 }
 
+/// True when `candidate` is `ancestor` itself or lives anywhere inside its
+/// subtree — used so a hit on any part of an adorned Model never counts as
+/// occlusion of that Model's billboard.
+fn ref_is_descendant(dom: &WeakDom, mut candidate: Ref, ancestor: Ref) -> bool {
+    while !candidate.is_none() {
+        if candidate == ancestor { return true; }
+        candidate = match dom.get_by_ref(candidate) {
+            Some(instance) => instance.parent(),
+            None => return false,
+        };
+    }
+    false
+}
+
 fn gather_class(dom: &WeakDom, referent: Ref, class: &str, output: &mut Vec<Ref>) {
     let Some(instance) = dom.get_by_ref(referent) else { return; };
     if instance.class == class { output.push(referent); }
@@ -2114,9 +2128,23 @@ pub fn draw_starter_gui(
         if max_distance > 0.0 && projected[2] > max_distance { continue; }
         let always_on_top = bool_value(billboard.properties.get(&rbx_dom_weak::ustr("AlwaysOnTop")), false);
         if !always_on_top {
-            if let Some(hit) = crate::bevy_render::pick_part(viewport_scene, orbit, [projected[0], projected[1]], aspect) {
+            // Adorn occlusion is a DEPTH test: the billboard hides only when
+            // scene geometry sits strictly IN FRONT of its anchor point.
+            // Geometry BEHIND the projected point (baseplate, distant walls)
+            // must not swallow a floating billboard, and hitting the adornee
+            // itself — or any part of an adorned Model — never occludes.
+            if let Some((hit, hit_distance)) = crate::bevy_render::pick_part_distance(viewport_scene, orbit, [projected[0], projected[1]], aspect) {
                 let occlusion_target = if anchor.class == "Attachment" { anchor.parent() } else { adornee };
-                if hit != occlusion_target { continue; }
+                let (sin_pitch, cos_pitch) = orbit.pitch.sin_cos();
+                let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
+                let camera = [orbit.target[0]+orbit.dist*cos_pitch*sin_yaw, orbit.target[1]+orbit.dist*sin_pitch,
+                    orbit.target[2]+orbit.dist*cos_pitch*cos_yaw];
+                let anchor_distance = ((point[0]-camera[0]).powi(2)
+                    + (point[1]-camera[1]).powi(2)
+                    + (point[2]-camera[2]).powi(2)).sqrt();
+                if hit_distance + 0.5 < anchor_distance
+                    && hit != occlusion_target
+                    && !ref_is_descendant(dom, hit, occlusion_target) { continue; }
             }
         }
         let lower_limit = number(billboard.properties.get(&rbx_dom_weak::ustr("DistanceLowerLimit")), 0.0).max(0.0);
@@ -2230,10 +2258,17 @@ pub fn draw_starter_gui(
         let surface_rect = Rect::from_center_size(surface_center, Vec2::new(surface_width, surface_height));
         let always_on_top = bool_value(surface.properties.get(&rbx_dom_weak::ustr("AlwaysOnTop")), false);
         if !always_on_top {
+            // Same depth-tested occlusion as billboards: only geometry
+            // strictly in front of the face center hides the SurfaceGui.
             let center = transform(fixed);
             if let Some(projected) = crate::bevy_render::project_world_point(orbit, center, aspect) {
-                if let Some(hit) = crate::bevy_render::pick_part(viewport_scene, orbit, [projected[0], projected[1]], aspect) {
-                    if hit != adornee { continue; }
+                if let Some((hit, hit_distance)) = crate::bevy_render::pick_part_distance(viewport_scene, orbit, [projected[0], projected[1]], aspect) {
+                    let center_distance = ((center[0]-camera[0]).powi(2)
+                        + (center[1]-camera[1]).powi(2)
+                        + (center[2]-camera[2]).powi(2)).sqrt();
+                    if hit_distance + 0.5 < center_distance
+                        && hit != adornee
+                        && !ref_is_descendant(dom, hit, adornee) { continue; }
                 }
             }
         }
