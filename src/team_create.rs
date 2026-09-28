@@ -16,7 +16,10 @@
 //! Connected RakNet reliability and JoinData → live change-item application
 //! make up the rest of the Stage 1 engine.
 
-use blake2::{Blake2b512, Digest};
+use blake2::{
+    digest::{consts::U32, Mac},
+    Blake2b512, Blake2bMac, Digest,
+};
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce, Tag,
@@ -416,6 +419,8 @@ struct EarlyAuthData {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Request2Material {
     early_key_version: u16,
+    early_key_revert_version: u16,
+    early_key_hashes_job_id: bool,
     server_early_public_key: [u8; 32],
     auth: EarlyAuthData,
 }
@@ -466,10 +471,33 @@ fn json_u16(value: &serde_json::Value) -> Option<u16> {
         .and_then(|number| u16::try_from(number).ok())
 }
 
-/// Parse the KeyRing JSON consumed by `KeyRing::parseConfig`, then reproduce
-/// `RakPeerCrypto::getClientKeyInfo(true)`: select the version named by the
-/// `send` member of the `RakNetEarlyPublicKey` application.
-fn parse_server_early_key(config: &serde_json::Value) -> Result<(u16, [u8; 32]), String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServerEarlyKey {
+    version: u16,
+    revert_version: u16,
+    hashes_job_id: bool,
+    bytes: [u8; 32],
+}
+
+fn keyed_blake2b_256(key: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
+    let mut mac = <Blake2bMac<U32> as Mac>::new_from_slice(key)
+        .map_err(|_| "KeyRing key is not a valid BLAKE2b secret".to_string())?;
+    Mac::update(&mut mac, data);
+    let digest = Mac::finalize(mac).into_bytes();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    Ok(output)
+}
+
+/// Parse the JSON consumed by native 2022 `KeyRing::parseConfig`, then model
+/// `KeyRing::getKeyForProduction("RakNetEarlyPublicKey")`. `parseVersion`
+/// conditionally replaces the decoded value with keyed BLAKE2b-256(jobId)
+/// when the selected version's `hashJobId` member is true. The version ID
+/// itself does not change.
+fn parse_server_early_key_with_revert(
+    config: &serde_json::Value,
+    key_ring_revert: bool,
+) -> Result<ServerEarlyKey, String> {
     let key_ring_text = find_field_ci(config, "ClientPublicKeyData", 0)
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| "join config has no ClientPublicKeyData".to_string())?;
@@ -482,46 +510,91 @@ fn parse_server_early_key(config: &serde_json::Value) -> Result<(u16, [u8; 32]),
     let send_version = get_ci(application, "send")
         .and_then(json_u16)
         .ok_or_else(|| "RakNetEarlyPublicKey has no valid send version".to_string())?;
+    let revert_version = get_ci(application, "revert")
+        .and_then(json_u16)
+        .ok_or_else(|| "RakNetEarlyPublicKey has no valid revert version".to_string())?;
     let versions = get_ci(application, "versions")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "RakNetEarlyPublicKey has no versions array".to_string())?;
-    let selected = versions
+    let send = versions
         .iter()
         .find(|version| get_ci(version, "id").and_then(json_u16) == Some(send_version))
         .ok_or_else(|| format!("RakNetEarlyPublicKey send version {send_version} is absent"))?;
-    let allowed = get_ci(selected, "allowed")
+    let revert = versions
+        .iter()
+        .find(|version| get_ci(version, "id").and_then(json_u16) == Some(revert_version))
+        .ok_or_else(|| {
+            format!("RakNetEarlyPublicKey revert version {revert_version} is absent")
+        })?;
+    let send_allowed = get_ci(send, "allowed")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if !allowed {
-        // `RakPeerCrypto::getClientKeyInfo(true)` does not use the JSON value
-        // when this production gate is false. It keeps the selected version
-        // but substitutes Studio's compiled-in kPublicEarlyTestKey. That test
-        // key is not present in the join response, so using `value` here would
-        // deterministically derive the wrong early session keys.
+    if !send_allowed {
+        // Native parseConfig rejects an application whose normal send version
+        // is not production-allowed. A revert version may be disallowed and
+        // retained because DFFlag::KeyRingRevert is an emergency bypass.
         return Err(format!(
-            "RakNetEarlyPublicKey version {send_version} is not allowed; the 2022 client would substitute its unavailable compiled-in test key"
+            "RakNetEarlyPublicKey send version {send_version} is not production-allowed"
         ));
     }
+    let (selected_version, selected) = if key_ring_revert {
+        (revert_version, revert)
+    } else {
+        (send_version, send)
+    };
     let encoded = get_ci(selected, "value")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("RakNetEarlyPublicKey version {send_version} has no value"))?;
-    let key: [u8; 32] = decode_base64(encoded)
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| {
-            format!("RakNetEarlyPublicKey version {send_version} is not exactly 32 bytes")
-        })?;
-    Ok((send_version, key))
+        .ok_or_else(|| format!("RakNetEarlyPublicKey version {selected_version} has no value"))?;
+    let decoded = decode_base64(encoded).ok_or_else(|| {
+        format!("RakNetEarlyPublicKey version {selected_version} is not valid Base64")
+    })?;
+    if decoded.is_empty() {
+        return Err(format!(
+            "RakNetEarlyPublicKey version {selected_version} decodes to an empty key"
+        ));
+    }
+    let hashes_job_id = get_ci(selected, "hashJobId")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let effective_key = if hashes_job_id {
+        let job_id = find_field_ci(config, "GameId", 0)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "RakNetEarlyPublicKey version {selected_version} requires a GameId for hashJobId"
+                )
+            })?;
+        keyed_blake2b_256(&decoded, job_id.as_bytes())?
+    } else {
+        decoded.try_into().map_err(|_| {
+            format!("RakNetEarlyPublicKey version {selected_version} is not exactly 32 bytes")
+        })?
+    };
+    Ok(ServerEarlyKey {
+        version: selected_version,
+        revert_version,
+        hashes_job_id,
+        bytes: effective_key,
+    })
+}
+
+fn parse_server_early_key(config: &serde_json::Value) -> Result<ServerEarlyKey, String> {
+    // DFFlag::KeyRingRevert is false during normal production operation.
+    parse_server_early_key_with_revert(config, false)
 }
 
 fn extract_request2_material(config: &serde_json::Value) -> Result<Request2Material, String> {
-    let (early_key_version, server_early_public_key) = parse_server_early_key(config)?;
+    let early_key = parse_server_early_key(config)?;
     let client_ticket = find_field_ci(config, "ClientTicket", 0)
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| "join config has no ClientTicket for early authentication".to_string())?;
     let auth = parse_early_auth_data(&client_ticket)?;
     Ok(Request2Material {
-        early_key_version,
-        server_early_public_key,
+        early_key_version: early_key.version,
+        early_key_revert_version: early_key.revert_version,
+        early_key_hashes_job_id: early_key.hashes_job_id,
+        server_early_public_key: early_key.bytes,
         auth,
     })
 }
@@ -1231,8 +1304,14 @@ pub fn probe_join_config(config: &serde_json::Value, max: usize, timeout_ms: u64
     let request2 = extract_request2_material(config);
     match &request2 {
         Ok(material) => heading.push_str(&format!(
-            "\nEncrypted OpenRequest2 ready: production-allowed key version {}, auth version {}, pre-auth {} bytes, auth {} bytes",
+            "\nEncrypted OpenRequest2 ready: production key send {} (revert {}; hashJobId {}), auth version {}, pre-auth {} bytes, auth {} bytes",
             material.early_key_version,
+            material.early_key_revert_version,
+            if material.early_key_hashes_job_id {
+                "applied"
+            } else {
+                "not set"
+            },
             material.auth.auth_version,
             material.auth.preauth_blob.len(),
             material.auth.auth_blob.len()
@@ -1346,6 +1425,8 @@ mod tests {
         });
         let material = extract_request2_material(&config).unwrap();
         assert_eq!(material.early_key_version, 5);
+        assert_eq!(material.early_key_revert_version, 5);
+        assert!(!material.early_key_hashes_job_id);
         assert_eq!(
             material.server_early_public_key,
             <[u8; 32]>::try_from(
@@ -1367,8 +1448,75 @@ mod tests {
             }
         });
         let error = extract_request2_material(&config).unwrap_err();
-        assert!(error.contains("not allowed"));
-        assert!(error.contains("compiled-in test key"));
+        assert!(error.contains("not production-allowed"));
+    }
+
+    #[test]
+    fn models_emergency_revert_version_even_when_revert_is_disallowed() {
+        let key_ring = serde_json::json!({
+            "applications": {
+                "RakNetEarlyPublicKey": {
+                    "versions": [
+                        {
+                            "id": 5,
+                            "value": "EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI=",
+                            "allowed": true
+                        },
+                        {
+                            "id": 4,
+                            "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                            "allowed": false
+                        }
+                    ],
+                    "send": 5,
+                    "revert": 4
+                }
+            }
+        });
+        let config = serde_json::json!({
+            "settings": { "ClientPublicKeyData": key_ring.to_string() }
+        });
+        assert_eq!(parse_server_early_key(&config).unwrap().version, 5);
+        let reverted = parse_server_early_key_with_revert(&config, true).unwrap();
+        assert_eq!(reverted.version, 4);
+        assert_eq!(reverted.revert_version, 4);
+        assert_eq!(reverted.bytes, [0u8; 32]);
+    }
+
+    #[test]
+    fn hashes_key_ring_value_with_exact_game_id_when_requested() {
+        let key_ring = serde_json::json!({
+            "applications": {
+                "RakNetEarlyPublicKey": {
+                    "versions": [{
+                        "id": 5,
+                        "value": "EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI=",
+                        "allowed": true,
+                        "hashJobId": true
+                    }],
+                    "send": 5,
+                    "revert": 5
+                }
+            }
+        });
+        let config = serde_json::json!({
+            "settings": {
+                "GameId": "89924573-d189-4499-8702-150868c5d601",
+                "ClientPublicKeyData": key_ring.to_string()
+            }
+        });
+        let key = parse_server_early_key(&config).unwrap();
+        assert_eq!(key.version, 5);
+        assert_eq!(key.revert_version, 5);
+        assert!(key.hashes_job_id);
+        assert_eq!(
+            key.bytes,
+            [
+                0x2a, 0xfe, 0x8e, 0xee, 0x84, 0x43, 0x4c, 0x31, 0xef, 0xe6, 0x0c, 0x20,
+                0xf9, 0xb6, 0x4c, 0x9b, 0xb3, 0xdf, 0x9f, 0x2a, 0x19, 0x6a, 0x1c, 0x2d,
+                0xb3, 0x1f, 0x4a, 0xc0, 0xed, 0x7b, 0xc6, 0x78,
+            ]
+        );
     }
 
     #[test]
@@ -1401,6 +1549,8 @@ mod tests {
 
         let material = Request2Material {
             early_key_version: 5,
+            early_key_revert_version: 5,
+            early_key_hashes_job_id: false,
             server_early_public_key: server_public,
             auth: EarlyAuthData {
                 auth_version: 6,
