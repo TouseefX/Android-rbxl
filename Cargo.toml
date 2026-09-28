@@ -32,6 +32,12 @@ flate2 = "1.1.9"
 zstd = "0.13"
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
+# 2022 RakPeerCrypto-compatible primitives for encrypted OpenRequest2. These
+# are pure Rust, so the Android build does not need to package libsodium.
+blake2 = "0.10"
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "gzip", "brotli", "zstd"] }
 # Roblox CDN textures are not guaranteed to be PNG/JPEG; modern assets often
 # arrive as WebP and older uploaded images can be GIF/BMP.
