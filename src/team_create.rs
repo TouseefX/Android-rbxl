@@ -489,6 +489,19 @@ fn parse_server_early_key(config: &serde_json::Value) -> Result<(u16, [u8; 32]),
         .iter()
         .find(|version| get_ci(version, "id").and_then(json_u16) == Some(send_version))
         .ok_or_else(|| format!("RakNetEarlyPublicKey send version {send_version} is absent"))?;
+    let allowed = get_ci(selected, "allowed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !allowed {
+        // `RakPeerCrypto::getClientKeyInfo(true)` does not use the JSON value
+        // when this production gate is false. It keeps the selected version
+        // but substitutes Studio's compiled-in kPublicEarlyTestKey. That test
+        // key is not present in the join response, so using `value` here would
+        // deterministically derive the wrong early session keys.
+        return Err(format!(
+            "RakNetEarlyPublicKey version {send_version} is not allowed; the 2022 client would substitute its unavailable compiled-in test key"
+        ));
+    }
     let encoded = get_ci(selected, "value")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("RakNetEarlyPublicKey version {send_version} has no value"))?;
@@ -960,7 +973,8 @@ fn parse_probe_reply(packet: &[u8]) -> Result<RbxOpenReply1, String> {
 /// Roblox server; unlike a generic unconnected ping, this is the request
 /// Studio sends immediately before encrypted open-request-2.
 pub fn probe_endpoint(endpoint: &Endpoint, timeout_ms: u64) -> Result<String, String> {
-    probe_endpoint_with_rupp(endpoint, timeout_ms, None, None)
+    let mut request2_attempted = false;
+    probe_endpoint_with_rupp(endpoint, timeout_ms, None, None, &mut request2_attempted)
 }
 
 fn probe_endpoint_with_rupp(
@@ -968,6 +982,7 @@ fn probe_endpoint_with_rupp(
     timeout_ms: u64,
     rupp: Option<&RuppProbeMaterial>,
     request2: Option<&Request2Material>,
+    request2_attempted: &mut bool,
 ) -> Result<String, String> {
     const PROBE_MTUS: [u16; 3] = [1492, DEFAULT_PROBE_MTU, 576];
     const ROUNDS: usize = 2;
@@ -978,14 +993,11 @@ fn probe_endpoint_with_rupp(
     let started = Instant::now();
     let request1_deadline = started + Duration::from_millis(timeout_ms.max(1_200));
     let prefixes: Vec<(Option<u8>, Vec<u8>)> = if let Some(material) = rupp {
-        // `TokenTlv::findTokenInBitstreamIfNext` accepts exactly subtypes 1
-        // and 2. Live 2022 Team Create routing accepted subtype 1; subtype 2
-        // remains a compatibility fallback. Separate sockets identify which
-        // prefix produced Reply1 so Request2 can retain it exactly.
-        vec![
-            (Some(1), build_rupp_header(material, 1)?),
-            (Some(2), build_rupp_header(material, 2)?),
-        ]
+        // CloudEditConnectionModel constructs TokenType::GameService, whose
+        // serialized value is 1. The server dispatcher also forwards a RUPP
+        // token to processRbxOpenRequest2 only for this subtype. Subtype 2 is
+        // accepted by the generic TLV parser but is not the Team Create path.
+        vec![(Some(1), build_rupp_header(material, 1)?)]
     } else {
         vec![(None, Vec::new())]
     };
@@ -999,9 +1011,8 @@ fn probe_endpoint_with_rupp(
             if Instant::now() >= request1_deadline {
                 break 'rounds;
             }
-            // Give each token subtype its own source port. A delayed Reply1
-            // can then never be misattributed to the next subtype, while the
-            // socket that actually succeeds is retained for Request2.
+            // Keep each routed candidate on its own source port, and retain
+            // the exact socket that receives Reply1 for encrypted Request2.
             let socket = UdpSocket::bind(endpoint.bind_address())
                 .map_err(|error| format!("{target}: bind failed: {error}"))?;
             // RakPeer cycles MTU candidates. Send one candidate group under a
@@ -1108,6 +1119,10 @@ fn probe_endpoint_with_rupp(
     let request2_started = Instant::now();
     let request2_wait_ms = timeout_ms.max(REQUEST2_MIN_WAIT_MS);
     let request2_deadline = request2_started + Duration::from_millis(request2_wait_ms);
+    // A valid pre-auth MAC is entered into the server's replay set before
+    // early AEAD is checked. Conservatively treat even an uncertain send as
+    // consuming this join config, and never try Request2 on another endpoint.
+    *request2_attempted = true;
     socket
         .send_to(&packet2, from)
         .map_err(|error| format!("{target}: RbxOpenRequest2 send failed: {error}"))?;
@@ -1216,7 +1231,7 @@ pub fn probe_join_config(config: &serde_json::Value, max: usize, timeout_ms: u64
     let request2 = extract_request2_material(config);
     match &request2 {
         Ok(material) => heading.push_str(&format!(
-            "\nEncrypted OpenRequest2 ready: key version {}, auth version {}, pre-auth {} bytes, auth {} bytes",
+            "\nEncrypted OpenRequest2 ready: production-allowed key version {}, auth version {}, pre-auth {} bytes, auth {} bytes",
             material.early_key_version,
             material.auth.auth_version,
             material.auth.preauth_blob.len(),
@@ -1225,21 +1240,40 @@ pub fn probe_join_config(config: &serde_json::Value, max: usize, timeout_ms: u64
         Err(reason) => heading.push_str(&format!("\nOpenRequest2 unavailable: {reason}")),
     }
     let mut lines = vec![heading];
-    for endpoint in endpoints.iter().take(max) {
+    let endpoint_limit = endpoints.len().min(max);
+    let mut request2_attempted = false;
+    let mut visited = 0usize;
+    for endpoint in endpoints.iter().take(endpoint_limit) {
+        visited += 1;
         let material = if is_internal_address(&endpoint.address) {
             None
         } else {
             rupp.as_ref().ok()
         };
+        let request2_for_endpoint = if request2_attempted {
+            None
+        } else {
+            request2.as_ref().ok()
+        };
         match probe_endpoint_with_rupp(
             endpoint,
             timeout_ms,
             material,
-            request2.as_ref().ok(),
+            request2_for_endpoint,
+            &mut request2_attempted,
         ) {
             Ok(line) => lines.push(line),
             Err(line) => lines.push(line),
         }
+        if request2_attempted {
+            break;
+        }
+    }
+    if request2_attempted && visited < endpoint_limit {
+        lines.push(format!(
+            "Skipped {} additional endpoint(s): encrypted pre-auth is replay-protected and Request2 was already attempted once",
+            endpoint_limit - visited
+        ));
     }
     lines.join("\n")
 }
@@ -1322,6 +1356,19 @@ mod tests {
         assert_eq!(material.auth.auth_version, 6);
         assert_eq!(material.auth.preauth_blob, (0u8..32).collect::<Vec<_>>());
         assert_eq!(material.auth.auth_blob, (0xa0u8..0xb0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rejects_disallowed_production_key_instead_of_using_its_json_value() {
+        let config = serde_json::json!({
+            "settings": {
+                "ClientPublicKeyData": "{\"applications\":{\"RakNetEarlyPublicKey\":{\"versions\":[{\"id\":5,\"value\":\"EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI=\",\"allowed\":false}],\"send\":5,\"revert\":5}}}",
+                "ClientTicket": "ticket-prefix;ignored;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=;oKGio6SlpqeoqaqrrK2urw==;6"
+            }
+        });
+        let error = extract_request2_material(&config).unwrap_err();
+        assert!(error.contains("not allowed"));
+        assert!(error.contains("compiled-in test key"));
     }
 
     #[test]
