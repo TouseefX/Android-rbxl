@@ -36,6 +36,7 @@ mod selection_edit;
 mod live_session;
 mod lua_runtime;
 mod network_codec;
+mod raknet_2022;
 mod plugins;
 mod project;
 mod roblox_api_data;
