@@ -419,7 +419,9 @@ struct EarlyAuthData {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Request2Material {
     early_key_version: u16,
+    early_key_send_version: u16,
     early_key_revert_version: u16,
+    early_key_uses_revert: bool,
     early_key_hashes_job_id: bool,
     server_early_public_key: [u8; 32],
     auth: EarlyAuthData,
@@ -474,7 +476,10 @@ fn json_u16(value: &serde_json::Value) -> Option<u16> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ServerEarlyKey {
     version: u16,
+    send_version: u16,
     revert_version: u16,
+    uses_revert: bool,
+    allowed: bool,
     hashes_job_id: bool,
     bytes: [u8; 32],
 }
@@ -542,6 +547,9 @@ fn parse_server_early_key_with_revert(
     } else {
         (send_version, send)
     };
+    let selected_allowed = get_ci(selected, "allowed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let encoded = get_ci(selected, "value")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("RakNetEarlyPublicKey version {selected_version} has no value"))?;
@@ -573,7 +581,10 @@ fn parse_server_early_key_with_revert(
     };
     Ok(ServerEarlyKey {
         version: selected_version,
+        send_version,
         revert_version,
+        uses_revert: key_ring_revert,
+        allowed: selected_allowed,
         hashes_job_id,
         bytes: effective_key,
     })
@@ -584,19 +595,38 @@ fn parse_server_early_key(config: &serde_json::Value) -> Result<ServerEarlyKey, 
     parse_server_early_key_with_revert(config, false)
 }
 
-fn extract_request2_material(config: &serde_json::Value) -> Result<Request2Material, String> {
-    let early_key = parse_server_early_key(config)?;
+fn extract_request2_material_with_revert(
+    config: &serde_json::Value,
+    key_ring_revert: bool,
+) -> Result<Request2Material, String> {
+    let early_key = parse_server_early_key_with_revert(config, key_ring_revert)?;
+    if !early_key.allowed {
+        // RakPeerCrypto::getClientKeyInfo replaces a disallowed production
+        // selection with Studio's compiled-in kPublicEarlyTestKey while
+        // retaining the selected version ID. That constant is not supplied by
+        // gamejoin, so using the JSON value would be a deterministic mismatch.
+        return Err(format!(
+            "selected RakNetEarlyPublicKey version {} is disallowed; native Studio would substitute its unavailable compiled-in test key",
+            early_key.version
+        ));
+    }
     let client_ticket = find_field_ci(config, "ClientTicket", 0)
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| "join config has no ClientTicket for early authentication".to_string())?;
     let auth = parse_early_auth_data(&client_ticket)?;
     Ok(Request2Material {
         early_key_version: early_key.version,
+        early_key_send_version: early_key.send_version,
         early_key_revert_version: early_key.revert_version,
+        early_key_uses_revert: early_key.uses_revert,
         early_key_hashes_job_id: early_key.hashes_job_id,
         server_early_public_key: early_key.bytes,
         auth,
     })
+}
+
+fn extract_request2_material(config: &serde_json::Value) -> Result<Request2Material, String> {
+    extract_request2_material_with_revert(config, false)
 }
 
 struct Request2Crypto {
@@ -1272,8 +1302,20 @@ fn probe_endpoint_with_rupp(
 }
 
 /// Probe up to `max` endpoints from a join config and produce a readable
-/// multi-line report.
+/// multi-line report using normal KeyRing production selection (`send`).
 pub fn probe_join_config(config: &serde_json::Value, max: usize, timeout_ms: u64) -> String {
+    probe_join_config_with_key_ring_revert(config, max, timeout_ms, false)
+}
+
+/// Same one-use handshake probe, with explicit modeling of the native
+/// `DFFlag::KeyRingRevert` emergency selection. This mode must receive its own
+/// fresh gamejoin config because the pre-auth material cannot be replayed.
+pub fn probe_join_config_with_key_ring_revert(
+    config: &serde_json::Value,
+    max: usize,
+    timeout_ms: u64,
+    key_ring_revert: bool,
+) -> String {
     let all_endpoints = parse_all_join_endpoints(config);
     let internal_count = all_endpoints
         .iter()
@@ -1301,11 +1343,17 @@ pub fn probe_join_config(config: &serde_json::Value, max: usize, timeout_ms: u64
         )),
         Err(reason) => heading.push_str(&format!("\nRUPP routing unavailable: {reason}")),
     }
-    let request2 = extract_request2_material(config);
+    let request2 = extract_request2_material_with_revert(config, key_ring_revert);
     match &request2 {
         Ok(material) => heading.push_str(&format!(
-            "\nEncrypted OpenRequest2 ready: production key send {} (revert {}; hashJobId {}), auth version {}, pre-auth {} bytes, auth {} bytes",
+            "\nEncrypted OpenRequest2 ready: selected key version {} via {} (send {}; revert {}; hashJobId {}), auth version {}, pre-auth {} bytes, auth {} bytes",
             material.early_key_version,
+            if material.early_key_uses_revert {
+                "KeyRingRevert"
+            } else {
+                "send"
+            },
+            material.early_key_send_version,
             material.early_key_revert_version,
             if material.early_key_hashes_job_id {
                 "applied"
@@ -1443,7 +1491,9 @@ mod tests {
         });
         let material = extract_request2_material(&config).unwrap();
         assert_eq!(material.early_key_version, 5);
+        assert_eq!(material.early_key_send_version, 5);
         assert_eq!(material.early_key_revert_version, 5);
+        assert!(!material.early_key_uses_revert);
         assert!(!material.early_key_hashes_job_id);
         assert_eq!(
             material.server_early_public_key,
@@ -1497,7 +1547,10 @@ mod tests {
         assert_eq!(parse_server_early_key(&config).unwrap().version, 5);
         let reverted = parse_server_early_key_with_revert(&config, true).unwrap();
         assert_eq!(reverted.version, 4);
+        assert_eq!(reverted.send_version, 5);
         assert_eq!(reverted.revert_version, 4);
+        assert!(reverted.uses_revert);
+        assert!(!reverted.allowed);
         assert_eq!(reverted.bytes, [0u8; 32]);
     }
 
@@ -1567,7 +1620,9 @@ mod tests {
 
         let material = Request2Material {
             early_key_version: 5,
+            early_key_send_version: 5,
             early_key_revert_version: 5,
+            early_key_uses_revert: false,
             early_key_hashes_job_id: false,
             server_early_public_key: server_public,
             auth: EarlyAuthData {
