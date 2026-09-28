@@ -210,6 +210,7 @@ impl<'a> ByteReader<'a> {
             )));
         }
         self.end -= count;
+        Ok(())
     }
 }
 
