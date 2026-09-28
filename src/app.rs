@@ -1827,10 +1827,19 @@ ui.label("Place ID:");
 
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("🎫 Negotiate Join").clicked() {
-                            self.team_create_negotiate(false);
+                            self.team_create_negotiate(false, false);
                         }
                         if ui.button("⚡ Warm Up Server").clicked() {
-                            self.team_create_negotiate(true);
+                            self.team_create_negotiate(true, false);
+                        }
+                        if ui
+                            .button("🎯 Fresh Join + Probe")
+                            .on_hover_text(
+                                "Negotiates a brand-new one-use ticket and hands it directly to the UDP handshake without any UI delay",
+                            )
+                            .clicked()
+                        {
+                            self.team_create_negotiate(false, true);
                         }
                         let can_probe = self
                             .team_create_join_config
@@ -5684,7 +5693,7 @@ ui.label("Place ID:");
     /// gamejoin request and summarize the returned server config — the
     /// address/port the UDP replication client would connect to. Proves the
     /// whole cookie → session → server pipeline works from this device.
-    fn team_create_negotiate(&mut self, preemptive: bool) {
+    fn team_create_negotiate(&mut self, preemptive: bool, probe_immediately: bool) {
         let Some(cookie) = self.roblosecurity_cookie() else {
             self.team_create_response =
                 "Set your .ROBLOSECURITY cookie in the Settings tab first".into();
@@ -5700,9 +5709,28 @@ ui.label("Place ID:");
                 let endpoints = crate::team_create::parse_join_config(&v);
                 let all_null = crate::team_create::join_response_is_all_null(&v);
                 let summary = if let Some(first) = endpoints.first() {
+                    // Native Studio consumes early-auth material immediately
+                    // after gamejoin returns. The combined action does the
+                    // same, avoiding expiry or accidental reuse between two
+                    // separate UI clicks.
+                    if probe_immediately && !preemptive {
+                        self.status =
+                            "Fresh join received — probing one-use ticket immediately…".into();
+                        let report = crate::team_create::probe_join_config(&v, 3, 2500);
+                        self.log_info(format!(
+                            "Team Create immediate Rbx handshake probe:\n{report}"
+                        ));
+                        self.team_create_response = format!(
+                            "Fresh gamejoin config handed directly to the UDP handshake (no UI delay)\n{report}"
+                        );
+                        self.status =
+                            "Immediate Rbx handshake probe finished — see panel output".into();
+                        return;
+                    }
+
                     // Only a config with an actual socket target may enable
-                    // the handshake probe. The parser handles settings,
-                    // joinTicket, joinScript, and other nested wrappers.
+                    // the separate handshake button. The parser handles
+                    // settings, joinTicket, joinScript, and nested wrappers.
                     self.team_create_join_config = Some(v.clone());
                     let mut text = if preemptive {
                         String::from("Server warm-up config received")

@@ -1318,6 +1318,24 @@ pub fn probe_join_config(config: &serde_json::Value, max: usize, timeout_ms: u64
         )),
         Err(reason) => heading.push_str(&format!("\nOpenRequest2 unavailable: {reason}")),
     }
+    if let Some(rcc_version) = find_field_ci(config, "RccVersion", 0)
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        heading.push_str(&format!("\nAdvertised RCC version: {rcc_version}"));
+    }
+    if let Some(ephemeral_key) = find_field_ci(config, "EphemeralEarlyPubKey", 0)
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        match decode_base64(&ephemeral_key) {
+            Some(decoded) => heading.push_str(&format!(
+                "\nJoin config also contains EphemeralEarlyPubKey ({} decoded bytes); authoritative 2022 RakPeerCrypto does not select this field",
+                decoded.len()
+            )),
+            None => heading.push_str(
+                "\nJoin config contains EphemeralEarlyPubKey, but it is not valid Base64",
+            ),
+        }
+    }
     let mut lines = vec![heading];
     let endpoint_limit = endpoints.len().min(max);
     let mut request2_attempted = false;
