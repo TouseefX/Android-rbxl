@@ -140,12 +140,55 @@ fn collect_recursive(v: &serde_json::Value, out: &mut Vec<Endpoint>, depth: usiz
     }
 }
 
-/// Extract every server endpoint from a team-create response, independent of
-/// which response wrapper contains the config.
-pub fn parse_join_config(v: &serde_json::Value) -> Vec<Endpoint> {
+fn parse_all_join_endpoints(v: &serde_json::Value) -> Vec<Endpoint> {
     let mut out = Vec::new();
     collect_recursive(v, &mut out, 0);
     out
+}
+
+fn is_internal_address(address: &str) -> bool {
+    fn v4_is_internal(o: [u8; 4]) -> bool {
+        o[0] == 0
+            || o[0] == 10
+            || o[0] == 127
+            || (o[0] == 169 && o[1] == 254)
+            || (o[0] == 172 && (16..=31).contains(&o[1]))
+            || (o[0] == 192 && o[1] == 168)
+            || (o[0] == 100 && (64..=127).contains(&o[1]))
+    }
+
+    match address.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => v4_is_internal(ip.octets()),
+        Ok(IpAddr::V6(ip)) => {
+            let o = ip.octets();
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || (o[0] & 0xfe) == 0xfc // fc00::/7 unique-local
+                || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80) // fe80::/10 link-local
+                || (o[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+                    && v4_is_internal([o[12], o[13], o[14], o[15]]))
+        }
+        // A hostname may be publicly routable; do not discard it.
+        Err(_) => false,
+    }
+}
+
+fn prefer_public_endpoints(all: Vec<Endpoint>) -> Vec<Endpoint> {
+    if all.iter().any(|e| !is_internal_address(&e.address)) {
+        all.into_iter()
+            .filter(|e| !is_internal_address(&e.address))
+            .collect()
+    } else {
+        all
+    }
+}
+
+/// Extract usable server endpoints from a team-create response, independent
+/// of which response wrapper contains the config. If Roblox supplies public
+/// UDMUX and private RCC addresses together, keep the public targets: a phone
+/// on the Internet cannot route to addresses such as 10.x.x.x.
+pub fn parse_join_config(v: &serde_json::Value) -> Vec<Endpoint> {
+    prefer_public_endpoints(parse_all_join_endpoints(v))
 }
 
 /// True when a response contains no value other than nulls/empty containers.
@@ -243,51 +286,101 @@ pub fn parse_rbx_open_reply1(packet: &[u8]) -> Result<RbxOpenReply1, String> {
 /// Roblox server; unlike a generic unconnected ping, this is the request
 /// Studio sends immediately before encrypted open-request-2.
 pub fn probe_endpoint(endpoint: &Endpoint, timeout_ms: u64) -> Result<String, String> {
+    const PROBE_MTUS: [u16; 3] = [1492, DEFAULT_PROBE_MTU, 576];
+    const ROUNDS: usize = 2;
+
     let target = endpoint.label();
     let socket = UdpSocket::bind(endpoint.bind_address())
         .map_err(|e| format!("{target}: bind failed: {e}"))?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(timeout_ms.max(100))))
-        .map_err(|e| format!("{target}: socket timeout: {e}"))?;
-
-    let packet = build_rbx_open_request1(DEFAULT_PROBE_MTU)?;
     let started = Instant::now();
-    socket
-        .send_to(&packet, (endpoint.address.as_str(), endpoint.port))
-        .map_err(|e| format!("{target}: RbxOpenRequest1 send failed: {e}"))?;
+    let deadline = started + Duration::from_millis(timeout_ms.max(300));
+
+    // RakPeer normally tries several MTU candidates and retransmits its UDP
+    // probe. A single 1200-byte datagram was too easy to lose and could turn
+    // ordinary UDP loss into a false negative.
+    let mut sent = 0usize;
+    for _ in 0..ROUNDS {
+        for mtu in PROBE_MTUS {
+            let packet = build_rbx_open_request1(mtu)?;
+            socket
+                .send_to(&packet, (endpoint.address.as_str(), endpoint.port))
+                .map_err(|e| format!("{target}: RbxOpenRequest1 send failed: {e}"))?;
+            sent += 1;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     let mut buf = [0u8; 2048];
-    match socket.recv_from(&mut buf) {
-        Ok((n, from)) => match parse_rbx_open_reply1(&buf[..n]) {
-            Ok(reply) => Ok(format!(
-                "{target}: ✅ RbxOpenReply1 — {n} bytes from {from}, server GUID {:016x}, MTU {}, encryption {}, RTT {} ms",
-                reply.server_guid,
-                reply.mtu,
-                if reply.encryption_enabled { "requested" } else { "deferred to request 2" },
-                started.elapsed().as_millis()
-            )),
-            Err(reason) => Err(format!(
-                "{target}: received {n} bytes from {from}, but it was not a valid 2022 RbxOpenReply1: {reason}"
-            )),
-        },
-        Err(_) => Err(format!(
-            "{target}: no RbxOpenReply1 in {timeout_ms} ms (UDP path filtered, endpoint expired, or incompatible server)"
-        )),
+    let mut invalid_replies = Vec::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        socket
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+            .map_err(|e| format!("{target}: socket timeout: {e}"))?;
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) => match parse_rbx_open_reply1(&buf[..n]) {
+                Ok(reply) => {
+                    return Ok(format!(
+                        "{target}: ✅ RbxOpenReply1 — {n} bytes from {from}, server GUID {:016x}, MTU {}, encryption {}, RTT {} ms",
+                        reply.server_guid,
+                        reply.mtu,
+                        if reply.encryption_enabled { "requested" } else { "deferred to request 2" },
+                        started.elapsed().as_millis()
+                    ));
+                }
+                Err(reason) => invalid_replies.push(format!("{n} bytes from {from}: {reason}")),
+            },
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("{target}: UDP receive failed: {e}")),
+        }
+    }
+
+    if !invalid_replies.is_empty() {
+        return Err(format!(
+            "{target}: received UDP after {sent} probes, but no valid 2022 RbxOpenReply1 ({})",
+            invalid_replies.join("; ")
+        ));
+    }
+    if is_internal_address(&endpoint.address) {
+        Err(format!(
+            "{target}: private/internal server address is not routable from this phone; a public UDMUX endpoint is required"
+        ))
+    } else {
+        Err(format!(
+            "{target}: endpoint found, but no reply to {sent} bare 2022 RbxOpenRequest1 probes in {timeout_ms} ms. This public UDMUX path likely requires its session/token/crypto outer framing before it will pass the RakNet packet; endpoint detection itself succeeded"
+        ))
     }
 }
 
 /// Probe up to `max` endpoints from a join config and produce a readable
 /// multi-line report.
 pub fn probe_join_config(config: &serde_json::Value, max: usize, timeout_ms: u64) -> String {
-    let endpoints = parse_join_config(config);
+    let all_endpoints = parse_all_join_endpoints(config);
+    let internal_count = all_endpoints
+        .iter()
+        .filter(|e| is_internal_address(&e.address))
+        .count();
+    let endpoints = prefer_public_endpoints(all_endpoints);
     if endpoints.is_empty() {
         return "No server endpoints found in the join config (unexpected shape — check the raw JSON keys)".into();
     }
-    let mut lines = vec![format!(
-        "{} endpoint(s) in join config; probing {}…",
+    let mut heading = format!(
+        "{} usable endpoint(s) in join config; probing {}…",
         endpoints.len(),
         endpoints.len().min(max)
-    )];
+    );
+    if internal_count > 0 && endpoints.iter().all(|e| !is_internal_address(&e.address)) {
+        heading.push_str(&format!(
+            " ({internal_count} private RCC address(es) ignored as non-routable)"
+        ));
+    }
+    let mut lines = vec![heading];
     for endpoint in endpoints.iter().take(max) {
         match probe_endpoint(endpoint, timeout_ms) {
             Ok(line) => lines.push(line),
@@ -351,8 +444,15 @@ mod tests {
             vec![
                 Endpoint { address: "128.116.1.2".into(), port: 53641 },
                 Endpoint { address: "128.116.1.3".into(), port: 53640 },
-                Endpoint { address: "10.0.0.2".into(), port: 53640 },
             ]
+        );
+        // The private RCC target is retained only when no public UDMUX target
+        // exists; otherwise it cannot be reached from an Internet client.
+        assert_eq!(
+            parse_join_config(&serde_json::json!({
+                "settings": { "MachineAddress": "10.0.0.2", "ServerPort": 53640 }
+            })),
+            vec![Endpoint { address: "10.0.0.2".into(), port: 53640 }]
         );
     }
 

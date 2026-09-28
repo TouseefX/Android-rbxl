@@ -1846,7 +1846,7 @@ ui.label("Place ID:");
                         if probe.clicked() {
                             if let Some(cfg) = self.team_create_join_config.clone() {
                                 self.status = "Probing customized RakNet handshake…".into();
-                                let report = crate::team_create::probe_join_config(&cfg, 3, 1200);
+                                let report = crate::team_create::probe_join_config(&cfg, 3, 2500);
                                 self.log_info(format!("Team Create Rbx handshake probe:\n{report}"));
                                 self.team_create_response = report;
                                 self.status = "Rbx handshake probe finished — see panel output".into();
