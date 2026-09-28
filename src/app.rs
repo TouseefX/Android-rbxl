@@ -1839,12 +1839,14 @@ ui.label("Place ID:");
                         let probe = ui
                             .add_enabled(can_probe, egui::Button::new("📡 Probe Rbx Handshake"))
                             .on_hover_text(if can_probe {
-                                "Sends the exact 2022 RbxOpenRequest1 and validates RbxOpenReply1; blocks a few seconds"
+                                "Runs the complete RUPP-routed encrypted 2022 open handshake. The join ticket is one-use, so this probe consumes the current config"
                             } else {
-                                "Run Warm Up Server followed by Negotiate Join; the button enables only when the response contains a usable server endpoint"
+                                "Run Negotiate Join immediately before each probe; encrypted early-auth material is one-use"
                             });
                         if probe.clicked() {
-                            if let Some(cfg) = self.team_create_join_config.clone() {
+                            // Request2 pre-auth MACs are replay-protected. Consume the
+                            // config so a second click cannot silently reuse a ticket.
+                            if let Some(cfg) = self.team_create_join_config.take() {
                                 self.status = "Probing customized RakNet handshake…".into();
                                 let report = crate::team_create::probe_join_config(&cfg, 3, 2500);
                                 self.log_info(format!("Team Create Rbx handshake probe:\n{report}"));

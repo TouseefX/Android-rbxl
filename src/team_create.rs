@@ -972,18 +972,19 @@ fn probe_endpoint_with_rupp(
     const PROBE_MTUS: [u16; 3] = [1492, DEFAULT_PROBE_MTU, 576];
     const ROUNDS: usize = 2;
     const REQUEST1_CANDIDATE_WAIT_MS: u64 = 450;
+    const REQUEST2_MIN_WAIT_MS: u64 = 5_000;
 
     let target = endpoint.label();
     let started = Instant::now();
-    let deadline = started + Duration::from_millis(timeout_ms.max(1_200));
+    let request1_deadline = started + Duration::from_millis(timeout_ms.max(1_200));
     let prefixes: Vec<(Option<u8>, Vec<u8>)> = if let Some(material) = rupp {
         // `TokenTlv::findTokenInBitstreamIfNext` accepts exactly subtypes 1
-        // and 2. Current 2022 production uses 2; trying 1 afterward preserves
-        // compatibility with the rollout and, unlike the old burst probe,
-        // identifies which prefix produced Reply1 for use by Request2.
+        // and 2. Live 2022 Team Create routing accepted subtype 1; subtype 2
+        // remains a compatibility fallback. Separate sockets identify which
+        // prefix produced Reply1 so Request2 can retain it exactly.
         vec![
-            (Some(2), build_rupp_header(material, 2)?),
             (Some(1), build_rupp_header(material, 1)?),
+            (Some(2), build_rupp_header(material, 2)?),
         ]
     } else {
         vec![(None, Vec::new())]
@@ -995,7 +996,7 @@ fn probe_endpoint_with_rupp(
     let mut receive_buf = [0u8; 2048];
     'rounds: for _ in 0..ROUNDS {
         for (token_type, prefix) in &prefixes {
-            if Instant::now() >= deadline {
+            if Instant::now() >= request1_deadline {
                 break 'rounds;
             }
             // Give each token subtype its own source port. A delayed Reply1
@@ -1015,7 +1016,7 @@ fn probe_endpoint_with_rupp(
                 sent += 1;
             }
             let candidate_deadline = std::cmp::min(
-                deadline,
+                request1_deadline,
                 Instant::now() + Duration::from_millis(REQUEST1_CANDIDATE_WAIT_MS),
             );
             while let Some(remaining) = candidate_deadline.checked_duration_since(Instant::now()) {
@@ -1099,13 +1100,21 @@ fn probe_endpoint_with_rupp(
         request2_material,
         &crypto,
     )?;
+    let request2_aad_len = usize::from(packet2[selected_prefix.len() + 18]);
+    let request2_ciphertext_len = usize::from(u16::from_be_bytes([
+        packet2[selected_prefix.len() + 19],
+        packet2[selected_prefix.len() + 20],
+    ]));
+    let request2_started = Instant::now();
+    let request2_wait_ms = timeout_ms.max(REQUEST2_MIN_WAIT_MS);
+    let request2_deadline = request2_started + Duration::from_millis(request2_wait_ms);
     socket
         .send_to(&packet2, from)
         .map_err(|error| format!("{target}: RbxOpenRequest2 send failed: {error}"))?;
 
     let mut buf = [0u8; 2048];
     let mut request2_replies = Vec::new();
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+    while let Some(remaining) = request2_deadline.checked_duration_since(Instant::now()) {
         socket
             .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
             .map_err(|error| format!("{target}: socket timeout: {error}"))?;
@@ -1162,11 +1171,13 @@ fn probe_endpoint_with_rupp(
     }
     if request2_replies.is_empty() {
         Err(format!(
-            "{target}: ✅ {request1_summary}; no RbxOpenReply2 before the {timeout_ms} ms handshake deadline"
+            "{target}: ✅ {request1_summary}; sent {}-byte encrypted RbxOpenRequest2 (AAD {request2_aad_len}, ciphertext {request2_ciphertext_len}) and received no UDP response during its independent {request2_wait_ms} ms reply window. RUPP/OpenRequest1 is proven; the server silently rejected either the one-use pre-auth material or early AEAD. Negotiate a fresh join config before every retry",
+            packet2.len()
         ))
     } else {
         Err(format!(
-            "{target}: ✅ {request1_summary}; received UDP after OpenRequest2 but could not accept OpenReply2 ({})",
+            "{target}: ✅ {request1_summary}; received UDP after OpenRequest2 in {} ms but could not accept OpenReply2 ({})",
+            request2_started.elapsed().as_millis(),
             request2_replies.join("; ")
         ))
     }
