@@ -1832,12 +1832,15 @@ ui.label("Place ID:");
                         if ui.button("⚡ Warm Up Server").clicked() {
                             self.team_create_negotiate(true);
                         }
-                        if self.team_create_join_config.is_some()
-                            && ui
-                                .button("📡 Probe Rbx Handshake")
-                                .on_hover_text("Sends the exact 2022 RbxOpenRequest1 and validates RbxOpenReply1; blocks a few seconds")
-                                .clicked()
-                        {
+                        let can_probe = self.team_create_join_config.is_some();
+                        let probe = ui
+                            .add_enabled(can_probe, egui::Button::new("📡 Probe Rbx Handshake"))
+                            .on_hover_text(if can_probe {
+                                "Sends the exact 2022 RbxOpenRequest1 and validates RbxOpenReply1; blocks a few seconds"
+                            } else {
+                                "Run Warm Up Server followed by Negotiate Join to obtain a server endpoint first"
+                            });
+                        if probe.clicked() {
                             if let Some(cfg) = self.team_create_join_config.clone() {
                                 self.status = "Probing customized RakNet handshake…".into();
                                 let report = crate::team_create::probe_join_config(&cfg, 3, 1200);
@@ -5687,10 +5690,10 @@ ui.label("Place ID:");
         match RobloxApiClient::team_create_join(&cookie, &self.open_cloud_place_id, preemptive) {
             Ok(v) => {
                 let endpoints = crate::team_create::parse_join_config(&v);
-                if !endpoints.is_empty() {
-                    // Keep the config so the UDP probe button can use it.
-                    self.team_create_join_config = Some(v.clone());
-                }
+                // Keep every successful response so the handshake action is
+                // consistently enabled. If an unfamiliar response shape has
+                // no endpoints, the probe itself reports that diagnostic.
+                self.team_create_join_config = Some(v.clone());
                 let mut summary = if preemptive {
                     String::from("Server warm-up request accepted")
                 } else {
