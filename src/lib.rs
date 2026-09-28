@@ -35,6 +35,7 @@ mod schema;
 mod selection_edit;
 mod live_session;
 mod lua_runtime;
+mod network_codec;
 mod plugins;
 mod project;
 mod roblox_api_data;
