@@ -233,6 +233,49 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
     Some(decoded)
 }
 
+/// Match the `RBX::Url::urlDecode` step used by Studio before it installs
+/// `EphemeralEarlyPubKey` into the legacy RakNet KeyRing application. This is
+/// percent decoding, not form decoding: an unescaped `+` remains the Base64
+/// alphabet character rather than becoming a space.
+fn url_percent_decode(text: &str) -> Result<String, String> {
+    fn hex_nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let input = text.trim().as_bytes();
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0usize;
+    while index < input.len() {
+        if input[index] == b'%' {
+            if index + 2 >= input.len() {
+                return Err("EphemeralEarlyPubKey ends with an incomplete percent escape".into());
+            }
+            let high = hex_nibble(input[index + 1]).ok_or_else(|| {
+                format!(
+                    "EphemeralEarlyPubKey has an invalid percent escape at byte {index}"
+                )
+            })?;
+            let low = hex_nibble(input[index + 2]).ok_or_else(|| {
+                format!(
+                    "EphemeralEarlyPubKey has an invalid percent escape at byte {index}"
+                )
+            })?;
+            output.push((high << 4) | low);
+            index += 3;
+        } else {
+            output.push(input[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output)
+        .map_err(|_| "URL-decoded EphemeralEarlyPubKey is not UTF-8 Base64 text".to_string())
+}
+
 fn decode_base64_16(text: &str) -> Option<[u8; 16]> {
     decode_base64(text)?.try_into().ok()
 }
@@ -319,6 +362,10 @@ pub const RBX_OPEN_REQUEST_2: u8 = 0x78;
 pub const RBX_OPEN_REPLY_2: u8 = 0x7d;
 pub const RBX_PROTOCOL_VERSION: u8 = 5;
 const RBX_OPEN_REQUEST_2_VERSION: u8 = 3;
+// Studio 0.735 and PlayerConfigurer generate the legacy RakNet application
+// with the URL-decoded Team Create key at id/send/revert 5. This remains
+// distinct from RbxTransportEphemeralEarlyPublicKey, whose generated id is 1.
+const RAKNET_EPHEMERAL_EARLY_KEY_VERSION: u16 = 5;
 pub const DEFAULT_PROBE_MTU: u16 = 1200;
 const IPV6_UDP_HEADER_BYTES: usize = 40;
 const EARLY_AEAD_OVERHEAD: usize = 28; // 12-byte nonce + 16-byte detached tag
@@ -423,6 +470,7 @@ struct Request2Material {
     early_key_revert_version: u16,
     early_key_uses_revert: bool,
     early_key_hashes_job_id: bool,
+    early_key_uses_ephemeral_override: bool,
     server_early_public_key: [u8; 32],
     auth: EarlyAuthData,
 }
@@ -481,6 +529,7 @@ struct ServerEarlyKey {
     uses_revert: bool,
     allowed: bool,
     hashes_job_id: bool,
+    uses_ephemeral_override: bool,
     bytes: [u8; 32],
 }
 
@@ -494,15 +543,45 @@ fn keyed_blake2b_256(key: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
     Ok(output)
 }
 
-/// Parse the JSON consumed by native 2022 `KeyRing::parseConfig`, then model
-/// `KeyRing::getKeyForProduction("RakNetEarlyPublicKey")`. `parseVersion`
-/// conditionally replaces the decoded value with keyed BLAKE2b-256(jobId)
-/// when the selected version's `hashJobId` member is true. The version ID
-/// itself does not change.
+/// Reproduce Studio 0.735's Team Create KeyRing setup. A nonempty
+/// `EphemeralEarlyPubKey` takes the entire legacy RakNet branch: Studio URL
+/// decodes it, generates a one-version `RakNetEarlyPublicKey` application at
+/// id/send/revert 5, and does not parse `ClientPublicKeyData`. Only when the
+/// ephemeral value is absent or empty does Studio parse the supplied KeyRing.
+/// In that fallback, `parseVersion` conditionally replaces a decoded value
+/// with keyed BLAKE2b-256(jobId) when `hashJobId` is true.
 fn parse_server_early_key_with_revert(
     config: &serde_json::Value,
     key_ring_revert: bool,
 ) -> Result<ServerEarlyKey, String> {
+    if let Some(ephemeral_value) = find_field_ci(config, "EphemeralEarlyPubKey", 0) {
+        let raw_ephemeral = ephemeral_value.as_str().ok_or_else(|| {
+            "join config EphemeralEarlyPubKey is present but is not a string".to_string()
+        })?;
+        if !raw_ephemeral.is_empty() {
+            let encoded = url_percent_decode(raw_ephemeral)?;
+            let decoded = decode_base64(&encoded).ok_or_else(|| {
+                "URL-decoded EphemeralEarlyPubKey is not valid Base64".to_string()
+            })?;
+            let bytes: [u8; 32] = decoded.try_into().map_err(|decoded: Vec<u8>| {
+                format!(
+                    "URL-decoded EphemeralEarlyPubKey is {} bytes, not exactly 32",
+                    decoded.len()
+                )
+            })?;
+            return Ok(ServerEarlyKey {
+                version: RAKNET_EPHEMERAL_EARLY_KEY_VERSION,
+                send_version: RAKNET_EPHEMERAL_EARLY_KEY_VERSION,
+                revert_version: RAKNET_EPHEMERAL_EARLY_KEY_VERSION,
+                uses_revert: key_ring_revert,
+                allowed: true,
+                hashes_job_id: false,
+                uses_ephemeral_override: true,
+                bytes,
+            });
+        }
+    }
+
     let key_ring_text = find_field_ci(config, "ClientPublicKeyData", 0)
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| "join config has no ClientPublicKeyData".to_string())?;
@@ -586,6 +665,7 @@ fn parse_server_early_key_with_revert(
         uses_revert: key_ring_revert,
         allowed: selected_allowed,
         hashes_job_id,
+        uses_ephemeral_override: false,
         bytes: effective_key,
     })
 }
@@ -620,6 +700,7 @@ fn extract_request2_material_with_revert(
         early_key_revert_version: early_key.revert_version,
         early_key_uses_revert: early_key.uses_revert,
         early_key_hashes_job_id: early_key.hashes_job_id,
+        early_key_uses_ephemeral_override: early_key.uses_ephemeral_override,
         server_early_public_key: early_key.bytes,
         auth,
     })
@@ -1348,10 +1429,12 @@ pub fn probe_join_config_with_key_ring_revert(
         Ok(material) => heading.push_str(&format!(
             "\nEncrypted OpenRequest2 ready: selected key version {} via {} (send {}; revert {}; hashJobId {}), auth version {}, pre-auth {} bytes, auth {} bytes",
             material.early_key_version,
-            if material.early_key_uses_revert {
+            if material.early_key_uses_ephemeral_override {
+                "URL-decoded EphemeralEarlyPubKey override"
+            } else if material.early_key_uses_revert {
                 "KeyRingRevert"
             } else {
-                "send"
+                "ClientPublicKeyData send"
             },
             material.early_key_send_version,
             material.early_key_revert_version,
@@ -1373,14 +1456,18 @@ pub fn probe_join_config_with_key_ring_revert(
     }
     if let Some(ephemeral_key) = find_field_ci(config, "EphemeralEarlyPubKey", 0)
         .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty())
     {
-        match decode_base64(&ephemeral_key) {
+        match url_percent_decode(&ephemeral_key)
+            .ok()
+            .and_then(|encoded| decode_base64(&encoded))
+        {
             Some(decoded) => heading.push_str(&format!(
-                "\nJoin config also contains EphemeralEarlyPubKey ({} decoded bytes); authoritative 2022 RakPeerCrypto does not select this field",
-                decoded.len()
+                "\nNative Team Create ephemeral override decoded successfully ({} bytes; legacy RakNet id/send/revert {})",
+                decoded.len(), RAKNET_EPHEMERAL_EARLY_KEY_VERSION
             )),
             None => heading.push_str(
-                "\nJoin config contains EphemeralEarlyPubKey, but it is not valid Base64",
+                "\nEphemeralEarlyPubKey failed native URL-decode/Base64 processing",
             ),
         }
     }
@@ -1482,6 +1569,58 @@ mod tests {
     }
 
     #[test]
+    fn percent_decodes_ephemeral_early_public_key_without_form_plus_conversion() {
+        assert_eq!(
+            url_percent_decode(
+                "EyxEK%2BAQ%2B9V%2BcmAzKKp25x%2FMwVA6riGTJ9FNnJmT9HI%3D"
+            )
+            .unwrap(),
+            "EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI="
+        );
+        assert_eq!(url_percent_decode("A+B").unwrap(), "A+B");
+        assert!(url_percent_decode("bad%2").is_err());
+        assert!(url_percent_decode("bad%XZ").is_err());
+    }
+
+    #[test]
+    fn ephemeral_team_create_key_replaces_client_public_key_data() {
+        let encoded_key =
+            "EyxEK%2BAQ%2B9V%2BcmAzKKp25x%2FMwVA6riGTJ9FNnJmT9HI%3D";
+        let config = serde_json::json!({
+            "settings": {
+                "EphemeralEarlyPubKey": encoded_key,
+                // Native Studio does not parse this field in the nonempty
+                // ephemeral branch, so deliberately make it invalid JSON.
+                "ClientPublicKeyData": "must not be parsed",
+                "ClientTicket": "ticket-prefix;ignored;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=;oKGio6SlpqeoqaqrrK2urw==;6"
+            }
+        });
+
+        let material = extract_request2_material(&config).unwrap();
+        assert_eq!(
+            material.early_key_version,
+            RAKNET_EPHEMERAL_EARLY_KEY_VERSION
+        );
+        assert_eq!(
+            material.early_key_send_version,
+            RAKNET_EPHEMERAL_EARLY_KEY_VERSION
+        );
+        assert_eq!(
+            material.early_key_revert_version,
+            RAKNET_EPHEMERAL_EARLY_KEY_VERSION
+        );
+        assert!(material.early_key_uses_ephemeral_override);
+        assert!(!material.early_key_hashes_job_id);
+        assert_eq!(
+            material.server_early_public_key,
+            <[u8; 32]>::try_from(
+                decode_base64("EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI=").unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn extracts_2022_key_ring_and_client_ticket_early_auth() {
         let config = serde_json::json!({
             "settings": {
@@ -1495,6 +1634,7 @@ mod tests {
         assert_eq!(material.early_key_revert_version, 5);
         assert!(!material.early_key_uses_revert);
         assert!(!material.early_key_hashes_job_id);
+        assert!(!material.early_key_uses_ephemeral_override);
         assert_eq!(
             material.server_early_public_key,
             <[u8; 32]>::try_from(
@@ -1624,6 +1764,7 @@ mod tests {
             early_key_revert_version: 5,
             early_key_uses_revert: false,
             early_key_hashes_job_id: false,
+            early_key_uses_ephemeral_override: false,
             server_early_public_key: server_public,
             auth: EarlyAuthData {
                 auth_version: 6,
