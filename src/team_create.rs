@@ -362,9 +362,11 @@ pub const RBX_OPEN_REQUEST_2: u8 = 0x78;
 pub const RBX_OPEN_REPLY_2: u8 = 0x7d;
 pub const RBX_PROTOCOL_VERSION: u8 = 5;
 const RBX_OPEN_REQUEST_2_VERSION: u8 = 3;
-// Studio 0.735 and PlayerConfigurer generate the legacy RakNet application
-// with the URL-decoded Team Create key at id/send/revert 5. This remains
-// distinct from RbxTransportEphemeralEarlyPublicKey, whose generated id is 1.
+// PlayerConfigurer directly emits the URL-decoded legacy RakNet key at
+// id/send/revert 5. Studio 0.735 uses the same application and generated
+// config shape; its R8D helper argument is omitted by the pseudocode export,
+// so 5 is the evidence-backed paired-path value rather than a visible Studio
+// call-site literal. RbxTransportEphemeralEarlyPublicKey remains separate at 1.
 const RAKNET_EPHEMERAL_EARLY_KEY_VERSION: u16 = 5;
 pub const DEFAULT_PROBE_MTU: u16 = 1200;
 const IPV6_UDP_HEADER_BYTES: usize = 40;
@@ -546,8 +548,9 @@ fn keyed_blake2b_256(key: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
 /// Reproduce Studio 0.735's Team Create KeyRing setup. A nonempty
 /// `EphemeralEarlyPubKey` takes the entire legacy RakNet branch: Studio URL
 /// decodes it, generates a one-version `RakNetEarlyPublicKey` application at
-/// id/send/revert 5, and does not parse `ClientPublicKeyData`. Only when the
-/// ephemeral value is absent or empty does Studio parse the supplied KeyRing.
+/// the paired-path version 5, and does not parse `ClientPublicKeyData`. Only
+/// when the ephemeral value is absent or empty does Studio parse the supplied
+/// KeyRing.
 /// In that fallback, `parseVersion` conditionally replaces a decoded value
 /// with keyed BLAKE2b-256(jobId) when `hashJobId` is true.
 fn parse_server_early_key_with_revert(
