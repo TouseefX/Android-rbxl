@@ -11,14 +11,16 @@
 //! - Schema helper strings/counts use unsigned base-128 varints.
 //! - Vector3 = 3 floats; UDim = float scale + i32 offset.
 //! - CoordinateFrame = 3 position floats + one orientation byte. Values 1..
-//!   select a standard orientation (id = byte-1); zero calls the separate
-//!   Compressor::readRotation codec, whose source was NOT in the archive.
+//!   select a standard orientation (id = byte-1); zero uses the six-byte
+//!   smallest-three quaternion from `Compressor::readRotation`.
+//! - `Compressor.c` additionally defines exact compact rotation, translation,
+//!   full velocity, and compact velocity codecs; all readers are below.
 //!
 //! Schema definition packets start with byte 0x97, followed by a compressed
 //! NetworkStream. `parse_uncompressed_schema` parses the exact payload AFTER
-//! Replicator::decompressBitStream. Decompression itself deliberately remains
-//! unavailable until `Compressor.c` / `Replicator::decompressBitStream` is
-//! supplied; guessing it would desynchronize and corrupt every later item.
+//! Replicator::decompressBitStream. That stream-compression function is not in
+//! either uploaded archive (it is distinct from the transform `Compressor.c`);
+//! guessing it would desynchronize and corrupt every later item.
 
 use std::fmt;
 
@@ -222,20 +224,130 @@ impl<'a> NetworkReader<'a> {
         Ok(UDim2 { x: self.read_udim()?, y: self.read_udim()? })
     }
 
-    /// Reads the position and orientation marker of a CoordinateFrame. A
-    /// non-zero marker is a standard orientation id (`marker - 1`). Marker 0
-    /// is followed by Compressor::readRotation data; because that source is
-    /// absent, we return a precise MissingCodec error rather than guessing.
-    pub fn read_coordinate_frame_header(&mut self) -> Result<CoordinateFrameHeader> {
+    /// Reads the position and orientation marker of a CoordinateFrame.
+    /// Non-zero markers select one of Roblox's standard axis-aligned matrices
+    /// (`marker - 1`). Zero is followed by the six-byte smallest-three
+    /// quaternion encoded by `Compressor::readRotation`.
+    pub fn read_coordinate_frame(&mut self) -> Result<CoordinateFrame> {
         let position = self.read_vector3()?;
         let marker = self.read_u8()?;
-        if marker == 0 {
-            return Err(CodecError::MissingCodec("Compressor::readRotation"));
+        let rotation = if marker == 0 {
+            self.read_rotation()?
+        } else {
+            Rotation::Standard(marker - 1)
+        };
+        Ok(CoordinateFrame { position, rotation })
+    }
+
+    /// Exact six-byte `Compressor::readRotation` codec: three signed 15-bit
+    /// smallest-three quaternion components and a two-bit omitted-axis index.
+    pub fn read_rotation(&mut self) -> Result<Rotation> {
+        let qx_encoded = self.read_u16()?;
+        let qyz_encoded = self.read_u32()?;
+        let omitted = (qyz_encoded >> 30) as usize;
+        let packed = [
+            sign_extend(u32::from(qx_encoded) & 0x7fff, 15),
+            sign_extend((qyz_encoded >> 15) & 0x7fff, 15),
+            sign_extend(qyz_encoded & 0x7fff, 15),
+        ];
+        let q = decode_smallest_three(packed, 16383.0, omitted);
+        Ok(Rotation::Matrix(quaternion_to_matrix(q)))
+    }
+
+    /// Exact four-byte compact rotation codec: three signed 10-bit
+    /// smallest-three components plus the omitted-axis index.
+    pub fn read_rotation_compact(&mut self) -> Result<Rotation> {
+        let encoded = self.read_u32()?;
+        let omitted = (encoded >> 30) as usize;
+        let packed = [
+            sign_extend((encoded >> 20) & 0x3ff, 10),
+            sign_extend((encoded >> 10) & 0x3ff, 10),
+            sign_extend(encoded & 0x3ff, 10),
+        ];
+        let q = decode_smallest_three(packed, 511.0, omitted);
+        Ok(Rotation::Matrix(quaternion_to_matrix(q)))
+    }
+
+    /// Exact variable-width `Compressor::readTranslation` codec. The header
+    /// stores a five-bit exponent and the sign bit of each coordinate; the
+    /// remaining magnitudes use 10, 16, or 21 bits depending on the exponent.
+    pub fn read_translation(&mut self) -> Result<[f32; 3]> {
+        let header = self.read_u8()?;
+        let exponent = u32::from(header >> 3);
+        let signs = [u32::from((header >> 2) & 1), u32::from((header >> 1) & 1), u32::from(header & 1)];
+        let scale = 2.0_f32.powi(exponent as i32);
+
+        let (x, y, z, denominator) = if exponent <= 4 {
+            let packed = self.read_u32()?;
+            (
+                sign_extend((signs[0] << 10) | (packed >> 20), 11),
+                sign_extend((signs[1] << 10) | ((packed >> 10) & 0x3ff), 11),
+                sign_extend((signs[2] << 10) | (packed & 0x3ff), 11),
+                1023.0,
+            )
+        } else if exponent <= 10 {
+            (
+                sign_extend((signs[0] << 16) | u32::from(self.read_u16()?), 17),
+                sign_extend((signs[1] << 16) | u32::from(self.read_u16()?), 17),
+                sign_extend((signs[2] << 16) | u32::from(self.read_u16()?), 17),
+                65535.0,
+            )
+        } else {
+            let xy = self.read_u32()?;
+            let yz = self.read_u32()?;
+            (
+                sign_extend((signs[0] << 21) | (xy >> 11), 22),
+                sign_extend((signs[1] << 21) | ((xy & 0x7ff) << 10) | (yz >> 21), 22),
+                sign_extend((signs[2] << 21) | (yz & 0x1f_ffff), 22),
+                2_097_151.0,
+            )
+        };
+        Ok([
+            x as f32 / denominator * scale,
+            y as f32 / denominator * scale,
+            z as f32 / denominator * scale,
+        ])
+    }
+
+    /// Exact five-byte `Compressor::readVelocity` codec. A zero header is the
+    /// special all-zero vector; otherwise it carries an exponent and the high
+    /// four bits of Z while a u32 carries three signed 12-bit components.
+    pub fn read_velocity(&mut self) -> Result<[f32; 3]> {
+        let header = self.read_u8()?;
+        if header == 0 {
+            return Ok([0.0; 3]);
         }
-        Ok(CoordinateFrameHeader {
-            position,
-            orientation_id: marker - 1,
-        })
+        let packed = self.read_u32()?;
+        let x = sign_extend(packed >> 20, 12);
+        let y = sign_extend((packed >> 8) & 0xfff, 12);
+        let z = sign_extend((u32::from(header & 0x0f) << 8) | (packed & 0xff), 12);
+        let scale = 2.0_f32.powi(i32::from(header >> 4) - 1);
+        Ok([
+            x as f32 / 2047.0 * scale,
+            y as f32 / 2047.0 * scale,
+            z as f32 / 2047.0 * scale,
+        ])
+    }
+
+    /// Exact three-byte compact velocity codec: signed five-bit exponent and
+    /// three signed six-bit components. As in the full codec, zero is special.
+    pub fn read_velocity_compact(&mut self) -> Result<[f32; 3]> {
+        let a = self.read_u8()?;
+        if a == 0 {
+            return Ok([0.0; 3]);
+        }
+        let b = self.read_u8()?;
+        let c = self.read_u8()?;
+        let exponent = sign_extend(u32::from((a >> 2) & 0x1f), 5);
+        let x = sign_extend((u32::from(a & 0x03) << 4) | u32::from(b >> 4), 6);
+        let y = sign_extend((u32::from(b & 0x0f) << 2) | u32::from(c >> 6), 6);
+        let z = sign_extend(u32::from(c & 0x3f), 6);
+        let scale = 2.0_f32.powi(exponent);
+        Ok([
+            x as f32 / 31.0 * scale,
+            y as f32 / 31.0 * scale,
+            z as f32 / 31.0 * scale,
+        ])
     }
 }
 
@@ -252,9 +364,65 @@ pub struct UDim2 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CoordinateFrameHeader {
+pub enum Rotation {
+    /// Roblox standard orientation id (wire marker minus one).
+    Standard(u8),
+    /// Row-major 3×3 rotation matrix decoded from a compressed quaternion.
+    Matrix([[f32; 3]; 3]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoordinateFrame {
     pub position: [f32; 3],
-    pub orientation_id: u8,
+    pub rotation: Rotation,
+}
+
+const ROTATION_MAX_COMPONENT: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+fn sign_extend(value: u32, bits: u32) -> i32 {
+    let shift = 32 - bits;
+    ((value << shift) as i32) >> shift
+}
+
+/// Rebuild a normalized [x,y,z,w] quaternion from Roblox's smallest-three
+/// representation. `omitted` is the index of the non-negative largest
+/// component; the remaining indices stay in natural ascending order.
+fn decode_smallest_three(encoded: [i32; 3], denominator: f32, omitted: usize) -> [f32; 4] {
+    let mut q = [0.0_f32; 4];
+    let mut src = 0;
+    for (axis, component) in q.iter_mut().enumerate() {
+        if axis != omitted {
+            *component = encoded[src] as f32 / denominator * ROTATION_MAX_COMPONENT;
+            src += 1;
+        }
+    }
+    let sum_other = q.iter().map(|v| v * v).sum::<f32>();
+    q[omitted] = (1.0 - sum_other).max(0.0).sqrt();
+    let norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut q {
+            *v /= norm;
+        }
+    }
+    q
+}
+
+fn quaternion_to_matrix(q: [f32; 4]) -> [[f32; 3]; 3] {
+    let [x, y, z, w] = q;
+    let xx = x * x;
+    let yy = y * y;
+    let zz = z * z;
+    let xy = x * y;
+    let xz = x * z;
+    let yz = y * z;
+    let wx = w * x;
+    let wy = w * y;
+    let wz = w * z;
+    [
+        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+        [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+        [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+    ]
 }
 
 /// Write-only counterpart for the primitives whose exact layout is confirmed
@@ -346,6 +514,72 @@ impl NetworkWriter {
         self.write_bytes(value.as_bytes());
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// JoinDataItemV2 envelope (before stream decompression)
+// ---------------------------------------------------------------------------
+
+/// The 2022 server writes this RakNet user-packet marker first for each
+/// JoinDataV2 blob (`LOBYTE(inByteArray) = -125`).
+pub const ROBLOX_DATA_PACKET_ID: u8 = 0x83;
+/// `ItemTypeJoinDataV2`, written as byte 22 by constructBlobStreams.
+pub const JOIN_DATA_V2_ITEM_TYPE: u8 = 22;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JoinDataSubtype {
+    SharedString = 1,
+    CacheableInstances = 2,
+    NotCacheableInstances = 3,
+    PartInstances = 4,
+}
+
+impl TryFrom<u8> for JoinDataSubtype {
+    type Error = CodecError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::SharedString),
+            2 => Ok(Self::CacheableInstances),
+            3 => Ok(Self::NotCacheableInstances),
+            4 => Ok(Self::PartInstances),
+            _ => Err(CodecError::InvalidData(format!(
+                "unknown JoinDataV2 subtype {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinDataV2Header {
+    pub subtype: JoinDataSubtype,
+    /// Offset at which the self-delimiting compressed stream begins.
+    pub compressed_offset: usize,
+}
+
+/// Parse the three confirmed bytes preceding every JoinDataV2 compressed
+/// stream: 0x83, item type 22, subtype 1..4. The compressed frame itself is
+/// self-delimiting; after decompression advances the input cursor, instance
+/// subtypes append u32-BE metadata count + invalid-range varints.
+pub fn parse_join_data_v2_header(packet: &[u8]) -> Result<JoinDataV2Header> {
+    let mut r = NetworkReader::new(packet);
+    let packet_id = r.read_u8()?;
+    if packet_id != ROBLOX_DATA_PACKET_ID {
+        return Err(CodecError::InvalidData(format!(
+            "expected Roblox data packet 0x{ROBLOX_DATA_PACKET_ID:02x}, got 0x{packet_id:02x}"
+        )));
+    }
+    let item_type = r.read_u8()?;
+    if item_type != JOIN_DATA_V2_ITEM_TYPE {
+        return Err(CodecError::InvalidData(format!(
+            "expected JoinDataV2 item type {JOIN_DATA_V2_ITEM_TYPE}, got {item_type}"
+        )));
+    }
+    Ok(JoinDataV2Header {
+        subtype: JoinDataSubtype::try_from(r.read_u8()?)?,
+        compressed_offset: r.position(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +840,39 @@ mod tests {
         assert_eq!(r.read_string().unwrap(), "hello");
         assert_eq!(r.read_var_u32().unwrap(), 300);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn transform_compressors_decode_identity_and_zero() {
+        // Smallest-three identity quaternion: omitted component W (index 3),
+        // all transmitted components zero.
+        let full_rotation = [0x00, 0x00, 0xc0, 0x00, 0x00, 0x00];
+        let mut r = NetworkReader::new(&full_rotation);
+        match r.read_rotation().unwrap() {
+            Rotation::Matrix(m) => assert_eq!(m, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            Rotation::Standard(_) => panic!("expected compressed matrix"),
+        }
+
+        let compact_rotation = [0xc0, 0x00, 0x00, 0x00];
+        let mut r = NetworkReader::new(&compact_rotation);
+        match r.read_rotation_compact().unwrap() {
+            Rotation::Matrix(m) => assert_eq!(m, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            Rotation::Standard(_) => panic!("expected compressed matrix"),
+        }
+
+        let mut r = NetworkReader::new(&[0, 0, 0, 0, 0]);
+        assert_eq!(r.read_translation().unwrap(), [0.0; 3]);
+        let mut r = NetworkReader::new(&[0]);
+        assert_eq!(r.read_velocity().unwrap(), [0.0; 3]);
+        let mut r = NetworkReader::new(&[0]);
+        assert_eq!(r.read_velocity_compact().unwrap(), [0.0; 3]);
+    }
+
+    #[test]
+    fn parses_join_data_v2_envelope() {
+        let h = parse_join_data_v2_header(&[0x83, 22, 3, 0xaa]).unwrap();
+        assert_eq!(h.subtype, JoinDataSubtype::NotCacheableInstances);
+        assert_eq!(h.compressed_offset, 3);
     }
 
     #[test]
