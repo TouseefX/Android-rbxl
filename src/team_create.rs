@@ -903,9 +903,9 @@ struct RbxOpenReply2 {
     _session_client_to_server: [u8; 32],
 }
 
-fn strip_optional_rupp_prefix(packet: &[u8]) -> Result<&[u8], String> {
+fn strip_optional_rupp_prefix(packet: &[u8]) -> Result<(&[u8], usize), String> {
     if packet.first() != Some(&RUPP_PROTOCOL_RAKNET) {
-        return Ok(packet);
+        return Ok((packet, 0));
     }
     if packet.len() < 4 {
         return Err("truncated RUPP response prefix".into());
@@ -914,14 +914,14 @@ fn strip_optional_rupp_prefix(packet: &[u8]) -> Result<&[u8], String> {
     if header_len < 4 || header_len > packet.len() {
         return Err(format!("invalid RUPP response header length {header_len}"));
     }
-    Ok(&packet[header_len..])
+    Ok((&packet[header_len..], header_len))
 }
 
 fn parse_rbx_open_reply2(
     packet: &[u8],
     crypto: &Request2Crypto,
 ) -> Result<RbxOpenReply2, String> {
-    let packet = strip_optional_rupp_prefix(packet)?;
+    let (packet, stripped_rupp_len) = strip_optional_rupp_prefix(packet)?;
     let Some(&packet_id) = packet.first() else {
         return Err("RbxOpenReply2 is empty".into());
     };
@@ -956,8 +956,27 @@ fn parse_rbx_open_reply2(
     if aad_len < 21 || aad_len > packet.len() {
         return Err(format!("RbxOpenReply2 has invalid AAD length {aad_len}"));
     }
+    // Studio 0.735's routed reply passes the total AAD offset (including the
+    // already-stripped RUPP header) to earlyEncryptData while that helper's
+    // crypto view starts after RUPP. Consequently `aadLen` extends that many
+    // bytes into the logical Reply2 body. Those bytes remain clear but are
+    // authenticated. The header's ciphertextLen continues to describe the
+    // complete logical body, including this clear prefix.
+    const OPEN_REPLY_2_HEADER_LEN: usize = 21;
+    let clear_body_prefix_len = aad_len - OPEN_REPLY_2_HEADER_LEN;
+    if clear_body_prefix_len > ciphertext_len {
+        return Err(format!(
+            "RbxOpenReply2 AAD consumes {clear_body_prefix_len} body bytes, exceeding ciphertext length {ciphertext_len}"
+        ));
+    }
+    if clear_body_prefix_len != 0 && clear_body_prefix_len != stripped_rupp_len {
+        return Err(format!(
+            "RbxOpenReply2 AAD body prefix is {clear_body_prefix_len} bytes, but stripped RUPP header is {stripped_rupp_len} bytes"
+        ));
+    }
+    let encrypted_meaningful_len = ciphertext_len - clear_body_prefix_len;
     let minimum_len = aad_len
-        .checked_add(ciphertext_len)
+        .checked_add(encrypted_meaningful_len)
         .and_then(|length| length.checked_add(EARLY_AEAD_OVERHEAD))
         .ok_or_else(|| "RbxOpenReply2 length overflow".to_string())?;
     if packet.len() < minimum_len {
@@ -966,33 +985,41 @@ fn parse_rbx_open_reply2(
             packet.len()
         ));
     }
-    // The 2022 server reserves 28 zero bytes before calling earlyEncryptData.
-    // Those bytes become additional authenticated ciphertext, after which
-    // earlyEncryptData appends the real nonce and tag. The header's
-    // ciphertextLen still describes only the meaningful body. Roblox's client
-    // therefore decrypts every byte between AAD and the final 28-byte suffix
-    // and simply leaves this zero tail unread.
+
+    // Both the 2022 and 0.735 servers may reserve 28 zero bytes before calling
+    // earlyEncryptData. They become authenticated ciphertext before the real
+    // 12-byte nonce and 16-byte tag. Native clients decrypt the zero tail but
+    // leave it unread after parsing the logical body.
     let ciphertext_end = packet.len() - EARLY_AEAD_OVERHEAD;
-    let actual_ciphertext_len = ciphertext_end - aad_len;
-    if actual_ciphertext_len != ciphertext_len
-        && actual_ciphertext_len != ciphertext_len + EARLY_AEAD_OVERHEAD
-    {
+    let actual_encrypted_len = ciphertext_end - aad_len;
+    let encrypted_zero_tail_len = actual_encrypted_len
+        .checked_sub(encrypted_meaningful_len)
+        .ok_or_else(|| {
+            format!(
+                "RbxOpenReply2 encrypted body is {actual_encrypted_len} bytes, shorter than required {encrypted_meaningful_len}"
+            )
+        })?;
+    if encrypted_zero_tail_len != 0 && encrypted_zero_tail_len != EARLY_AEAD_OVERHEAD {
         return Err(format!(
-            "RbxOpenReply2 ciphertext length mismatch: header says {ciphertext_len}, wire has {actual_ciphertext_len}"
+            "RbxOpenReply2 encrypted zero tail has unexpected length {encrypted_zero_tail_len} (logical body {ciphertext_len}, clear authenticated prefix {clear_body_prefix_len}, encrypted wire {actual_encrypted_len})"
         ));
     }
     let nonce = &packet[ciphertext_end..ciphertext_end + 12];
     let tag = Tag::from_slice(&packet[ciphertext_end + 12..]);
-    let mut plaintext = packet[aad_len..ciphertext_end].to_vec();
+    let mut encrypted_plaintext = packet[aad_len..ciphertext_end].to_vec();
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&crypto.early_server_to_client));
     cipher
         .decrypt_in_place_detached(
             Nonce::from_slice(nonce),
             &packet[..aad_len],
-            &mut plaintext,
+            &mut encrypted_plaintext,
             tag,
         )
         .map_err(|_| "RbxOpenReply2 early ChaCha20-Poly1305 authentication failed".to_string())?;
+
+    let mut plaintext = Vec::with_capacity(clear_body_prefix_len + encrypted_plaintext.len());
+    plaintext.extend_from_slice(&packet[OPEN_REPLY_2_HEADER_LEN..aad_len]);
+    plaintext.extend_from_slice(&encrypted_plaintext);
 
     if plaintext.len() < 32 + 8 + 8 + 2 + 1 + 7 {
         return Err(format!(
@@ -1868,6 +1895,80 @@ mod tests {
             reply._session_client_to_server.as_slice(),
             hex_fixture("771b077ce6ed993d92009e89ce7c956a76fdb1d319e1560f28fd3d48aeaf18e9")
         );
+    }
+
+    #[test]
+    fn authenticates_0735_routed_reply_with_rupp_extended_aad() {
+        let client_secret = StaticSecret::from([7u8; 32]);
+        let client_public = PublicKey::from(&client_secret).to_bytes();
+        let crypto = Request2Crypto {
+            client_secret,
+            client_public,
+            early_server_to_client: [0x42; 32],
+            early_client_to_server: [0; 32],
+            client_guid: 1,
+        };
+        let server_secret = StaticSecret::from([9u8; 32]);
+        let server_public = PublicKey::from(&server_secret).to_bytes();
+
+        // The live 0.735 shape has a 23-byte RUPP prefix. The server writes an
+        // AAD length of 21 + 23, leaving the first 23 logical body bytes clear
+        // and authenticated, then encrypts the remaining 35 body bytes plus
+        // its reserved 28-byte zero tail. That is the observed header 58 / wire
+        // 63 combination in a 158-byte routed datagram.
+        let mut rupp = vec![RUPP_PROTOCOL_RAKNET, 0, 0, 23, RUPP_TLV_TOKEN, 17, 1];
+        rupp.extend_from_slice(&[0xa5; 16]);
+        assert_eq!(rupp.len(), 23);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&server_public);
+        body.extend_from_slice(&RAK_PEER_CAPABILITIES_2022_BASE.to_be_bytes());
+        body.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
+        body.extend_from_slice(&1200u16.to_be_bytes());
+        body.push(1);
+        body.push(4);
+        body.extend([10u8, 0, 0, 5].map(|byte| !byte));
+        body.extend_from_slice(&61_201u16.to_be_bytes());
+        assert_eq!(body.len(), 58);
+
+        let mut aad = Vec::new();
+        aad.push(RBX_OPEN_REPLY_2);
+        aad.extend_from_slice(&OFFLINE_MAGIC);
+        aad.push(0); // no refreshed token in the logical body
+        aad.push(44); // fixed 21-byte header + stripped 23-byte RUPP length
+        aad.extend_from_slice(&58u16.to_be_bytes());
+        aad.extend_from_slice(&body[..23]);
+        assert_eq!(aad.len(), 44);
+
+        let mut encrypted = body[23..].to_vec();
+        encrypted.extend_from_slice(&[0; EARLY_AEAD_OVERHEAD]);
+        assert_eq!(encrypted.len(), 63);
+        let nonce = application_nonce(0);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&crypto.early_server_to_client));
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut encrypted)
+            .unwrap();
+
+        let mut packet = rupp;
+        packet.extend_from_slice(&aad);
+        packet.extend_from_slice(&encrypted);
+        packet.extend_from_slice(&nonce);
+        packet.extend_from_slice(tag.as_slice());
+        assert_eq!(packet.len(), 158);
+
+        let reply = parse_rbx_open_reply2(&packet, &crypto).unwrap();
+        assert_eq!(reply.version, 0);
+        assert_eq!(reply.server_guid, 0x1112_1314_1516_1718);
+        assert_eq!(reply.mtu, 1200);
+        assert_eq!(reply.selected_encryption, 1);
+        assert_eq!(
+            reply.binding_address,
+            Endpoint {
+                address: "10.0.0.5".into(),
+                port: 61_201,
+            }
+        );
+        assert_eq!(reply.returned_rupp_token, None);
     }
 
     #[test]
