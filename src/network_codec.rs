@@ -16,11 +16,10 @@
 //! - `Compressor.c` additionally defines exact compact rotation, translation,
 //!   full velocity, and compact velocity codecs; all readers are below.
 //!
-//! Schema definition packets start with byte 0x97, followed by a compressed
-//! NetworkStream. `parse_uncompressed_schema` parses the exact payload AFTER
-//! Replicator::decompressBitStream. That stream-compression function is not in
-//! either uploaded archive (it is distinct from the transform `Compressor.c`);
-//! guessing it would desynchronize and corrupt every later item.
+//! Schema definition packets start with byte 0x97, followed by the exact
+//! `Replicator::compressBitStream` frame found in Replicator.c: compressed and
+//! uncompressed u32-BE lengths, then a Zstandard frame. Both framing directions
+//! and complete schema packet decoding are implemented below.
 
 use std::fmt;
 
@@ -33,6 +32,7 @@ pub enum CodecError {
     InvalidUtf8(String),
     InvalidVarint,
     InvalidData(String),
+    Compression(String),
     /// The 2022 decompile calls a codec whose implementation was not present
     /// in the uploaded archive.
     MissingCodec(&'static str),
@@ -50,6 +50,7 @@ impl fmt::Display for CodecError {
             Self::InvalidUtf8(e) => write!(f, "network string is not UTF-8: {e}"),
             Self::InvalidVarint => write!(f, "invalid/overflowing unsigned varint"),
             Self::InvalidData(e) => write!(f, "invalid network data: {e}"),
+            Self::Compression(e) => write!(f, "network Zstandard error: {e}"),
             Self::MissingCodec(name) => write!(f, "missing decompiled wire codec: {name}"),
         }
     }
@@ -517,6 +518,64 @@ impl NetworkWriter {
 }
 
 // ---------------------------------------------------------------------------
+// Replicator Zstandard framing
+// ---------------------------------------------------------------------------
+
+/// Maximum uncompressed frame accepted from the network. The 2022 client
+/// trusts the transmitted u32 enough to allocate it; Android should not let a
+/// hostile/malformed server request 4 GiB, so our client uses a defensive cap.
+pub const MAX_UNCOMPRESSED_FRAME: usize = 256 * 1024 * 1024;
+
+/// Exact `Replicator::compressBitStream` framing from Replicator.c:
+/// `[compressed_size:u32 BE][uncompressed_size:u32 BE][ZSTD frame]`.
+pub fn compress_stream_frame(data: &[u8], compression_level: i32) -> Result<Vec<u8>> {
+    if data.len() > u32::MAX as usize {
+        return Err(CodecError::LimitExceeded {
+            wanted: data.len(),
+            limit: u32::MAX as usize,
+        });
+    }
+    let compressed = zstd::bulk::compress(data, compression_level)
+        .map_err(|e| CodecError::Compression(e.to_string()))?;
+    if compressed.len() > u32::MAX as usize {
+        return Err(CodecError::LimitExceeded {
+            wanted: compressed.len(),
+            limit: u32::MAX as usize,
+        });
+    }
+    let mut out = NetworkWriter::new();
+    out.write_u32(compressed.len() as u32);
+    out.write_u32(data.len() as u32);
+    out.write_bytes(&compressed);
+    Ok(out.into_inner())
+}
+
+/// Exact `Replicator::decompressBitStream` behavior. It reads the two BE
+/// lengths, decompresses exactly `compressed_size` bytes with ZSTD, verifies
+/// the result is exactly `uncompressed_size`, and leaves the reader positioned
+/// after the frame so JoinDataV2 can consume its trailing metadata.
+pub fn decompress_stream_frame(reader: &mut NetworkReader<'_>) -> Result<Vec<u8>> {
+    let compressed_size = reader.read_u32()? as usize;
+    let uncompressed_size = reader.read_u32()? as usize;
+    if uncompressed_size > MAX_UNCOMPRESSED_FRAME {
+        return Err(CodecError::LimitExceeded {
+            wanted: uncompressed_size,
+            limit: MAX_UNCOMPRESSED_FRAME,
+        });
+    }
+    let compressed = reader.take(compressed_size)?;
+    let decoded = zstd::bulk::decompress(compressed, uncompressed_size)
+        .map_err(|e| CodecError::Compression(e.to_string()))?;
+    if decoded.len() != uncompressed_size {
+        return Err(CodecError::InvalidData(format!(
+            "expected ZSTD frame to decode to {uncompressed_size} bytes, got {}",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
+
+// ---------------------------------------------------------------------------
 // JoinDataItemV2 envelope (before stream decompression)
 // ---------------------------------------------------------------------------
 
@@ -579,6 +638,118 @@ pub fn parse_join_data_v2_header(packet: &[u8]) -> Result<JoinDataV2Header> {
     Ok(JoinDataV2Header {
         subtype: JoinDataSubtype::try_from(r.read_u8()?)?,
         compressed_offset: r.position(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidJoinRange {
+    pub offset: u32,
+    pub length: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinChildOrder {
+    pub number_of_children: u32,
+    pub index_in_parent: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedJoinDataV2 {
+    pub subtype: JoinDataSubtype,
+    pub stream: Vec<u8>,
+    /// None for SHARED_STRING, otherwise the advertised number of instances.
+    pub metadata_count: Option<u32>,
+    pub invalid_ranges: Vec<InvalidJoinRange>,
+    /// Present only for the deprecated ordered variant (one pair per instance).
+    pub child_order: Vec<JoinChildOrder>,
+    /// Server appended ItemTypeEnd (zero) after this JoinData item.
+    pub has_end_marker: bool,
+}
+
+/// Decode the complete outer JoinDataV2 packet through ZSTD and parse its
+/// trailing metadata exactly as `DeserializingJoinDataItemV2::prepWork` does.
+/// `no_order_info` is the negotiated getJDIv2NoOrderInfo feature flag; when
+/// false, the legacy child-count/index pair follows for every instance.
+pub fn decode_join_data_v2_packet(
+    packet: &[u8],
+    no_order_info: bool,
+) -> Result<DecodedJoinDataV2> {
+    let header = parse_join_data_v2_header(packet)?;
+    let mut reader = NetworkReader::new(packet);
+    reader.set_position(header.compressed_offset)?;
+    let stream = decompress_stream_frame(&mut reader)?;
+
+    let mut metadata_count = None;
+    let mut invalid_ranges = Vec::new();
+    let mut child_order = Vec::new();
+    if header.subtype != JoinDataSubtype::SharedString {
+        let count = reader.read_u32()?;
+        metadata_count = Some(count);
+        let invalid_count = checked_count(reader.read_var_u32()?, "invalid JoinData range")?;
+        invalid_ranges.reserve(invalid_count);
+        for _ in 0..invalid_count {
+            let range = InvalidJoinRange {
+                offset: reader.read_var_u32()?,
+                length: reader.read_var_u32()?,
+            };
+            let end = u64::from(range.offset) + u64::from(range.length);
+            if end > stream.len() as u64 {
+                return Err(CodecError::InvalidData(format!(
+                    "invalid JoinData range {}+{} exceeds decoded stream length {}",
+                    range.offset,
+                    range.length,
+                    stream.len()
+                )));
+            }
+            invalid_ranges.push(range);
+        }
+        invalid_ranges.sort_by_key(|r| r.offset);
+
+        if !no_order_info {
+            let count_usize = usize::try_from(count).map_err(|_| {
+                CodecError::InvalidData(format!("JoinData metadata count {count} is too large"))
+            })?;
+            if count_usize > u16::MAX as usize * 16 {
+                return Err(CodecError::LimitExceeded {
+                    wanted: count_usize,
+                    limit: u16::MAX as usize * 16,
+                });
+            }
+            child_order.reserve(count_usize);
+            for _ in 0..count_usize {
+                child_order.push(JoinChildOrder {
+                    number_of_children: reader.read_var_u32()?,
+                    index_in_parent: reader.read_var_u32()?,
+                });
+            }
+        }
+    }
+
+    let has_end_marker = if reader.is_empty() {
+        false
+    } else {
+        let marker = reader.read_u8()?;
+        if marker != 0 {
+            return Err(CodecError::InvalidData(format!(
+                "expected JoinData ItemTypeEnd marker 0, got {marker}"
+            )));
+        }
+        true
+    };
+    if !reader.is_empty() {
+        return Err(CodecError::InvalidData(format!(
+            "{} trailing byte(s) after JoinDataV2",
+            reader.remaining()
+        )));
+    }
+
+    Ok(DecodedJoinDataV2 {
+        subtype: header.subtype,
+        stream,
+        metadata_count,
+        invalid_ranges,
+        child_order,
+        has_end_marker,
     })
 }
 
@@ -784,23 +955,24 @@ pub fn parse_uncompressed_schema(bytes: &[u8]) -> Result<NetworkSchema> {
     })
 }
 
-/// Inspect a complete schema packet. Validates/removes the confirmed 0x97
-/// packet id, then stops explicitly at the missing compression codec.
-pub fn inspect_schema_packet(packet: &[u8]) -> Result<()> {
-    let Some((&id, compressed)) = packet.split_first() else {
-        return Err(CodecError::UnexpectedEof { needed: 1, remaining: 0 });
-    };
+/// Decode a complete 2022 schema packet: validate/remove packet id 0x97,
+/// decompress its length-prefixed ZSTD stream, and parse all dictionaries.
+pub fn parse_schema_packet(packet: &[u8]) -> Result<NetworkSchema> {
+    let mut reader = NetworkReader::new(packet);
+    let id = reader.read_u8()?;
     if id != SCHEMA_PACKET_ID {
         return Err(CodecError::InvalidData(format!(
             "expected schema packet id 0x{SCHEMA_PACKET_ID:02x}, got 0x{id:02x}"
         )));
     }
-    if compressed.is_empty() {
-        return Err(CodecError::UnexpectedEof { needed: 1, remaining: 0 });
+    let uncompressed = decompress_stream_frame(&mut reader)?;
+    if !reader.is_empty() {
+        return Err(CodecError::InvalidData(format!(
+            "{} trailing byte(s) after schema ZSTD frame",
+            reader.remaining()
+        )));
     }
-    Err(CodecError::MissingCodec(
-        "Replicator::decompressBitStream (archive did not include implementation)",
-    ))
+    parse_uncompressed_schema(&uncompressed)
 }
 
 fn checked_count(value: u32, kind: &str) -> Result<usize> {
@@ -876,6 +1048,27 @@ mod tests {
     }
 
     #[test]
+    fn zstd_framing_and_join_metadata_round_trip() {
+        let payload = b"one serialized instance";
+        let framed = compress_stream_frame(payload, 3).unwrap();
+        let mut reader = NetworkReader::new(&framed);
+        assert_eq!(decompress_stream_frame(&mut reader).unwrap(), payload);
+        assert!(reader.is_empty());
+
+        let mut packet = vec![0x83, 22, 3];
+        packet.extend_from_slice(&framed);
+        packet.extend_from_slice(&1_u32.to_be_bytes()); // metadata count
+        packet.push(0); // invalid-range count varint
+        packet.push(0); // ItemTypeEnd
+        let join = decode_join_data_v2_packet(&packet, true).unwrap();
+        assert_eq!(join.subtype, JoinDataSubtype::NotCacheableInstances);
+        assert_eq!(join.stream, payload);
+        assert_eq!(join.metadata_count, Some(1));
+        assert!(join.invalid_ranges.is_empty());
+        assert!(join.has_end_marker);
+    }
+
+    #[test]
     fn parses_minimal_schema_exactly() {
         let mut w = NetworkWriter::new();
         // enums: one
@@ -910,5 +1103,10 @@ mod tests {
         assert_eq!(schema.classes[0].events[0].name, "Touched");
         assert_eq!(schema.known_prefixes, vec!["", "rbxassetid://"]);
         assert_eq!(schema.fixed_dictionary, vec!["Name"]);
+
+        let mut packet = vec![SCHEMA_PACKET_ID];
+        packet.extend_from_slice(&compress_stream_frame(w.as_slice(), 3).unwrap());
+        let from_packet = parse_schema_packet(&packet).unwrap();
+        assert_eq!(from_packet, schema);
     }
 }
