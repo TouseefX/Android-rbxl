@@ -1,7 +1,9 @@
 //! Roblox 2022 network byte-stream and schema codecs.
 //!
 //! Derived directly from the decompiled `NetworkStream.c` and
-//! `NetworkSchema.c` uploaded in `roblox-2022-network-codec-extras.zip`.
+//! `NetworkSchema.c` uploaded in `roblox-2022-network-codec-extras.zip`,
+//! plus the complete `VariantValueSetter.c` uploaded in
+//! `roblox-2022-raknet-and-schema.zip`.
 //! Important wire facts confirmed by those functions:
 //!
 //! - NetworkStream is BYTE-aligned (despite several callers naming it a
@@ -199,6 +201,42 @@ impl<'a> NetworkReader<'a> {
             }
         }
         Err(CodecError::InvalidVarint)
+    }
+
+    pub fn read_var_u64(&mut self) -> Result<u64> {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = self.read_u8()?;
+            if shift == 63 && byte > 1 {
+                return Err(CodecError::InvalidVarint);
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(CodecError::InvalidVarint)
+    }
+
+    /// Signed varints used by NetworkValueFormat_Int/Int64. Roblox's
+    /// `deserializeSignedVarint` family uses ZigZag on the unsigned base-128
+    /// representation, keeping small negative and positive values compact.
+    pub fn read_var_i32(&mut self) -> Result<i32> {
+        let encoded = self.read_var_u32()?;
+        Ok(((encoded >> 1) as i32) ^ -((encoded & 1) as i32))
+    }
+
+    pub fn read_var_i64(&mut self) -> Result<i64> {
+        let encoded = self.read_var_u64()?;
+        Ok(((encoded >> 1) as i64) ^ -((encoded & 1) as i64))
+    }
+
+    pub fn read_var_bytes(&mut self) -> Result<Vec<u8>> {
+        let len = self.read_var_u32()? as usize;
+        if len > self.limit {
+            return Err(CodecError::LimitExceeded { wanted: len, limit: self.limit });
+        }
+        Ok(self.take(len)?.to_vec())
     }
 
     pub fn read_vector3(&mut self) -> Result<[f32; 3]> {
@@ -506,6 +544,28 @@ impl NetworkWriter {
                 break;
             }
         }
+    }
+
+    pub fn write_var_u64(&mut self, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            self.write_u8(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    pub fn write_var_i32(&mut self, value: i32) {
+        self.write_var_u32(((value as u32) << 1) ^ ((value >> 31) as u32));
+    }
+
+    pub fn write_var_i64(&mut self, value: i64) {
+        self.write_var_u64(((value as u64) << 1) ^ ((value >> 63) as u64));
     }
 
     pub fn write_var_string(&mut self, value: &str) -> Result<()> {
@@ -835,6 +895,359 @@ impl NetworkSchema {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Schema value decoder
+// ---------------------------------------------------------------------------
+
+/// Numeric IDs assigned by the 2022 `NetworkValueFormat` enum. The mapping
+/// comes from `defaultSchemaTypeForReflectionType` (which writes the numeric
+/// IDs) cross-referenced with the named cases in the complete
+/// `schemaReadValue<VariantValueSetter>` instantiation.
+pub mod value_format {
+    pub const UNSUPPORTED: u8 = 0;
+    pub const STRING: u8 = 2;
+    pub const PROTECTED_STRING_SERVER_INDEX: u8 = 3;
+    pub const PROTECTED_STRING_SOURCE: u8 = 4;
+    pub const ENUM_VARINT: u8 = 7;
+    pub const BINARY_STRING: u8 = 8;
+    pub const BOOL: u8 = 9;
+    pub const INT: u8 = 10;
+    pub const FLOAT: u8 = 11;
+    pub const DOUBLE: u8 = 12;
+    pub const UDIM: u8 = 13;
+    pub const UDIM2: u8 = 14;
+    pub const RAY: u8 = 15;
+    pub const FACES: u8 = 16;
+    pub const AXES: u8 = 17;
+    pub const BRICK_COLOR: u8 = 18;
+    pub const COLOR3: u8 = 19;
+    pub const COLOR3_UINT8: u8 = 20;
+    pub const VECTOR2: u8 = 21;
+    pub const VECTOR3: u8 = 22;
+    pub const VECTOR2_INT16: u8 = 24;
+    pub const VECTOR3_INT16: u8 = 25;
+    pub const CFRAME_EXACT: u8 = 26;
+    pub const CFRAME: u8 = 27;
+    pub const INSTANCE_GUID: u8 = 28;
+    pub const TUPLE: u8 = 29;
+    pub const VALUE_ARRAY: u8 = 30;
+    pub const VALUE_TABLE: u8 = 31;
+    pub const VALUE_MAP: u8 = 32;
+    pub const CONTENT_ID: u8 = 33;
+    pub const SYSTEM_ADDRESS: u8 = 34;
+    pub const NUMBER_SEQUENCE: u8 = 35;
+    pub const NUMBER_SEQUENCE_KEYPOINT: u8 = 36;
+    pub const NUMBER_RANGE: u8 = 37;
+    pub const COLOR_SEQUENCE: u8 = 38;
+    pub const COLOR_SEQUENCE_KEYPOINT: u8 = 39;
+    pub const RECT2D: u8 = 40;
+    pub const PHYSICAL_PROPERTIES: u8 = 41;
+    pub const REGION3: u8 = 42;
+    pub const REGION3_INT16: u8 = 43;
+    pub const INT64: u8 = 44;
+    pub const SHARED_STRING: u8 = 46;
+    pub const PROTECTED_STRING_BYTECODE: u8 = 47;
+    pub const DATE_TIME: u8 = 48;
+    pub const STRING_FIXED_DICTIONARY: u8 = 49;
+    pub const OPTIONAL_CFRAME_EXACT: u8 = 50;
+    pub const OPTIONAL_CFRAME: u8 = 51;
+    pub const UNIQUE_ID: u8 = 52;
+    pub const PATH_WAYPOINT: u8 = 53;
+    pub const FONT: u8 = 54;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NetworkValue {
+    String(String),
+    Binary(Vec<u8>),
+    Bool(bool),
+    Int(i32),
+    Int64(i64),
+    Float(f32),
+    Double(f64),
+    Enum(u32),
+    UDim(UDim),
+    UDim2(UDim2),
+    Ray { origin: [f32; 3], direction: [f32; 3] },
+    BitMask(i32),
+    BrickColor(u16),
+    Color3([f32; 3]),
+    Color3Uint8([u8; 3]),
+    Vector2([f32; 2]),
+    Vector3([f32; 3]),
+    Vector2Int16([i16; 2]),
+    Vector3Int16([i16; 3]),
+    CoordinateFrame(CoordinateFrame),
+    ContentId(String),
+    SystemAddress(u32),
+    NumberSequence(Vec<[f32; 3]>),
+    NumberSequenceKeypoint([f32; 3]),
+    NumberRange([f32; 2]),
+    ColorSequence(Vec<[f32; 5]>),
+    ColorSequenceKeypoint([f32; 5]),
+    Rect2d { min: [f32; 2], max: [f32; 2] },
+    /// None means Roblox's default physical properties; Some stores density,
+    /// friction, elasticity, friction weight, and elasticity weight.
+    PhysicalProperties(Option<[f32; 5]>),
+    Region3 { low: [f32; 3], high: [f32; 3] },
+    Region3Int16 { min: [i16; 3], max: [i16; 3] },
+    /// MD5-like 16-byte dictionary key. JoinData subtype 1 supplies the body.
+    SharedStringHash([u8; 16]),
+    DateTimeMillis(i64),
+    OptionalCoordinateFrame(Option<CoordinateFrame>),
+    UniqueId { raw_bits: u64, timestamp: u32, index: u32 },
+    PathWaypoint { position: [f32; 3], action: u8, label: String },
+    Font { weight: u16, style: u8, family: String, cached_face_id: String },
+    FixedDictionaryString { network_id: u32, value: String },
+    /// Format 3 intentionally carries no bytes in the 2022 reader; Studio
+    /// leaves the destination value unchanged.
+    UnavailableProtectedString,
+}
+
+pub fn network_value_format_name(format: u8) -> &'static str {
+    use value_format::*;
+    match format {
+        UNSUPPORTED => "Unsupported",
+        STRING => "String_NeverDictionary",
+        PROTECTED_STRING_SERVER_INDEX => "ProtectedStringServerIndexString",
+        PROTECTED_STRING_SOURCE => "ProtectedStringSource",
+        ENUM_VARINT => "Enum_VarInt",
+        BINARY_STRING => "BinaryString",
+        BOOL => "Bool",
+        INT => "Int",
+        FLOAT => "Float",
+        DOUBLE => "Double",
+        UDIM => "UDim",
+        UDIM2 => "UDim2",
+        RAY => "Ray",
+        FACES => "Faces",
+        AXES => "Axes",
+        BRICK_COLOR => "BrickColor",
+        COLOR3 => "Color3",
+        COLOR3_UINT8 => "Color3uint8",
+        VECTOR2 => "Vector2",
+        VECTOR3 => "Vector3_Fixed12Bytes",
+        VECTOR2_INT16 => "Vector2int16",
+        VECTOR3_INT16 => "Vector3int16",
+        CFRAME_EXACT => "CoordinateFrame_ExactEncoding",
+        CFRAME => "CoordinateFrame_GeneralEncoding",
+        INSTANCE_GUID => "InstanceGuid",
+        TUPLE => "Tuple",
+        VALUE_ARRAY => "ValueArray",
+        VALUE_TABLE => "ValueTable",
+        VALUE_MAP => "ValueMap",
+        CONTENT_ID => "ContentId",
+        SYSTEM_ADDRESS => "SystemAddress",
+        NUMBER_SEQUENCE => "NumberSequence",
+        NUMBER_SEQUENCE_KEYPOINT => "NumberSequenceKeypoint",
+        NUMBER_RANGE => "NumberRange",
+        COLOR_SEQUENCE => "ColorSequence",
+        COLOR_SEQUENCE_KEYPOINT => "ColorSequenceKeypoint",
+        RECT2D => "Rect2d",
+        PHYSICAL_PROPERTIES => "PhysicalProperties",
+        REGION3 => "Region3",
+        REGION3_INT16 => "Region3int16",
+        INT64 => "Int64",
+        SHARED_STRING => "SharedString",
+        PROTECTED_STRING_BYTECODE => "ProtectedStringBytecode",
+        DATE_TIME => "DateTime",
+        STRING_FIXED_DICTIONARY => "String_FixedDictionary",
+        OPTIONAL_CFRAME_EXACT => "OptionalCoordinateFrame_ExactEncoding",
+        OPTIONAL_CFRAME => "OptionalCoordinateFrame_GeneralEncoding",
+        UNIQUE_ID => "UniqueId",
+        PATH_WAYPOINT => "PathWaypointWithLabel",
+        FONT => "Font",
+        _ => "Unknown",
+    }
+}
+
+fn read_hash16(reader: &mut NetworkReader<'_>) -> Result<[u8; 16]> {
+    Ok(reader.take(16)?.try_into().unwrap())
+}
+
+fn read_float_array<const N: usize>(reader: &mut NetworkReader<'_>) -> Result<[f32; N]> {
+    let mut result = [0.0; N];
+    for value in &mut result {
+        *value = reader.read_f32()?;
+    }
+    Ok(result)
+}
+
+fn read_i16_array<const N: usize>(reader: &mut NetworkReader<'_>) -> Result<[i16; N]> {
+    let mut result = [0; N];
+    for value in &mut result {
+        *value = reader.read_i16()?;
+    }
+    Ok(result)
+}
+
+fn read_sequence<const N: usize>(reader: &mut NetworkReader<'_>, kind: &str) -> Result<Vec<[f32; N]>> {
+    let count = reader.read_u32()? as usize;
+    // Both 2022 NetworkStream readers reject over 20 keypoints.
+    if count > 20 {
+        return Err(CodecError::InvalidData(format!("{kind} has {count} keypoints; maximum is 20")));
+    }
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(read_float_array(reader)?);
+    }
+    Ok(values)
+}
+
+fn read_optional_cframe(reader: &mut NetworkReader<'_>) -> Result<Option<CoordinateFrame>> {
+    // Unlike ordinary CFrame, OptionalCFrame packs presence into the high bit
+    // of the orientation marker and writes rotation BEFORE translation.
+    let marker = reader.read_u8()?;
+    if marker & 0x80 == 0 {
+        return Ok(None);
+    }
+    let rotation_marker = marker & 0x7f;
+    let rotation = if rotation_marker == 0 {
+        reader.read_rotation()?
+    } else {
+        Rotation::Standard(rotation_marker - 1)
+    };
+    let position = reader.read_vector3()?;
+    Ok(Some(CoordinateFrame { position, rotation }))
+}
+
+/// Decode one property/event value according to the value format carried by
+/// NetworkSchema. This covers every fixed-layout format in the uploaded 2022
+/// `VariantValueSetter` body. Dynamic containers, Instance GUID scope coding,
+/// exact-CFrame coding, and prefixed ContentIds deliberately return
+/// `MissingCodec` rather than guessing.
+pub fn read_schema_value(
+    reader: &mut NetworkReader<'_>,
+    ty: &SchemaType,
+    schema: &NetworkSchema,
+    use_dictionaries: bool,
+) -> Result<NetworkValue> {
+    use value_format::*;
+    match ty.value_format {
+        STRING => Ok(NetworkValue::String(reader.read_var_string()?)),
+        PROTECTED_STRING_SERVER_INDEX => Ok(NetworkValue::UnavailableProtectedString),
+        PROTECTED_STRING_SOURCE | PROTECTED_STRING_BYTECODE => {
+            Ok(NetworkValue::SharedStringHash(read_hash16(reader)?))
+        }
+        ENUM_VARINT => Ok(NetworkValue::Enum(reader.read_var_u32()?)),
+        BINARY_STRING => Ok(NetworkValue::Binary(reader.read_var_bytes()?)),
+        BOOL => Ok(NetworkValue::Bool(reader.read_bool()?)),
+        INT => Ok(NetworkValue::Int(reader.read_var_i32()?)),
+        FLOAT => Ok(NetworkValue::Float(reader.read_f32()?)),
+        DOUBLE => Ok(NetworkValue::Double(reader.read_f64()?)),
+        UDIM => Ok(NetworkValue::UDim(reader.read_udim()?)),
+        UDIM2 => Ok(NetworkValue::UDim2(reader.read_udim2()?)),
+        RAY => Ok(NetworkValue::Ray {
+            origin: reader.read_vector3()?,
+            direction: reader.read_vector3()?,
+        }),
+        FACES | AXES => Ok(NetworkValue::BitMask(reader.read_i32()?)),
+        BRICK_COLOR => Ok(NetworkValue::BrickColor(reader.read_u16()?)),
+        COLOR3 => Ok(NetworkValue::Color3(reader.read_vector3()?)),
+        COLOR3_UINT8 => Ok(NetworkValue::Color3Uint8(reader.read_color3_u8()?)),
+        VECTOR2 => Ok(NetworkValue::Vector2(read_float_array(reader)?)),
+        VECTOR3 => Ok(NetworkValue::Vector3(reader.read_vector3()?)),
+        VECTOR2_INT16 => Ok(NetworkValue::Vector2Int16(reader.read_vector2_i16()?)),
+        VECTOR3_INT16 => Ok(NetworkValue::Vector3Int16(reader.read_vector3_i16()?)),
+        CFRAME_EXACT => Err(CodecError::MissingCodec("deserializeCoordinateFrameExact")),
+        CFRAME => Ok(NetworkValue::CoordinateFrame(reader.read_coordinate_frame()?)),
+        INSTANCE_GUID => Err(CodecError::MissingCodec("deserializeGuidScope")),
+        TUPLE | VALUE_ARRAY | VALUE_TABLE | VALUE_MAP => {
+            Err(CodecError::MissingCodec("dynamic Variant container"))
+        }
+        CONTENT_ID if use_dictionaries => Err(CodecError::MissingCodec("readPrefixedContentId")),
+        CONTENT_ID => Ok(NetworkValue::ContentId(reader.read_var_string()?.replace('\\', "/"))),
+        SYSTEM_ADDRESS => Ok(NetworkValue::SystemAddress(reader.read_var_u32()?)),
+        NUMBER_SEQUENCE => Ok(NetworkValue::NumberSequence(read_sequence(reader, "NumberSequence")?)),
+        NUMBER_SEQUENCE_KEYPOINT => {
+            Ok(NetworkValue::NumberSequenceKeypoint(read_float_array(reader)?))
+        }
+        NUMBER_RANGE => Ok(NetworkValue::NumberRange(read_float_array(reader)?)),
+        COLOR_SEQUENCE => Ok(NetworkValue::ColorSequence(read_sequence(reader, "ColorSequence")?)),
+        COLOR_SEQUENCE_KEYPOINT => {
+            Ok(NetworkValue::ColorSequenceKeypoint(read_float_array(reader)?))
+        }
+        RECT2D => {
+            let a: [f32; 2] = read_float_array(reader)?;
+            let b: [f32; 2] = read_float_array(reader)?;
+            Ok(NetworkValue::Rect2d {
+                min: [a[0].min(b[0]), a[1].min(b[1])],
+                max: [a[0].max(b[0]), a[1].max(b[1])],
+            })
+        }
+        PHYSICAL_PROPERTIES => {
+            let value = if reader.read_bool()? {
+                Some(read_float_array(reader)?)
+            } else {
+                None
+            };
+            Ok(NetworkValue::PhysicalProperties(value))
+        }
+        REGION3 => {
+            let low = reader.read_vector3()?;
+            let high = reader.read_vector3()?;
+            Ok(NetworkValue::Region3 { low, high })
+        }
+        REGION3_INT16 => {
+            let min = read_i16_array(reader)?;
+            let max = read_i16_array(reader)?;
+            Ok(NetworkValue::Region3Int16 { min, max })
+        }
+        INT64 => Ok(NetworkValue::Int64(reader.read_var_i64()?)),
+        SHARED_STRING => Ok(NetworkValue::SharedStringHash(read_hash16(reader)?)),
+        DATE_TIME => Ok(NetworkValue::DateTimeMillis(reader.read_i64()?)),
+        STRING_FIXED_DICTIONARY => {
+            let first = reader.read_u8()?;
+            if first & 0x80 != 0 {
+                let short_id = u32::from(first & 0x7f);
+                let network_id = if short_id < 0x7f {
+                    short_id
+                } else {
+                    127_u32.checked_add(reader.read_var_u32()?).ok_or(CodecError::InvalidVarint)?
+                };
+                let value = schema
+                    .fixed_dictionary
+                    .get(network_id as usize)
+                    .ok_or_else(|| CodecError::InvalidData(format!(
+                        "fixed dictionary id {network_id} is out of range ({})",
+                        schema.fixed_dictionary.len()
+                    )))?
+                    .clone();
+                Ok(NetworkValue::FixedDictionaryString { network_id, value })
+            } else {
+                let value = if first < 0x7f {
+                    reader.read_utf8_bytes(first as usize)?
+                } else {
+                    reader.read_var_string()?
+                };
+                Ok(NetworkValue::String(value))
+            }
+        }
+        OPTIONAL_CFRAME_EXACT => Err(CodecError::MissingCodec("deserializeOptionalCoordinateFrameExact")),
+        OPTIONAL_CFRAME => Ok(NetworkValue::OptionalCoordinateFrame(read_optional_cframe(reader)?)),
+        UNIQUE_ID => Ok(NetworkValue::UniqueId {
+            raw_bits: reader.read_u64()?,
+            timestamp: reader.read_u32()?,
+            index: reader.read_u32()?,
+        }),
+        PATH_WAYPOINT => Ok(NetworkValue::PathWaypoint {
+            position: reader.read_vector3()?,
+            action: reader.read_u8()?,
+            label: reader.read_string()?,
+        }),
+        FONT => Ok(NetworkValue::Font {
+            weight: reader.read_u16()?,
+            style: reader.read_u8()?,
+            family: reader.read_string()?.replace('\\', "/"),
+            cached_face_id: reader.read_string()?.replace('\\', "/"),
+        }),
+        UNSUPPORTED => Err(CodecError::InvalidData("value uses unsupported network format".into())),
+        other => Err(CodecError::InvalidData(format!(
+            "unknown NetworkValueFormat {other}"
+        ))),
+    }
+}
+
 /// Parse the exact UNCOMPRESSED payload consumed by
 /// `NetworkSchema::initializeFromSchemaDefinitionPacket` after its call to
 /// `Replicator::decompressBitStream`.
@@ -1066,6 +1479,80 @@ mod tests {
         assert_eq!(join.metadata_count, Some(1));
         assert!(join.invalid_ranges.is_empty());
         assert!(join.has_end_marker);
+    }
+
+    #[test]
+    fn signed_varints_round_trip() {
+        let mut w = NetworkWriter::new();
+        for value in [i32::MIN, -65, -1, 0, 1, 64, i32::MAX] {
+            w.write_var_i32(value);
+        }
+        for value in [i64::MIN, -65, -1, 0, 1, 64, i64::MAX] {
+            w.write_var_i64(value);
+        }
+        let bytes = w.into_inner();
+        let mut r = NetworkReader::new(&bytes);
+        for value in [i32::MIN, -65, -1, 0, 1, 64, i32::MAX] {
+            assert_eq!(r.read_var_i32().unwrap(), value);
+        }
+        for value in [i64::MIN, -65, -1, 0, 1, 64, i64::MAX] {
+            assert_eq!(r.read_var_i64().unwrap(), value);
+        }
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn decodes_schema_values_and_fixed_dictionary() {
+        let schema = NetworkSchema {
+            enums: Vec::new(),
+            classes: Vec::new(),
+            transmitted_property_count: 0,
+            transmitted_event_count: 0,
+            known_prefixes: vec![String::new()],
+            fixed_dictionary: vec!["Name".into(), "Parent".into()],
+        };
+
+        let mut w = NetworkWriter::new();
+        w.write_var_i32(-1234);
+        w.write_f32(1.25);
+        w.write_u8(0x81); // short fixed-dictionary id 1
+        let bytes = w.into_inner();
+        let mut r = NetworkReader::new(&bytes);
+
+        assert_eq!(
+            read_schema_value(
+                &mut r,
+                &SchemaType { value_format: value_format::INT, enum_id: NO_ENUM_ID },
+                &schema,
+                false,
+            )
+            .unwrap(),
+            NetworkValue::Int(-1234)
+        );
+        assert_eq!(
+            read_schema_value(
+                &mut r,
+                &SchemaType { value_format: value_format::FLOAT, enum_id: NO_ENUM_ID },
+                &schema,
+                false,
+            )
+            .unwrap(),
+            NetworkValue::Float(1.25)
+        );
+        assert_eq!(
+            read_schema_value(
+                &mut r,
+                &SchemaType {
+                    value_format: value_format::STRING_FIXED_DICTIONARY,
+                    enum_id: NO_ENUM_ID,
+                },
+                &schema,
+                false,
+            )
+            .unwrap(),
+            NetworkValue::FixedDictionaryString { network_id: 1, value: "Parent".into() }
+        );
+        assert!(r.is_empty());
     }
 
     #[test]

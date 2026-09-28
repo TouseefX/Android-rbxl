@@ -1834,16 +1834,16 @@ ui.label("Place ID:");
                         }
                         if self.team_create_join_config.is_some()
                             && ui
-                                .button("📡 Probe Server (UDP)")
-                                .on_hover_text("Sends a RakNet-style unconnected ping to the negotiated endpoints; blocks a few seconds")
+                                .button("📡 Probe Rbx Handshake")
+                                .on_hover_text("Sends the exact 2022 RbxOpenRequest1 and validates RbxOpenReply1; blocks a few seconds")
                                 .clicked()
                         {
                             if let Some(cfg) = self.team_create_join_config.clone() {
-                                self.status = "Probing session server over UDP…".into();
+                                self.status = "Probing customized RakNet handshake…".into();
                                 let report = crate::team_create::probe_join_config(&cfg, 3, 1200);
-                                self.log_info(format!("Team Create UDP probe:\n{report}"));
+                                self.log_info(format!("Team Create Rbx handshake probe:\n{report}"));
                                 self.team_create_response = report;
-                                self.status = "UDP probe finished — see panel output".into();
+                                self.status = "Rbx handshake probe finished — see panel output".into();
                             }
                         }
                     });
