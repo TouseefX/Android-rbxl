@@ -1832,13 +1832,16 @@ ui.label("Place ID:");
                         if ui.button("⚡ Warm Up Server").clicked() {
                             self.team_create_negotiate(true);
                         }
-                        let can_probe = self.team_create_join_config.is_some();
+                        let can_probe = self
+                            .team_create_join_config
+                            .as_ref()
+                            .is_some_and(|cfg| !crate::team_create::parse_join_config(cfg).is_empty());
                         let probe = ui
                             .add_enabled(can_probe, egui::Button::new("📡 Probe Rbx Handshake"))
                             .on_hover_text(if can_probe {
                                 "Sends the exact 2022 RbxOpenRequest1 and validates RbxOpenReply1; blocks a few seconds"
                             } else {
-                                "Run Warm Up Server followed by Negotiate Join to obtain a server endpoint first"
+                                "Run Warm Up Server followed by Negotiate Join; the button enables only when the response contains a usable server endpoint"
                             });
                         if probe.clicked() {
                             if let Some(cfg) = self.team_create_join_config.clone() {
@@ -5686,34 +5689,61 @@ ui.label("Place ID:");
             return;
         };
         let label = if preemptive { "warm-up" } else { "join negotiation" };
+        // Never leave the probe enabled with a stale config when a later
+        // negotiation fails or returns an all-null HTTP-200 response.
+        self.team_create_join_config = None;
         self.log_info(format!("Team Create {label} for place {}", self.open_cloud_place_id.trim()));
         match RobloxApiClient::team_create_join(&cookie, &self.open_cloud_place_id, preemptive) {
             Ok(v) => {
                 let endpoints = crate::team_create::parse_join_config(&v);
-                // Keep every successful response so the handshake action is
-                // consistently enabled. If an unfamiliar response shape has
-                // no endpoints, the probe itself reports that diagnostic.
-                self.team_create_join_config = Some(v.clone());
-                let mut summary = if preemptive {
-                    String::from("Server warm-up request accepted")
-                } else {
-                    String::from("Join config received")
-                };
-                if let Some(first) = endpoints.first() {
-                    summary.push_str(&format!(" — server {}", first.label()));
+                let all_null = crate::team_create::join_response_is_all_null(&v);
+                let summary = if let Some(first) = endpoints.first() {
+                    // Only a config with an actual socket target may enable
+                    // the handshake probe. The parser handles settings,
+                    // joinTicket, joinScript, and other nested wrappers.
+                    self.team_create_join_config = Some(v.clone());
+                    let mut text = if preemptive {
+                        String::from("Server warm-up config received")
+                    } else {
+                        String::from("Join config received")
+                    };
+                    text.push_str(&format!(" — server {}", first.label()));
                     if endpoints.len() > 1 {
-                        summary.push_str(&format!(" (+{} more endpoint(s))", endpoints.len() - 1));
+                        text.push_str(&format!(" (+{} more endpoint(s))", endpoints.len() - 1));
                     }
-                }
-                let mut raw: String = v.to_string().chars().take(700).collect();
-                if raw.len() < v.to_string().len() {
+                    self.status = format!("✅ Team Create {label} returned a server endpoint");
+                    text
+                } else if all_null {
+                    self.status = format!("Team Create {label} failed — empty response");
+                    format!(
+                        "Team Create {label} returned only null/empty values; negotiation failed and the handshake probe remains disabled"
+                    )
+                } else if preemptive {
+                    self.status = "Team Create warm-up accepted — negotiate join next".into();
+                    String::from(
+                        "Server warm-up response received, but it has no server endpoint yet; run Negotiate Join. The handshake probe remains disabled",
+                    )
+                } else {
+                    self.status = "Team Create join returned no usable server endpoint".into();
+                    String::from(
+                        "Join response has no usable Address/Port, ServerConnections, or UdmuxEndpoints; the handshake probe remains disabled",
+                    )
+                };
+
+                let full_raw = v.to_string();
+                let mut raw: String = full_raw.chars().take(700).collect();
+                if raw.chars().count() < full_raw.chars().count() {
                     raw.push('…');
                 }
                 self.team_create_response = format!("{summary}\n{raw}");
-                self.status = format!("✅ Team Create {label} succeeded");
-                self.log_info(format!("Team Create {label}: {summary}"));
+                if endpoints.is_empty() {
+                    self.log_error(format!("Team Create {label}: {summary}"));
+                } else {
+                    self.log_info(format!("Team Create {label}: {summary}"));
+                }
             }
             Err(e) => {
+                self.team_create_join_config = None;
                 self.team_create_response = format!("Error: {e}");
                 self.status = format!("Team Create {label} failed");
                 self.log_error(format!("Team Create {label}: {e}"));

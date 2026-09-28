@@ -84,9 +84,11 @@ fn collect_level(v: &serde_json::Value, out: &mut Vec<Endpoint>) {
         }
     }
 
+    // Some Team Create fleet versions pair Address with ServerPort instead
+    // of Port, so accept either at the same object level.
     if let (Some(address), Some(port)) = (
         get_ci(v, "Address").and_then(as_addr),
-        get_ci(v, "Port").and_then(as_port),
+        get_ci(v, "Port").and_then(as_port).or(server_port),
     ) {
         push_unique(out, Endpoint { address, port });
     }
@@ -105,23 +107,61 @@ fn push_unique(out: &mut Vec<Endpoint>, e: Endpoint) {
     }
 }
 
-/// Extract every server endpoint we can find in a team-create join config.
-/// Checks the top level plus the common nesting levels (`joinScript`,
-/// `serverConnections` array entries).
-pub fn parse_join_config(v: &serde_json::Value) -> Vec<Endpoint> {
-    let mut out = Vec::new();
-    collect_level(v, &mut out);
-    if let Some(js) = get_ci(v, "joinScript") {
-        collect_level(js, &mut out);
+/// Walk wrapper objects used by different gamejoin fleet versions. Team
+/// Create responses have placed the same config under `joinScript`,
+/// `settings`, and `joinTicket`; limiting parsing to one named wrapper makes
+/// a valid response look endpoint-less. A small depth cap also lets us read
+/// wrappers serialized as JSON strings without accepting unbounded input.
+fn collect_recursive(v: &serde_json::Value, out: &mut Vec<Endpoint>, depth: usize) {
+    if depth > 12 {
+        return;
     }
-    for key in ["serverConnections", "ServerConnections"] {
-        if let Some(arr) = get_ci(v, key).and_then(|c| c.as_array()) {
-            for e in arr {
-                collect_level(e, &mut out);
+    match v {
+        serde_json::Value::Object(map) => {
+            collect_level(v, out);
+            for child in map.values() {
+                collect_recursive(child, out, depth + 1);
             }
         }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_recursive(child, out, depth + 1);
+            }
+        }
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if (text.starts_with('{') || text.starts_with('[')) && text.len() <= 2_000_000 {
+                if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(text) {
+                    collect_recursive(&decoded, out, depth + 1);
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+/// Extract every server endpoint from a team-create response, independent of
+/// which response wrapper contains the config.
+pub fn parse_join_config(v: &serde_json::Value) -> Vec<Endpoint> {
+    let mut out = Vec::new();
+    collect_recursive(v, &mut out, 0);
     out
+}
+
+/// True when a response contains no value other than nulls/empty containers.
+/// HTTP 2xx with an all-null gamejoin object is a failed negotiation, not a
+/// usable config and must not enable the UDP probe.
+pub fn join_response_is_all_null(v: &serde_json::Value) -> bool {
+    fn has_value(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Null => false,
+            serde_json::Value::Array(items) => items.iter().any(has_value),
+            serde_json::Value::Object(map) => map.values().any(has_value),
+            serde_json::Value::String(s) => !s.trim().is_empty(),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+        }
+    }
+    !has_value(v)
 }
 
 /// RakNet offline-message magic, retained by Roblox's customized open
@@ -287,5 +327,53 @@ mod tests {
 
         packet[0] = 0x1c;
         assert!(parse_rbx_open_reply1(&packet).is_err());
+    }
+
+    #[test]
+    fn finds_endpoints_in_nested_team_create_wrappers() {
+        let config = serde_json::json!({
+            "status": 2,
+            "joinTicket": "ticket-value",
+            "settings": {
+                "ServerPort": 53640,
+                "UdmuxEndpoints": [
+                    { "Address": "128.116.1.2", "Port": 53641 },
+                    { "Address": "128.116.1.3" }
+                ],
+                "ServerConnections": [
+                    { "Address": "10.0.0.2", "Port": 53640 }
+                ]
+            }
+        });
+        let endpoints = parse_join_config(&config);
+        assert_eq!(
+            endpoints,
+            vec![
+                Endpoint { address: "128.116.1.2".into(), port: 53641 },
+                Endpoint { address: "128.116.1.3".into(), port: 53640 },
+                Endpoint { address: "10.0.0.2".into(), port: 53640 },
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_endpoints_in_json_string_and_rejects_all_null_response() {
+        let wrapped = serde_json::json!({
+            "joinTicket": "{\"settings\":{\"Address\":\"127.0.0.1\",\"ServerPort\":5000}}"
+        });
+        assert_eq!(
+            parse_join_config(&wrapped),
+            vec![Endpoint { address: "127.0.0.1".into(), port: 5000 }]
+        );
+
+        assert!(join_response_is_all_null(&serde_json::json!({
+            "joinTicket": null,
+            "settings": null,
+            "message": null
+        })));
+        assert!(join_response_is_all_null(&serde_json::json!({})));
+        assert!(!join_response_is_all_null(&serde_json::json!({
+            "message": "starting"
+        })));
     }
 }
