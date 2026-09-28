@@ -558,7 +558,7 @@ fn parse_server_early_key_with_revert(
         .unwrap_or(false);
     let effective_key = if hashes_job_id {
         let job_id = find_field_ci(config, "GameId", 0)
-            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.as_str().map(str::to_owned))
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 format!(
