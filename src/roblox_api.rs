@@ -278,6 +278,38 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Accept either the raw browser-cookie value or a pasted Cookie header and
+/// return only the `.ROBLOSECURITY` value. Sending
+/// `.ROBLOSECURITY=.ROBLOSECURITY=...` makes Roblox treat the request as a
+/// different/anonymous session, which in turn makes an otherwise fresh CSRF
+/// token look invalid.
+fn normalize_roblosecurity_cookie(raw: &str) -> Result<String, String> {
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err("A .ROBLOSECURITY cookie is required.".into());
+    }
+
+    let lower = input.to_ascii_lowercase();
+    let mut value = if let Some(start) = lower.find(".roblosecurity=") {
+        let start = start + ".roblosecurity=".len();
+        input[start..].split(';').next().unwrap_or_default().trim()
+    } else {
+        input
+    };
+    if value.len() >= 2 {
+        let quoted = (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\''));
+        if quoted {
+            value = &value[1..value.len() - 1];
+        }
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("The .ROBLOSECURITY cookie value is empty.".into());
+    }
+    Ok(value.to_string())
+}
+
 /// Truncate a response body to a short snippet for error messages.
 fn snippet(s: &str) -> String {
     s.chars().take(400).collect::<String>()
@@ -414,6 +446,7 @@ impl RobloxApiClient {
     /// cookie, read the fresh token from the 403 response's x-csrf-token
     /// header (roblox-cookie-upload-endpoints.md §0).
     fn fetch_csrf_token(cookie: &str) -> Result<String, String> {
+        let cookie = normalize_roblosecurity_cookie(cookie)?;
         let http = reqwest::blocking::Client::builder()
             .user_agent("rbxl-editor")
             .timeout(std::time::Duration::from_secs(20))
@@ -421,7 +454,7 @@ impl RobloxApiClient {
             .map_err(|e| format!("HTTP client build error: {e}"))?;
         let resp = http
             .post("https://auth.roblox.com/v2/logout")
-            .header("Cookie", format!(".ROBLOSECURITY={}", cookie.trim()))
+            .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
             .header("Content-Length", "0")
             .send()
             .map_err(|e| format!("CSRF handshake error: {e}"))?;
@@ -682,15 +715,17 @@ impl RobloxApiClient {
     }
 
     /// Shared POST to the hidden `Data/Upload.ashx` endpoint with full CSRF
-    /// handling: pre-fetch a token via the logout handshake, send the bytes
-    /// as `application/xml` (what Studio sends), and retry once on ANY
-    /// failed status that carries an `x-csrf-token` header — this endpoint's
-    /// error page is broken and can answer HTTP 500 instead of 403 while
-    /// still handing out the token (roblox-cookie-upload-endpoints.md §1).
+    /// challenge handling. The token must come from the session represented
+    /// by the exact Cookie header sent to this endpoint. Ask Upload.ashx for
+    /// its own challenge first, then follow every replacement token it sends
+    /// for a few attempts (Roblox can intermittently rotate/reject a token).
+    /// This endpoint's broken error page can answer HTTP 500 instead of 403
+    /// while still returning the usable `x-csrf-token` response header.
     fn post_upload_ashx(cookie: &str, url: &str, bytes: &[u8]) -> Result<String, String> {
         if bytes.is_empty() {
             return Err("Nothing to upload (empty data).".into());
         }
+        let cookie = normalize_roblosecurity_cookie(cookie)?;
         let http = reqwest::blocking::Client::builder()
             .user_agent("Roblox/WinInet")
             .timeout(std::time::Duration::from_secs(120))
@@ -710,31 +745,59 @@ impl RobloxApiClient {
             req.send().map_err(|e| format!("Upload network error: {e}"))
         };
 
-        // First try with a pre-fetched token from the standard handshake;
-        // fall back to sending without one.
-        let mut resp = match Self::fetch_csrf_token(cookie) {
-            Ok(token) => send(Some(&token))?,
-            Err(_) => send(None)?,
-        };
-        if !resp.status().is_success() {
-            let token = resp
+        // Deliberately begin without a token. Unlike a logout-prefetched
+        // token, the challenge returned here is guaranteed to correspond to
+        // this upload host, Cookie header, and request flow.
+        let mut csrf: Option<String> = None;
+        let mut tried_logout_fallback = false;
+        let mut last_failure: Option<(reqwest::StatusCode, String)> = None;
+        for attempt in 1..=4 {
+            let resp = send(csrf.as_deref())?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp.text().unwrap_or_default());
+            }
+
+            // Read this before consuming the response body. Follow a fresh
+            // token regardless of 403 vs 500: Upload.ashx is known to emit
+            // the wrong status when rendering its CSRF error page.
+            let challenged_token = resp
                 .headers()
                 .get("x-csrf-token")
                 .and_then(|t| t.to_str().ok())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
                 .map(str::to_string);
-            if let Some(token) = token {
-                resp = send(Some(&token))?;
+            let text = resp.text().unwrap_or_default();
+            last_failure = Some((status, text));
+
+            if attempt < 4 {
+                if let Some(token) = challenged_token {
+                    csrf = Some(token);
+                    continue;
+                }
+
+                // Very old/broken Upload.ashx responses occasionally omit
+                // the challenge header. Keep the standard logout handshake
+                // as a one-time fallback, but never prefer it over the token
+                // challenged by the actual upload request.
+                if !tried_logout_fallback {
+                    tried_logout_fallback = true;
+                    if let Ok(token) = Self::fetch_csrf_token(&cookie) {
+                        csrf = Some(token);
+                        continue;
+                    }
+                }
             }
+            break;
         }
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        if !status.is_success() {
-            return Err(format!(
-                "Upload.ashx failed (HTTP {status}): {}",
-                snippet(&text)
-            ));
-        }
-        Ok(text)
+
+        let (status, text) = last_failure
+            .unwrap_or((reqwest::StatusCode::INTERNAL_SERVER_ERROR, String::new()));
+        Err(format!(
+            "Upload.ashx failed after CSRF refresh (HTTP {status}): {}",
+            snippet(&text)
+        ))
     }
 
     /// Team Create join negotiation (team-create-sessions-explained.md §1b):
