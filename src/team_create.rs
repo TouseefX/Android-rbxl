@@ -722,14 +722,30 @@ fn parse_rbx_open_reply2(
     crypto: &Request2Crypto,
 ) -> Result<RbxOpenReply2, String> {
     let packet = strip_optional_rupp_prefix(packet)?;
+    let Some(&packet_id) = packet.first() else {
+        return Err("RbxOpenReply2 is empty".into());
+    };
+    if packet_id != RBX_OPEN_REPLY_2 {
+        if packet.len() == 25 && packet[1..17] == OFFLINE_MAGIC {
+            let server_guid = u64::from_be_bytes(packet[17..25].try_into().unwrap());
+            let meaning = match packet[0] {
+                0x0b => "connection attempt failed (invalid/unset encryption)",
+                0x12 => "already connected",
+                0x14 => "no free incoming connections",
+                0x1a => "IP address connected recently",
+                _ => "offline connection error",
+            };
+            return Err(format!(
+                "server returned {meaning} id 0x{:02x} (GUID {server_guid:016x})",
+                packet[0]
+            ));
+        }
+        return Err(format!(
+            "expected RbxOpenReply2 id 0x{RBX_OPEN_REPLY_2:02x}, got 0x{packet_id:02x}"
+        ));
+    }
     if packet.len() < 21 + EARLY_AEAD_OVERHEAD {
         return Err(format!("RbxOpenReply2 is too short: {} bytes", packet.len()));
-    }
-    if packet[0] != RBX_OPEN_REPLY_2 {
-        return Err(format!(
-            "expected RbxOpenReply2 id 0x{RBX_OPEN_REPLY_2:02x}, got 0x{:02x}",
-            packet[0]
-        ));
     }
     if packet[1..17] != OFFLINE_MAGIC {
         return Err("RbxOpenReply2 has invalid offline-message magic".into());
@@ -1427,6 +1443,24 @@ mod tests {
             reply._session_client_to_server.as_slice(),
             hex_fixture("771b077ce6ed993d92009e89ce7c956a76fdb1d319e1560f28fd3d48aeaf18e9")
         );
+    }
+
+    #[test]
+    fn reports_raknet_offline_error_after_open_request_2() {
+        let client_secret = StaticSecret::from([7u8; 32]);
+        let crypto = Request2Crypto {
+            client_public: PublicKey::from(&client_secret).to_bytes(),
+            client_secret,
+            early_server_to_client: [0; 32],
+            early_client_to_server: [0; 32],
+            client_guid: 1,
+        };
+        let mut packet = vec![0x14];
+        packet.extend_from_slice(&OFFLINE_MAGIC);
+        packet.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
+        let error = parse_rbx_open_reply2(&packet, &crypto).unwrap_err();
+        assert!(error.contains("no free incoming connections"));
+        assert!(error.contains("1112131415161718"));
     }
 
     #[test]
