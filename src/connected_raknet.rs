@@ -1015,7 +1015,10 @@ pub(crate) fn establish_connected_session(
                 next_datagram_number,
                 reliable_message_number,
                 &request_payload,
-                true,
+                // InternalPacket::timesSent is incremented to one for the
+                // first retransmission; current ReliabilityLayer marks the
+                // optional resent bit only once that counter reaches two.
+                retransmissions >= 1,
                 retry_padding,
             )?;
             last_wire_bytes = retransmit.wire_bytes;
