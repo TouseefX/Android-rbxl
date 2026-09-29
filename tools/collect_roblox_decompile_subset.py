@@ -4,6 +4,7 @@
 Usage:
     python3 collect_roblox_decompile_subset.py /path/to/decompile
     python3 collect_roblox_decompile_subset.py /path/to/decompile -o ~/Desktop/roblox-network-focused.zip
+    python3 collect_roblox_decompile_subset.py /path/to/decompile --follow-up
 """
 
 from __future__ import annotations
@@ -43,6 +44,21 @@ CONTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tiny second-pass subset for details that the broad archive's size trimming can
+# discard. In particular, RakNet's connected request appends `versionB` as its
+# incoming password, but the runtime Cloud Edit initializer that constructs the
+# value can live in an otherwise unrelated free-function shard. Time's precise
+# clock implementation is similarly easy to lose when it is grouped that way.
+FOLLOW_UP_CONTENT_RE = re.compile(
+    rb"(?:"
+    rb"RBX::Network::versionB|"
+    rb"initWithCloudEditSecurity|initWithPlayerSecurity|initWithoutSecurity|"
+    rb"Name:[^\r\n]*(?:Network::setVersion|Time[^\r\n]*(?:now|getStart|getTickCount))|"
+    rb"Name:[^\r\n]*__ZN3RBX4Time[^\r\n]*(?:3now|8getStart|12getTickCount)"
+    rb")",
+    re.IGNORECASE,
+)
+
 ARCHIVE_OR_BINARY_SUFFIXES = {
     ".7z", ".a", ".app", ".bin", ".bmp", ".bz2", ".dmg", ".dylib",
     ".exe", ".gif", ".gz", ".ico", ".jpeg", ".jpg", ".o", ".pdf",
@@ -61,7 +77,7 @@ def is_probably_text(path: Path) -> bool:
     return b"\x00" not in sample
 
 
-def content_matches(path: Path) -> bool:
+def content_matches(path: Path, pattern: re.Pattern[bytes] = CONTENT_RE) -> bool:
     """Search in chunks while retaining overlap for boundary-spanning symbols."""
     overlap = b""
     try:
@@ -71,7 +87,7 @@ def content_matches(path: Path) -> bool:
                 if not chunk:
                     return False
                 data = overlap + chunk
-                if CONTENT_RE.search(data):
+                if pattern.search(data):
                     return True
                 overlap = data[-256:]
     except OSError:
@@ -85,8 +101,19 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        default=Path("roblox-network-focused.zip"),
-        help="output ZIP path (default: ./roblox-network-focused.zip)",
+        default=None,
+        help=(
+            "output ZIP path (default: ./roblox-network-focused.zip, or "
+            "./roblox-network-followup.zip with --follow-up)"
+        ),
+    )
+    parser.add_argument(
+        "--follow-up",
+        action="store_true",
+        help=(
+            "create a tiny second-pass archive containing only Cloud Edit "
+            "versionB/password and precise Time clock definitions/callers"
+        ),
     )
     return parser.parse_args()
 
@@ -94,7 +121,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     source = args.source.expanduser().resolve()
-    output = args.output.expanduser().resolve()
+    output_arg = args.output or Path(
+        "roblox-network-followup.zip" if args.follow_up else "roblox-network-focused.zip"
+    )
+    output = output_arg.expanduser().resolve()
 
     if not source.is_dir():
         print(f"error: not a directory: {source}", file=sys.stderr)
@@ -118,7 +148,10 @@ def main() -> int:
             relative_path = path.relative_to(source)
 
             reason = ""
-            if FILENAME_RE.search(name):
+            if args.follow_up:
+                if is_probably_text(path) and content_matches(path, FOLLOW_UP_CONTENT_RE):
+                    reason = "follow-up definition/call-site content"
+            elif FILENAME_RE.search(name):
                 reason = "filename"
             elif len(relative_path.parts) <= 2 and re.search(
                 r"version|build|manifest|readme|symbol", name, re.IGNORECASE
@@ -132,8 +165,13 @@ def main() -> int:
 
     output.parent.mkdir(parents=True, exist_ok=True)
     manifest_lines = [
-        "Focused Roblox networking decompile subset",
+        (
+            "Roblox networking decompile follow-up subset"
+            if args.follow_up
+            else "Focused Roblox networking decompile subset"
+        ),
         f"Source root: {source}",
+        f"Mode: {'follow-up' if args.follow_up else 'focused'}",
         f"Files scanned: {scanned}",
         f"Files included: {len(selected)}",
         "",
