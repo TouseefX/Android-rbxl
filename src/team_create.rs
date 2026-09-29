@@ -903,9 +903,11 @@ struct RbxOpenReply2 {
     _session_client_to_server: [u8; 32],
 }
 
-fn strip_optional_rupp_prefix(packet: &[u8]) -> Result<(&[u8], usize), String> {
+fn strip_optional_rupp_prefix(
+    packet: &[u8],
+) -> Result<(&[u8], usize, Option<[u8; 16]>), String> {
     if packet.first() != Some(&RUPP_PROTOCOL_RAKNET) {
-        return Ok((packet, 0));
+        return Ok((packet, 0, None));
     }
     if packet.len() < 4 {
         return Err("truncated RUPP response prefix".into());
@@ -914,14 +916,45 @@ fn strip_optional_rupp_prefix(packet: &[u8]) -> Result<(&[u8], usize), String> {
     if header_len < 4 || header_len > packet.len() {
         return Err(format!("invalid RUPP response header length {header_len}"));
     }
-    Ok((&packet[header_len..], header_len))
+
+    // In 0.735 the refreshed route token is carried by the response's RUPP
+    // Token TLV rather than appended to the decrypted OpenReply2 body. Token
+    // TLV value byte zero is its lineage/subtype; the following 16 bytes are
+    // the token used by subsequent routed packets.
+    let mut returned_token = None;
+    let mut cursor = 4usize;
+    while cursor < header_len {
+        let tlv_type = *packet
+            .get(cursor)
+            .ok_or_else(|| "RUPP response ends before TLV type".to_string())?;
+        let tlv_len = usize::from(
+            *packet
+                .get(cursor + 1)
+                .ok_or_else(|| "RUPP response ends before TLV length".to_string())?,
+        );
+        cursor += 2;
+        let value = packet
+            .get(cursor..cursor + tlv_len)
+            .ok_or_else(|| "RUPP response has a truncated TLV value".to_string())?;
+        if tlv_type == RUPP_TLV_TOKEN {
+            if tlv_len != usize::from(RUPP_TOKEN_VALUE_LENGTH) {
+                return Err(format!(
+                    "RUPP response token TLV has length {tlv_len}, expected {RUPP_TOKEN_VALUE_LENGTH}"
+                ));
+            }
+            returned_token = Some(value[1..17].try_into().unwrap());
+        }
+        cursor += tlv_len;
+    }
+    Ok((&packet[header_len..], header_len, returned_token))
 }
 
 fn parse_rbx_open_reply2(
     packet: &[u8],
     crypto: &Request2Crypto,
 ) -> Result<RbxOpenReply2, String> {
-    let (packet, stripped_rupp_len) = strip_optional_rupp_prefix(packet)?;
+    let (packet, stripped_rupp_len, rupp_returned_token) =
+        strip_optional_rupp_prefix(packet)?;
     let Some(&packet_id) = packet.first() else {
         return Err("RbxOpenReply2 is empty".into());
     };
@@ -1021,38 +1054,62 @@ fn parse_rbx_open_reply2(
     plaintext.extend_from_slice(&packet[OPEN_REPLY_2_HEADER_LEN..aad_len]);
     plaintext.extend_from_slice(&encrypted_plaintext);
 
-    if plaintext.len() < 32 + 8 + 8 + 2 + 1 + 7 {
+    if plaintext.len() < ciphertext_len {
         return Err(format!(
-            "RbxOpenReply2 decrypted body is too short: {} bytes",
+            "RbxOpenReply2 reconstructed body is {} bytes, shorter than logical length {ciphertext_len}",
             plaintext.len()
         ));
     }
+    let (logical_body, zero_tail) = plaintext.split_at(ciphertext_len);
+    if zero_tail.len() != encrypted_zero_tail_len
+        || zero_tail.iter().any(|byte| *byte != 0)
+    {
+        return Err(format!(
+            "RbxOpenReply2 has an invalid {}-byte decrypted zero tail",
+            zero_tail.len()
+        ));
+    }
+    if logical_body.len() < 32 + 8 + 8 + 2 + 1 + 7 {
+        return Err(format!(
+            "RbxOpenReply2 logical body is too short: {} bytes",
+            logical_body.len()
+        ));
+    }
+
     let mut cursor = 0usize;
-    let server_ephemeral_key: [u8; 32] = plaintext[cursor..cursor + 32].try_into().unwrap();
+    let server_ephemeral_key: [u8; 32] = logical_body[cursor..cursor + 32].try_into().unwrap();
     cursor += 32;
-    let server_capabilities = u64::from_be_bytes(plaintext[cursor..cursor + 8].try_into().unwrap());
+    let server_capabilities =
+        u64::from_be_bytes(logical_body[cursor..cursor + 8].try_into().unwrap());
     cursor += 8;
-    let server_guid = u64::from_be_bytes(plaintext[cursor..cursor + 8].try_into().unwrap());
+    let server_guid = u64::from_be_bytes(logical_body[cursor..cursor + 8].try_into().unwrap());
     cursor += 8;
-    let mtu = u16::from_be_bytes(plaintext[cursor..cursor + 2].try_into().unwrap());
+    let mtu = u16::from_be_bytes(logical_body[cursor..cursor + 2].try_into().unwrap());
     cursor += 2;
-    let selected_encryption = plaintext[cursor];
+    let selected_encryption = logical_body[cursor];
     cursor += 1;
-    let binding_address = read_system_address(&plaintext, &mut cursor)?;
-    let returned_rupp_token = if version != 0 {
-        let token_len = *plaintext
-            .get(cursor)
-            .ok_or_else(|| "RbxOpenReply2 has no returned RUPP token length".to_string())?
-            as usize;
+    let binding_address = read_system_address(logical_body, &mut cursor)?;
+
+    // The 2022 format optionally appended a length byte and 16-byte refreshed
+    // token to the encrypted body. Current 0.735 clients stop immediately after
+    // SystemAddress because token refresh moved to the outer RUPP Token TLV.
+    let inline_returned_token = if cursor < logical_body.len() {
+        if version == 0 {
+            return Err(format!(
+                "RbxOpenReply2 version 0 has {} unexpected logical trailing byte(s)",
+                logical_body.len() - cursor
+            ));
+        }
+        let token_len = logical_body[cursor] as usize;
         cursor += 1;
         if token_len != 16 {
             return Err(format!(
-                "RbxOpenReply2 returned RUPP token has length {token_len}, expected 16"
+                "RbxOpenReply2 inline RUPP token has length {token_len}, expected 16"
             ));
         }
-        let token: [u8; 16] = plaintext
+        let token: [u8; 16] = logical_body
             .get(cursor..cursor + token_len)
-            .ok_or_else(|| "RbxOpenReply2 returned RUPP token is truncated".to_string())?
+            .ok_or_else(|| "RbxOpenReply2 inline RUPP token is truncated".to_string())?
             .try_into()
             .unwrap();
         cursor += token_len;
@@ -1060,15 +1117,20 @@ fn parse_rbx_open_reply2(
     } else {
         None
     };
-    let trailing = &plaintext[cursor..];
-    if !trailing.is_empty()
-        && (trailing.len() != EARLY_AEAD_OVERHEAD || trailing.iter().any(|byte| *byte != 0))
-    {
+    if cursor != logical_body.len() {
         return Err(format!(
-            "RbxOpenReply2 has {} unexpected decrypted trailing byte(s)",
-            trailing.len()
+            "RbxOpenReply2 has {} unexpected logical trailing byte(s)",
+            logical_body.len() - cursor
         ));
     }
+    let returned_rupp_token = match (rupp_returned_token, inline_returned_token) {
+        (Some(outer), Some(inline)) if outer != inline => {
+            return Err("RbxOpenReply2 outer and inline RUPP tokens disagree".into());
+        }
+        (Some(outer), _) => Some(outer),
+        (_, Some(inline)) => Some(inline),
+        (None, None) => None,
+    };
     if mtu < 576 {
         return Err(format!("RbxOpenReply2 returned invalid MTU {mtu}"));
     }
@@ -1934,7 +1996,7 @@ mod tests {
         let mut aad = Vec::new();
         aad.push(RBX_OPEN_REPLY_2);
         aad.extend_from_slice(&OFFLINE_MAGIC);
-        aad.push(0); // no refreshed token in the logical body
+        aad.push(1); // token refresh is in the outer RUPP TLV, not this body
         aad.push(44); // fixed 21-byte header + stripped 23-byte RUPP length
         aad.extend_from_slice(&58u16.to_be_bytes());
         aad.extend_from_slice(&body[..23]);
@@ -1957,7 +2019,7 @@ mod tests {
         assert_eq!(packet.len(), 158);
 
         let reply = parse_rbx_open_reply2(&packet, &crypto).unwrap();
-        assert_eq!(reply.version, 0);
+        assert_eq!(reply.version, 1);
         assert_eq!(reply.server_guid, 0x1112_1314_1516_1718);
         assert_eq!(reply.mtu, 1200);
         assert_eq!(reply.selected_encryption, 1);
@@ -1968,7 +2030,7 @@ mod tests {
                 port: 61_201,
             }
         );
-        assert_eq!(reply.returned_rupp_token, None);
+        assert_eq!(reply.returned_rupp_token, Some([0xa5; 16]));
     }
 
     #[test]
