@@ -15,9 +15,15 @@ use chacha20poly1305::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 const SESSION_AEAD_OVERHEAD: usize = 18;
+// SessionCrypto's constructor initializes both connected-RakNet nonce
+// counters to the little-endian integer represented by the first eight bytes
+// of `UniqueNumbeR`. Consequently the first nonce is the complete literal,
+// not eight zero bytes followed by `mbeR`.
+const INITIAL_RAK_NONCE_COUNTER: u64 = 0x754e_6575_7169_6e55;
 const ID_CONNECTION_REQUEST: u8 = 0x09;
 const ID_CONNECTION_REQUEST_ACCEPTED: u8 = 0x10;
 const RUPP_PROTOCOL_RAKNET: u8 = 1;
@@ -79,8 +85,8 @@ impl SessionCrypto {
         Self {
             server_to_client,
             client_to_server,
-            tx_nonce: 0,
-            rx_nonce: 0,
+            tx_nonce: INITIAL_RAK_NONCE_COUNTER,
+            rx_nonce: INITIAL_RAK_NONCE_COUNTER,
         }
     }
 
@@ -130,7 +136,9 @@ impl SessionCrypto {
 
 /// Normal RakNet SessionCrypto uses a different final nonce byte than the
 /// early/application crypto: native copies `UniqueNumbeR`, then replaces its
-/// first eight bytes with the little-endian counter.
+/// first eight bytes with the little-endian counter. The constructor seeds
+/// that counter with little-endian `UniqueNu`, so the first nonce remains the
+/// complete `UniqueNumbeR` literal.
 fn rak_nonce(counter: u64) -> [u8; 12] {
     let mut nonce = *b"UniqueNumbeR";
     nonce[..8].copy_from_slice(&counter.to_le_bytes());
@@ -282,11 +290,16 @@ fn send_plain_datagram(
     Ok(wire_len)
 }
 
+fn raknet_time_ms() -> u64 {
+    // RakNet::GetTime() is a monotonic millisecond clock. Its absolute origin
+    // is deliberately unspecified; only values produced by this process are
+    // compared or echoed by the protocol.
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 fn connection_request_payload(client_guid: u64) -> (Vec<u8>, u64) {
-    let request_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let request_time = raknet_time_ms();
     let mut payload = Vec::with_capacity(18);
     payload.push(ID_CONNECTION_REQUEST);
     payload.extend_from_slice(&client_guid.to_be_bytes());
@@ -311,7 +324,9 @@ fn send_connection_request(
         is_join_data: false,
         is_resent: retransmission && features.resent_bit,
         is_continuous_send: false,
-        needs_b_and_as: false,
+        // Both current congestion implementations begin in slow start.
+        // ReliabilityLayer writes GetIsInSlowStart() into this header bit.
+        needs_b_and_as: true,
         source_system_time: None,
         datagram_number,
         extra_padding: 0,
@@ -954,17 +969,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connected_crypto_uses_low_u16_and_uppercase_r_nonce() {
+    fn connected_crypto_starts_with_native_unique_number_nonce() {
         let server_to_client = [0x22; 32];
         let client_to_server = [0x11; 32];
         let mut crypto = SessionCrypto::new(server_to_client, client_to_server);
         let plaintext = b"connected-raknet";
         let wire = crypto.encrypt(plaintext).unwrap();
         assert_eq!(wire.len(), plaintext.len() + SESSION_AEAD_OVERHEAD);
-        assert_eq!(&wire[plaintext.len()..plaintext.len() + 2], &[0, 0]);
+        assert_eq!(&wire[plaintext.len()..plaintext.len() + 2], b"Un");
 
-        let nonce = rak_nonce(0);
-        assert_eq!(&nonce[8..], b"mbeR");
+        let nonce = rak_nonce(INITIAL_RAK_NONCE_COUNTER);
+        assert_eq!(&nonce, b"UniqueNumbeR");
         let mut decoded = wire[..plaintext.len()].to_vec();
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&client_to_server));
         cipher
@@ -976,6 +991,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decoded, plaintext);
+        assert_eq!(crypto.tx_nonce, INITIAL_RAK_NONCE_COUNTER + 1);
     }
 
     #[test]
