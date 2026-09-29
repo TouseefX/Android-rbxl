@@ -1,48 +1,96 @@
 # 0.735 — Resolution of the four remaining boundaries
 
 Build: **0.735 Studio, Mac symbols, 2026-08**. All quotes verbatim from the export; addresses preserved.
-Still true: no assembly/runtime capture can come from this text-only export — but each boundary is now closed or reduced to pure byte-value confirmation.
+No instruction-level operand or runtime capture can come from this text-only export. Boundaries 2–4 are algorithmically determined; Boundary 1 is reduced to one surviving compatible source but remains formally operand-unproven.
 
 ---
 
-## Boundary 1 — RUPP object installed at 0x1039c5c89: RESOLVED
+## Boundary 1 — RUPP object installed at 0x1039c5c89: strongest decompile resolution (operand-unproven)
 
-The client Reply2 install is an exact mirror of the Request2 (server-side) install at 0x1039c4fe2–0x1039c5027, where Hex-Rays' argument recovery **survived** (RakPeer.c:8863–8870):
+### Retraction
 
-```c
-RBX::make_shared<RBX::Rupp::Rupp>(a1: v104);          /*0x1039c4fe2*/  // fresh, EMPTY Rupp
-v68 = v91;                                            /*0x1039c4fe7*/
-v69 = (Rupp**)((char*)v91 + 5280);                    /*0x1039c4fee*/
-shared_ptr<Rupp>::operator=(a1: v91+5280, a2: v104);  /*0x1039c5002*/  // ← installed object identified
-shared_ptr<Rupp>::~shared_ptr(a1: v104);              /*0x1039c500a*/
-*(_OWORD *)v101 = 0; v102 = 0;                        //               // empty token blob
-Rupp::addTokenTlv(a1: *((_QWORD*)v68 + 660), a2: v101); /*0x1039c5027*/ // (!) +660 QWORDs == +5280 bytes — 4th independent confirmation of the offset
-```
+The earlier claim that `0x1039c5c89` installs a freshly-created empty Rupp by mirroring the Request2 path is withdrawn. `RBX::make_shared<RBX::Rupp::Rupp>` occurs exactly twice in `RakPeer.c`:
 
-**Answer: the installed object is a newly-created empty `RBX::Rupp::Rupp` (default flags), to which a Token TLV is appended immediately after installation.** The client's 0x1039c5c89 sequence is the same shape (same helper calls immediately before/after, same +5280). The "hidden source operand" is the local `make_shared<Rupp>` result. Token content thereafter is maintained by the generator machinery shipped in the P1 zip (`updateTokenTlv` 0x1037b6072, `autoUpdateToken` 0x1037b5f7a, `requestImmediateTokenRegeneration` 0x1037b67ae, Client/ServerRuppGenerator).
+| site | context |
+|---|---|
+| `0x1039c4fe2` | server-side `processRbxOpenRequest2` (installs at `rss+5280`, adds an empty-token TLV) |
+| `0x1039d0714` | `RakPeer::setupRuppImpl` (installs at the `RakPeer+3296` template) |
 
-## Boundary 2 — route prefix of the first connected packet: RESOLVED
+Neither site falls inside `processRbxOpenReply2` (`0x1039c5404–0x1039c5e1b`). There is no `make_shared`, `addTokenTlv`, or endpoint-TLV construction adjacent to the client install.
 
-`RakPeer::startOfflineBitStream(BitStream& out, const RemoteSystemStruct* rss, …)` @ **0x1039c2eac** (RakPeer.c:7590+):
+### `setupRuppImpl` builds the client default RUPP at `RakPeer+3296`
 
 ```c
-  *(_OWORD *)v18 = 0;
-  if ( rss != nullptr )
-    shared_ptr<Rupp>::operator=(a1: v18 /* a2 dropped: &rss->rupp (+5280) */);   /*0x1039c2eed*/
-  ... (else branch: vtable+816 ... -- covered below)
-  if ( v18[0] != nullptr ) {
-    ruppLen = Rupp::getHeaderTotalByteLength(v18[0]);                 /*0x1039c2f0f*/
-    BitStream::AddBitsAndReallocate(out, 8*ruppLen);                  /*0x1039c2f29*/
-    log "[DFLog::Rupp] Offline ruppLength: {}"
-    v10 = BitStream data base;                                        /*0x1039c2f93*/
-    Rupp::serialize(a1: status, a2: rupp, a3: v10 /*buf@0*/, a4: ruppLen, a5: a4 /*startOffset*/); /*0x1039c2fa6*/
-    BitStream::SetWriteOffset(out, 8*ruppLen, false);                 /*0x1039c3086*/  // RakNet header follows after
-  }
+RBX::make_shared<RBX::Rupp::Rupp>(a1: &v12);                       /*0x1039d0714*/
+v8 = a1 + 412;                                                     /*0x1039d0719*/  // +3296 bytes
+shared_ptr<Rupp>::operator=(a1: a1 + 412, a2: &v12);               /*0x1039d0726*/
+RBX::Rupp::Rupp::setFlag(a1: a1[412], a2: 0, a3: a2);              /*0x1039d0763*/
+result = RBX::Rupp::Rupp::addTokenTlv(a1: *v8, a2: a3);            /*0x1039d0798*/
+if (result == 0) {
+  if (inet_pton(2,  serverName, &v4)  != 0) return addIpv4EndpointTlv(*v8, v4,  port); /*0x1039d07f5*/
+  if (inet_pton(30, serverName, &v12) != 0) return addIpv6EndpointTlv(*v8, v12, port); /*0x1039d0820*/
+  return 10;                                                        /*0x1039d0827*/
+}
 ```
 
-So **every** connected outgoing packet (first = `sendApplicationConnectionRequest` right after Reply2, called at 0x1039c5c3c) is built as: reset BitStream → serialize the **per-connection rss+5280 RUPP at byte offset 0** (cleartext) → append RakNet DatagramHeader+payload after it. **Route prefix = exactly `Rupp::serialize`'s output of the installed Rupp** — for a freshly-installed client Rupp that is a base header + Token TLV; nothing else gets prepended.
+`getRuppHeader()` copies the same `shared_ptr` from `this+3296` (strong-count word at `+3304`). The public `setupRupp` wrapper at `0x1039d06ae` is reached virtually/from a thunk in the Connect machinery, so textual call-site search does not expose its caller.
 
-Reverse-direction variant (`startOfflineBitStreamReverse` @ **0x1039ce1dc**, RakPeer.c:14190+): constructs `Rupp(1,1)` + `addIpv4ReverseEndpointTlv(srcAddr+24, srcPort @ +70)` and serializes the same way — this is the server-reply route prefix.
+### Receive path confirms `rss+5280` is the live connected RUPP
+
+`ProcessNetworkPacket` at `0x1039c617a` copies the `shared_ptr` from `rss+5280` and mutates that RUPP from connected receive results:
+
+```c
+shared_ptr<Rupp>::operator=(a1: &v36 /* a2 dropped: rss+5280 */);    /*0x1039c62ec*/
+if (*(v36+48) != 0) {
+  if (Rupp::updateTokenFromDeserializationResult(v36, incomingResult, t) == 0) /*0x1039c6312*/
+    RakPeer::sendClientTokenUpdateTimeTelemetry(...);                /*0x1039c6324*/
+} else {
+  updated = Rupp::updateTokenFromDeserializationResult(v36, incomingResult, t); /*0x1039c634c*/
+  /* reportLateRuppTokenUpdate uses *(rss+5280)+64 */                 /*0x1039c65a4*/
+}
+```
+
+`updateTokenFromDeserializationResult` has three call sites in the export: the two RakPeer connected-receive sites above, plus `ClientRuppGenerator::onPeerPacketReceived` at `0x1037b4dae`, which updates the generator's in-place Rupp at `this+96`. All are receive-path consumers; none occurs inside Reply2. The in-place `ClientRuppGenerator` object is not a `shared_ptr<Rupp>` operand candidate for `0x1039c5c89`.
+
+### Elimination table for the hidden source operand
+
+| candidate | status | evidence |
+|---|---|---|
+| Fresh `make_shared<Rupp>` | **Disproven** | No `make_shared` occurs inside Reply2. |
+| `RequestedConnectionStruct`-carried Rupp | **Disproven** | Reply2 has no RCS Rupp-field access. |
+| Rebuilt from the reply's parsed RUPP | **Disproven** | Reply2 consumes no `DeserializationResult` and performs no token/endpoint construction. |
+| `RakPeer+3296` default template | **Sole surviving compatible candidate** | The RakPeer default at `+3296` is the only identified client-side `shared_ptr<Rupp>` compatible with this assignment. |
+
+The default-template conclusion is also consistent with the reimplementation's constructed/emitted 31-byte prefix—base header, subtype-1 Token TLV, and IPv4 endpoint TLV—from its own diagnostic output, not a native Studio first-connected datagram. The source remains formally operand-unproven until instruction-level disassembly or a native capture is available.
+
+## Boundary 2 — first connected route prefix: connected online path confirmed
+
+Connected reliability datagrams use `ReliabilityLayer::startOnlineBitStream` at `0x1039e1158`, not the `startOfflineBitStream` family:
+
+```c
+BitStream::Reset(out);
+if (rupp) {
+  ruppLen = Rupp::getHeaderTotalByteLength(rupp);                    /*0x1039e1199*/
+  BitStream::AddBitsAndReallocate(out, 8 * ruppLen);
+  ReliabilityLayer::reportRuppMissingTlvs(this, rupp);               /*0x1039e11c6*/
+  Rupp::serialize(status, rupp, bitstream_base, ruppLen, timeUS);     /*0x1039e120b*/
+  /* reportRuppSerializationFailure if status != 0 */                /*0x1039e122e*/
+  BitStream::SetWriteOffset(out, 8 * ruppLen, false);                 /*0x1039e1247*/
+  if (*(rupp+6) != 0) RakPeer::reportLateRuppTokenUpdate(...);        /*0x1039e1269*/
+}
+```
+
+Its callers cover data (`sendDatagrams`, `0x1039e31e3`), ACK (`SendACKs`, `0x1039e3a9b`), and NAK (`checkSendNak`, `0x1039e166f`) datagrams. The caller supplies the RUPP dereferenced from the per-connection `shared_ptr`, so the serialized clear prefix begins at byte zero for each connected datagram class.
+
+`reportRuppMissingTlvs` at `0x1039e127e` checks:
+
+| check | meaning | condition |
+|---|---|---|
+| `rupp->hasTlv(1)` | Token TLV | Missing is reported. |
+| `rupp->hasTlv(2)` | IPv4 endpoint TLV | Required unless the `RakPeer+3728` mode suppresses it. |
+| `rupp->hasTlv(6)` | Reverse/relay endpoint TLV | Checked when a relay address is configured. |
+
+These checks corroborate the endpoint-bearing `setupRuppImpl` model and contradict a token-only normal client prefix. Combined with Boundary 1, the evidence-backed initial connected prefix remains the 31-byte subtype-1 Token plus private IPv4 endpoint form.
 
 ## Boundary 3 — session-key activation + `encryptRakDataInPlace` keys: RESOLVED (algorithm-complete)
 
@@ -88,7 +136,7 @@ Server analog (same file family): `serverInitEarlySessionKeys_DualPair` @ **0x10
 Your hook address 0x1039e8c34 sits at the entry of `SocketLayer::SendToOrDelay` (SocketLayer.c — shipped in the P1 zip). Pseudocode determines the buffer; a capture would only yield byte values, not structure:
 
 ```
-[ ruppLen bytes : serialized RUPP, CLEARTEXT                              ]  ← startOfflineBitStream
+[ ruppLen bytes : serialized RUPP, CLEARTEXT                              ]  ← ReliabilityLayer::startOnlineBitStream
 [ N bytes       : RakNet DatagramHeader + payload, AEAD ciphertext        ]  ← encryptRakDataInPlace over [ruppLen, ruppLen+N)
 [ 2 bytes       : packet counter low-16 LE                                ]
 [ 16 bytes      : Poly1305 / GCM tag                                      ]
@@ -98,6 +146,8 @@ call chain: `SendImmediate/SendBitStream` → (RakPeer::) `SendToOrDelay` wrappe
 
 ---
 
-### What still genuinely needs runtime evidence
+### What remains outside the decompile export
 
-Only byte *values*, not structure: (a) the actual 5-tuple/low-16 counter wiring on pathological reconnects, (b) the live session key bytes by definition, (c) final Tag bytes — all three are entropy, not logic. If your emulator reproduces the layout above and the server still rejects, the delta is cryptographic (key schedule / nonce counter base / trailer order), not routing or packet shape.
+The hidden source operand at `0x1039c5c89` requires instruction-level disassembly for absolute proof. A native first-connected-datagram capture would independently verify the resulting 31-byte prefix and provide the live five-tuple, low-16 counter bytes, ciphertext, and final authentication tag. Hook values at `encryptRakDataInPlace` (`0x1039ea560`) and `SocketLayer::SendToOrDelay` (`0x1039e8c34`) would then permit the only remaining byte-for-byte comparison against the reimplementation.
+
+Until one of those artifacts is available, the `RakPeer+3296` template is the overwhelmingly likely assignment source, but remains formally operand-unproven. No packet-shape, routing, key-direction, nonce, AEAD-framing, or reliability change is warranted by this text-only evidence.
