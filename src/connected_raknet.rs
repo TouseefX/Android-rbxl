@@ -9,11 +9,13 @@ use crate::raknet_2022::{
     AckRange, DataDatagram, Datagram, DatagramFeatures, InternalPacket, NakDatagram,
     PacketReliability,
 };
+use crate::team_create::{build_rbx_open_request1_with_prefix, parse_probe_reply};
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce, Tag,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -35,6 +37,7 @@ const UINT24_HALF_RANGE: u32 = 0x0080_0000;
 const INITIAL_RTO_MS: u64 = 350;
 const MAX_RTO_MS: u64 = 2_000;
 const MIN_CONNECT_WAIT_MS: u64 = 5_000;
+const REFRESHED_RUPP_PROBE_WAIT_MS: u64 = 750;
 const MAX_SPLIT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) struct ConnectedConfig {
@@ -71,6 +74,15 @@ pub(crate) struct ConnectionAcceptedSummary {
 struct ReceivedRuppToken {
     token_type: u8,
     value: [u8; 16],
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionRequestSendTrace {
+    wire_bytes: usize,
+    encrypted_region_bytes: usize,
+    nonce_suffix: [u8; 2],
+    extra_padding: u16,
+    plaintext: Vec<u8>,
 }
 
 struct SessionCrypto {
@@ -319,7 +331,8 @@ fn send_connection_request(
     reliable_message_number: u32,
     payload: &[u8],
     retransmission: bool,
-) -> Result<usize, String> {
+    extra_padding: u16,
+) -> Result<ConnectionRequestSendTrace, String> {
     let data = DataDatagram {
         is_join_data: false,
         is_resent: retransmission && features.resent_bit,
@@ -329,7 +342,7 @@ fn send_connection_request(
         needs_b_and_as: true,
         source_system_time: None,
         datagram_number,
-        extra_padding: 0,
+        extra_padding,
         packets: vec![InternalPacket {
             reliability: PacketReliability::Reliable,
             data_bit_length: u16::try_from(payload.len() * 8)
@@ -344,7 +357,16 @@ fn send_connection_request(
     };
     let plaintext = encode_data_datagram(&data, features)
         .map_err(|error| format!("failed to encode ID_CONNECTION_REQUEST: {error}"))?;
-    send_plain_datagram(socket, peer, prefix, crypto, &plaintext, mtu)
+    let nonce_suffix = crypto.tx_nonce.to_le_bytes()[..2].try_into().unwrap();
+    let encrypted_region_bytes = plaintext.len() + SESSION_AEAD_OVERHEAD;
+    let wire_bytes = send_plain_datagram(socket, peer, prefix, crypto, &plaintext, mtu)?;
+    Ok(ConnectionRequestSendTrace {
+        wire_bytes,
+        encrypted_region_bytes,
+        nonce_suffix,
+        extra_padding,
+        plaintext,
+    })
 }
 
 fn send_ack(
@@ -741,6 +763,166 @@ fn parse_connection_accepted(payload: &[u8]) -> Result<AcceptedPayload, String> 
     })
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index != 0 {
+            output.push(' ');
+        }
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn describe_rupp_prefix(prefix: &[u8]) -> String {
+    if prefix.len() < 4 {
+        return format!("truncated {}-byte prefix", prefix.len());
+    }
+    let declared = usize::from(u16::from_be_bytes([prefix[2], prefix[3]]));
+    let mut cursor = 4usize;
+    let mut tlvs = Vec::new();
+    while cursor + 2 <= prefix.len() {
+        let kind = prefix[cursor];
+        let length = usize::from(prefix[cursor + 1]);
+        cursor += 2;
+        let Some(value) = prefix.get(cursor..cursor.saturating_add(length)) else {
+            tlvs.push(format!("type {kind} truncated length {length}"));
+            break;
+        };
+        let description = match (kind, length) {
+            (RUPP_TLV_TOKEN, RUPP_TOKEN_VALUE_LENGTH) => {
+                format!("token(length 17, subtype {})", value[0])
+            }
+            (2, 6) => {
+                let address = Ipv4Addr::new(value[0], value[1], value[2], value[3]);
+                let port = u16::from_be_bytes([value[4], value[5]]);
+                format!("ipv4(length 6, {address}:{port})")
+            }
+            (3, 18) => {
+                let port = u16::from_be_bytes([value[16], value[17]]);
+                format!("ipv6(length 18, port {port})")
+            }
+            _ => format!("type {kind}(length {length})"),
+        };
+        tlvs.push(description);
+        cursor += length;
+    }
+    if cursor != prefix.len() {
+        tlvs.push(format!("{} trailing byte(s)", prefix.len() - cursor));
+    }
+    format!(
+        "protocol {}, flags 0x{:02x}, declared length {declared}, actual length {}, TLVs [{}]",
+        prefix[0],
+        prefix[1],
+        prefix.len(),
+        tlvs.join(", ")
+    )
+}
+
+fn format_request_wire_trace(
+    trace: &ConnectionRequestSendTrace,
+    prefix: &[u8],
+    features: DatagramFeatures,
+    common_capabilities: u64,
+    local: Option<SocketAddr>,
+    peer: SocketAddr,
+    request_time: u64,
+) -> String {
+    let data_header_len = 1
+        + (features.include_timestamp as usize) * 4
+        + 3
+        + (features.avoid_packet_size as usize) * 2;
+    let reliability_header_len = 6usize;
+    let data_header = trace
+        .plaintext
+        .get(..data_header_len)
+        .map(hex_bytes)
+        .unwrap_or_else(|| "<truncated>".into());
+    let reliability_header = trace
+        .plaintext
+        .get(data_header_len..data_header_len + reliability_header_len)
+        .map(hex_bytes)
+        .unwrap_or_else(|| "<truncated>".into());
+    format!(
+        "wire trace: local {}, destination {peer}, capabilities 0x{common_capabilities:016x}, features(timestamp {}, avoided-size field {}, join-data bit {}, resent bit {}), RUPP {{{}}}, RUPP hex [{}], data header ({data_header_len} bytes) [{data_header}], reliable header ({reliability_header_len} bytes) [{reliability_header}], complete plaintext ({} bytes, padding {}) [{}], encrypted region {} bytes, nonce suffix [{}], final UDP payload {} bytes, request time {request_time}, connection password length 0",
+        local.map(|address| address.to_string()).unwrap_or_else(|| "unknown".into()),
+        features.include_timestamp,
+        features.avoid_packet_size,
+        features.join_data_bit,
+        features.resent_bit,
+        describe_rupp_prefix(prefix),
+        hex_bytes(prefix),
+        trace.plaintext.len(),
+        trace.extra_padding,
+        hex_bytes(&trace.plaintext),
+        trace.encrypted_region_bytes,
+        hex_bytes(&trace.nonce_suffix),
+        trace.wire_bytes,
+    )
+}
+
+fn probe_refreshed_rupp_route(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    prefix: &[u8],
+    mtu: u16,
+) -> String {
+    let packet = match build_rbx_open_request1_with_prefix(mtu, prefix) {
+        Ok(packet) => packet,
+        Err(error) => return format!("refreshed-RUPP route check could not be built: {error}"),
+    };
+    if let Err(error) = socket.send_to(&packet, peer) {
+        return format!("refreshed-RUPP route check send failed: {error}");
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(REFRESHED_RUPP_PROBE_WAIT_MS);
+    let mut buffer = vec![0u8; usize::from(mtu).saturating_add(512).max(2048)];
+    let mut other_responses = Vec::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if let Err(error) = socket.set_read_timeout(Some(remaining.max(Duration::from_millis(1)))) {
+            return format!("refreshed-RUPP route check timeout setup failed: {error}");
+        }
+        match socket.recv_from(&mut buffer) {
+            Ok((length, source)) if source == peer => {
+                if let Ok(reply) = parse_probe_reply(&buffer[..length]) {
+                    return format!(
+                        "refreshed-RUPP route check succeeded: {}-byte RbxOpenReply1, server GUID {:016x}, MTU {}",
+                        length, reply.server_guid, reply.mtu
+                    );
+                }
+                let packet_id = buffer[..length]
+                    .first()
+                    .map(|value| format!("0x{value:02x}"))
+                    .unwrap_or_else(|| "empty".into());
+                other_responses.push(format!("{length} bytes (first byte {packet_id})"));
+            }
+            Ok((length, source)) => {
+                other_responses.push(format!("ignored {length} bytes from {source}"));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return format!("refreshed-RUPP route check receive failed: {error}"),
+        }
+    }
+    if other_responses.is_empty() {
+        format!(
+            "refreshed-RUPP route check received no response to a {}-byte request in {REFRESHED_RUPP_PROBE_WAIT_MS} ms",
+            packet.len()
+        )
+    } else {
+        format!(
+            "refreshed-RUPP route check received no RbxOpenReply1; other responses: {}",
+            other_responses.join(", ")
+        )
+    }
+}
+
 /// Send encrypted reliable `ID_CONNECTION_REQUEST`, process encrypted
 /// ACK/NAK/data datagrams, retransmit with fresh datagram/session nonces, and
 /// ACK the accepted response before returning.
@@ -763,9 +945,9 @@ pub(crate) fn establish_connected_session(
     let mut retransmissions = 0usize;
     let mut request_acked = false;
     let mut refreshed_rupp_tokens = 0usize;
-    let mut last_wire_bytes = 0usize;
+    let mut send_traces = Vec::new();
 
-    last_wire_bytes = send_connection_request(
+    let first_send = send_connection_request(
         socket,
         peer,
         &config.rupp_prefix,
@@ -776,7 +958,24 @@ pub(crate) fn establish_connected_session(
         reliable_message_number,
         &request_payload,
         false,
+        0,
     )?;
+    let first_wire_trace = format_request_wire_trace(
+        &first_send,
+        &config.rupp_prefix,
+        features,
+        config.common_capabilities,
+        socket.local_addr().ok(),
+        peer,
+        request_time,
+    );
+    send_traces.push(format!(
+        "datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
+        first_send.wire_bytes,
+        first_send.extra_padding,
+        hex_bytes(&first_send.nonce_suffix)
+    ));
+    let mut last_wire_bytes = first_send.wire_bytes;
     sent_datagrams.push(next_datagram_number);
     next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
 
@@ -793,7 +992,15 @@ pub(crate) fn establish_connected_session(
             break;
         }
         if !request_acked && now >= next_retransmit {
-            last_wire_bytes = send_connection_request(
+            // Native can add zero padding when the complete UDP payload size
+            // occurs in its configured avoided-size vector. The live first
+            // request is exactly 79 bytes and the exported build does not
+            // expose that runtime vector, so retransmissions exercise the
+            // native one-byte fallback while preserving the exact encoded
+            // padding-count field. This distinguishes a size-79 path drop
+            // from routing or SessionCrypto rejection.
+            let retry_padding = if features.avoid_packet_size { 1 } else { 0 };
+            let retransmit = send_connection_request(
                 socket,
                 peer,
                 &config.rupp_prefix,
@@ -804,7 +1011,15 @@ pub(crate) fn establish_connected_session(
                 reliable_message_number,
                 &request_payload,
                 true,
+                retry_padding,
             )?;
+            last_wire_bytes = retransmit.wire_bytes;
+            send_traces.push(format!(
+                "datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
+                retransmit.wire_bytes,
+                retransmit.extra_padding,
+                hex_bytes(&retransmit.nonce_suffix)
+            ));
             sent_datagrams.push(next_datagram_number);
             next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
             retransmissions += 1;
@@ -950,17 +1165,24 @@ pub(crate) fn establish_connected_session(
         }
     }
 
+    let route_check = probe_refreshed_rupp_route(
+        socket,
+        peer,
+        &config.rupp_prefix,
+        config.mtu,
+    );
     let detail = if errors.is_empty() {
         String::new()
     } else {
         format!("; receive diagnostics: {}", errors.join("; "))
     };
     Err(format!(
-        "sent {last_wire_bytes}-byte encrypted reliable ID_CONNECTION_REQUEST in {} datagram(s), but no ID_CONNECTION_REQUEST_ACCEPTED arrived in {} ms (request ACKed: {request_acked}, tx nonce {}, rx nonce {}){detail}",
+        "sent {last_wire_bytes}-byte encrypted reliable ID_CONNECTION_REQUEST in {} datagram(s), but no ID_CONNECTION_REQUEST_ACCEPTED arrived in {} ms (request ACKed: {request_acked}, tx nonce {}, rx nonce {}){detail}; sends: {}; {first_wire_trace}; {route_check}",
         sent_datagrams.len(),
         started.elapsed().as_millis(),
         crypto.tx_nonce,
-        crypto.rx_nonce
+        crypto.rx_nonce,
+        send_traces.join("; ")
     ))
 }
 

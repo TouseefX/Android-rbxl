@@ -1232,7 +1232,10 @@ pub fn build_rbx_open_request1(mtu: u16) -> Result<Vec<u8>, String> {
     build_rbx_open_request1_with_prefix(mtu, &[])
 }
 
-fn build_rbx_open_request1_with_prefix(mtu: u16, prefix: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn build_rbx_open_request1_with_prefix(
+    mtu: u16,
+    prefix: &[u8],
+) -> Result<Vec<u8>, String> {
     let mtu = usize::from(mtu);
     if mtu < 576 {
         return Err(format!("RbxOpenRequest1 MTU {mtu} is below the 576-byte protocol minimum"));
@@ -1286,7 +1289,7 @@ pub fn parse_rbx_open_reply1(packet: &[u8]) -> Result<RbxOpenReply1, String> {
     })
 }
 
-fn parse_probe_reply(packet: &[u8]) -> Result<RbxOpenReply1, String> {
+pub(crate) fn parse_probe_reply(packet: &[u8]) -> Result<RbxOpenReply1, String> {
     if let Ok(reply) = parse_rbx_open_reply1(packet) {
         return Ok(reply);
     }
