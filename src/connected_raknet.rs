@@ -9,7 +9,6 @@ use crate::raknet_2022::{
     AckRange, DataDatagram, Datagram, DatagramFeatures, InternalPacket, NakDatagram,
     PacketReliability,
 };
-use crate::team_create::{build_rbx_open_request1_with_prefix, parse_probe_reply};
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce, Tag,
@@ -37,8 +36,9 @@ const UINT24_HALF_RANGE: u32 = 0x0080_0000;
 const INITIAL_RTO_MS: u64 = 350;
 const MAX_RTO_MS: u64 = 2_000;
 const MIN_CONNECT_WAIT_MS: u64 = 5_000;
-const REFRESHED_RUPP_PROBE_WAIT_MS: u64 = 750;
 const MAX_SPLIT_BYTES: usize = 64 * 1024 * 1024;
+
+static RAKNET_TIME_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
 pub(crate) struct ConnectedConfig {
     pub client_guid: u64,
@@ -47,6 +47,12 @@ pub(crate) struct ConnectedConfig {
     pub session_server_to_client: [u8; 32],
     pub session_client_to_server: [u8; 32],
     pub rupp_prefix: Vec<u8>,
+    /// Current OpenReply2 can carry the server's subtype-2 route token in its
+    /// outer RUPP header. Native RakPeer does not install that offline token
+    /// into the newly assigned remote; it starts online traffic with the
+    /// default subtype-1 header and accepts a token update only after the
+    /// online packet resolves that active remote.
+    pub deferred_reply2_rupp_token_type: Option<u8>,
     pub timeout_ms: u64,
 }
 
@@ -302,12 +308,22 @@ fn send_plain_datagram(
     Ok(wire_len)
 }
 
+/// Start the process-local RakNet clock before any handshake I/O. Native's
+/// monotonic clock is already running when RakPeer connects; initializing a
+/// lazy origin while constructing ID_CONNECTION_REQUEST incorrectly made the
+/// first request timestamp exactly zero.
+pub(crate) fn initialize_raknet_time() {
+    RAKNET_TIME_ORIGIN.get_or_init(Instant::now);
+}
+
 fn raknet_time_ms() -> u64 {
     // RakNet::GetTime() is a monotonic millisecond clock. Its absolute origin
     // is deliberately unspecified; only values produced by this process are
     // compared or echoed by the protocol.
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64
+    RAKNET_TIME_ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 fn connection_request_payload(client_guid: u64) -> (Vec<u8>, u64) {
@@ -893,68 +909,6 @@ fn format_request_wire_trace(
     )
 }
 
-fn probe_refreshed_rupp_route(
-    socket: &UdpSocket,
-    peer: SocketAddr,
-    prefix: &[u8],
-    mtu: u16,
-) -> String {
-    let packet = match build_rbx_open_request1_with_prefix(mtu, prefix) {
-        Ok(packet) => packet,
-        Err(error) => return format!("refreshed-RUPP route check could not be built: {error}"),
-    };
-    if let Err(error) = socket.send_to(&packet, peer) {
-        return format!("refreshed-RUPP route check send failed: {error}");
-    }
-
-    let deadline = Instant::now() + Duration::from_millis(REFRESHED_RUPP_PROBE_WAIT_MS);
-    let mut buffer = vec![0u8; usize::from(mtu).saturating_add(512).max(2048)];
-    let mut other_responses = Vec::new();
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        if let Err(error) = socket.set_read_timeout(Some(remaining.max(Duration::from_millis(1)))) {
-            return format!("refreshed-RUPP route check timeout setup failed: {error}");
-        }
-        match socket.recv_from(&mut buffer) {
-            Ok((length, source)) if source == peer => {
-                if let Ok(reply) = parse_probe_reply(&buffer[..length]) {
-                    return format!(
-                        "refreshed-RUPP route check succeeded: {}-byte RbxOpenReply1, server GUID {:016x}, MTU {}",
-                        length, reply.server_guid, reply.mtu
-                    );
-                }
-                let packet_id = buffer[..length]
-                    .first()
-                    .map(|value| format!("0x{value:02x}"))
-                    .unwrap_or_else(|| "empty".into());
-                other_responses.push(format!("{length} bytes (first byte {packet_id})"));
-            }
-            Ok((length, source)) => {
-                other_responses.push(format!("ignored {length} bytes from {source}"));
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                break;
-            }
-            Err(error) => return format!("refreshed-RUPP route check receive failed: {error}"),
-        }
-    }
-    if other_responses.is_empty() {
-        format!(
-            "refreshed-RUPP route check received no response to a {}-byte request in {REFRESHED_RUPP_PROBE_WAIT_MS} ms",
-            packet.len()
-        )
-    } else {
-        format!(
-            "refreshed-RUPP route check received no RbxOpenReply1; other responses: {}",
-            other_responses.join(", ")
-        )
-    }
-}
-
 /// Send encrypted reliable `ID_CONNECTION_REQUEST`, process encrypted
 /// ACK/NAK/data datagrams, retransmit with fresh datagram/session nonces, and
 /// ACK the accepted response before returning.
@@ -1024,14 +978,12 @@ pub(crate) fn establish_connected_session(
             break;
         }
         if !request_acked && now >= next_retransmit {
-            // Native can add zero padding when the complete UDP payload size
-            // occurs in its configured avoided-size vector. The live first
-            // request is exactly 79 bytes and the exported build does not
-            // expose that runtime vector, so retransmissions exercise the
-            // native one-byte fallback while preserving the exact encoded
-            // padding-count field. This distinguishes a size-79 path drop
-            // from routing or SessionCrypto rejection.
-            let retry_padding = if features.avoid_packet_size { 1 } else { 0 };
+            // Keep retransmissions byte-for-byte native unless an avoided-size
+            // list is actually known. The capability only enables the u16
+            // padding-count field; it does not itself require padding. The old
+            // unconditional one-byte retry was a diagnostic experiment, not a
+            // wire behavior established by the current build.
+            let retry_padding = 0;
             let retransmit = send_connection_request(
                 socket,
                 peer,
@@ -1197,19 +1149,19 @@ pub(crate) fn establish_connected_session(
         }
     }
 
-    let route_check = probe_refreshed_rupp_route(
-        socket,
-        peer,
-        &config.rupp_prefix,
-        config.mtu,
-    );
     let detail = if errors.is_empty() {
         String::new()
     } else {
         format!("; receive diagnostics: {}", errors.join("; "))
     };
+    let route_state = match config.deferred_reply2_rupp_token_type {
+        Some(token_type) => format!(
+            "native-matched route state: the initial subtype-1 GameService token remained on outbound online packets; OpenReply2 advertised outer token subtype {token_type}, whose installation is deferred until an online packet resolves the active remote"
+        ),
+        None => "native-matched route state: the initial GameService token remained on outbound online packets; OpenReply2 advertised no outer token update".to_string(),
+    };
     Err(format!(
-        "sent {last_wire_bytes}-byte encrypted reliable ID_CONNECTION_REQUEST in {} datagram(s), but no ID_CONNECTION_REQUEST_ACCEPTED arrived in {} ms (request ACKed: {request_acked}, tx nonce {}, rx nonce {}){detail}; sends: {}; {first_wire_trace}; {route_check}",
+        "sent {last_wire_bytes}-byte encrypted reliable ID_CONNECTION_REQUEST in {} datagram(s), but no ID_CONNECTION_REQUEST_ACCEPTED arrived in {} ms (request ACKed: {request_acked}, tx nonce {}, rx nonce {}){detail}; sends: {}; {first_wire_trace}; {route_state}",
         sent_datagrams.len(),
         started.elapsed().as_millis(),
         crypto.tx_nonce,

@@ -105,6 +105,11 @@ fn rebuild_scene_system(
 /// Build and run the Bevy editor app. `initial_bytes` (a raw place file) is
 /// loaded at startup if present — used by the desktop runner for validation.
 pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
+    // RakNet::GetTime is process-monotonic and already running long before a
+    // connection starts. Seed our equivalent at app startup rather than on
+    // the first ID_CONNECTION_REQUEST, which would otherwise encode zero.
+    connected_raknet::initialize_raknet_time();
+
     let mut editor = EditorApp::default();
     if let Some(bytes) = initial_bytes {
         editor.load_from_bytes(bytes);

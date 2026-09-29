@@ -18,7 +18,9 @@
 //! `ID_CONNECTION_REQUEST_ACCEPTED`. JoinData → live change-item application
 //! remains the next Stage 1 layer.
 
-use crate::connected_raknet::{establish_connected_session, ConnectedConfig};
+use crate::connected_raknet::{
+    establish_connected_session, initialize_raknet_time, ConnectedConfig,
+};
 use blake2::{
     digest::{consts::U32, Mac},
     Blake2b512, Blake2bMac, Digest,
@@ -461,47 +463,6 @@ fn build_rupp_header(
     header.extend_from_slice(&header_len.to_be_bytes());
     header.extend_from_slice(&tlvs);
     Ok(header)
-}
-
-fn update_rupp_header_token(
-    header: &mut [u8],
-    token_type: u8,
-    token: [u8; 16],
-) -> Result<(), String> {
-    if header.len() < 4 || header[0] != RUPP_PROTOCOL_RAKNET {
-        return Err("cannot install refreshed token without an outbound RUPP header".into());
-    }
-    let header_len = usize::from(u16::from_be_bytes([header[2], header[3]]));
-    if header_len != header.len() {
-        return Err(format!(
-            "outbound RUPP header length {header_len} does not match {} bytes",
-            header.len()
-        ));
-    }
-    let mut cursor = 4usize;
-    while cursor < header_len {
-        if cursor + 2 > header_len {
-            return Err("outbound RUPP header ends inside a TLV header".into());
-        }
-        let kind = header[cursor];
-        let length = usize::from(header[cursor + 1]);
-        cursor += 2;
-        if cursor + length > header_len {
-            return Err("outbound RUPP header has a truncated TLV".into());
-        }
-        if kind == RUPP_TLV_TOKEN {
-            if length != usize::from(RUPP_TOKEN_VALUE_LENGTH) {
-                return Err(format!(
-                    "outbound RUPP token TLV has length {length}, expected {RUPP_TOKEN_VALUE_LENGTH}"
-                ));
-            }
-            header[cursor] = token_type;
-            header[cursor + 1..cursor + 17].copy_from_slice(&token);
-            return Ok(());
-        }
-        cursor += length;
-    }
-    Err("outbound RUPP header has no token TLV".into())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -970,10 +931,12 @@ fn strip_optional_rupp_prefix(
         return Err(format!("invalid RUPP response header length {header_len}"));
     }
 
-    // In 0.735 the refreshed route token is carried by the response's RUPP
-    // Token TLV rather than appended to the decrypted OpenReply2 body. Token
-    // TLV value byte zero is its lineage/subtype; the following 16 bytes are
-    // the token used by subsequent routed packets.
+    // In 0.735 the server-advertised route token is carried by the response's
+    // outer RUPP Token TLV rather than appended to the decrypted OpenReply2
+    // body. Token TLV value byte zero is its lineage/subtype; the following
+    // 16 bytes become eligible for the outbound header once an online packet
+    // has resolved the active remote (the offline Reply2 itself does not
+    // trigger native RakPeer's per-remote token updater).
     let mut returned_token = None;
     let mut cursor = 4usize;
     while cursor < header_len {
@@ -1326,6 +1289,10 @@ fn probe_endpoint_with_rupp(
     const REQUEST1_CANDIDATE_WAIT_MS: u64 = 450;
     const REQUEST2_MIN_WAIT_MS: u64 = 5_000;
 
+    // Native RakNet's monotonic clock is already running before Connect. Do
+    // the equivalent before Request1 so the later application request does
+    // not receive a lazy-origin timestamp of zero.
+    initialize_raknet_time();
     let target = endpoint.label();
     let started = Instant::now();
     let request1_deadline = started + Duration::from_millis(timeout_ms.max(1_200));
@@ -1397,7 +1364,7 @@ fn probe_endpoint_with_rupp(
         }
     }
 
-    let Some((socket, reply1, from, mut selected_prefix, selected_token_type)) = accepted else {
+    let Some((socket, reply1, from, selected_prefix, selected_token_type)) = accepted else {
         if !invalid_replies.is_empty() {
             return Err(format!(
                 "{target}: received UDP after {sent} probes, but no valid 2022 RbxOpenReply1 ({})",
@@ -1498,7 +1465,7 @@ fn probe_endpoint_with_rupp(
                             reply2.binding_address.label(),
                             reply2.server_capabilities,
                             if reply2.returned_rupp_token.is_some() {
-                                ", refreshed RUPP token received"
+                                ", server RUPP token observed (deferred until online receive)"
                             } else {
                                 ""
                             },
@@ -1509,13 +1476,16 @@ fn probe_endpoint_with_rupp(
                                 "{open_reply_summary}\nConnected RakNet currently requires negotiated ChaCha20-Poly1305, not {encryption}"
                             ));
                         }
-                        if let Some(token) = reply2.returned_rupp_token {
-                            let token_type = reply2.returned_rupp_token_type.ok_or_else(|| {
-                                "current connected RakNet requires the refreshed token's outer RUPP subtype"
-                                    .to_string()
-                            })?;
-                            update_rupp_header_token(&mut selected_prefix, token_type, token)?;
-                        }
+                        // Current native RakPeer does not feed an offline
+                        // OpenReply2's DeserializationResult into the RUPP
+                        // token updater. It assigns the default subtype-1
+                        // GameService RUPP object to the new remote and sends
+                        // ID_CONNECTION_REQUEST with that header. A subtype-2
+                        // token is installed only on a later online receive,
+                        // after ProcessNetworkPacket resolves the active
+                        // remote. Replacing the token here made the very first
+                        // online packet differ from native and was rejected by
+                        // the routed path without an ACK.
                         let common_capabilities =
                             reply2.server_capabilities & RAK_PEER_CAPABILITIES_2022_BASE;
                         match establish_connected_session(
@@ -1528,6 +1498,8 @@ fn probe_endpoint_with_rupp(
                                 session_server_to_client: reply2.session_server_to_client,
                                 session_client_to_server: reply2.session_client_to_server,
                                 rupp_prefix: selected_prefix.clone(),
+                                deferred_reply2_rupp_token_type:
+                                    reply2.returned_rupp_token_type,
                                 timeout_ms,
                             },
                         ) {
