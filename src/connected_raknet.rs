@@ -59,6 +59,10 @@ pub(crate) struct ConnectedConfig {
     /// solely for the post-native online route diagnostic.
     pub deferred_reply2_rupp_token_type: Option<u8>,
     pub deferred_reply2_rupp_token: Option<[u8; 16]>,
+    /// Exact outer RUPP header returned with OpenReply2. It is retained only
+    /// for a late diagnostic; audited native traffic still starts with the
+    /// subtype-1 client header.
+    pub deferred_reply2_rupp_prefix: Option<Vec<u8>>,
     pub timeout_ms: u64,
 }
 
@@ -947,10 +951,12 @@ pub(crate) fn establish_connected_session(
     );
     let (request_payload, request_time) = connection_request_payload(config.client_guid);
     // Keep native subtype-1 traffic first. These alternatives are emitted
-    // only after several unanswered native retransmissions, so they diagnose
-    // whether UDMUX retained flow affinity or requires Reply2's outer token
-    // without replacing the audited initial behavior.
-    let diagnostic_reply2_prefix = diagnostic_reply2_rupp_prefix(&config)?;
+    // only after several unanswered native retransmissions. Preserve the
+    // exact token-only outer header returned with Reply2 in addition to the
+    // receive-updater shape (refreshed token in the client endpoint-bearing
+    // header); those are observably different routed packets.
+    let diagnostic_exact_reply2_prefix = config.deferred_reply2_rupp_prefix.clone();
+    let diagnostic_refreshed_prefix = diagnostic_reply2_rupp_prefix(&config)?;
     let mut route_diagnostics_sent = false;
     let mut route_diagnostic_count = 0usize;
     let mut next_datagram_number = 0u32;
@@ -1039,15 +1045,13 @@ pub(crate) fn establish_connected_session(
             next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
             retransmissions += 1;
 
-            // A bare encrypted online datagram and a datagram routed with the
-            // outer token advertised by Reply2 are both valid online packet
-            // forms. Send each once only after three unanswered native
-            // subtype-1 retransmissions. Any ACK from either distinguishes a
-            // route-lifecycle mismatch from SessionCrypto/datagram rejection;
-            // neither diagnostic changes the retained native outbound header.
+            // Send the route alternatives once only after three unanswered
+            // native retransmissions. Any ACK distinguishes a route-lifecycle
+            // mismatch from SessionCrypto/datagram rejection; no diagnostic
+            // changes the retained native outbound header.
             if retransmissions == 3 && !route_diagnostics_sent {
                 route_diagnostics_sent = true;
-                if let Some(prefix) = diagnostic_reply2_prefix.as_deref() {
+                if let Some(prefix) = diagnostic_exact_reply2_prefix.as_deref() {
                     let diagnostic = send_connection_request(
                         socket,
                         peer,
@@ -1063,7 +1067,34 @@ pub(crate) fn establish_connected_session(
                     )?;
                     last_wire_bytes = diagnostic.wire_bytes;
                     send_traces.push(format!(
-                        "online diagnostic Reply2-token datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
+                        "online diagnostic exact Reply2 outer-header datagram {next_datagram_number} ({}-byte RUPP), {} bytes, padding {}, nonce suffix [{}]",
+                        prefix.len(),
+                        diagnostic.wire_bytes,
+                        diagnostic.extra_padding,
+                        hex_bytes(&diagnostic.nonce_suffix)
+                    ));
+                    sent_datagrams.push(next_datagram_number);
+                    next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
+                    route_diagnostic_count += 1;
+                }
+
+                if let Some(prefix) = diagnostic_refreshed_prefix.as_deref() {
+                    let diagnostic = send_connection_request(
+                        socket,
+                        peer,
+                        prefix,
+                        &mut crypto,
+                        features,
+                        config.mtu,
+                        next_datagram_number,
+                        reliable_message_number,
+                        &request_payload,
+                        true,
+                        0,
+                    )?;
+                    last_wire_bytes = diagnostic.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic refreshed endpoint-bearing token datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
                         diagnostic.wire_bytes,
                         diagnostic.extra_padding,
                         hex_bytes(&diagnostic.nonce_suffix)
@@ -1247,7 +1278,8 @@ pub(crate) fn establish_connected_session(
     };
     let route_state = match config.deferred_reply2_rupp_token_type {
         Some(token_type) => format!(
-            "native-matched route state: the initial subtype-1 GameService token remained on normal outbound online packets; OpenReply2 advertised outer token subtype {token_type}, whose installation is deferred until an online packet resolves the active remote; after native retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response"
+            "native-matched route state: the initial subtype-1 GameService token remained on normal outbound online packets; OpenReply2 advertised outer token subtype {token_type} in a {}-byte exact header, whose installation is deferred until an online packet resolves the active remote; after native retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response",
+            config.deferred_reply2_rupp_prefix.as_ref().map(Vec::len).unwrap_or(0)
         ),
         None => format!(
             "native-matched route state: the initial GameService token remained on normal outbound online packets; OpenReply2 advertised no outer token update; after native retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response"

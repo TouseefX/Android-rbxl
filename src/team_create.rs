@@ -902,6 +902,7 @@ fn build_rbx_open_request2(
     Ok(packet)
 }
 
+#[derive(Debug)]
 struct RbxOpenReply2 {
     version: u8,
     server_capabilities: u64,
@@ -911,6 +912,10 @@ struct RbxOpenReply2 {
     binding_address: Endpoint,
     returned_rupp_token: Option<[u8; 16]>,
     returned_rupp_token_type: Option<u8>,
+    /// Exact clear RUPP header received outside OpenReply2. Current routed
+    /// replies use a 23-byte token-only header, which is distinct from the
+    /// client's 31-byte token-plus-private-endpoint header.
+    returned_rupp_prefix: Option<Vec<u8>>,
     session_server_to_client: [u8; 32],
     session_client_to_server: [u8; 32],
 }
@@ -923,9 +928,9 @@ struct ReceivedRuppToken {
 
 fn strip_optional_rupp_prefix(
     packet: &[u8],
-) -> Result<(&[u8], usize, Option<ReceivedRuppToken>), String> {
+) -> Result<(&[u8], usize, Option<ReceivedRuppToken>, Option<Vec<u8>>), String> {
     if packet.first() != Some(&RUPP_PROTOCOL_RAKNET) {
-        return Ok((packet, 0, None));
+        return Ok((packet, 0, None, None));
     }
     if packet.len() < 4 {
         return Err("truncated RUPP response prefix".into());
@@ -969,14 +974,20 @@ fn strip_optional_rupp_prefix(
         }
         cursor += tlv_len;
     }
-    Ok((&packet[header_len..], header_len, returned_token))
+    let exact_prefix = packet[..header_len].to_vec();
+    Ok((
+        &packet[header_len..],
+        header_len,
+        returned_token,
+        Some(exact_prefix),
+    ))
 }
 
 fn parse_rbx_open_reply2(
     packet: &[u8],
     crypto: &Request2Crypto,
 ) -> Result<RbxOpenReply2, String> {
-    let (packet, stripped_rupp_len, rupp_returned_token) =
+    let (packet, stripped_rupp_len, rupp_returned_token, returned_rupp_prefix) =
         strip_optional_rupp_prefix(packet)?;
     let Some(&packet_id) = packet.first() else {
         return Err("RbxOpenReply2 is empty".into());
@@ -1177,6 +1188,7 @@ fn parse_rbx_open_reply2(
         binding_address,
         returned_rupp_token,
         returned_rupp_token_type,
+        returned_rupp_prefix,
         session_server_to_client,
         session_client_to_server,
     })
@@ -1468,10 +1480,13 @@ fn probe_endpoint_with_rupp(
                             reply2.mtu,
                             reply2.binding_address.label(),
                             reply2.server_capabilities,
-                            if reply2.returned_rupp_token.is_some() {
-                                ", server RUPP token observed (deferred until online receive)"
+                            if let Some(prefix) = reply2.returned_rupp_prefix.as_ref() {
+                                format!(
+                                    ", server RUPP token observed in {}-byte outer header (deferred until online receive)",
+                                    prefix.len()
+                                )
                             } else {
-                                ""
+                                String::new()
                             },
                             started.elapsed().as_millis()
                         );
@@ -1505,6 +1520,7 @@ fn probe_endpoint_with_rupp(
                                 deferred_reply2_rupp_token_type:
                                     reply2.returned_rupp_token_type,
                                 deferred_reply2_rupp_token: reply2.returned_rupp_token,
+                                deferred_reply2_rupp_prefix: reply2.returned_rupp_prefix,
                                 timeout_ms,
                             },
                         ) {
@@ -2041,6 +2057,7 @@ mod tests {
             0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
             0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
         ]));
+        assert_eq!(reply.returned_rupp_prefix, None);
         assert_eq!(
             reply.session_server_to_client.as_slice(),
             hex_fixture("649940507f84e6ae006913e4ca1d7595094a7555162fba87f2c8f37383c736ef")
@@ -2103,6 +2120,7 @@ mod tests {
             .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut encrypted)
             .unwrap();
 
+        let expected_rupp = rupp.clone();
         let mut packet = rupp;
         packet.extend_from_slice(&aad);
         packet.extend_from_slice(&encrypted);
@@ -2124,6 +2142,7 @@ mod tests {
         );
         assert_eq!(reply.returned_rupp_token, Some([0xa5; 16]));
         assert_eq!(reply.returned_rupp_token_type, Some(2));
+        assert_eq!(reply.returned_rupp_prefix, Some(expected_rupp));
     }
 
     #[test]

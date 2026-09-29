@@ -181,6 +181,12 @@ seconds_per_tick = (mach_timebase_info.numer / mach_timebase_info.denom) * 1e-9
 
 Both fall back to `1e-9` if `mach_timebase_info` fails. Thus the request timestamp is elapsed monotonic milliseconds since a lazy process-local start sample. It is neither Unix time nor raw `mach_absolute_time`, and it has no server-shared absolute origin. The reimplementation's app-start-seeded `Instant` preserves the protocol-relevant origin and monotonic elapsed-time semantics; no further wire-format correction follows from the completed clock trace.
 
+## Live 0.741 routed outcome after the password correction
+
+A fresh no-UI-delay session against RCC `0.741.0.7411056` authenticated OpenReply2 and emitted the corrected 79-byte packet: 31-byte subtype-1 client RUPP, 30-byte plaintext, and 18-byte SessionCrypto trailer. The plaintext was byte-structurally correct, including the 20-byte application request ending in `00 5e 11`, but neither it nor subsequent endpoint-bearing subtype-2 and bare diagnostics received an ACK.
+
+That run did not actually test the exact RUPP returned with OpenReply2. The routed 158-byte Reply2 shape carries a **23-byte token-only outer header**, while the old “Reply2-token” diagnostic replaced the token inside the client's **31-byte token-plus-private-endpoint header**. The implementation now preserves the exact returned header and sends it once as a late diagnostic, separately from both the native 31-byte subtype-1 form and the receive-updater-style 31-byte subtype-2 form. Native-first behavior remains unchanged.
+
 ---
 
 ### What remains outside the decompile export
