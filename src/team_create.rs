@@ -376,7 +376,11 @@ const RAKNET_EPHEMERAL_EARLY_KEY_VERSION: u16 = 5;
 pub const DEFAULT_PROBE_MTU: u16 = 1200;
 const IPV6_UDP_HEADER_BYTES: usize = 40;
 const EARLY_AEAD_OVERHEAD: usize = 28; // 12-byte nonce + 16-byte detached tag
-const RAK_PEER_CAPABILITIES_2022_BASE: u64 = 0x0000_0002_321e_7e1e;
+// Current 0.735 `buildCapabilitiesHelper(..., PeerType::Client)` always sets
+// these bits. Additional bits are runtime-flag gated; do not advertise those
+// until the corresponding behavior is implemented. The old 2022 constant
+// falsely negotiated server bits 19 and 25 in the latest live session.
+const RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR: u64 = 0x0000_0203_58b7_eafa;
 
 // Exact current RUPP values from Rupp::{serialize,TokenTlv,Ipv4Tlv,Ipv6Tlv}. 0.735
 // retains the same wire values used by the earlier transport implementation.
@@ -857,7 +861,7 @@ fn build_rbx_open_request2(
         .map_err(|_| format!("RbxOpenRequest2 AAD is too large: {} bytes", aad.len()))?;
 
     let mut plaintext = Vec::with_capacity(32 + material.auth.auth_blob.len());
-    plaintext.extend_from_slice(&RAK_PEER_CAPABILITIES_2022_BASE.to_be_bytes());
+    plaintext.extend_from_slice(&RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR.to_be_bytes());
     plaintext.extend_from_slice(&crypto.client_guid.to_be_bytes());
     plaintext.extend_from_slice(&mtu.to_be_bytes());
     plaintext.push(1); // ChaCha20-Poly1305; getSupportAes()==false path
@@ -1487,7 +1491,7 @@ fn probe_endpoint_with_rupp(
                         // online packet differ from native and was rejected by
                         // the routed path without an ACK.
                         let common_capabilities =
-                            reply2.server_capabilities & RAK_PEER_CAPABILITIES_2022_BASE;
+                            reply2.server_capabilities & RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR;
                         match establish_connected_session(
                             &socket,
                             reply_from,
@@ -2022,7 +2026,7 @@ mod tests {
         ));
         let reply = parse_rbx_open_reply2(&packet, &crypto).unwrap();
         assert_eq!(reply.version, 1);
-        assert_eq!(reply.server_capabilities, RAK_PEER_CAPABILITIES_2022_BASE);
+        assert_eq!(reply.server_capabilities, RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR);
         assert_eq!(reply.server_guid, 0x1112_1314_1516_1718);
         assert_eq!(reply.mtu, 1200);
         assert_eq!(reply.selected_encryption, 1);
@@ -2072,7 +2076,7 @@ mod tests {
 
         let mut body = Vec::new();
         body.extend_from_slice(&server_public);
-        body.extend_from_slice(&RAK_PEER_CAPABILITIES_2022_BASE.to_be_bytes());
+        body.extend_from_slice(&RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR.to_be_bytes());
         body.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
         body.extend_from_slice(&1200u16.to_be_bytes());
         body.push(1);
