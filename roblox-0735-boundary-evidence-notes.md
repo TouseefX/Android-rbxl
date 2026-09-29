@@ -162,6 +162,25 @@ Finally, `RakPeer::sendApplicationConnectionRequest` writes ID `0x09`, GUID, `Ge
 
 The password belongs inside the encrypted reliable application payload; it does not alter the clear RUPP prefix or SessionCrypto trailer. With the previously observed 31-byte prefix and otherwise identical framing, adding these two bytes raises the initial UDP payload from 77 to 79 bytes.
 
+## Current-build `GetTime(false)` clock — resolved
+
+The second targeted export includes the previously missing free-function definitions. `RakNet::GetTime(bool)` @ **0x1039b48c3** takes the false branch used by the application request, calls `RBX::Time::now((SampleMethod)2)`, scales its seconds by `1,000,000`, and divides the resulting microseconds by `1,000` to produce milliseconds. The decompile renders the intermediate conversion as `(unsigned int)(int)(now * 1000000.0)`; that narrowing is recorded literally here rather than extrapolated into a new transport requirement.
+
+`Time::now<2>` @ **0x1041b6780** forwards directly to `RBX::nowPrecise` @ **0x1041b678a**. `nowPrecise` has two flag-selected implementations, but both have the same clock origin and unit:
+
+1. Read `mach_absolute_time()`.
+2. Lazily establish the process-local `RBX::startTime` from a `mach_absolute_time()` sample (`nowPrecise` does so directly on the `FasterPreciseTime` path; the other path calls `Time::getStart`).
+3. Subtract that start tick from the current tick.
+4. Multiply by seconds per tick.
+
+`RBX::tick_resolution` @ **0x1041b68e8** and the old-path `tick_frequency_helper` @ **0x1041b6e3d** compute the same scale:
+
+```
+seconds_per_tick = (mach_timebase_info.numer / mach_timebase_info.denom) * 1e-9
+```
+
+Both fall back to `1e-9` if `mach_timebase_info` fails. Thus the request timestamp is elapsed monotonic milliseconds since a lazy process-local start sample. It is neither Unix time nor raw `mach_absolute_time`, and it has no server-shared absolute origin. The reimplementation's app-start-seeded `Instant` preserves the protocol-relevant origin and monotonic elapsed-time semantics; no further wire-format correction follows from the completed clock trace.
+
 ---
 
 ### What remains outside the decompile export

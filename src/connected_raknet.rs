@@ -326,18 +326,19 @@ fn send_plain_datagram(
     Ok(wire_len)
 }
 
-/// Start the process-local RakNet clock before any handshake I/O. Native's
-/// monotonic clock is already running when RakPeer connects; initializing a
-/// lazy origin while constructing ID_CONNECTION_REQUEST incorrectly made the
-/// first request timestamp exactly zero.
+/// Start the process-local RakNet clock before any handshake I/O. Current
+/// native `Time::now<2>` measures from a lazy process-local mach-time sample,
+/// normally established before RakPeer connects. Initializing our equivalent
+/// while constructing ID_CONNECTION_REQUEST made its first timestamp exactly
+/// zero instead.
 pub(crate) fn initialize_raknet_time() {
     RAKNET_TIME_ORIGIN.get_or_init(Instant::now);
 }
 
 fn raknet_time_ms() -> u64 {
-    // RakNet::GetTime() is a monotonic millisecond clock. Its absolute origin
-    // is deliberately unspecified; only values produced by this process are
-    // compared or echoed by the protocol.
+    // Current RakNet::GetTime(false) converts Time::now<2>'s monotonic elapsed
+    // seconds to microseconds and then milliseconds. Only process-local elapsed
+    // time is represented; there is no wall-clock or server-shared origin.
     RAKNET_TIME_ORIGIN
         .get_or_init(Instant::now)
         .elapsed()

@@ -1293,9 +1293,9 @@ fn probe_endpoint_with_rupp(
     const REQUEST1_CANDIDATE_WAIT_MS: u64 = 450;
     const REQUEST2_MIN_WAIT_MS: u64 = 5_000;
 
-    // Native RakNet's monotonic clock is already running before Connect. Do
-    // the equivalent before Request1 so the later application request does
-    // not receive a lazy-origin timestamp of zero.
+    // Native Time::now<2> uses a lazy process-local monotonic start sample,
+    // normally established before Connect. Do the equivalent before Request1
+    // so the later application request does not receive a zero timestamp.
     initialize_raknet_time();
     let target = endpoint.label();
     let started = Instant::now();
