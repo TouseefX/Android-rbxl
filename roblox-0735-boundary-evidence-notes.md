@@ -144,6 +144,24 @@ Your hook address 0x1039e8c34 sits at the entry of `SocketLayer::SendToOrDelay` 
 
 call chain: `SendImmediate/SendBitStream` → (RakPeer::) `SendToOrDelay` wrapper @ 0x1039e1c20 → `SocketLayer::SendToOrDelay` @ 0x1039e8c34 → `RakPeer::trackSocketSendResult` @ 0x1039e1c59. Destination = the SystemAddress from the RSS/calling site; the socket is the shared_ptr<RakNetSocket> threaded through every send signature.
 
+## Connected request correction — Cloud Edit password resolved
+
+The targeted current-build follow-up export resolves `RBX::Network::versionB` without relying on the older source tree. `initWithCloudEditSecurity` @ **0x106d750b2** first assigns the empty string, appends `"^"` @ **0x106d750d8**, and pushes decimal `17` @ **0x106d750e9**. The resulting byte string is exactly:
+
+```
+5e 11
+```
+
+`Network::Server::setupToReceiveStudioClients` calls that initializer @ **0x10687cdcb**, reads the resulting pointer and length, and passes both to the RakPeer incoming-password virtual call. On the client side, `RakNetClientConnection::connect` reads the same global string and passes its pointer/length to RakPeer `Connect` @ **0x106724dc3**.
+
+Finally, `RakPeer::sendApplicationConnectionRequest` writes ID `0x09`, GUID, `GetTime`, and the false security byte, then appends the requested-connection password from `a2+58` with its length at `a2+314` @ **0x1039d00f3–0x1039d0103**. The Cloud Edit application payload is therefore byte-exact:
+
+```
+09 || GUID_BE || GetTime(false)_BE || 00 || 5e 11
+```
+
+The password belongs inside the encrypted reliable application payload; it does not alter the clear RUPP prefix or SessionCrypto trailer. With the previously observed 31-byte prefix and otherwise identical framing, adding these two bytes raises the initial UDP payload from 77 to 79 bytes.
+
 ---
 
 ### What remains outside the decompile export

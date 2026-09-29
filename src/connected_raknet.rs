@@ -27,6 +27,10 @@ const SESSION_AEAD_OVERHEAD: usize = 18;
 const INITIAL_RAK_NONCE_COUNTER: u64 = 0x754e_6575_7169_6e55;
 const ID_CONNECTION_REQUEST: u8 = 0x09;
 const ID_CONNECTION_REQUEST_ACCEPTED: u8 = 0x10;
+// Current Cloud Edit initializes RBX::Network::versionB to the two password
+// bytes `'^'` and 17. RakNetClientConnection passes that string to Connect,
+// and sendApplicationConnectionRequest appends it after the security byte.
+const CLOUD_EDIT_CONNECTION_PASSWORD: [u8; 2] = [b'^', 17];
 const RUPP_PROTOCOL_RAKNET: u8 = 1;
 const RUPP_TLV_TOKEN: u8 = 1;
 const RUPP_TOKEN_VALUE_LENGTH: usize = 17;
@@ -342,11 +346,12 @@ fn raknet_time_ms() -> u64 {
 
 fn connection_request_payload(client_guid: u64) -> (Vec<u8>, u64) {
     let request_time = raknet_time_ms();
-    let mut payload = Vec::with_capacity(18);
+    let mut payload = Vec::with_capacity(18 + CLOUD_EDIT_CONNECTION_PASSWORD.len());
     payload.push(ID_CONNECTION_REQUEST);
     payload.extend_from_slice(&client_guid.to_be_bytes());
     payload.extend_from_slice(&request_time.to_be_bytes());
-    payload.push(0); // no security/password challenge
+    payload.push(0); // RakNet security/challenge flag is disabled.
+    payload.extend_from_slice(&CLOUD_EDIT_CONNECTION_PASSWORD);
     (payload, request_time)
 }
 
@@ -906,7 +911,7 @@ fn format_request_wire_trace(
         .map(hex_bytes)
         .unwrap_or_else(|| "<truncated>".into());
     format!(
-        "wire trace: local {}, destination {peer}, capabilities 0x{common_capabilities:016x}, features(timestamp {}, avoided-size field {}, join-data bit {}, resent bit {}), RUPP {{{}}}, RUPP hex (token bytes redacted) [{}], data header ({data_header_len} bytes) [{data_header}], reliable header ({reliability_header_len} bytes) [{reliability_header}], complete plaintext ({} bytes, padding {}) [{}], encrypted region {} bytes, nonce suffix [{}], final UDP payload {} bytes, request time {request_time}, connection password length 0",
+        "wire trace: local {}, destination {peer}, capabilities 0x{common_capabilities:016x}, features(timestamp {}, avoided-size field {}, join-data bit {}, resent bit {}), RUPP {{{}}}, RUPP hex (token bytes redacted) [{}], data header ({data_header_len} bytes) [{data_header}], reliable header ({reliability_header_len} bytes) [{reliability_header}], complete plaintext ({} bytes, padding {}) [{}], encrypted region {} bytes, nonce suffix [{}], final UDP payload {} bytes, request time {request_time}, connection password length {}",
         local.map(|address| address.to_string()).unwrap_or_else(|| "unknown".into()),
         features.include_timestamp,
         features.avoid_packet_size,
@@ -920,6 +925,7 @@ fn format_request_wire_trace(
         trace.encrypted_region_bytes,
         hex_bytes(&trace.nonce_suffix),
         trace.wire_bytes,
+        CLOUD_EDIT_CONNECTION_PASSWORD.len(),
     )
 }
 
@@ -1259,6 +1265,19 @@ pub(crate) fn establish_connected_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_request_appends_current_cloud_edit_password() {
+        let guid = 0x0102_0304_0506_0708;
+        let (payload, request_time) = connection_request_payload(guid);
+
+        assert_eq!(payload.len(), 20);
+        assert_eq!(payload[0], ID_CONNECTION_REQUEST);
+        assert_eq!(&payload[1..9], &guid.to_be_bytes());
+        assert_eq!(&payload[9..17], &request_time.to_be_bytes());
+        assert_eq!(payload[17], 0);
+        assert_eq!(&payload[18..], &[0x5e, 0x11]);
+    }
 
     #[test]
     fn connected_crypto_starts_with_native_unique_number_nonce() {

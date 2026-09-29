@@ -53,7 +53,9 @@ FOLLOW_UP_CONTENT_RE = re.compile(
     rb"(?:"
     rb"RBX::Network::versionB|"
     rb"initWithCloudEditSecurity|initWithPlayerSecurity|initWithoutSecurity|"
-    rb"Name:[^\r\n]*(?:Network::setVersion|Time[^\r\n]*(?:now|getStart|getTickCount))|"
+    rb"RakNet::GetTime|RBX::nowPrecise|RBX::tick_resolution|"
+    rb"Name:[^\r\n]*(?:Network::setVersion|nowPrecise|tick_resolution|"
+    rb"Time[^\r\n]*(?:now|getStart|getTickCount))|"
     rb"Name:[^\r\n]*__ZN3RBX4Time[^\r\n]*(?:3now|8getStart|12getTickCount)"
     rb")",
     re.IGNORECASE,
