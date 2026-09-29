@@ -1,10 +1,13 @@
-//! Byte-exact codecs for Roblox's customized 2022 RakNet reliability layer.
+//! Byte-exact codecs for Roblox's customized RakNet reliability layer.
 //!
-//! The layouts are taken from the uploaded `DatagramHeaderFormat.c`,
-//! `ReliabilityLayer::CreateInternalPacketFromBitStream`,
-//! `WriteToBitStreamFromInternalPacket`, and `BitStream.c` bodies. This module
-//! is deliberately transport-only: callers must run SessionCrypto first when
-//! RakNet encryption is negotiated, then pass the decrypted bytes here.
+//! The layouts were originally recovered from the uploaded 2022
+//! `DatagramHeaderFormat.c`, `ReliabilityLayer::CreateInternalPacketFromBitStream`,
+//! `WriteToBitStreamFromInternalPacket`, and `BitStream.c` bodies. They have
+//! now been re-audited against the matching 0.735 functions; both current
+//! congestion implementations omit datagram timestamps, while current
+//! negotiated capability bits select the optional header fields. This module
+//! is deliberately transport-only: callers run SessionCrypto first and pass
+//! the decrypted bytes here.
 
 use crate::network_codec::{CodecError, Result};
 
@@ -17,7 +20,8 @@ const MAX_SPLIT_PACKET_COUNT: u32 = 500_000;
 pub struct DatagramFeatures {
     /// Congestion manager's `includeTimestampWithDatagrams()` result.
     pub include_timestamp: bool,
-    /// Capability 0x8000. Adds the u16 trailing-padding count.
+    /// Current 0.735 common-capability low-byte sign test. When enabled,
+    /// DatagramHeaderFormat adds the u16 trailing-padding count.
     pub avoid_packet_size: bool,
     /// Capability 0x200000. Adds the data-datagram JoinData bit.
     pub join_data_bit: bool,

@@ -13,9 +13,12 @@
 //!   the same UDP socket by authenticated and encrypted
 //!   `RbxOpenRequest2`/`RbxOpenReply2`.
 //!
-//! Connected RakNet reliability and JoinData → live change-item application
-//! make up the rest of the Stage 1 engine.
+//! The same probe now continues through normal SessionCrypto, reliable
+//! `ID_CONNECTION_REQUEST`, encrypted ACK/NAK handling, and
+//! `ID_CONNECTION_REQUEST_ACCEPTED`. JoinData → live change-item application
+//! remains the next Stage 1 layer.
 
+use crate::connected_raknet::{establish_connected_session, ConnectedConfig};
 use blake2::{
     digest::{consts::U32, Mac},
     Blake2b512, Blake2bMac, Digest,
@@ -373,7 +376,9 @@ const IPV6_UDP_HEADER_BYTES: usize = 40;
 const EARLY_AEAD_OVERHEAD: usize = 28; // 12-byte nonce + 16-byte detached tag
 const RAK_PEER_CAPABILITIES_2022_BASE: u64 = 0x0000_0002_321e_7e1e;
 
-// Exact 2022 RUPP values from Rupp::{serialize,TokenTlv,Ipv4Tlv,Ipv6Tlv}.
+// Exact current RUPP values from Rupp::{serialize,TokenTlv,Ipv4Tlv,Ipv6Tlv}. 0.735
+// retains the same wire values used by the earlier transport implementation.
+
 const RUPP_PROTOCOL_RAKNET: u8 = 1;
 const RUPP_FLAG_DIRECT_SERVER_RETURN: u8 = 1;
 const RUPP_TLV_TOKEN: u8 = 1;
@@ -456,6 +461,47 @@ fn build_rupp_header(
     header.extend_from_slice(&header_len.to_be_bytes());
     header.extend_from_slice(&tlvs);
     Ok(header)
+}
+
+fn update_rupp_header_token(
+    header: &mut [u8],
+    token_type: u8,
+    token: [u8; 16],
+) -> Result<(), String> {
+    if header.len() < 4 || header[0] != RUPP_PROTOCOL_RAKNET {
+        return Err("cannot install refreshed token without an outbound RUPP header".into());
+    }
+    let header_len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+    if header_len != header.len() {
+        return Err(format!(
+            "outbound RUPP header length {header_len} does not match {} bytes",
+            header.len()
+        ));
+    }
+    let mut cursor = 4usize;
+    while cursor < header_len {
+        if cursor + 2 > header_len {
+            return Err("outbound RUPP header ends inside a TLV header".into());
+        }
+        let kind = header[cursor];
+        let length = usize::from(header[cursor + 1]);
+        cursor += 2;
+        if cursor + length > header_len {
+            return Err("outbound RUPP header has a truncated TLV".into());
+        }
+        if kind == RUPP_TLV_TOKEN {
+            if length != usize::from(RUPP_TOKEN_VALUE_LENGTH) {
+                return Err(format!(
+                    "outbound RUPP token TLV has length {length}, expected {RUPP_TOKEN_VALUE_LENGTH}"
+                ));
+            }
+            header[cursor] = token_type;
+            header[cursor + 1..cursor + 17].copy_from_slice(&token);
+            return Ok(());
+        }
+        cursor += length;
+    }
+    Err("outbound RUPP header has no token TLV".into())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -899,13 +945,20 @@ struct RbxOpenReply2 {
     selected_encryption: u8,
     binding_address: Endpoint,
     returned_rupp_token: Option<[u8; 16]>,
-    _session_server_to_client: [u8; 32],
-    _session_client_to_server: [u8; 32],
+    returned_rupp_token_type: Option<u8>,
+    session_server_to_client: [u8; 32],
+    session_client_to_server: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReceivedRuppToken {
+    token_type: u8,
+    value: [u8; 16],
 }
 
 fn strip_optional_rupp_prefix(
     packet: &[u8],
-) -> Result<(&[u8], usize, Option<[u8; 16]>), String> {
+) -> Result<(&[u8], usize, Option<ReceivedRuppToken>), String> {
     if packet.first() != Some(&RUPP_PROTOCOL_RAKNET) {
         return Ok((packet, 0, None));
     }
@@ -942,7 +995,10 @@ fn strip_optional_rupp_prefix(
                     "RUPP response token TLV has length {tlv_len}, expected {RUPP_TOKEN_VALUE_LENGTH}"
                 ));
             }
-            returned_token = Some(value[1..17].try_into().unwrap());
+            returned_token = Some(ReceivedRuppToken {
+                token_type: value[0],
+                value: value[1..17].try_into().unwrap(),
+            });
         }
         cursor += tlv_len;
     }
@@ -1124,13 +1180,14 @@ fn parse_rbx_open_reply2(
         ));
     }
     let returned_rupp_token = match (rupp_returned_token, inline_returned_token) {
-        (Some(outer), Some(inline)) if outer != inline => {
+        (Some(outer), Some(inline)) if outer.value != inline => {
             return Err("RbxOpenReply2 outer and inline RUPP tokens disagree".into());
         }
-        (Some(outer), _) => Some(outer),
+        (Some(outer), _) => Some(outer.value),
         (_, Some(inline)) => Some(inline),
         (None, None) => None,
     };
+    let returned_rupp_token_type = rupp_returned_token.map(|token| token.token_type);
     if mtu < 576 {
         return Err(format!("RbxOpenReply2 returned invalid MTU {mtu}"));
     }
@@ -1152,8 +1209,9 @@ fn parse_rbx_open_reply2(
         selected_encryption,
         binding_address,
         returned_rupp_token,
-        _session_server_to_client: session_server_to_client,
-        _session_client_to_server: session_client_to_server,
+        returned_rupp_token_type,
+        session_server_to_client,
+        session_client_to_server,
     })
 }
 
@@ -1336,7 +1394,7 @@ fn probe_endpoint_with_rupp(
         }
     }
 
-    let Some((socket, reply1, from, selected_prefix, selected_token_type)) = accepted else {
+    let Some((socket, reply1, from, mut selected_prefix, selected_token_type)) = accepted else {
         if !invalid_replies.is_empty() {
             return Err(format!(
                 "{target}: received UDP after {sent} probes, but no valid 2022 RbxOpenReply1 ({})",
@@ -1429,7 +1487,7 @@ fn probe_endpoint_with_rupp(
                             2 => "AES-256-GCM",
                             _ => unreachable!(),
                         };
-                        return Ok(format!(
+                        let open_reply_summary = format!(
                             "{target}: ✅ {request1_summary}\n✅ RbxOpenReply2 — {length} bytes from {reply_from}, version {}, server GUID {:016x}, MTU {}, encryption {encryption}, binding {}, capabilities 0x{:016x}, session keys derived{}, handshake elapsed {} ms",
                             reply2.version,
                             reply2.server_guid,
@@ -1442,7 +1500,61 @@ fn probe_endpoint_with_rupp(
                                 ""
                             },
                             started.elapsed().as_millis()
-                        ));
+                        );
+                        if reply2.selected_encryption != 1 {
+                            return Err(format!(
+                                "{open_reply_summary}\nConnected RakNet currently requires negotiated ChaCha20-Poly1305, not {encryption}"
+                            ));
+                        }
+                        if let Some(token) = reply2.returned_rupp_token {
+                            let token_type = reply2.returned_rupp_token_type.ok_or_else(|| {
+                                "current connected RakNet requires the refreshed token's outer RUPP subtype"
+                                    .to_string()
+                            })?;
+                            update_rupp_header_token(&mut selected_prefix, token_type, token)?;
+                        }
+                        let common_capabilities =
+                            reply2.server_capabilities & RAK_PEER_CAPABILITIES_2022_BASE;
+                        match establish_connected_session(
+                            &socket,
+                            reply_from,
+                            ConnectedConfig {
+                                client_guid: crypto.client_guid,
+                                mtu: reply2.mtu,
+                                common_capabilities,
+                                session_server_to_client: reply2.session_server_to_client,
+                                session_client_to_server: reply2.session_client_to_server,
+                                rupp_prefix: selected_prefix.clone(),
+                                timeout_ms,
+                            },
+                        ) {
+                            Ok(accepted) => {
+                                return Ok(format!(
+                                    "{open_reply_summary}\n✅ ID_CONNECTION_REQUEST_ACCEPTED — {} bytes from {}, datagram {}, {:?}, client address {}, system index {}, {} internal addresses, request time {}, server time {}, server epoch {} µs, request ACKed {}, retransmissions {}, RUPP refreshes {}, session nonces tx/rx {}/{}, connected in {} ms",
+                                    accepted.wire_bytes,
+                                    accepted.source,
+                                    accepted.datagram_number,
+                                    accepted.reliability,
+                                    accepted.client_address,
+                                    accepted.system_index,
+                                    accepted.internal_address_count,
+                                    accepted.request_time,
+                                    accepted.server_time,
+                                    accepted.server_epoch_time_us,
+                                    accepted.request_acked,
+                                    accepted.retransmissions,
+                                    accepted.refreshed_rupp_tokens,
+                                    accepted.tx_nonce,
+                                    accepted.rx_nonce,
+                                    accepted.elapsed_ms
+                                ));
+                            }
+                            Err(reason) => {
+                                return Err(format!(
+                                    "{open_reply_summary}\nConnected RakNet failed after authenticated OpenReply2: {reason}"
+                                ));
+                            }
+                        }
                     }
                     Err(reason) => request2_replies.push(format!(
                         "{length} bytes from {reply_from}: {reason}"
@@ -1950,11 +2062,11 @@ mod tests {
             0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
         ]));
         assert_eq!(
-            reply._session_server_to_client.as_slice(),
+            reply.session_server_to_client.as_slice(),
             hex_fixture("649940507f84e6ae006913e4ca1d7595094a7555162fba87f2c8f37383c736ef")
         );
         assert_eq!(
-            reply._session_client_to_server.as_slice(),
+            reply.session_client_to_server.as_slice(),
             hex_fixture("771b077ce6ed993d92009e89ce7c956a76fdb1d319e1560f28fd3d48aeaf18e9")
         );
     }
@@ -1978,7 +2090,7 @@ mod tests {
         // and authenticated, then encrypts the remaining 35 body bytes plus
         // its reserved 28-byte zero tail. That is the observed header 58 / wire
         // 63 combination in a 158-byte routed datagram.
-        let mut rupp = vec![RUPP_PROTOCOL_RAKNET, 0, 0, 23, RUPP_TLV_TOKEN, 17, 1];
+        let mut rupp = vec![RUPP_PROTOCOL_RAKNET, 0, 0, 23, RUPP_TLV_TOKEN, 17, 2];
         rupp.extend_from_slice(&[0xa5; 16]);
         assert_eq!(rupp.len(), 23);
 
@@ -2031,6 +2143,7 @@ mod tests {
             }
         );
         assert_eq!(reply.returned_rupp_token, Some([0xa5; 16]));
+        assert_eq!(reply.returned_rupp_token_type, Some(2));
     }
 
     #[test]
