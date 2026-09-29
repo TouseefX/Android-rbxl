@@ -1500,6 +1500,7 @@ fn probe_endpoint_with_rupp(
                                 rupp_prefix: selected_prefix.clone(),
                                 deferred_reply2_rupp_token_type:
                                     reply2.returned_rupp_token_type,
+                                deferred_reply2_rupp_token: reply2.returned_rupp_token,
                                 timeout_ms,
                             },
                         ) {

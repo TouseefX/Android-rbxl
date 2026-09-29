@@ -51,8 +51,10 @@ pub(crate) struct ConnectedConfig {
     /// outer RUPP header. Native RakPeer does not install that offline token
     /// into the newly assigned remote; it starts online traffic with the
     /// default subtype-1 header and accepts a token update only after the
-    /// online packet resolves that active remote.
+    /// online packet resolves that active remote. Retain the advertised value
+    /// solely for the post-native online route diagnostic.
     pub deferred_reply2_rupp_token_type: Option<u8>,
+    pub deferred_reply2_rupp_token: Option<[u8; 16]>,
     pub timeout_ms: u64,
 }
 
@@ -281,6 +283,18 @@ fn update_outbound_rupp_token(
         cursor += length;
     }
     Err("outbound RUPP header has no token TLV to refresh".into())
+}
+
+fn diagnostic_reply2_rupp_prefix(config: &ConnectedConfig) -> Result<Option<Vec<u8>>, String> {
+    let (Some(token_type), Some(value)) = (
+        config.deferred_reply2_rupp_token_type,
+        config.deferred_reply2_rupp_token,
+    ) else {
+        return Ok(None);
+    };
+    let mut prefix = config.rupp_prefix.clone();
+    update_outbound_rupp_token(&mut prefix, ReceivedRuppToken { token_type, value })?;
+    Ok(Some(prefix))
 }
 
 fn send_plain_datagram(
@@ -925,6 +939,13 @@ pub(crate) fn establish_connected_session(
         config.session_client_to_server,
     );
     let (request_payload, request_time) = connection_request_payload(config.client_guid);
+    // Keep native subtype-1 traffic first. These alternatives are emitted
+    // only after several unanswered native retransmissions, so they diagnose
+    // whether UDMUX retained flow affinity or requires Reply2's outer token
+    // without replacing the audited initial behavior.
+    let diagnostic_reply2_prefix = diagnostic_reply2_rupp_prefix(&config)?;
+    let mut route_diagnostics_sent = false;
+    let mut route_diagnostic_count = 0usize;
     let mut next_datagram_number = 0u32;
     let reliable_message_number = 0u32;
     let mut sent_datagrams = Vec::new();
@@ -956,7 +977,7 @@ pub(crate) fn establish_connected_session(
         request_time,
     );
     send_traces.push(format!(
-        "datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
+        "native subtype-1 datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
         first_send.wire_bytes,
         first_send.extra_padding,
         hex_bytes(&first_send.nonce_suffix)
@@ -999,7 +1020,7 @@ pub(crate) fn establish_connected_session(
             )?;
             last_wire_bytes = retransmit.wire_bytes;
             send_traces.push(format!(
-                "datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
+                "native subtype-1 datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
                 retransmit.wire_bytes,
                 retransmit.extra_padding,
                 hex_bytes(&retransmit.nonce_suffix)
@@ -1007,6 +1028,66 @@ pub(crate) fn establish_connected_session(
             sent_datagrams.push(next_datagram_number);
             next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
             retransmissions += 1;
+
+            // A bare encrypted online datagram and a datagram routed with the
+            // outer token advertised by Reply2 are both valid online packet
+            // forms. Send each once only after three unanswered native
+            // subtype-1 retransmissions. Any ACK from either distinguishes a
+            // route-lifecycle mismatch from SessionCrypto/datagram rejection;
+            // neither diagnostic changes the retained native outbound header.
+            if retransmissions == 3 && !route_diagnostics_sent {
+                route_diagnostics_sent = true;
+                if let Some(prefix) = diagnostic_reply2_prefix.as_deref() {
+                    let diagnostic = send_connection_request(
+                        socket,
+                        peer,
+                        prefix,
+                        &mut crypto,
+                        features,
+                        config.mtu,
+                        next_datagram_number,
+                        reliable_message_number,
+                        &request_payload,
+                        true,
+                        0,
+                    )?;
+                    last_wire_bytes = diagnostic.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic Reply2-token datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
+                        diagnostic.wire_bytes,
+                        diagnostic.extra_padding,
+                        hex_bytes(&diagnostic.nonce_suffix)
+                    ));
+                    sent_datagrams.push(next_datagram_number);
+                    next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
+                    route_diagnostic_count += 1;
+                }
+
+                let diagnostic = send_connection_request(
+                    socket,
+                    peer,
+                    &[],
+                    &mut crypto,
+                    features,
+                    config.mtu,
+                    next_datagram_number,
+                    reliable_message_number,
+                    &request_payload,
+                    true,
+                    0,
+                )?;
+                last_wire_bytes = diagnostic.wire_bytes;
+                send_traces.push(format!(
+                    "online diagnostic flow-affinity datagram {next_datagram_number} (no RUPP), {} bytes, padding {}, nonce suffix [{}]",
+                    diagnostic.wire_bytes,
+                    diagnostic.extra_padding,
+                    hex_bytes(&diagnostic.nonce_suffix)
+                ));
+                sent_datagrams.push(next_datagram_number);
+                next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
+                route_diagnostic_count += 1;
+            }
+
             rto = (rto * 2).min(Duration::from_millis(MAX_RTO_MS));
             next_retransmit = Instant::now() + rto;
         }
@@ -1156,9 +1237,11 @@ pub(crate) fn establish_connected_session(
     };
     let route_state = match config.deferred_reply2_rupp_token_type {
         Some(token_type) => format!(
-            "native-matched route state: the initial subtype-1 GameService token remained on outbound online packets; OpenReply2 advertised outer token subtype {token_type}, whose installation is deferred until an online packet resolves the active remote"
+            "native-matched route state: the initial subtype-1 GameService token remained on normal outbound online packets; OpenReply2 advertised outer token subtype {token_type}, whose installation is deferred until an online packet resolves the active remote; after native retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response"
         ),
-        None => "native-matched route state: the initial GameService token remained on outbound online packets; OpenReply2 advertised no outer token update".to_string(),
+        None => format!(
+            "native-matched route state: the initial GameService token remained on normal outbound online packets; OpenReply2 advertised no outer token update; after native retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response"
+        ),
     };
     Err(format!(
         "sent {last_wire_bytes}-byte encrypted reliable ID_CONNECTION_REQUEST in {} datagram(s), but no ID_CONNECTION_REQUEST_ACCEPTED arrived in {} ms (request ACKed: {request_acked}, tx nonce {}, rx nonce {}){detail}; sends: {}; {first_wire_trace}; {route_state}",
