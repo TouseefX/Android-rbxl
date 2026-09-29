@@ -1875,6 +1875,13 @@ ui.label("Place ID:");
                     });
 
                     if !self.team_create_response.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Handshake Output").strong());
+                            if ui.button("📋 Copy Output").clicked() {
+                                jni_bridge::trigger_copy_to_clipboard(&self.team_create_response);
+                                self.status = "Copied Team Create output to Android clipboard".into();
+                            }
+                        });
                         egui::ScrollArea::vertical()
                             .id_salt("team_create_response_scroll")
                             .max_height(120.0)
