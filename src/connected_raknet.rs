@@ -774,6 +774,38 @@ fn hex_bytes(bytes: &[u8]) -> String {
     output
 }
 
+fn redacted_rupp_hex(prefix: &[u8]) -> String {
+    let mut redacted = vec![false; prefix.len()];
+    let mut cursor = 4usize;
+    while cursor + 2 <= prefix.len() {
+        let kind = prefix[cursor];
+        let length = usize::from(prefix[cursor + 1]);
+        cursor += 2;
+        let Some(end) = cursor.checked_add(length).filter(|end| *end <= prefix.len()) else {
+            break;
+        };
+        if kind == RUPP_TLV_TOKEN && length == RUPP_TOKEN_VALUE_LENGTH {
+            // Preserve the subtype byte but never copy the refreshed routing
+            // credential into screenshots, logs, or issue reports.
+            redacted[cursor + 1..end].fill(true);
+        }
+        cursor = end;
+    }
+
+    let mut output = String::with_capacity(prefix.len() * 3);
+    for (index, byte) in prefix.iter().enumerate() {
+        if index != 0 {
+            output.push(' ');
+        }
+        if redacted[index] {
+            output.push_str("**");
+        } else {
+            let _ = write!(output, "{byte:02x}");
+        }
+    }
+    output
+}
+
 fn describe_rupp_prefix(prefix: &[u8]) -> String {
     if prefix.len() < 4 {
         return format!("truncated {}-byte prefix", prefix.len());
@@ -844,14 +876,14 @@ fn format_request_wire_trace(
         .map(hex_bytes)
         .unwrap_or_else(|| "<truncated>".into());
     format!(
-        "wire trace: local {}, destination {peer}, capabilities 0x{common_capabilities:016x}, features(timestamp {}, avoided-size field {}, join-data bit {}, resent bit {}), RUPP {{{}}}, RUPP hex [{}], data header ({data_header_len} bytes) [{data_header}], reliable header ({reliability_header_len} bytes) [{reliability_header}], complete plaintext ({} bytes, padding {}) [{}], encrypted region {} bytes, nonce suffix [{}], final UDP payload {} bytes, request time {request_time}, connection password length 0",
+        "wire trace: local {}, destination {peer}, capabilities 0x{common_capabilities:016x}, features(timestamp {}, avoided-size field {}, join-data bit {}, resent bit {}), RUPP {{{}}}, RUPP hex (token bytes redacted) [{}], data header ({data_header_len} bytes) [{data_header}], reliable header ({reliability_header_len} bytes) [{reliability_header}], complete plaintext ({} bytes, padding {}) [{}], encrypted region {} bytes, nonce suffix [{}], final UDP payload {} bytes, request time {request_time}, connection password length 0",
         local.map(|address| address.to_string()).unwrap_or_else(|| "unknown".into()),
         features.include_timestamp,
         features.avoid_packet_size,
         features.join_data_bit,
         features.resent_bit,
         describe_rupp_prefix(prefix),
-        hex_bytes(prefix),
+        redacted_rupp_hex(prefix),
         trace.plaintext.len(),
         trace.extra_padding,
         hex_bytes(&trace.plaintext),
@@ -1242,6 +1274,17 @@ mod tests {
         assert_eq!(prefix[6], 2);
         assert_eq!(&prefix[7..23], &[0x22; 16]);
         assert_eq!(&prefix[23..], endpoint);
+    }
+
+    #[test]
+    fn wire_diagnostics_redact_refreshed_rupp_token() {
+        let mut prefix = vec![1, 0, 0, 31, 1, 17, 2];
+        prefix.extend_from_slice(&[0x22; 16]);
+        prefix.extend_from_slice(&[2, 6, 10, 0, 0, 1, 0x1f, 0x90]);
+        let diagnostic = redacted_rupp_hex(&prefix);
+        assert!(diagnostic.starts_with("01 00 00 1f 01 11 02 ** **"));
+        assert!(diagnostic.ends_with("02 06 0a 00 00 01 1f 90"));
+        assert!(!diagnostic.contains("22 22"));
     }
 
     #[test]
