@@ -60,6 +60,14 @@ impl SessionCipher {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DiagnosticSessionKeyCandidate {
+    pub label: &'static str,
+    pub server_to_client: [u8; 32],
+    pub client_to_server: [u8; 32],
+    pub cipher: SessionCipher,
+}
+
 pub(crate) struct ConnectedConfig {
     pub client_guid: u64,
     pub mtu: u16,
@@ -72,6 +80,7 @@ pub(crate) struct ConnectedConfig {
     /// both orientations are late diagnostics rather than native defaults.
     pub sha512_session_first_half: [u8; 32],
     pub sha512_session_second_half: [u8; 32],
+    pub diagnostic_session_key_candidates: Vec<DiagnosticSessionKeyCandidate>,
     pub rupp_prefix: Vec<u8>,
     /// Current OpenReply2 can carry the server's subtype-2 route token in its
     /// outer RUPP header. Native RakPeer does not install that offline token
@@ -130,6 +139,11 @@ struct SessionCrypto {
     cipher: SessionCipher,
     tx_nonce: u64,
     rx_nonce: u64,
+}
+
+struct DiagnosticCryptoPath {
+    label: &'static str,
+    crypto: SessionCrypto,
 }
 
 impl SessionCrypto {
@@ -1135,6 +1149,18 @@ pub(crate) fn establish_connected_session(
         config.sha512_session_first_half,
         SessionCipher::Aes256Gcm,
     );
+    let diagnostic_key_candidates = config.diagnostic_session_key_candidates.clone();
+    let mut diagnostic_crypto_paths: Vec<DiagnosticCryptoPath> = diagnostic_key_candidates
+        .iter()
+        .map(|candidate| DiagnosticCryptoPath {
+            label: candidate.label,
+            crypto: SessionCrypto::new(
+                candidate.server_to_client,
+                candidate.client_to_server,
+                candidate.cipher,
+            ),
+        })
+        .collect();
     let (request_payload, request_time) = connection_request_payload(config.client_guid);
     // Keep native subtype-1 traffic first. These alternatives are emitted
     // only after several unanswered native retransmissions. Preserve the
@@ -1151,6 +1177,7 @@ pub(crate) fn establish_connected_session(
     let mut established_matrix_count = 0usize;
     let mut fresh_first_matrix_count = 0usize;
     let mut aes_cipher_matrix_count = 0usize;
+    let mut seeded_kdf_matrix_count = 0usize;
     let mut next_datagram_number = 0u32;
     let reliable_message_number = 0u32;
     let mut sent_datagrams = Vec::new();
@@ -1625,6 +1652,58 @@ pub(crate) fn establish_connected_session(
                     }
                 }
 
+                if !diagnostic_key_candidates.is_empty() {
+                    if let Some(prefix) = diagnostic_original_flags_zero_prefix.as_deref() {
+                        for candidate in &diagnostic_key_candidates {
+                            let diagnostic = send_fresh_connection_request_candidate(
+                                socket,
+                                peer,
+                                prefix,
+                                candidate.server_to_client,
+                                candidate.client_to_server,
+                                candidate.cipher,
+                                features,
+                                config.mtu,
+                                &request_payload,
+                            )?;
+                            last_wire_bytes = diagnostic.wire_bytes;
+                            send_traces.push(format!(
+                                "online diagnostic fresh-first subtype-1/flags-0 RUPP + {} datagram 0, {} bytes, nonce suffix [{}]",
+                                candidate.label,
+                                diagnostic.wire_bytes,
+                                hex_bytes(&diagnostic.nonce_suffix)
+                            ));
+                            sent_datagrams.push(0);
+                            seeded_kdf_matrix_count += 1;
+                        }
+                    }
+
+                    if let Some(prefix) = diagnostic_established_prefix.as_deref() {
+                        for candidate in &diagnostic_key_candidates {
+                            let diagnostic = send_fresh_connection_request_candidate(
+                                socket,
+                                peer,
+                                prefix,
+                                candidate.server_to_client,
+                                candidate.client_to_server,
+                                candidate.cipher,
+                                features,
+                                config.mtu,
+                                &request_payload,
+                            )?;
+                            last_wire_bytes = diagnostic.wire_bytes;
+                            send_traces.push(format!(
+                                "online diagnostic fresh-first established subtype-2/flags-0 RUPP + {} datagram 0, {} bytes, nonce suffix [{}]",
+                                candidate.label,
+                                diagnostic.wire_bytes,
+                                hex_bytes(&diagnostic.nonce_suffix)
+                            ));
+                            sent_datagrams.push(0);
+                            seeded_kdf_matrix_count += 1;
+                        }
+                    }
+                }
+
                 if let Some(prefix) = diagnostic_exact_reply2_prefix.as_deref() {
                     let diagnostic = send_connection_request(
                         socket,
@@ -1755,24 +1834,52 @@ pub(crate) fn establish_connected_session(
             }
         }
         let (plaintext, crypto_path) = match crypto.decrypt(encrypted) {
-            Ok(value) => (value, 0u8),
+            Ok(value) => (value, 0usize),
             Err(blake_error) => match sha512_first_rx_crypto.decrypt(encrypted) {
-                Ok(value) => (value, 1u8),
+                Ok(value) => (value, 1usize),
                 Err(sha_first_rx_error) => match sha512_first_tx_crypto.decrypt(encrypted) {
-                    Ok(value) => (value, 2u8),
+                    Ok(value) => (value, 2usize),
                     Err(sha_first_tx_error) => match aes_blake_crypto.decrypt(encrypted) {
-                        Ok(value) => (value, 3u8),
+                        Ok(value) => (value, 3usize),
                         Err(aes_blake_error) => {
                             match aes_sha512_first_rx_crypto.decrypt(encrypted) {
-                                Ok(value) => (value, 4u8),
+                                Ok(value) => (value, 4usize),
                                 Err(aes_sha_first_rx_error) => {
                                     match aes_sha512_first_tx_crypto.decrypt(encrypted) {
-                                        Ok(value) => (value, 5u8),
+                                        Ok(value) => (value, 5usize),
                                         Err(aes_sha_first_tx_error) => {
-                                            errors.push(format!(
-                                                "connected RakNet authentication failed for all KDF/cipher candidates (negotiated BLAKE2b: {blake_error}; negotiated SHA-512 first-half RX: {sha_first_rx_error}; negotiated SHA-512 first-half TX: {sha_first_tx_error}; AES-GCM BLAKE2b: {aes_blake_error}; AES-GCM SHA-512 first-half RX: {aes_sha_first_rx_error}; AES-GCM SHA-512 first-half TX: {aes_sha_first_tx_error})"
-                                            ));
-                                            continue;
+                                            let mut diagnostic_errors = Vec::new();
+                                            let mut diagnostic_match = None;
+                                            for (index, path) in
+                                                diagnostic_crypto_paths.iter_mut().enumerate()
+                                            {
+                                                match path.crypto.decrypt(encrypted) {
+                                                    Ok(value) => {
+                                                        diagnostic_match = Some((value, 6 + index));
+                                                        break;
+                                                    }
+                                                    Err(error) => diagnostic_errors.push(format!(
+                                                        "{}: {error}",
+                                                        path.label
+                                                    )),
+                                                }
+                                            }
+                                            if let Some(value) = diagnostic_match {
+                                                value
+                                            } else {
+                                                let diagnostics = if diagnostic_errors.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!(
+                                                        "; seeded diagnostics: {}",
+                                                        diagnostic_errors.join("; ")
+                                                    )
+                                                };
+                                                errors.push(format!(
+                                                    "connected RakNet authentication failed for all KDF/cipher candidates (negotiated BLAKE2b: {blake_error}; negotiated SHA-512 first-half RX: {sha_first_rx_error}; negotiated SHA-512 first-half TX: {sha_first_tx_error}; AES-GCM BLAKE2b: {aes_blake_error}; AES-GCM SHA-512 first-half RX: {aes_sha_first_rx_error}; AES-GCM SHA-512 first-half TX: {aes_sha_first_tx_error}{diagnostics})"
+                                                ));
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
@@ -1857,6 +1964,15 @@ pub(crate) fn establish_connected_session(
                         config.mtu,
                         data.datagram_number,
                     )?,
+                    index if index >= 6 => send_ack(
+                        socket,
+                        peer,
+                        &config.rupp_prefix,
+                        &mut diagnostic_crypto_paths[index - 6].crypto,
+                        features,
+                        config.mtu,
+                        data.datagram_number,
+                    )?,
                     _ => unreachable!(),
                 }
                 let missing = datagram_tracker.observe(data.datagram_number);
@@ -1915,6 +2031,15 @@ pub(crate) fn establish_connected_session(
                         config.mtu,
                         missing,
                     )?,
+                    index if index >= 6 => send_nak(
+                        socket,
+                        peer,
+                        &config.rupp_prefix,
+                        &mut diagnostic_crypto_paths[index - 6].crypto,
+                        features,
+                        config.mtu,
+                        missing,
+                    )?,
                     _ => unreachable!(),
                 }
                 for packet in data.packets {
@@ -1969,6 +2094,10 @@ pub(crate) fn establish_connected_session(
                                 aes_sha512_first_tx_crypto.tx_nonce,
                                 aes_sha512_first_tx_crypto.rx_nonce,
                             ),
+                            index if index >= 6 => {
+                                let path = &diagnostic_crypto_paths[index - 6];
+                                (path.label, path.crypto.tx_nonce, path.crypto.rx_nonce)
+                            }
                             _ => unreachable!(),
                         };
                         return Ok(ConnectionAcceptedSummary {
@@ -2002,7 +2131,7 @@ pub(crate) fn establish_connected_session(
         format!("; receive diagnostics: {}", errors.join("; "))
     };
     let kdf_state = format!(
-        "current-build KDF/cipher state: negotiated connected cipher {}, {kdf_diagnostic_count} SHA-512 orientation diagnostic(s), {established_matrix_count} established-header/KDF matrix diagnostic(s), {fresh_first_matrix_count} fresh-first route/KDF diagnostic(s), and {aes_cipher_matrix_count} AES-GCM cipher-mapping diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation",
+        "current-build KDF/cipher state: negotiated connected cipher {}, {kdf_diagnostic_count} SHA-512 orientation diagnostic(s), {established_matrix_count} established-header/KDF matrix diagnostic(s), {fresh_first_matrix_count} fresh-first route/KDF diagnostic(s), {aes_cipher_matrix_count} AES-GCM cipher-mapping diagnostic(s), and {seeded_kdf_matrix_count} RandomSeed1 seeded-KDF diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation",
         config.session_cipher.label()
     );
     let route_state = match config.deferred_reply2_rupp_token_type {
@@ -2114,6 +2243,7 @@ mod tests {
             session_server_to_client: [0; 32],
             session_client_to_server: [0; 32],
             session_cipher: SessionCipher::ChaCha20Poly1305,
+            diagnostic_session_key_candidates: Vec::new(),
             sha512_session_first_half: [0; 32],
             sha512_session_second_half: [0; 32],
             rupp_prefix: client_prefix,
@@ -2145,6 +2275,7 @@ mod tests {
             session_server_to_client: [0; 32],
             session_client_to_server: [0; 32],
             session_cipher: SessionCipher::ChaCha20Poly1305,
+            diagnostic_session_key_candidates: Vec::new(),
             sha512_session_first_half: [0; 32],
             sha512_session_second_half: [0; 32],
             rupp_prefix: client_prefix,

@@ -19,7 +19,8 @@
 //! remains the next Stage 1 layer.
 
 use crate::connected_raknet::{
-    establish_connected_session, initialize_raknet_time, ConnectedConfig, SessionCipher,
+    establish_connected_session, initialize_raknet_time, ConnectedConfig,
+    DiagnosticSessionKeyCandidate, SessionCipher,
 };
 use blake2::{
     digest::{consts::U32, Mac},
@@ -498,6 +499,7 @@ struct Request2Material {
     early_key_hashes_job_id: bool,
     early_key_uses_ephemeral_override: bool,
     server_early_public_key: [u8; 32],
+    normal_session_seed: Option<Vec<u8>>,
     auth: EarlyAuthData,
 }
 
@@ -721,6 +723,10 @@ fn extract_request2_material_with_revert(
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| "join config has no ClientTicket for early authentication".to_string())?;
     let auth = parse_early_auth_data(&client_ticket)?;
+    let normal_session_seed = find_field_ci(config, "RandomSeed1", 0)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .and_then(|text| decode_base64(&text))
+        .filter(|bytes| !bytes.is_empty() && bytes.len() <= 1024);
     Ok(Request2Material {
         early_key_version: early_key.version,
         early_key_send_version: early_key.send_version,
@@ -729,6 +735,7 @@ fn extract_request2_material_with_revert(
         early_key_hashes_job_id: early_key.hashes_job_id,
         early_key_uses_ephemeral_override: early_key.uses_ephemeral_override,
         server_early_public_key: early_key.bytes,
+        normal_session_seed,
         auth,
     })
 }
@@ -783,15 +790,35 @@ fn derive_client_session_keys_sha512(
     client_public: &[u8; 32],
     server_public: &[u8; 32],
 ) -> Result<([u8; 32], [u8; 32]), String> {
+    derive_client_session_keys_sha512_with_seed(client_secret, client_public, server_public, None, false)
+}
+
+fn derive_client_session_keys_sha512_with_seed(
+    client_secret: &StaticSecret,
+    client_public: &[u8; 32],
+    server_public: &[u8; 32],
+    seed: Option<&[u8]>,
+    seed_first: bool,
+) -> Result<([u8; 32], [u8; 32]), String> {
     let server_public = PublicKey::from(*server_public);
     let shared = client_secret.diffie_hellman(&server_public);
     if shared.as_bytes().iter().all(|byte| *byte == 0) {
         return Err("X25519 peer public key produced the forbidden all-zero secret".into());
     }
     let mut hash = Sha512::new();
+    if seed_first {
+        if let Some(seed) = seed {
+            hash.update(seed);
+        }
+    }
     hash.update(shared.as_bytes());
     hash.update(client_public);
     hash.update(server_public.as_bytes());
+    if !seed_first {
+        if let Some(seed) = seed {
+            hash.update(seed);
+        }
+    }
     let digest = hash.finalize();
     let mut first = [0u8; 32];
     let mut second = [0u8; 32];
@@ -962,6 +989,7 @@ struct RbxOpenReply2 {
     session_client_to_server: [u8; 32],
     sha512_session_first_half: [u8; 32],
     sha512_session_second_half: [u8; 32],
+    diagnostic_session_key_candidates: Vec<DiagnosticSessionKeyCandidate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1077,6 +1105,7 @@ fn describe_received_rupp_prefix(prefix: &[u8]) -> String {
 fn parse_rbx_open_reply2(
     packet: &[u8],
     crypto: &Request2Crypto,
+    normal_session_seed: Option<&[u8]>,
 ) -> Result<RbxOpenReply2, String> {
     let (packet, stripped_rupp_len, rupp_returned_token, returned_rupp_prefix) =
         strip_optional_rupp_prefix(packet)?;
@@ -1276,6 +1305,47 @@ fn parse_rbx_open_reply2(
             &crypto.client_public,
             &server_ephemeral_key,
         )?;
+    let mut diagnostic_session_key_candidates = Vec::new();
+    if let Some(seed) = normal_session_seed {
+        let (suffix_first, suffix_second) = derive_client_session_keys_sha512_with_seed(
+            &crypto.client_secret,
+            &crypto.client_public,
+            &server_ephemeral_key,
+            Some(seed),
+            false,
+        )?;
+        diagnostic_session_key_candidates.push(DiagnosticSessionKeyCandidate {
+            label: "RandomSeed1 SHA-512 suffix first-half RX + AES-GCM",
+            server_to_client: suffix_first,
+            client_to_server: suffix_second,
+            cipher: SessionCipher::Aes256Gcm,
+        });
+        diagnostic_session_key_candidates.push(DiagnosticSessionKeyCandidate {
+            label: "RandomSeed1 SHA-512 suffix first-half TX + AES-GCM",
+            server_to_client: suffix_second,
+            client_to_server: suffix_first,
+            cipher: SessionCipher::Aes256Gcm,
+        });
+        let (prefix_first, prefix_second) = derive_client_session_keys_sha512_with_seed(
+            &crypto.client_secret,
+            &crypto.client_public,
+            &server_ephemeral_key,
+            Some(seed),
+            true,
+        )?;
+        diagnostic_session_key_candidates.push(DiagnosticSessionKeyCandidate {
+            label: "RandomSeed1 SHA-512 prefix first-half RX + AES-GCM",
+            server_to_client: prefix_first,
+            client_to_server: prefix_second,
+            cipher: SessionCipher::Aes256Gcm,
+        });
+        diagnostic_session_key_candidates.push(DiagnosticSessionKeyCandidate {
+            label: "RandomSeed1 SHA-512 prefix first-half TX + AES-GCM",
+            server_to_client: prefix_second,
+            client_to_server: prefix_first,
+            cipher: SessionCipher::Aes256Gcm,
+        });
+    }
     Ok(RbxOpenReply2 {
         version,
         server_capabilities,
@@ -1290,6 +1360,7 @@ fn parse_rbx_open_reply2(
         session_client_to_server,
         sha512_session_first_half,
         sha512_session_second_half,
+        diagnostic_session_key_candidates,
     })
 }
 
@@ -1559,7 +1630,11 @@ fn probe_endpoint_with_rupp(
                 if parse_probe_reply(&buf[..length]).is_ok() {
                     continue;
                 }
-                match parse_rbx_open_reply2(&buf[..length], &crypto) {
+                match parse_rbx_open_reply2(
+                    &buf[..length],
+                    &crypto,
+                    request2_material.normal_session_seed.as_deref(),
+                ) {
                     Ok(reply2) => {
                         if reply2.server_guid != reply1.server_guid {
                             return Err(format!(
@@ -1614,6 +1689,8 @@ fn probe_endpoint_with_rupp(
                                 session_cipher,
                                 sha512_session_first_half: reply2.sha512_session_first_half,
                                 sha512_session_second_half: reply2.sha512_session_second_half,
+                                diagnostic_session_key_candidates:
+                                    reply2.diagnostic_session_key_candidates,
                                 rupp_prefix: selected_prefix.clone(),
                                 deferred_reply2_rupp_token_type:
                                     reply2.returned_rupp_token_type,
@@ -1738,7 +1815,7 @@ pub fn probe_join_config_with_key_ring_revert(
             .map(|value| format!("string({} chars)", value.len()))
             .unwrap_or_else(|| diagnostic_scalar(&seed));
         heading.push_str(&format!(
-            "\nCurrent normal-session seed metadata: RandomSeed1 {shape} (not applied to the proven 0.735 KX path)"
+            "\nCurrent normal-session seed metadata: RandomSeed1 {shape} (used only in bounded current-build seeded-KDF diagnostics when decodable; not applied to the proven 0.735 KX path)"
         ));
     }
     let request2 = extract_request2_material_with_revert(config, key_ring_revert);
@@ -2097,6 +2174,7 @@ mod tests {
             early_key_hashes_job_id: false,
             early_key_uses_ephemeral_override: false,
             server_early_public_key: server_public,
+            normal_session_seed: None,
             auth: EarlyAuthData {
                 auth_version: 6,
                 preauth_blob: (0u8..32).collect(),
@@ -2171,7 +2249,7 @@ mod tests {
             "0a69c266da84ffd556e697175654e756d62657256c133fd6fbb218b1fc0d4af68",
             "e1bf8c"
         ));
-        let reply = parse_rbx_open_reply2(&packet, &crypto).unwrap();
+        let reply = parse_rbx_open_reply2(&packet, &crypto, None).unwrap();
         assert_eq!(reply.version, 1);
         assert_eq!(reply.server_capabilities, RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR);
         assert_eq!(reply.server_guid, 0x1112_1314_1516_1718);
@@ -2259,7 +2337,7 @@ mod tests {
         packet.extend_from_slice(tag.as_slice());
         assert_eq!(packet.len(), 158);
 
-        let reply = parse_rbx_open_reply2(&packet, &crypto).unwrap();
+        let reply = parse_rbx_open_reply2(&packet, &crypto, None).unwrap();
         assert_eq!(reply.version, 1);
         assert_eq!(reply.server_guid, 0x1112_1314_1516_1718);
         assert_eq!(reply.mtu, 1200);
@@ -2293,7 +2371,7 @@ mod tests {
         let mut packet = vec![0x14];
         packet.extend_from_slice(&OFFLINE_MAGIC);
         packet.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
-        let error = parse_rbx_open_reply2(&packet, &crypto).unwrap_err();
+        let error = parse_rbx_open_reply2(&packet, &crypto, None).unwrap_err();
         assert!(error.contains("no free incoming connections"));
         assert!(error.contains("1112131415161718"));
     }
