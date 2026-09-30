@@ -19,7 +19,7 @@
 //! remains the next Stage 1 layer.
 
 use crate::connected_raknet::{
-    establish_connected_session, initialize_raknet_time, ConnectedConfig,
+    establish_connected_session, initialize_raknet_time, ConnectedConfig, SessionCipher,
 };
 use blake2::{
     digest::{consts::U32, Mac},
@@ -1567,11 +1567,12 @@ fn probe_endpoint_with_rupp(
                                 reply2.server_guid, reply1.server_guid
                             ));
                         }
-                        let encryption = match reply2.selected_encryption {
-                            1 => "ChaCha20-Poly1305",
-                            2 => "AES-256-GCM",
+                        let session_cipher = match reply2.selected_encryption {
+                            1 => SessionCipher::ChaCha20Poly1305,
+                            2 => SessionCipher::Aes256Gcm,
                             _ => unreachable!(),
                         };
+                        let encryption = session_cipher.label();
                         let open_reply_summary = format!(
                             "{target}: ✅ {request1_summary}\n✅ RbxOpenReply2 — {length} bytes from {reply_from}, version {}, server GUID {:016x}, MTU {}, encryption {encryption}, binding {}, capabilities 0x{:016x}, session keys derived{}, handshake elapsed {} ms",
                             reply2.version,
@@ -1589,11 +1590,6 @@ fn probe_endpoint_with_rupp(
                             },
                             started.elapsed().as_millis()
                         );
-                        if reply2.selected_encryption != 1 {
-                            return Err(format!(
-                                "{open_reply_summary}\nConnected RakNet currently requires negotiated ChaCha20-Poly1305, not {encryption}"
-                            ));
-                        }
                         // Current native RakPeer does not feed an offline
                         // OpenReply2's DeserializationResult into the RUPP
                         // token updater. It assigns the default subtype-1
@@ -1615,6 +1611,7 @@ fn probe_endpoint_with_rupp(
                                 common_capabilities,
                                 session_server_to_client: reply2.session_server_to_client,
                                 session_client_to_server: reply2.session_client_to_server,
+                                session_cipher,
                                 sha512_session_first_half: reply2.sha512_session_first_half,
                                 sha512_session_second_half: reply2.sha512_session_second_half,
                                 rupp_prefix: selected_prefix.clone(),

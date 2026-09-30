@@ -217,7 +217,22 @@ The authenticated offline path is still solid: routed Request1 received Reply1 f
 
 No connected ACK or `ID_CONNECTION_REQUEST_ACCEPTED` arrived for any candidate in that build: native subtype-1/BLAKE2b retries, original subtype-1 SHA-512 half orientations, established subtype-2/flags-0 endpoint-bearing BLAKE2b and SHA-512 half orientations, exact 23-byte Reply2 header, refreshed subtype-2 endpoint-bearing header, no-RUPP flow-affinity send, or one final native retry. This shifts suspicion away from UI delay, Request2 key selection, password, basic reliability encoding, and the specific 23-vs-31 Reply2-token gap.
 
-One important diagnostic caveat remains: the established-header/KDF matrix was emitted after several native retransmissions, so those matrix packets used later datagram numbers and later transmit nonce counters. If earlier packets were being dropped before the server's connected crypto consumed them, a valid alternate route/KDF could still require a fresh datagram-0 packet with the initial `UniqueNu` nonce. The implementation now adds a bounded fresh-first matrix for subtype-1/flags-0 and established subtype-2/flags-0 prefixes across BLAKE2b and both SHA-512 half orientations. A continued all-silent result from that build would make the concrete current-build RUPP token generator or matching-build key-installation path the next strongest boundary.
+One important diagnostic caveat remained: the established-header/KDF matrix was emitted after several native retransmissions, so those matrix packets used later datagram numbers and later transmit nonce counters. If earlier packets were being dropped before the server's connected crypto consumed them, a valid alternate route/KDF could still require a fresh datagram-0 packet with the initial `UniqueNu` nonce. Commit `8a67cb6` added a bounded fresh-first matrix for subtype-1/flags-0 and established subtype-2/flags-0 prefixes across BLAKE2b and both SHA-512 half orientations.
+
+### Fresh 0.740 no-delay live result after the fresh-first matrix
+
+A fresh no-UI-delay session against advertised RCC `0.740.487.7400001` authenticated the full offline path again. The safe metadata changed only in per-ticket values:
+
+- `TokenGenAlgorithm = 1`
+- `PepperId = 1790790878`
+- `RandomSeed1 = string(88 chars)`
+- public UDMUX `128.116.50.33:60356` routed to private RCC `10.20.3.206:60356`
+- Reply1 GUID `1962642e45076f7c`, MTU `1200`
+- Reply2 was 158 bytes, version 1, selected byte mapped by the legacy code to ChaCha20-Poly1305, capabilities `0x0000020350b70892`, and carried the same 23-byte token-only subtype-2 outer RUPP shape
+
+The connected request was still structurally correct: 31-byte subtype-1/private-RCC RUPP, data header `81 00 00 00`, reliable header `40 00 a0 00 00 00`, payload `09 || client_guid_be || request_time_be || 00 || 5e 11`, first nonce suffix `[55 6e]`, final UDP payload 79 bytes. No ACK or accept arrived for any of the 19 packets, including all six fresh-first datagram-0/initial-nonce route/KDF candidates. This rules out the specific delayed-datagram/advanced-nonce caveat.
+
+The next bounded diagnostic is cipher mapping rather than another reliability-layout change. The legacy 0.735 Reply2 byte interpretation selects ChaCha for value `1`, but an independent current-build packet corpus reports AES-256-GCM connected payloads with the same 18-byte SessionCrypto trailer. The implementation now keeps negotiated-cipher behavior native-first, supports selected AES-GCM if a server advertises it, and adds a late AES-GCM fresh-first matrix for subtype-1/flags-0 and established subtype-2/flags-0 RUPP prefixes across BLAKE2b and both SHA-512 half orientations. If that is also silent, the strongest remaining blockers are the concrete current-build RUPP token generator (`TokenGenAlgorithm=1`, `PepperId`) and matching-build normal-session key installation/epoch rekey evidence.
 
 ## 0.740 Windows Player recovery corrections
 
