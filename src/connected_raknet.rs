@@ -311,6 +311,26 @@ fn diagnostic_reply2_rupp_prefix(config: &ConnectedConfig) -> Result<Option<Vec<
     Ok(Some(prefix))
 }
 
+/// Build the established-session client shape measured in current captures:
+/// the Reply2 subtype-2 token and flags, plus the client's endpoint TLV. This
+/// differs from both exact Reply2 (23 bytes, no endpoint) and the 0.735 receive
+/// updater (31 bytes but retains the original subtype-1 header's flags).
+fn diagnostic_established_reply2_rupp_prefix(
+    config: &ConnectedConfig,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(mut prefix) = diagnostic_reply2_rupp_prefix(config)? else {
+        return Ok(None);
+    };
+    let Some(reply2_prefix) = config.deferred_reply2_rupp_prefix.as_deref() else {
+        return Ok(None);
+    };
+    if reply2_prefix.len() < 4 || reply2_prefix[0] != RUPP_PROTOCOL_RAKNET {
+        return Err("OpenReply2 exact RUPP header is unavailable for established-shape diagnostic".into());
+    }
+    prefix[1] = reply2_prefix[1];
+    Ok(Some(prefix))
+}
+
 fn send_plain_datagram(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -999,9 +1019,11 @@ pub(crate) fn establish_connected_session(
     // header); those are observably different routed packets.
     let diagnostic_exact_reply2_prefix = config.deferred_reply2_rupp_prefix.clone();
     let diagnostic_refreshed_prefix = diagnostic_reply2_rupp_prefix(&config)?;
+    let diagnostic_established_prefix = diagnostic_established_reply2_rupp_prefix(&config)?;
     let mut route_diagnostics_sent = false;
     let mut route_diagnostic_count = 0usize;
     let mut kdf_diagnostic_count = 0usize;
+    let mut established_matrix_count = 0usize;
     let mut next_datagram_number = 0u32;
     let reliable_message_number = 0u32;
     let mut sent_datagrams = Vec::new();
@@ -1142,6 +1164,82 @@ pub(crate) fn establish_connected_session(
                 sent_datagrams.push(next_datagram_number);
                 next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
                 kdf_diagnostic_count += 1;
+
+                // Current captures show the established client-to-server RUPP
+                // as 31 bytes with the subtype-2 token, client endpoint TLV,
+                // and Reply2's zero flags. Test that exact route shape across
+                // all evidence-backed normal-session KDF candidates so route
+                // and KDF changes cannot mask one another.
+                if let Some(prefix) = diagnostic_established_prefix.as_deref() {
+                    let current_blake = send_connection_request(
+                        socket,
+                        peer,
+                        prefix,
+                        &mut crypto,
+                        features,
+                        config.mtu,
+                        next_datagram_number,
+                        reliable_message_number,
+                        &request_payload,
+                        true,
+                        0,
+                    )?;
+                    last_wire_bytes = current_blake.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic established subtype-2/flags-0 RUPP + BLAKE2b datagram {next_datagram_number}, {} bytes, nonce suffix [{}]",
+                        current_blake.wire_bytes,
+                        hex_bytes(&current_blake.nonce_suffix)
+                    ));
+                    sent_datagrams.push(next_datagram_number);
+                    next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
+                    established_matrix_count += 1;
+
+                    let current_sha_first_rx = send_connection_request(
+                        socket,
+                        peer,
+                        prefix,
+                        &mut sha512_first_rx_crypto,
+                        features,
+                        config.mtu,
+                        next_datagram_number,
+                        reliable_message_number,
+                        &request_payload,
+                        true,
+                        0,
+                    )?;
+                    last_wire_bytes = current_sha_first_rx.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic established subtype-2/flags-0 RUPP + SHA-512 first-half RX datagram {next_datagram_number}, {} bytes, nonce suffix [{}]",
+                        current_sha_first_rx.wire_bytes,
+                        hex_bytes(&current_sha_first_rx.nonce_suffix)
+                    ));
+                    sent_datagrams.push(next_datagram_number);
+                    next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
+                    established_matrix_count += 1;
+
+                    let current_sha_first_tx = send_connection_request(
+                        socket,
+                        peer,
+                        prefix,
+                        &mut sha512_first_tx_crypto,
+                        features,
+                        config.mtu,
+                        next_datagram_number,
+                        reliable_message_number,
+                        &request_payload,
+                        true,
+                        0,
+                    )?;
+                    last_wire_bytes = current_sha_first_tx.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic established subtype-2/flags-0 RUPP + SHA-512 first-half TX datagram {next_datagram_number}, {} bytes, nonce suffix [{}]",
+                        current_sha_first_tx.wire_bytes,
+                        hex_bytes(&current_sha_first_tx.nonce_suffix)
+                    ));
+                    sent_datagrams.push(next_datagram_number);
+                    next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
+                    established_matrix_count += 1;
+                }
 
                 if let Some(prefix) = diagnostic_exact_reply2_prefix.as_deref() {
                     let diagnostic = send_connection_request(
@@ -1434,7 +1532,7 @@ pub(crate) fn establish_connected_session(
         format!("; receive diagnostics: {}", errors.join("; "))
     };
     let kdf_state = format!(
-        "current-build KDF state: {kdf_diagnostic_count} SHA-512 orientation diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation"
+        "current-build KDF state: {kdf_diagnostic_count} SHA-512 orientation diagnostic(s) and {established_matrix_count} established-header/KDF matrix diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation"
     );
     let route_state = match config.deferred_reply2_rupp_token_type {
         Some(token_type) => format!(
@@ -1524,6 +1622,38 @@ mod tests {
         assert_eq!(prefix[6], 2);
         assert_eq!(&prefix[7..23], &[0x22; 16]);
         assert_eq!(&prefix[23..], endpoint);
+    }
+
+    #[test]
+    fn established_reply2_diagnostic_combines_reply_flags_token_and_client_endpoint() {
+        let mut client_prefix = vec![1, 1, 0, 31, 1, 17, 1];
+        client_prefix.extend_from_slice(&[0x11; 16]);
+        let endpoint = [2, 6, 10, 0, 0, 1, 0x1f, 0x90];
+        client_prefix.extend_from_slice(&endpoint);
+        let mut reply_prefix = vec![1, 0, 0, 23, 1, 17, 2];
+        reply_prefix.extend_from_slice(&[0x22; 16]);
+        let config = ConnectedConfig {
+            client_guid: 1,
+            mtu: 1200,
+            common_capabilities: 0,
+            session_server_to_client: [0; 32],
+            session_client_to_server: [0; 32],
+            sha512_session_first_half: [0; 32],
+            sha512_session_second_half: [0; 32],
+            rupp_prefix: client_prefix,
+            deferred_reply2_rupp_token_type: Some(2),
+            deferred_reply2_rupp_token: Some([0x22; 16]),
+            deferred_reply2_rupp_prefix: Some(reply_prefix),
+            timeout_ms: 5_000,
+        };
+        let prefix = diagnostic_established_reply2_rupp_prefix(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.len(), 31);
+        assert_eq!(prefix[1], 0);
+        assert_eq!(prefix[6], 2);
+        assert_eq!(&prefix[7..23], &[0x22; 16]);
+        assert_eq!(&prefix[23..], &endpoint);
     }
 
     #[test]

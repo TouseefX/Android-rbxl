@@ -82,6 +82,18 @@ fn as_addr(v: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn diagnostic_scalar(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(value) if value.len() <= 64 => value.clone(),
+        serde_json::Value::String(value) => format!("string({} chars)", value.len()),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Array(value) => format!("array({} items)", value.len()),
+        serde_json::Value::Object(value) => format!("object({} fields)", value.len()),
+    }
+}
+
 /// Collect endpoints from ONE object level: direct `Address`+`Port`,
 /// `MachineAddress`+`ServerPort` (classic join script), and the
 /// `UdmuxEndpoints` array (per-entry `Port` falling back to `ServerPort`).
@@ -1713,6 +1725,24 @@ pub fn probe_join_config_with_key_ring_revert(
             material.rcc_endpoint.label()
         )),
         Err(reason) => heading.push_str(&format!("\nRUPP routing unavailable: {reason}")),
+    }
+    let token_algorithm = find_field_ci(config, "TokenGenAlgorithm", 0);
+    let pepper_id = find_field_ci(config, "PepperId", 0);
+    if token_algorithm.is_some() || pepper_id.is_some() {
+        heading.push_str(&format!(
+            "\nCurrent RUPP token-generation metadata: algorithm {}, pepper {} (observed only; generator not yet applied)",
+            token_algorithm.map(diagnostic_scalar).unwrap_or_else(|| "absent".into()),
+            pepper_id.map(diagnostic_scalar).unwrap_or_else(|| "absent".into())
+        ));
+    }
+    if let Some(seed) = find_field_ci(config, "RandomSeed1", 0) {
+        let shape = seed
+            .as_str()
+            .map(|value| format!("string({} chars)", value.len()))
+            .unwrap_or_else(|| diagnostic_scalar(seed));
+        heading.push_str(&format!(
+            "\nCurrent normal-session seed metadata: RandomSeed1 {shape} (not applied to the proven 0.735 KX path)"
+        ));
     }
     let request2 = extract_request2_material_with_revert(config, key_ring_revert);
     match &request2 {

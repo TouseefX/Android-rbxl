@@ -201,6 +201,8 @@ It does not yet establish the directional interpretation of the two 32-byte dige
 
 Source: `https://github.com/kingdudely/Roblox-RakNet-Decompilation-Project/blob/main/docs/PROVENANCE.md` (current-build static evidence; directional split explicitly unresolved).
 
+The first SHA-512 live diagnostic also received no ACK, but it used the original subtype-1/flags-1 client RUPP. The same current project's measured framing identifies established client-to-server headers as 31 bytes with a subtype-2 token and flags zero, while established server-to-client headers are the 23-byte token-only form. Therefore the next diagnostic is the bounded cross-product that had not yet been tested: a 31-byte header combining Reply2's flags-zero subtype-2 token with the original client endpoint TLV, encrypted once under BLAKE2b and under each SHA-512 digest-half orientation. This does not replace native-first behavior and does not expose the token.
+
 ---
 
 ### What remains outside the decompile export
