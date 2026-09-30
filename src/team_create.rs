@@ -1731,15 +1731,15 @@ pub fn probe_join_config_with_key_ring_revert(
     if token_algorithm.is_some() || pepper_id.is_some() {
         heading.push_str(&format!(
             "\nCurrent RUPP token-generation metadata: algorithm {}, pepper {} (observed only; generator not yet applied)",
-            token_algorithm.map(diagnostic_scalar).unwrap_or_else(|| "absent".into()),
-            pepper_id.map(diagnostic_scalar).unwrap_or_else(|| "absent".into())
+            token_algorithm.as_ref().map(diagnostic_scalar).unwrap_or_else(|| "absent".into()),
+            pepper_id.as_ref().map(diagnostic_scalar).unwrap_or_else(|| "absent".into())
         ));
     }
     if let Some(seed) = find_field_ci(config, "RandomSeed1", 0) {
         let shape = seed
             .as_str()
             .map(|value| format!("string({} chars)", value.len()))
-            .unwrap_or_else(|| diagnostic_scalar(seed));
+            .unwrap_or_else(|| diagnostic_scalar(&seed));
         heading.push_str(&format!(
             "\nCurrent normal-session seed metadata: RandomSeed1 {shape} (not applied to the proven 0.735 KX path)"
         ));
