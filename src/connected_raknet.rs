@@ -331,6 +331,34 @@ fn diagnostic_established_reply2_rupp_prefix(
     Ok(Some(prefix))
 }
 
+/// Keep the original subtype-1 token and private RCC endpoint but clear the
+/// direct-server-return flag. Current captures show flags zero on established
+/// client-to-server traffic; testing this separately avoids conflating that
+/// flag with the Reply2 subtype-2 token update.
+fn diagnostic_original_flags_zero_rupp_prefix(
+    config: &ConnectedConfig,
+) -> Result<Option<Vec<u8>>, String> {
+    if config.rupp_prefix.is_empty() {
+        return Ok(None);
+    }
+    if config.rupp_prefix.len() < 4 || config.rupp_prefix[0] != RUPP_PROTOCOL_RAKNET {
+        return Err("native RUPP header is unavailable for flags-zero diagnostic".into());
+    }
+    let declared = usize::from(u16::from_be_bytes([
+        config.rupp_prefix[2],
+        config.rupp_prefix[3],
+    ]));
+    if declared != config.rupp_prefix.len() {
+        return Err(format!(
+            "native RUPP header declares {declared} bytes but has {}",
+            config.rupp_prefix.len()
+        ));
+    }
+    let mut prefix = config.rupp_prefix.clone();
+    prefix[1] = 0;
+    Ok(Some(prefix))
+}
+
 fn send_plain_datagram(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -438,6 +466,32 @@ fn send_connection_request(
         extra_padding,
         plaintext,
     })
+}
+
+fn send_fresh_connection_request_candidate(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    prefix: &[u8],
+    server_to_client: [u8; 32],
+    client_to_server: [u8; 32],
+    features: DatagramFeatures,
+    mtu: u16,
+    payload: &[u8],
+) -> Result<ConnectionRequestSendTrace, String> {
+    let mut crypto = SessionCrypto::new(server_to_client, client_to_server);
+    send_connection_request(
+        socket,
+        peer,
+        prefix,
+        &mut crypto,
+        features,
+        mtu,
+        0,
+        0,
+        payload,
+        false,
+        0,
+    )
 }
 
 fn send_ack(
@@ -1020,10 +1074,12 @@ pub(crate) fn establish_connected_session(
     let diagnostic_exact_reply2_prefix = config.deferred_reply2_rupp_prefix.clone();
     let diagnostic_refreshed_prefix = diagnostic_reply2_rupp_prefix(&config)?;
     let diagnostic_established_prefix = diagnostic_established_reply2_rupp_prefix(&config)?;
+    let diagnostic_original_flags_zero_prefix = diagnostic_original_flags_zero_rupp_prefix(&config)?;
     let mut route_diagnostics_sent = false;
     let mut route_diagnostic_count = 0usize;
     let mut kdf_diagnostic_count = 0usize;
     let mut established_matrix_count = 0usize;
+    let mut fresh_first_matrix_count = 0usize;
     let mut next_datagram_number = 0u32;
     let reliable_message_number = 0u32;
     let mut sent_datagrams = Vec::new();
@@ -1239,6 +1295,131 @@ pub(crate) fn establish_connected_session(
                     sent_datagrams.push(next_datagram_number);
                     next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
                     established_matrix_count += 1;
+                }
+
+                // The previous matrix used the native retransmission timeline:
+                // advanced datagram numbers, resent-bit state, and advanced
+                // transmit nonces. If the server dropped earlier packets at
+                // the RUPP layer, the first accepted packet for an alternate
+                // route/KDF would still be datagram 0 with the initial
+                // `UniqueNu` nonce. Send a bounded fresh-first matrix to keep
+                // nonce/datagram state from masking a valid route or KDF.
+                if let Some(prefix) = diagnostic_original_flags_zero_prefix.as_deref() {
+                    let fresh_blake = send_fresh_connection_request_candidate(
+                        socket,
+                        peer,
+                        prefix,
+                        config.session_server_to_client,
+                        config.session_client_to_server,
+                        features,
+                        config.mtu,
+                        &request_payload,
+                    )?;
+                    last_wire_bytes = fresh_blake.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic fresh-first subtype-1/flags-0 RUPP + BLAKE2b datagram 0, {} bytes, nonce suffix [{}]",
+                        fresh_blake.wire_bytes,
+                        hex_bytes(&fresh_blake.nonce_suffix)
+                    ));
+                    sent_datagrams.push(0);
+                    fresh_first_matrix_count += 1;
+
+                    let fresh_sha_first_rx = send_fresh_connection_request_candidate(
+                        socket,
+                        peer,
+                        prefix,
+                        config.sha512_session_first_half,
+                        config.sha512_session_second_half,
+                        features,
+                        config.mtu,
+                        &request_payload,
+                    )?;
+                    last_wire_bytes = fresh_sha_first_rx.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic fresh-first subtype-1/flags-0 RUPP + SHA-512 first-half RX datagram 0, {} bytes, nonce suffix [{}]",
+                        fresh_sha_first_rx.wire_bytes,
+                        hex_bytes(&fresh_sha_first_rx.nonce_suffix)
+                    ));
+                    sent_datagrams.push(0);
+                    fresh_first_matrix_count += 1;
+
+                    let fresh_sha_first_tx = send_fresh_connection_request_candidate(
+                        socket,
+                        peer,
+                        prefix,
+                        config.sha512_session_second_half,
+                        config.sha512_session_first_half,
+                        features,
+                        config.mtu,
+                        &request_payload,
+                    )?;
+                    last_wire_bytes = fresh_sha_first_tx.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic fresh-first subtype-1/flags-0 RUPP + SHA-512 first-half TX datagram 0, {} bytes, nonce suffix [{}]",
+                        fresh_sha_first_tx.wire_bytes,
+                        hex_bytes(&fresh_sha_first_tx.nonce_suffix)
+                    ));
+                    sent_datagrams.push(0);
+                    fresh_first_matrix_count += 1;
+                }
+
+                if let Some(prefix) = diagnostic_established_prefix.as_deref() {
+                    let fresh_blake = send_fresh_connection_request_candidate(
+                        socket,
+                        peer,
+                        prefix,
+                        config.session_server_to_client,
+                        config.session_client_to_server,
+                        features,
+                        config.mtu,
+                        &request_payload,
+                    )?;
+                    last_wire_bytes = fresh_blake.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic fresh-first established subtype-2/flags-0 RUPP + BLAKE2b datagram 0, {} bytes, nonce suffix [{}]",
+                        fresh_blake.wire_bytes,
+                        hex_bytes(&fresh_blake.nonce_suffix)
+                    ));
+                    sent_datagrams.push(0);
+                    fresh_first_matrix_count += 1;
+
+                    let fresh_sha_first_rx = send_fresh_connection_request_candidate(
+                        socket,
+                        peer,
+                        prefix,
+                        config.sha512_session_first_half,
+                        config.sha512_session_second_half,
+                        features,
+                        config.mtu,
+                        &request_payload,
+                    )?;
+                    last_wire_bytes = fresh_sha_first_rx.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic fresh-first established subtype-2/flags-0 RUPP + SHA-512 first-half RX datagram 0, {} bytes, nonce suffix [{}]",
+                        fresh_sha_first_rx.wire_bytes,
+                        hex_bytes(&fresh_sha_first_rx.nonce_suffix)
+                    ));
+                    sent_datagrams.push(0);
+                    fresh_first_matrix_count += 1;
+
+                    let fresh_sha_first_tx = send_fresh_connection_request_candidate(
+                        socket,
+                        peer,
+                        prefix,
+                        config.sha512_session_second_half,
+                        config.sha512_session_first_half,
+                        features,
+                        config.mtu,
+                        &request_payload,
+                    )?;
+                    last_wire_bytes = fresh_sha_first_tx.wire_bytes;
+                    send_traces.push(format!(
+                        "online diagnostic fresh-first established subtype-2/flags-0 RUPP + SHA-512 first-half TX datagram 0, {} bytes, nonce suffix [{}]",
+                        fresh_sha_first_tx.wire_bytes,
+                        hex_bytes(&fresh_sha_first_tx.nonce_suffix)
+                    ));
+                    sent_datagrams.push(0);
+                    fresh_first_matrix_count += 1;
                 }
 
                 if let Some(prefix) = diagnostic_exact_reply2_prefix.as_deref() {
@@ -1532,7 +1713,7 @@ pub(crate) fn establish_connected_session(
         format!("; receive diagnostics: {}", errors.join("; "))
     };
     let kdf_state = format!(
-        "current-build KDF state: {kdf_diagnostic_count} SHA-512 orientation diagnostic(s) and {established_matrix_count} established-header/KDF matrix diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation"
+        "current-build KDF state: {kdf_diagnostic_count} SHA-512 orientation diagnostic(s), {established_matrix_count} established-header/KDF matrix diagnostic(s), and {fresh_first_matrix_count} fresh-first route/KDF diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation"
     );
     let route_state = match config.deferred_reply2_rupp_token_type {
         Some(token_type) => format!(
@@ -1653,6 +1834,36 @@ mod tests {
         assert_eq!(prefix[1], 0);
         assert_eq!(prefix[6], 2);
         assert_eq!(&prefix[7..23], &[0x22; 16]);
+        assert_eq!(&prefix[23..], &endpoint);
+    }
+
+    #[test]
+    fn original_flags_zero_diagnostic_preserves_token_and_endpoint() {
+        let mut client_prefix = vec![1, 1, 0, 31, 1, 17, 1];
+        client_prefix.extend_from_slice(&[0x11; 16]);
+        let endpoint = [2, 6, 10, 0, 0, 1, 0x1f, 0x90];
+        client_prefix.extend_from_slice(&endpoint);
+        let config = ConnectedConfig {
+            client_guid: 1,
+            mtu: 1200,
+            common_capabilities: 0,
+            session_server_to_client: [0; 32],
+            session_client_to_server: [0; 32],
+            sha512_session_first_half: [0; 32],
+            sha512_session_second_half: [0; 32],
+            rupp_prefix: client_prefix,
+            deferred_reply2_rupp_token_type: None,
+            deferred_reply2_rupp_token: None,
+            deferred_reply2_rupp_prefix: None,
+            timeout_ms: 5_000,
+        };
+        let prefix = diagnostic_original_flags_zero_rupp_prefix(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.len(), 31);
+        assert_eq!(prefix[1], 0);
+        assert_eq!(prefix[6], 1);
+        assert_eq!(&prefix[7..23], &[0x11; 16]);
         assert_eq!(&prefix[23..], &endpoint);
     }
 

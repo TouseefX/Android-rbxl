@@ -203,6 +203,22 @@ Source: `https://github.com/kingdudely/Roblox-RakNet-Decompilation-Project/blob/
 
 The first SHA-512 live diagnostic also received no ACK, but it used the original subtype-1/flags-1 client RUPP. The same current project's measured framing identifies established client-to-server headers as 31 bytes with a subtype-2 token and flags zero, while established server-to-client headers are the 23-byte token-only form. Therefore the next diagnostic is the bounded cross-product that had not yet been tested: a 31-byte header combining Reply2's flags-zero subtype-2 token with the original client endpoint TLV, encrypted once under BLAKE2b and under each SHA-512 digest-half orientation. This does not replace native-first behavior and does not expose the token.
 
+### Fresh 0.741 no-delay live result
+
+Commit `4776872` built successfully in Actions and was live-tested with a fresh gamejoin config handed directly to the UDP handshake. The safe config shape report was:
+
+- `TokenGenAlgorithm = 1`
+- `PepperId = 1790786389`
+- `RandomSeed1 = string(88 chars)`
+- advertised RCC version `0.741.0.7411056`
+- auth version `17`, pre-auth `33` bytes, auth `66` bytes
+
+The authenticated offline path is still solid: routed Request1 received Reply1 from `128.116.54.33:64830`; OpenRequest2 selected key version 5 through the URL-decoded `EphemeralEarlyPubKey` override; Reply2 was 158 bytes, version 1, ChaCha20-Poly1305, MTU 1200, capabilities `0x0000020350b70892`, and carried a 23-byte outer RUPP header with a subtype-2 token. The first connected plaintext was the corrected 30-byte reliable `ID_CONNECTION_REQUEST` under a 31-byte subtype-1/private-RCC RUPP header: data header `81 00 00 00`, reliable header `40 00 a0 00 00 00`, and payload `09 || client_guid_be || request_time_be || 00 || 5e 11`.
+
+No connected ACK or `ID_CONNECTION_REQUEST_ACCEPTED` arrived for any candidate in that build: native subtype-1/BLAKE2b retries, original subtype-1 SHA-512 half orientations, established subtype-2/flags-0 endpoint-bearing BLAKE2b and SHA-512 half orientations, exact 23-byte Reply2 header, refreshed subtype-2 endpoint-bearing header, no-RUPP flow-affinity send, or one final native retry. This shifts suspicion away from UI delay, Request2 key selection, password, basic reliability encoding, and the specific 23-vs-31 Reply2-token gap.
+
+One important diagnostic caveat remains: the established-header/KDF matrix was emitted after several native retransmissions, so those matrix packets used later datagram numbers and later transmit nonce counters. If earlier packets were being dropped before the server's connected crypto consumed them, a valid alternate route/KDF could still require a fresh datagram-0 packet with the initial `UniqueNu` nonce. The implementation now adds a bounded fresh-first matrix for subtype-1/flags-0 and established subtype-2/flags-0 prefixes across BLAKE2b and both SHA-512 half orientations. A continued all-silent result from that build would make the concrete current-build RUPP token generator or matching-build key-installation path the next strongest boundary.
+
 ## 0.740 Windows Player recovery corrections
 
 The parsed 0.740 archive targets Windows Player `0.740.0.7400927`, not the exact `0.741.19.7411056` Studio build. Its broad disassembly range `fn_0x000142897340.asm` was initially labelled only from later string xrefs. The first real body in that range, **`0x142897340–0x142897555`**, is instead the Windows `RakNet::RakPeer::generateUdmuxToken` implementation:
