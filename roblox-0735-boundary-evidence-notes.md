@@ -240,7 +240,15 @@ A fresh no-UI-delay session against RCC `0.741.0.7411056` authenticated Reply1/R
 
 No connected ACK or accept arrived for any of the 25 datagrams, including all six AES-GCM fresh-first route/KDF candidates. This removes simple selected-cipher mis-mapping as the explanation. The remaining current-build crypto gap is narrower: `RandomSeed1` is present in every fresh config and a public current-build headless-flow note treats it as normal-session KDF input, while the directly recovered 0.735 path does not. The implementation therefore now keeps the proven 0.735 KX native-first but adds bounded AES-GCM seeded-KDF diagnostics derived from `SHA512(seed || shared || client_pub || server_pub)` and `SHA512(shared || client_pub || server_pub || seed)`, both digest-half orientations, across subtype-1/flags-0 and established subtype-2/flags-0 fresh-first routes. The seed remains internal and is still reported only by shape.
 
-If the seeded-KDF matrix is also silent, the strongest remaining blockers are no longer reliability layout, route flags, 23-vs-31 RUPP framing, first nonce/datagram state, or connected cipher. They are the concrete current-build RUPP token generator (`TokenGenAlgorithm=1`, `PepperId`) and/or matching-build SessionCrypto key installation/epoch rekey logic.
+### Fresh 0.741 no-delay live result after RandomSeed1 seeded-KDF diagnostics
+
+A fresh no-UI-delay session against RCC `0.741.0.7411056` again authenticated Reply1/Reply2. Safe metadata was `TokenGenAlgorithm = 1`, `PepperId = 1790809599`, and `RandomSeed1 = string(88 chars)`; route was public UDMUX `128.116.97.33:63353` to private RCC `10.182.1.207:63353`. The connected plaintext remained the same corrected 30-byte request under a 31-byte subtype-1/private-RCC RUPP header.
+
+No connected ACK or accept arrived for any of the 33 datagrams, including all eight seeded-KDF diagnostics. This removes the tested `RandomSeed1` placements, simple selected-cipher mis-mapping, route flags, 23-vs-31 RUPP framing, first nonce/datagram state, password, basic reliable-header encoding, and UI/ticket timing as primary explanations.
+
+One bounded RUPP-token gap remained in the diagnostics: all subtype-2 endpoint-bearing sends used Reply2's 16-byte token value, while all original `TokenValue` sends kept subtype 1. Current captures show subtype 2 in established client-to-server headers, so the implementation now tests the missing shape separately: original GameService token bytes and private RCC endpoint, but flags zero and token subtype promoted to 2. It sends that promoted-original-token shape fresh-first across the existing KDF/cipher candidates, including the seeded AES-GCM variants, without printing token material.
+
+If the promoted-original-token matrix is also silent, the strongest remaining blockers are the concrete current-build RUPP token generator (`TokenGenAlgorithm=1`, `PepperId`) and/or matching-build SessionCrypto key installation/epoch rekey logic.
 
 ## 0.740 Windows Player recovery corrections
 

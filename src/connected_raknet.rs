@@ -420,6 +420,43 @@ fn diagnostic_original_flags_zero_rupp_prefix(
     Ok(Some(prefix))
 }
 
+/// Current captures consistently show a subtype-2 token byte on established
+/// client-to-server packets. The Reply2-refresh diagnostics changed both the
+/// subtype and the 16-byte value. Test the missing bounded case separately:
+/// preserve the original GameService token value and private RCC endpoint, but
+/// promote only its subtype byte to the established subtype and clear flags.
+fn diagnostic_original_token_promoted_type2_prefix(
+    config: &ConnectedConfig,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(mut prefix) = diagnostic_original_flags_zero_rupp_prefix(config)? else {
+        return Ok(None);
+    };
+    let header_len = usize::from(u16::from_be_bytes([prefix[2], prefix[3]]));
+    let mut cursor = 4usize;
+    while cursor < header_len {
+        if cursor + 2 > header_len {
+            return Err("promoted original-token RUPP header ends inside a TLV header".into());
+        }
+        let kind = prefix[cursor];
+        let length = usize::from(prefix[cursor + 1]);
+        cursor += 2;
+        if cursor + length > header_len {
+            return Err("promoted original-token RUPP header has a truncated TLV".into());
+        }
+        if kind == RUPP_TLV_TOKEN {
+            if length != RUPP_TOKEN_VALUE_LENGTH {
+                return Err(format!(
+                    "promoted original-token TLV has length {length}, expected {RUPP_TOKEN_VALUE_LENGTH}"
+                ));
+            }
+            prefix[cursor] = RUPP_RCC_TOKEN_TYPE;
+            return Ok(Some(prefix));
+        }
+        cursor += length;
+    }
+    Err("promoted original-token diagnostic found no token TLV".into())
+}
+
 fn send_plain_datagram(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -1171,6 +1208,7 @@ pub(crate) fn establish_connected_session(
     let diagnostic_refreshed_prefix = diagnostic_reply2_rupp_prefix(&config)?;
     let diagnostic_established_prefix = diagnostic_established_reply2_rupp_prefix(&config)?;
     let diagnostic_original_flags_zero_prefix = diagnostic_original_flags_zero_rupp_prefix(&config)?;
+    let diagnostic_original_type2_prefix = diagnostic_original_token_promoted_type2_prefix(&config)?;
     let mut route_diagnostics_sent = false;
     let mut route_diagnostic_count = 0usize;
     let mut kdf_diagnostic_count = 0usize;
@@ -1178,6 +1216,7 @@ pub(crate) fn establish_connected_session(
     let mut fresh_first_matrix_count = 0usize;
     let mut aes_cipher_matrix_count = 0usize;
     let mut seeded_kdf_matrix_count = 0usize;
+    let mut promoted_original_token_matrix_count = 0usize;
     let mut next_datagram_number = 0u32;
     let reliable_message_number = 0u32;
     let mut sent_datagrams = Vec::new();
@@ -1704,6 +1743,84 @@ pub(crate) fn establish_connected_session(
                     }
                 }
 
+                // Current captures show subtype 2 in the established client
+                // header. The earlier subtype-2 diagnostics also replaced the
+                // 16-byte value with Reply2's outer token. Test the missing
+                // shape: original GameService token bytes, promoted subtype 2,
+                // flags zero, and the original private endpoint.
+                if let Some(prefix) = diagnostic_original_type2_prefix.as_deref() {
+                    let mut candidates = vec![
+                        DiagnosticSessionKeyCandidate {
+                            label: "promoted original-token subtype-2 + BLAKE2b negotiated cipher",
+                            server_to_client: config.session_server_to_client,
+                            client_to_server: config.session_client_to_server,
+                            cipher: config.session_cipher,
+                        },
+                        DiagnosticSessionKeyCandidate {
+                            label: "promoted original-token subtype-2 + SHA-512 first-half RX negotiated cipher",
+                            server_to_client: config.sha512_session_first_half,
+                            client_to_server: config.sha512_session_second_half,
+                            cipher: config.session_cipher,
+                        },
+                        DiagnosticSessionKeyCandidate {
+                            label: "promoted original-token subtype-2 + SHA-512 first-half TX negotiated cipher",
+                            server_to_client: config.sha512_session_second_half,
+                            client_to_server: config.sha512_session_first_half,
+                            cipher: config.session_cipher,
+                        },
+                        DiagnosticSessionKeyCandidate {
+                            label: "promoted original-token subtype-2 + AES-GCM/BLAKE2b",
+                            server_to_client: config.session_server_to_client,
+                            client_to_server: config.session_client_to_server,
+                            cipher: SessionCipher::Aes256Gcm,
+                        },
+                        DiagnosticSessionKeyCandidate {
+                            label: "promoted original-token subtype-2 + AES-GCM/SHA-512 first-half RX",
+                            server_to_client: config.sha512_session_first_half,
+                            client_to_server: config.sha512_session_second_half,
+                            cipher: SessionCipher::Aes256Gcm,
+                        },
+                        DiagnosticSessionKeyCandidate {
+                            label: "promoted original-token subtype-2 + AES-GCM/SHA-512 first-half TX",
+                            server_to_client: config.sha512_session_second_half,
+                            client_to_server: config.sha512_session_first_half,
+                            cipher: SessionCipher::Aes256Gcm,
+                        },
+                    ];
+                    candidates.extend(diagnostic_key_candidates.iter().cloned().map(|mut candidate| {
+                        candidate.label = match candidate.label {
+                            "RandomSeed1 SHA-512 suffix first-half RX + AES-GCM" => "promoted original-token subtype-2 + RandomSeed1 SHA-512 suffix first-half RX + AES-GCM",
+                            "RandomSeed1 SHA-512 suffix first-half TX + AES-GCM" => "promoted original-token subtype-2 + RandomSeed1 SHA-512 suffix first-half TX + AES-GCM",
+                            "RandomSeed1 SHA-512 prefix first-half RX + AES-GCM" => "promoted original-token subtype-2 + RandomSeed1 SHA-512 prefix first-half RX + AES-GCM",
+                            "RandomSeed1 SHA-512 prefix first-half TX + AES-GCM" => "promoted original-token subtype-2 + RandomSeed1 SHA-512 prefix first-half TX + AES-GCM",
+                            other => other,
+                        };
+                        candidate
+                    }));
+                    for candidate in candidates {
+                        let diagnostic = send_fresh_connection_request_candidate(
+                            socket,
+                            peer,
+                            prefix,
+                            candidate.server_to_client,
+                            candidate.client_to_server,
+                            candidate.cipher,
+                            features,
+                            config.mtu,
+                            &request_payload,
+                        )?;
+                        last_wire_bytes = diagnostic.wire_bytes;
+                        send_traces.push(format!(
+                            "online diagnostic fresh-first {} datagram 0, {} bytes, nonce suffix [{}]",
+                            candidate.label,
+                            diagnostic.wire_bytes,
+                            hex_bytes(&diagnostic.nonce_suffix)
+                        ));
+                        sent_datagrams.push(0);
+                        promoted_original_token_matrix_count += 1;
+                    }
+                }
+
                 if let Some(prefix) = diagnostic_exact_reply2_prefix.as_deref() {
                     let diagnostic = send_connection_request(
                         socket,
@@ -2131,7 +2248,7 @@ pub(crate) fn establish_connected_session(
         format!("; receive diagnostics: {}", errors.join("; "))
     };
     let kdf_state = format!(
-        "current-build KDF/cipher state: negotiated connected cipher {}, {kdf_diagnostic_count} SHA-512 orientation diagnostic(s), {established_matrix_count} established-header/KDF matrix diagnostic(s), {fresh_first_matrix_count} fresh-first route/KDF diagnostic(s), {aes_cipher_matrix_count} AES-GCM cipher-mapping diagnostic(s), and {seeded_kdf_matrix_count} RandomSeed1 seeded-KDF diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation",
+        "current-build KDF/cipher state: negotiated connected cipher {}, {kdf_diagnostic_count} SHA-512 orientation diagnostic(s), {established_matrix_count} established-header/KDF matrix diagnostic(s), {fresh_first_matrix_count} fresh-first route/KDF diagnostic(s), {aes_cipher_matrix_count} AES-GCM cipher-mapping diagnostic(s), {seeded_kdf_matrix_count} RandomSeed1 seeded-KDF diagnostic(s), and {promoted_original_token_matrix_count} promoted original-token subtype-2 diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation",
         config.session_cipher.label()
     );
     let route_state = match config.deferred_reply2_rupp_token_type {
@@ -2290,6 +2407,38 @@ mod tests {
         assert_eq!(prefix.len(), 31);
         assert_eq!(prefix[1], 0);
         assert_eq!(prefix[6], 1);
+        assert_eq!(&prefix[7..23], &[0x11; 16]);
+        assert_eq!(&prefix[23..], &endpoint);
+    }
+
+    #[test]
+    fn original_token_promoted_type2_diagnostic_preserves_value_and_endpoint() {
+        let mut client_prefix = vec![1, 1, 0, 31, 1, 17, 1];
+        client_prefix.extend_from_slice(&[0x11; 16]);
+        let endpoint = [2, 6, 10, 0, 0, 1, 0x1f, 0x90];
+        client_prefix.extend_from_slice(&endpoint);
+        let config = ConnectedConfig {
+            client_guid: 1,
+            mtu: 1200,
+            common_capabilities: 0,
+            session_server_to_client: [0; 32],
+            session_client_to_server: [0; 32],
+            session_cipher: SessionCipher::ChaCha20Poly1305,
+            diagnostic_session_key_candidates: Vec::new(),
+            sha512_session_first_half: [0; 32],
+            sha512_session_second_half: [0; 32],
+            rupp_prefix: client_prefix,
+            deferred_reply2_rupp_token_type: None,
+            deferred_reply2_rupp_token: None,
+            deferred_reply2_rupp_prefix: None,
+            timeout_ms: 5_000,
+        };
+        let prefix = diagnostic_original_token_promoted_type2_prefix(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.len(), 31);
+        assert_eq!(prefix[1], 0);
+        assert_eq!(prefix[6], 2);
         assert_eq!(&prefix[7..23], &[0x11; 16]);
         assert_eq!(&prefix[23..], &endpoint);
     }
