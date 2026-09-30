@@ -187,6 +187,20 @@ A fresh no-UI-delay session against RCC `0.741.0.7411056` authenticated OpenRepl
 
 That run did not actually test the exact RUPP returned with OpenReply2. The routed 158-byte Reply2 shape carries a **23-byte token-only outer header**, while the old “Reply2-token” diagnostic replaced the token inside the client's **31-byte token-plus-private-endpoint header**. The implementation now preserves the exact returned header and sends it once as a late diagnostic, separately from both the native 31-byte subtype-1 form and the receive-updater-style 31-byte subtype-2 form. Native-first behavior remains unchanged.
 
+A second fresh run tested all three forms and still received no ACK. That removes the specific 23-vs-31-byte diagnostic gap and makes the 0.735-to-0.741 normal-session crypto boundary the strongest remaining candidate.
+
+## Current-build normal-session KDF boundary
+
+The public `kingdudely/Roblox-RakNet-Decompilation-Project` provenance updated on 2026-09-25 targets client build `9.4.260915.1d72b8c0`. Its current static trace reports **SHA-512**, not libsodium BLAKE2b, over:
+
+```text
+X25519 shared secret || local public key || peer public key
+```
+
+It does not yet establish the directional interpretation of the two 32-byte digest halves. This does not invalidate the live early channel: authenticated OpenReply2 directly proves that its separate early-key path works with the implemented BLAKE2b derivation. It does, however, justify two late normal-session diagnostics after the directly proven 0.735 BLAKE2b path fails: SHA-512 with the first half as client RX, and SHA-512 with the first half as client TX. Each candidate owns an independent nonce stream beginning at `UniqueNu`; neither changes the native-first packet.
+
+Source: `https://github.com/kingdudely/Roblox-RakNet-Decompilation-Project/blob/main/docs/PROVENANCE.md` (current-build static evidence; directional split explicitly unresolved).
+
 ---
 
 ### What remains outside the decompile export

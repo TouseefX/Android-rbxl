@@ -29,6 +29,7 @@ use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce, Tag,
 };
+use sha2::Sha512;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -758,6 +759,35 @@ fn derive_client_session_keys(
     Ok((rx, tx))
 }
 
+/// A September 2026 current-client static trace reports that normal ephemeral
+/// RakNet KX changed from libsodium's BLAKE2b crypto_kx construction to
+/// SHA-512 over the same `shared || client public || server public` transcript.
+/// The public trace does not yet prove which digest half is each direction, so
+/// connected transport tests both orderings only after the 0.735-native path
+/// has gone unanswered. Early OpenRequest2 crypto remains BLAKE2b: successful
+/// authenticated Reply2 packets directly prove that for the live fleet.
+fn derive_client_session_keys_sha512(
+    client_secret: &StaticSecret,
+    client_public: &[u8; 32],
+    server_public: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32]), String> {
+    let server_public = PublicKey::from(*server_public);
+    let shared = client_secret.diffie_hellman(&server_public);
+    if shared.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err("X25519 peer public key produced the forbidden all-zero secret".into());
+    }
+    let mut hash = Sha512::new();
+    hash.update(shared.as_bytes());
+    hash.update(client_public);
+    hash.update(server_public.as_bytes());
+    let digest = hash.finalize();
+    let mut first = [0u8; 32];
+    let mut second = [0u8; 32];
+    first.copy_from_slice(&digest[..32]);
+    second.copy_from_slice(&digest[32..]);
+    Ok((first, second))
+}
+
 fn begin_request2_crypto(material: &Request2Material) -> Result<Request2Crypto, String> {
     let mut secret_bytes = [0u8; 32];
     getrandom::fill(&mut secret_bytes)
@@ -918,6 +948,8 @@ struct RbxOpenReply2 {
     returned_rupp_prefix: Option<Vec<u8>>,
     session_server_to_client: [u8; 32],
     session_client_to_server: [u8; 32],
+    sha512_session_first_half: [u8; 32],
+    sha512_session_second_half: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -981,6 +1013,53 @@ fn strip_optional_rupp_prefix(
         returned_token,
         Some(exact_prefix),
     ))
+}
+
+fn describe_received_rupp_prefix(prefix: &[u8]) -> String {
+    if prefix.len() < 4 {
+        return format!("truncated ({} bytes)", prefix.len());
+    }
+    let declared = u16::from_be_bytes([prefix[2], prefix[3]]);
+    let mut tlvs = Vec::new();
+    let mut cursor = 4usize;
+    while cursor + 2 <= prefix.len() {
+        let kind = prefix[cursor];
+        let length = usize::from(prefix[cursor + 1]);
+        cursor += 2;
+        let Some(value) = prefix.get(cursor..cursor + length) else {
+            tlvs.push(format!("type {kind}(truncated length {length})"));
+            break;
+        };
+        let description = match (kind, value) {
+            (RUPP_TLV_TOKEN, [subtype, ..]) => {
+                format!("token(length {length}, subtype {subtype}, value redacted)")
+            }
+            (RUPP_TLV_IPV4, [a, b, c, d, port_hi, port_lo]) => format!(
+                "ipv4(length 6, {}:{})",
+                std::net::Ipv4Addr::new(*a, *b, *c, *d),
+                u16::from_be_bytes([*port_hi, *port_lo])
+            ),
+            (RUPP_TLV_IPV6, value) if value.len() == 18 => {
+                let mut address = [0u8; 16];
+                address.copy_from_slice(&value[..16]);
+                format!(
+                    "ipv6(length 18, [{}]:{})",
+                    std::net::Ipv6Addr::from(address),
+                    u16::from_be_bytes([value[16], value[17]])
+                )
+            }
+            _ => format!("type {kind}(length {length})"),
+        };
+        tlvs.push(description);
+        cursor += length;
+    }
+    format!(
+        "{{protocol {}, flags 0x{:02x}, declared length {declared}, actual length {}, TLVs [{}]}}",
+        prefix[0],
+        prefix[1],
+        prefix.len(),
+        tlvs.join(", ")
+    )
 }
 
 fn parse_rbx_open_reply2(
@@ -1179,6 +1258,12 @@ fn parse_rbx_open_reply2(
         &crypto.client_public,
         &server_ephemeral_key,
     )?;
+    let (sha512_session_first_half, sha512_session_second_half) =
+        derive_client_session_keys_sha512(
+            &crypto.client_secret,
+            &crypto.client_public,
+            &server_ephemeral_key,
+        )?;
     Ok(RbxOpenReply2 {
         version,
         server_capabilities,
@@ -1191,6 +1276,8 @@ fn parse_rbx_open_reply2(
         returned_rupp_prefix,
         session_server_to_client,
         session_client_to_server,
+        sha512_session_first_half,
+        sha512_session_second_half,
     })
 }
 
@@ -1482,8 +1569,8 @@ fn probe_endpoint_with_rupp(
                             reply2.server_capabilities,
                             if let Some(prefix) = reply2.returned_rupp_prefix.as_ref() {
                                 format!(
-                                    ", server RUPP token observed in {}-byte outer header (deferred until online receive)",
-                                    prefix.len()
+                                    ", server RUPP outer {} (token deferred until online receive)",
+                                    describe_received_rupp_prefix(prefix)
                                 )
                             } else {
                                 String::new()
@@ -1516,6 +1603,8 @@ fn probe_endpoint_with_rupp(
                                 common_capabilities,
                                 session_server_to_client: reply2.session_server_to_client,
                                 session_client_to_server: reply2.session_client_to_server,
+                                sha512_session_first_half: reply2.sha512_session_first_half,
+                                sha512_session_second_half: reply2.sha512_session_second_half,
                                 rupp_prefix: selected_prefix.clone(),
                                 deferred_reply2_rupp_token_type:
                                     reply2.returned_rupp_token_type,
@@ -1526,11 +1615,12 @@ fn probe_endpoint_with_rupp(
                         ) {
                             Ok(accepted) => {
                                 return Ok(format!(
-                                    "{open_reply_summary}\n✅ ID_CONNECTION_REQUEST_ACCEPTED — {} bytes from {}, datagram {}, {:?}, client address {}, system index {}, {} internal addresses, request time {}, server time {}, server epoch {} µs, request ACKed {}, retransmissions {}, RUPP refreshes {}, session nonces tx/rx {}/{}, connected in {} ms",
+                                    "{open_reply_summary}\n✅ ID_CONNECTION_REQUEST_ACCEPTED — {} bytes from {}, datagram {}, {:?}, session KDF {}, client address {}, system index {}, {} internal addresses, request time {}, server time {}, server epoch {} µs, request ACKed {}, retransmissions {}, RUPP refreshes {}, session nonces tx/rx {}/{}, connected in {} ms",
                                     accepted.wire_bytes,
                                     accepted.source,
                                     accepted.datagram_number,
                                     accepted.reliability,
+                                    accepted.session_kdf,
                                     accepted.client_address,
                                     accepted.system_index,
                                     accepted.internal_address_count,
@@ -1957,6 +2047,20 @@ mod tests {
             tx.as_slice(),
             hex_fixture("b6ece7514f1d029f7c8078993454f4f5e911492660f907da9dd3c111a84e479d")
         );
+        let (sha_first, sha_second) = derive_client_session_keys_sha512(
+            &client_secret,
+            &client_public,
+            &server_public,
+        )
+        .unwrap();
+        assert_eq!(
+            sha_first.as_slice(),
+            hex_fixture("fe25e49f9757bc61d9b1ab1ec7c70879583b996ca270b4bd003c28a8b65c0348")
+        );
+        assert_eq!(
+            sha_second.as_slice(),
+            hex_fixture("73d393eb41bb0009ebdace87c8bad7a6b6278a550c21b230c56fbdc587574615")
+        );
 
         let material = Request2Material {
             early_key_version: 5,
@@ -2142,7 +2246,11 @@ mod tests {
         );
         assert_eq!(reply.returned_rupp_token, Some([0xa5; 16]));
         assert_eq!(reply.returned_rupp_token_type, Some(2));
-        assert_eq!(reply.returned_rupp_prefix, Some(expected_rupp));
+        assert_eq!(reply.returned_rupp_prefix, Some(expected_rupp.clone()));
+        assert_eq!(
+            describe_received_rupp_prefix(&expected_rupp),
+            "{protocol 1, flags 0x00, declared length 23, actual length 23, TLVs [token(length 17, subtype 2, value redacted)]}"
+        );
     }
 
     #[test]

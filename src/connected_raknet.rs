@@ -50,6 +50,11 @@ pub(crate) struct ConnectedConfig {
     pub common_capabilities: u64,
     pub session_server_to_client: [u8; 32],
     pub session_client_to_server: [u8; 32],
+    /// Current-build SHA-512 KX digest halves. Public September 2026 static
+    /// evidence establishes the transcript but not the directional split, so
+    /// both orientations are late diagnostics rather than native defaults.
+    pub sha512_session_first_half: [u8; 32],
+    pub sha512_session_second_half: [u8; 32],
     pub rupp_prefix: Vec<u8>,
     /// Current OpenReply2 can carry the server's subtype-2 route token in its
     /// outer RUPP header. Native RakPeer does not install that offline token
@@ -70,6 +75,7 @@ pub(crate) struct ConnectedConfig {
 pub(crate) struct ConnectionAcceptedSummary {
     pub source: SocketAddr,
     pub wire_bytes: usize,
+    pub session_kdf: &'static str,
     pub client_address: String,
     pub system_index: u16,
     pub internal_address_count: usize,
@@ -324,9 +330,14 @@ fn send_plain_datagram(
     let mut wire = Vec::with_capacity(wire_len);
     wire.extend_from_slice(prefix);
     wire.extend_from_slice(&encrypted);
-    socket
+    let sent = socket
         .send_to(&wire, peer)
         .map_err(|error| format!("connected RakNet send to {peer} failed: {error}"))?;
+    if sent != wire_len {
+        return Err(format!(
+            "connected RakNet send to {peer} reported {sent} of {wire_len} UDP bytes"
+        ));
+    }
     Ok(wire_len)
 }
 
@@ -891,12 +902,28 @@ fn describe_rupp_prefix(prefix: &[u8]) -> String {
     )
 }
 
+fn route_selected_source(peer: SocketAddr, bound: Option<SocketAddr>) -> Option<SocketAddr> {
+    // An unconnected wildcard UDP socket keeps reporting 0.0.0.0/:: through
+    // getsockname even after sendto. A throwaway connected UDP socket performs
+    // the same kernel route lookup without transmitting; combine its selected
+    // interface address with the real handshake socket's retained source port.
+    let bind_address = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let probe = UdpSocket::bind(bind_address).ok()?;
+    probe.connect(peer).ok()?;
+    let mut selected = probe.local_addr().ok()?;
+    if let Some(bound) = bound {
+        selected.set_port(bound.port());
+    }
+    Some(selected)
+}
+
 fn format_request_wire_trace(
     trace: &ConnectionRequestSendTrace,
     prefix: &[u8],
     features: DatagramFeatures,
     common_capabilities: u64,
-    local: Option<SocketAddr>,
+    bound_local: Option<SocketAddr>,
+    route_local: Option<SocketAddr>,
     peer: SocketAddr,
     request_time: u64,
 ) -> String {
@@ -916,8 +943,9 @@ fn format_request_wire_trace(
         .map(hex_bytes)
         .unwrap_or_else(|| "<truncated>".into());
     format!(
-        "wire trace: local {}, destination {peer}, capabilities 0x{common_capabilities:016x}, features(timestamp {}, avoided-size field {}, join-data bit {}, resent bit {}), RUPP {{{}}}, RUPP hex (token bytes redacted) [{}], data header ({data_header_len} bytes) [{data_header}], reliable header ({reliability_header_len} bytes) [{reliability_header}], complete plaintext ({} bytes, padding {}) [{}], encrypted region {} bytes, nonce suffix [{}], final UDP payload {} bytes, request time {request_time}, connection password length {}",
-        local.map(|address| address.to_string()).unwrap_or_else(|| "unknown".into()),
+        "wire trace: socket bound {}, route-selected source {}, destination {peer}, capabilities 0x{common_capabilities:016x}, features(timestamp {}, avoided-size field {}, join-data bit {}, resent bit {}), RUPP {{{}}}, RUPP hex (token bytes redacted) [{}], data header ({data_header_len} bytes) [{data_header}], reliable header ({reliability_header_len} bytes) [{reliability_header}], complete plaintext ({} bytes, padding {}) [{}], encrypted region {} bytes, nonce suffix [{}], final UDP payload {} bytes, request time {request_time}, connection password length {}",
+        bound_local.map(|address| address.to_string()).unwrap_or_else(|| "unknown".into()),
+        route_local.map(|address| address.to_string()).unwrap_or_else(|| "unknown".into()),
         features.include_timestamp,
         features.avoid_packet_size,
         features.join_data_bit,
@@ -949,6 +977,20 @@ pub(crate) fn establish_connected_session(
         config.session_server_to_client,
         config.session_client_to_server,
     );
+    // The 0.735 binary directly proves BLAKE2b and remains the native first
+    // path. A current September 2026 client trace instead proves SHA-512 over
+    // the normal-session KX transcript, but leaves digest-half direction
+    // unresolved. Keep independent nonce streams for both evidence-backed
+    // orientations so a failed BLAKE2b packet does not consume their expected
+    // first nonce.
+    let mut sha512_first_rx_crypto = SessionCrypto::new(
+        config.sha512_session_first_half,
+        config.sha512_session_second_half,
+    );
+    let mut sha512_first_tx_crypto = SessionCrypto::new(
+        config.sha512_session_second_half,
+        config.sha512_session_first_half,
+    );
     let (request_payload, request_time) = connection_request_payload(config.client_guid);
     // Keep native subtype-1 traffic first. These alternatives are emitted
     // only after several unanswered native retransmissions. Preserve the
@@ -959,6 +1001,7 @@ pub(crate) fn establish_connected_session(
     let diagnostic_refreshed_prefix = diagnostic_reply2_rupp_prefix(&config)?;
     let mut route_diagnostics_sent = false;
     let mut route_diagnostic_count = 0usize;
+    let mut kdf_diagnostic_count = 0usize;
     let mut next_datagram_number = 0u32;
     let reliable_message_number = 0u32;
     let mut sent_datagrams = Vec::new();
@@ -980,12 +1023,14 @@ pub(crate) fn establish_connected_session(
         false,
         0,
     )?;
+    let bound_local = socket.local_addr().ok();
     let first_wire_trace = format_request_wire_trace(
         &first_send,
         &config.rupp_prefix,
         features,
         config.common_capabilities,
-        socket.local_addr().ok(),
+        bound_local,
+        route_selected_source(peer, bound_local),
         peer,
         request_time,
     );
@@ -1045,12 +1090,59 @@ pub(crate) fn establish_connected_session(
             next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
             retransmissions += 1;
 
-            // Send the route alternatives once only after three unanswered
-            // native retransmissions. Any ACK distinguishes a route-lifecycle
-            // mismatch from SessionCrypto/datagram rejection; no diagnostic
-            // changes the retained native outbound header.
+            // Send evidence-backed KDF and route alternatives once only after
+            // three unanswered native retransmissions. Any ACK distinguishes
+            // the relevant boundary; no diagnostic changes the retained
+            // native BLAKE2b/subtype-1 outbound state.
             if retransmissions == 3 && !route_diagnostics_sent {
                 route_diagnostics_sent = true;
+
+                let sha_first_rx = send_connection_request(
+                    socket,
+                    peer,
+                    &config.rupp_prefix,
+                    &mut sha512_first_rx_crypto,
+                    features,
+                    config.mtu,
+                    next_datagram_number,
+                    reliable_message_number,
+                    &request_payload,
+                    true,
+                    0,
+                )?;
+                last_wire_bytes = sha_first_rx.wire_bytes;
+                send_traces.push(format!(
+                    "online diagnostic SHA-512 KDF first-half RX datagram {next_datagram_number}, {} bytes, nonce suffix [{}]",
+                    sha_first_rx.wire_bytes,
+                    hex_bytes(&sha_first_rx.nonce_suffix)
+                ));
+                sent_datagrams.push(next_datagram_number);
+                next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
+                kdf_diagnostic_count += 1;
+
+                let sha_first_tx = send_connection_request(
+                    socket,
+                    peer,
+                    &config.rupp_prefix,
+                    &mut sha512_first_tx_crypto,
+                    features,
+                    config.mtu,
+                    next_datagram_number,
+                    reliable_message_number,
+                    &request_payload,
+                    true,
+                    0,
+                )?;
+                last_wire_bytes = sha_first_tx.wire_bytes;
+                send_traces.push(format!(
+                    "online diagnostic SHA-512 KDF first-half TX datagram {next_datagram_number}, {} bytes, nonce suffix [{}]",
+                    sha_first_tx.wire_bytes,
+                    hex_bytes(&sha_first_tx.nonce_suffix)
+                ));
+                sent_datagrams.push(next_datagram_number);
+                next_datagram_number = next_datagram_number.wrapping_add(1) & UINT24_MASK;
+                kdf_diagnostic_count += 1;
+
                 if let Some(prefix) = diagnostic_exact_reply2_prefix.as_deref() {
                     let diagnostic = send_connection_request(
                         socket,
@@ -1180,12 +1272,20 @@ pub(crate) fn establish_connected_session(
                 }
             }
         }
-        let plaintext = match crypto.decrypt(encrypted) {
-            Ok(value) => value,
-            Err(error) => {
-                errors.push(error);
-                continue;
-            }
+        let (plaintext, crypto_path) = match crypto.decrypt(encrypted) {
+            Ok(value) => (value, 0u8),
+            Err(blake_error) => match sha512_first_rx_crypto.decrypt(encrypted) {
+                Ok(value) => (value, 1u8),
+                Err(sha_first_rx_error) => match sha512_first_tx_crypto.decrypt(encrypted) {
+                    Ok(value) => (value, 2u8),
+                    Err(sha_first_tx_error) => {
+                        errors.push(format!(
+                            "connected RakNet authentication failed for all KDF candidates (BLAKE2b: {blake_error}; SHA-512 first-half RX: {sha_first_rx_error}; SHA-512 first-half TX: {sha_first_tx_error})"
+                        ));
+                        continue;
+                    }
+                },
+            },
         };
         let datagram = match parse_datagram(&plaintext, features) {
             Ok(value) => value,
@@ -1207,25 +1307,67 @@ pub(crate) fn establish_connected_session(
                 }
             }
             Datagram::Data(data) => {
-                send_ack(
-                    socket,
-                    peer,
-                    &config.rupp_prefix,
-                    &mut crypto,
-                    features,
-                    config.mtu,
-                    data.datagram_number,
-                )?;
+                match crypto_path {
+                    0 => send_ack(
+                        socket,
+                        peer,
+                        &config.rupp_prefix,
+                        &mut crypto,
+                        features,
+                        config.mtu,
+                        data.datagram_number,
+                    )?,
+                    1 => send_ack(
+                        socket,
+                        peer,
+                        &config.rupp_prefix,
+                        &mut sha512_first_rx_crypto,
+                        features,
+                        config.mtu,
+                        data.datagram_number,
+                    )?,
+                    2 => send_ack(
+                        socket,
+                        peer,
+                        &config.rupp_prefix,
+                        &mut sha512_first_tx_crypto,
+                        features,
+                        config.mtu,
+                        data.datagram_number,
+                    )?,
+                    _ => unreachable!(),
+                }
                 let missing = datagram_tracker.observe(data.datagram_number);
-                send_nak(
-                    socket,
-                    peer,
-                    &config.rupp_prefix,
-                    &mut crypto,
-                    features,
-                    config.mtu,
-                    missing,
-                )?;
+                match crypto_path {
+                    0 => send_nak(
+                        socket,
+                        peer,
+                        &config.rupp_prefix,
+                        &mut crypto,
+                        features,
+                        config.mtu,
+                        missing,
+                    )?,
+                    1 => send_nak(
+                        socket,
+                        peer,
+                        &config.rupp_prefix,
+                        &mut sha512_first_rx_crypto,
+                        features,
+                        config.mtu,
+                        missing,
+                    )?,
+                    2 => send_nak(
+                        socket,
+                        peer,
+                        &config.rupp_prefix,
+                        &mut sha512_first_tx_crypto,
+                        features,
+                        config.mtu,
+                        missing,
+                    )?,
+                    _ => unreachable!(),
+                }
                 for packet in data.packets {
                     let delivered = match reliability.receive(packet) {
                         Ok(value) => value,
@@ -1247,9 +1389,24 @@ pub(crate) fn establish_connected_session(
                                 accepted.request_time
                             ));
                         }
+                        let (session_kdf, tx_nonce, rx_nonce) = match crypto_path {
+                            0 => ("BLAKE2b (0.735 crypto_kx)", crypto.tx_nonce, crypto.rx_nonce),
+                            1 => (
+                                "SHA-512 (first digest half server-to-client)",
+                                sha512_first_rx_crypto.tx_nonce,
+                                sha512_first_rx_crypto.rx_nonce,
+                            ),
+                            2 => (
+                                "SHA-512 (first digest half client-to-server)",
+                                sha512_first_tx_crypto.tx_nonce,
+                                sha512_first_tx_crypto.rx_nonce,
+                            ),
+                            _ => unreachable!(),
+                        };
                         return Ok(ConnectionAcceptedSummary {
                             source,
                             wire_bytes: wire_length,
+                            session_kdf,
                             client_address: accepted.client_address,
                             system_index: accepted.system_index,
                             internal_address_count: accepted.internal_address_count,
@@ -1261,8 +1418,8 @@ pub(crate) fn establish_connected_session(
                             request_acked,
                             retransmissions,
                             refreshed_rupp_tokens,
-                            tx_nonce: crypto.tx_nonce,
-                            rx_nonce: crypto.rx_nonce,
+                            tx_nonce,
+                            rx_nonce,
                             elapsed_ms: started.elapsed().as_millis(),
                         });
                     }
@@ -1276,6 +1433,9 @@ pub(crate) fn establish_connected_session(
     } else {
         format!("; receive diagnostics: {}", errors.join("; "))
     };
+    let kdf_state = format!(
+        "current-build KDF state: {kdf_diagnostic_count} SHA-512 orientation diagnostic(s) also received no usable response; the authenticated early channel still proves its separate BLAKE2b derivation"
+    );
     let route_state = match config.deferred_reply2_rupp_token_type {
         Some(token_type) => format!(
             "native-matched route state: the initial subtype-1 GameService token remained on normal outbound online packets; OpenReply2 advertised outer token subtype {token_type} in a {}-byte exact header, whose installation is deferred until an online packet resolves the active remote; after native retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response",
@@ -1286,7 +1446,7 @@ pub(crate) fn establish_connected_session(
         ),
     };
     Err(format!(
-        "sent {last_wire_bytes}-byte encrypted reliable ID_CONNECTION_REQUEST in {} datagram(s), but no ID_CONNECTION_REQUEST_ACCEPTED arrived in {} ms (request ACKed: {request_acked}, tx nonce {}, rx nonce {}){detail}; sends: {}; {first_wire_trace}; {route_state}",
+        "sent {last_wire_bytes}-byte encrypted reliable ID_CONNECTION_REQUEST in {} datagram(s), but no ID_CONNECTION_REQUEST_ACCEPTED arrived in {} ms (request ACKed: {request_acked}, BLAKE2b tx nonce {}, rx nonce {}){detail}; sends: {}; {first_wire_trace}; {kdf_state}; {route_state}",
         sent_datagrams.len(),
         started.elapsed().as_millis(),
         crypto.tx_nonce,
