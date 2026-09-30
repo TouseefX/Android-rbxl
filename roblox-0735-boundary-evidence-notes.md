@@ -203,6 +203,24 @@ Source: `https://github.com/kingdudely/Roblox-RakNet-Decompilation-Project/blob/
 
 The first SHA-512 live diagnostic also received no ACK, but it used the original subtype-1/flags-1 client RUPP. The same current project's measured framing identifies established client-to-server headers as 31 bytes with a subtype-2 token and flags zero, while established server-to-client headers are the 23-byte token-only form. Therefore the next diagnostic is the bounded cross-product that had not yet been tested: a 31-byte header combining Reply2's flags-zero subtype-2 token with the original client endpoint TLV, encrypted once under BLAKE2b and under each SHA-512 digest-half orientation. This does not replace native-first behavior and does not expose the token.
 
+## 0.740 Windows Player recovery corrections
+
+The parsed 0.740 archive targets Windows Player `0.740.0.7400927`, not the exact `0.741.19.7411056` Studio build. Its broad disassembly range `fn_0x000142897340.asm` was initially labelled only from later string xrefs. The first real body in that range, **`0x142897340–0x142897555`**, is instead the Windows `RakNet::RakPeer::generateUdmuxToken` implementation:
+
+- its Microsoft x64 ABI is `(RakPeer *this, uint8_t *out, SystemAddress const *remote, uint32_t value, lineage byte on stack)`;
+- it reads the processor pointer at `RakPeer+0xEA0`;
+- lineage `6` forces the alternate-token boolean, while other values visible in this body clear it;
+- it builds local and optional remote endpoint context;
+- the ordinary path dispatches `RuppTokenProcessor` virtual `+0x18`, and the algorithm-telemetry path dispatches virtual `+0x20` with an additional algorithm-result output.
+
+This matches `lambdaBaa9::_Do_call` at `0x1428A4FB0`, which writes subtype `2`, loads the same five arguments, and invokes RakPeer vtable offset `+0x340` (slot **104**). Consequently the slot-104 concrete RakPeer target is `0x142897340`; the archive README's 80-slot export was truncated and its earlier classification of this broad disassembly as only a reply serializer was incorrect.
+
+This recovery still does **not** expose the token primitive. The Windows `RBX::Rupp::RuppTokenProcessor` vtable at `0x146C989B8` contains one deleting destructor followed by four pure-virtual entries. The Windows offsets correspond to the older Mac interface's `verify_DEPRECATED`, `verify`, `generate_DEPRECATED`, and `generate`; MSVC's one destructor slot shifts the two generation methods to `+0x18/+0x20`. `RakPeer::generateUdmuxToken` therefore only marshals endpoint/lineage inputs into a processor supplied by the server environment.
+
+The same Player binary's `setServerRuppStemma` path at `0x14289DFA0` allocates only the 16-byte base processor and installs that pure interface. That is consistent with dormant server code in a Player executable, not an embedded concrete RCC token backend. Recovering `TokenGenAlgorithm`, `PepperId`, and `RandomSeed1` semantics requires the concrete processor from a matching RCC/game-server module or a safe live configuration shape report; they cannot be inferred from this Player target.
+
+This boundary is independent of connected SessionCrypto. The 0.735 Studio `RakPeerCrypto::clientInitEphemeralSessionKeys` still directly proves normal-session installation through `crypto_kx_client_session_keys` into `SessionCrypto+96` (server-to-client) and `SessionCrypto+64` (client-to-server). The unresolved 0.740/0.741 question is whether the newer Reply2 path changed that KDF or key installation; the RUPP generator supplies no evidence either way.
+
 ---
 
 ### What remains outside the decompile export
