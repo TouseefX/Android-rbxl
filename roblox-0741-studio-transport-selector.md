@@ -15,6 +15,12 @@ Scratch disassembly artifacts are outside the repository:
 - `/tmp/winstudio_uploaded/raknet_ctor_0741.asm`
 - `/tmp/winstudio_uploaded/flag_funcs_0741.asm`
 - `/tmp/winstudio_uploaded/scan_transport.txt`
+- `/tmp/winstudio_uploaded/xrefs_selected.txt`
+- `/tmp/winstudio_uploaded/rbxtransport_config_funcs.asm`
+- `/tmp/winstudio_uploaded/xrefs_netstack.txt`
+- `/tmp/winstudio_uploaded/netstack_parser_snips.asm`
+- `/tmp/winstudio_uploaded/rbxtransport_full_remap.asm`
+- `/tmp/winstudio_uploaded/rbxtransport_client_funcs.asm`
 
 ## Selector conclusion
 
@@ -108,6 +114,8 @@ Important runtime implication: `UseRbxTransportClient` and `RefactorIngressFlow`
 
 It does not contain `FFlagUseRbxTransportClient`, `FFlagRefactorIngressFlow`, or the fallback-enable flags. That means public Studio settings do not prove RbxTransport-first Team Create. Private/runtime flags could still alter the decision.
 
+Runtime correction from the current investigation: treat Studio's `FFlagUseRbxTransport` and `FFlagStudioClientServerMDI2` as enabled by default for the active Team Create target. With those runtime flags accepted, configs that have a nonzero NetStack/RbxTransport port, an address, and a 32-byte RbxTransport early public key should be mapped to `selectedTransport=RbxTransport` before any legacy RakNet probe is attempted.
+
 ## Fallback flags
 
 | Flag/storage | Evidence | Selector behavior |
@@ -115,6 +123,33 @@ It does not contain `FFlagUseRbxTransportClient`, `FFlagRefactorIngressFlow`, or
 | `RakNetConnectionFailureFallbackToRbxTransport` storage `0x14d915cb0` | registration thunk `0x145b765e0..0x145b765f4`; selector reads at `0x145b75854` and `0x145b75ebc` | If initial selection is RakNet and this flag plus `canUseRbxTransport` are true, sets up fallback-to-RbxTransport (`0x145b75ef8..0x145b75fa9`). |
 | `RbxTransportConnectionFailureFallbackToRakNet` storage `0x14d915c88` | registration thunk `0x145b76640..0x145b76654`; selector reads at `0x145b75b39` | If initial selection is RbxTransport and this flag is true, sets up fallback-to-RakNet (`0x145b75b46..0x145b75c56`). |
 | `RbxTransportFallbackStudioMessage` storage object `0x14c4173b8` | registration thunk `0x145b76740..0x145b76754`; message use refs in fallback handling, e.g. `0x145b720dc..0x145b72109` | Used when an RbxTransport connection closes and Studio shows/logs a fallback message; it does not decide the initial transport branch. |
+
+## Join-config parser fields relevant to RbxTransport
+
+The general Studio test/join config parser is `0x141d44ef0..0x141d457f7`. Relevant output assignments recovered from `/tmp/winstudio_uploaded/rbxtransport_config_funcs.asm`:
+
+| Config key | Native output |
+|---|---:|
+| `ServerPort` | `+0x00` |
+| `ServerName` | string at `+0x10` |
+| `RbxTransportPort` | `+0x04` |
+| `RbxTransportToken` | string at `+0x30` |
+| `NumTestServerPlayersOnStartup` | `+0x08` |
+| `ExecuteTestService` | byte `+0x70` |
+| `IsInStudioTestServiceMode` | byte `+0x71` |
+
+The Team Create/join parser functions now known to consume the same native payload family are:
+
+| Function range | Relevant field refs |
+|---|---|
+| `0x145b845e0..0x145b8c1fd` | `RandomSeed1`, `TokenValue`, `UdmuxEndpoints`, `NetStackTokenValue`, `NetStackPort`, `GameFqdn` |
+| `0x14674c120..0x14674df77` | NetStack/join-config consumer |
+| `0x1467525e0..0x14675486d` | NetStack/join-config consumer |
+| `0x146f71f90..0x146f72ccb` | NetStack/join-config consumer |
+
+The useful snippet in `0x145b8b3ac..0x145b8b67a` reads, in order, `ServerConnections`, `UdmuxEndpoints`, `DirectServerReturn`, `TokenValue`, optional `MachineAddress`/`ServerPort`, `NetStackTokenValue`, `NetStackPort`, and `GameFqdn`. Token and seed bytes remain secrets; diagnostics should only report shapes/lengths.
+
+`RbxTransportEphemeralEarlyPublicKey` has static string xrefs at `0x1404788e1`, `0x1467586e1`, and `0x14675fc21`; `RbxTransportEphemeralEarlySecretKey` has a paired xref at `0x140478951`. The emitted KeyRing application uses id/send/revert `1` for `RbxTransportEphemeralEarlyPublicKey`, separate from the legacy RakNet early-key application id `5`.
 
 ## RbxTransport config handoff recovered so far
 
@@ -124,4 +159,45 @@ It does not contain `FFlagUseRbxTransportClient`, `FFlagRefactorIngressFlow`, or
 - `0x148f04fc0`: `[DFLog::NetworkClient] RbxTransport Client will connect without RuppConfig. udmuxEndpoint exists: {}, rbxTransportToken exists: {}`
 - `0x148f05050`: `[DFLog::NetworkClient] RbxTransport Client will connect to server {}|{}, udmux {}|{}`
 
-This is enough to prove selection, but not enough to implement the RbxTransport/QUIC client: the next native targets would be the downstream constructor/connect routine at `0x145cc44c0` and its auth/session-crypto callees.
+Additional structure recovered from the full `0x145b6a4b0` body in `/tmp/winstudio_uploaded/rbxtransport_full_remap.asm`:
+
+| Native source offset in the selector handoff struct | Meaning recovered so far |
+|---:|---|
+| `+0x08` string, `+0x28` word/dword | RCC/server address and port. These are parsed with `0x143449960`; failure goes to `RbxTransport Client rccAddr parse error: %s`. |
+| `+0x78` optional string/endpoint, `+0x98` dword | UDMUX endpoint/address and port used by the `will connect to server {}|{}, udmux {}|{}` log. |
+| `+0x122` byte | DirectServerReturn/RUPP flag copied into the RUPP config blob and logged as `DSR`. |
+| `+0x123` byte | RUPP token type logged by `RuppConfig = RCC {}:{}, DSR {}, Token type {}`. |
+| `+0x124..+0x133` bytes | 16-byte RbxTransport/RUPP token payload. Do not print. |
+| `+0x134` byte | Token-present flag; RUPP config is omitted if the UDMUX optional is empty or this byte is false. |
+| `+0x138` string optional | Game/FQDN-related string copied into the connect configuration when present. |
+| `+0x1f0` onward | Existing connection/base-client subobject copied into the outgoing RbxTransport configuration before network-emulation setup. |
+
+`0x145cc44c0` is no longer considered the QUIC handshake/auth routine. In the RbxTransport path it is reached after the connect configuration is assembled, receives the client `+0x1248` object plus the network-emulation output buffer, and populates packet-loss/latency/jitter fields (`sendPacketLossRatio`, `recvPacketLossRatio`, `sendLatencyMs`, `sendJitterMs`, `recvLatencyMs`, `recvJitterMs`).
+
+This is enough to prove selection and to keep the app on the RbxTransport branch, but not enough to implement the RbxTransport/QUIC client. The remaining native target is the actual BaseClient/QUIC connect-and-channel path that consumes the assembled configuration.
+
+## RbxTransport client/BaseClient path recovered so far
+
+`/tmp/winstudio_uploaded/rbxtransport_client_funcs.asm` maps the public client wrapper functions that own connection state and channel opening:
+
+| Function range | Role recovered so far |
+|---|---|
+| `0x14603b920..0x14603bb68` | `RbxTransportClient::connect`-style setter/start routine. It stores the connect configuration at client offsets `+0x68/+0x70`, rejects an empty configuration, calls a BaseClient virtual start method (`vtable +0x08`), and logs `Failed to start the BaseClient with configuration {}` when that start call fails. |
+| `0x14603bb70..0x14603c1e1` | Connection establishment path. It rejects `client+0x20` already-connected, creates an RbxTransport connection with `0x1435d0a40` using `client+0x60`, `client+0x68`, and `client+0x08`, stores it at `client+0x58`, waits via `0x14603eb70`, opens the client channel through connection vtable `+0x68`, then sets `client+0x20 = true`. |
+| `0x14603eb70..0x14603f4d5` | Wait/event loop for connection-open, receive-channel ACK, close, and timeout. Logs `connection opened`, `ACK ReceiveChannelOpened IN WaitForConnection`, `connection closed`, and `timed out`. |
+| `0x14603daf0..0x14603e26b` | Receive/event dispatch for ACK/unknown receive channel state. |
+| `0x14603e4e0..0x14603e7a5` and `0x14603e370..0x14603e4d5` | Message send/queue paths before and after the receive channel is open. |
+
+Important implication for implementation: RbxTransport does not start with Roblox's RakNet `RbxOpenRequest1/2` packets. The native client creates a QUIC/RbxTransport connection first, waits for a connection-open event, then opens/ACKs channels before game data is sent. The app therefore now stops at a safe selector/config report until the QUIC connect configuration and channel wire format are recovered.
+
+## App behavior after the RbxTransport pivot
+
+`src/team_create.rs` now performs a static-selector remap before sending any legacy RakNet datagrams. When a fresh Team Create config contains:
+
+- a usable public UDP/UDMUX endpoint,
+- an RCC/server endpoint,
+- `NetStackPort` or `RbxTransportPort`,
+- `NetStackTokenValue` or `RbxTransportToken` decoding to 16 bytes, and
+- a 32-byte RbxTransport early public key from either `EphemeralEarlyPubKey` or the `ClientPublicKeyData` application `RbxTransportEphemeralEarlyPublicKey`,
+
+it reports `selectedTransport=RbxTransport`, preserves only safe token/key metadata in the UI report, and intentionally skips the RakNet connected probe. This avoids burning a one-use Team Create config on the wrong transport now that the runtime flags are treated as RbxTransport-first. The actual QUIC/BaseClient auth and channel-open path still needs to be recovered before a live connected-client fix can be claimed; `0x145cc44c0` is now identified as the network-emulation configuration helper reached near the end of the RbxTransport path, not the QUIC handshake itself.

@@ -8,15 +8,17 @@
 //!   (`Address`/`Port`, `ServerPort` + `UdmuxEndpoints`, or the classic
 //!   joinScript `MachineAddress`/`ServerPort` shapes — the decompile's
 //!   `fillServerConnectionsArrayFromConfig` accepts several), and
-//! - the exact offline exchanges of Roblox's customized 2022 RakNet
-//!   handshake: RUPP-routed `RbxOpenRequest1`/`RbxOpenReply1`, followed on
-//!   the same UDP socket by authenticated and encrypted
-//!   `RbxOpenRequest2`/`RbxOpenReply2`.
+//! - transport selection after the join config is decoded. Legacy RakNet
+//!   configs still use Roblox's customized 2022 RUPP-routed
+//!   `RbxOpenRequest1`/`RbxOpenReply1` flow followed by encrypted
+//!   `RbxOpenRequest2`/`RbxOpenReply2`; configs that satisfy the current
+//!   0.741 RbxTransport selector are now mapped onto the QUIC-first
+//!   RbxTransport path instead of being forced through the RakNet probe.
 //!
-//! The same probe now continues through normal SessionCrypto, reliable
-//! `ID_CONNECTION_REQUEST`, encrypted ACK/NAK handling, and
+//! The legacy RakNet probe can continue through normal SessionCrypto,
+//! reliable `ID_CONNECTION_REQUEST`, encrypted ACK/NAK handling, and
 //! `ID_CONNECTION_REQUEST_ACCEPTED`. JoinData → live change-item application
-//! remains the next Stage 1 layer.
+//! remains the next Stage 1 layer after the selected transport is live.
 
 use crate::connected_raknet::{
     establish_connected_session, initialize_raknet_time, ConnectedConfig,
@@ -463,6 +465,174 @@ struct RuppProbeMaterial {
     /// configuration. OpenRequest1/OpenRequest2 still use `TokenValue`, but
     /// connected traffic should prefer this route when the config supplies it.
     connected_route: Option<RuppConnectedRouteMaterial>,
+}
+
+
+#[derive(Clone, Debug)]
+struct RbxTransportEarlyKeyMaterial {
+    source: String,
+    version: u16,
+    public_key: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct RbxTransportConnectPlan {
+    public_endpoint: Endpoint,
+    rcc_endpoint: Endpoint,
+    rbx_transport_port: u16,
+    token: [u8; 16],
+    token_shape: String,
+    early_key: RbxTransportEarlyKeyMaterial,
+    game_fqdn: Option<String>,
+}
+
+impl RbxTransportConnectPlan {
+    fn summary(&self) -> String {
+        let mut text = format!(
+            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport selected UDP/UDMUX target: {}\nRbxTransport RCC/RUPP config: RCC {} with NetStackPort {}, NetStackTokenValue {} ({} decoded bytes)\nRbxTransport early pubkey: {} version {}, {} bytes",
+            self.public_endpoint.label(),
+            self.rcc_endpoint.label(),
+            self.rbx_transport_port,
+            self.token_shape,
+            self.token.len(),
+            self.early_key.source,
+            self.early_key.version,
+            self.early_key.public_key.len(),
+        );
+        if let Some(game_fqdn) = &self.game_fqdn {
+            text.push_str(&format!("\nRbxTransport GameFqdn: {game_fqdn}"));
+        }
+        text.push_str(
+            "\nLegacy RakNet connected packets are intentionally skipped for this config; the remaining implementation target is the RbxTransport QUIC/BaseClient auth + channel-open path, not another RakNet route/KDF matrix.",
+        );
+        text
+    }
+}
+
+fn parse_rbx_transport_key_ring_app(
+    config: &serde_json::Value,
+) -> Result<RbxTransportEarlyKeyMaterial, String> {
+    let key_ring_text = find_field_ci(config, "ClientPublicKeyData", 0)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| "ClientPublicKeyData absent".to_string())?;
+    let key_ring: serde_json::Value = serde_json::from_str(&key_ring_text)
+        .map_err(|error| format!("ClientPublicKeyData is not valid KeyRing JSON: {error}"))?;
+    let applications = get_ci(&key_ring, "applications")
+        .ok_or_else(|| "ClientPublicKeyData has no applications object".to_string())?;
+    let application = get_ci(applications, "RbxTransportEphemeralEarlyPublicKey")
+        .ok_or_else(|| {
+            "ClientPublicKeyData has no RbxTransportEphemeralEarlyPublicKey application".to_string()
+        })?;
+    let send_version = get_ci(application, "send")
+        .and_then(json_u16)
+        .ok_or_else(|| {
+            "RbxTransportEphemeralEarlyPublicKey has no valid send version".to_string()
+        })?;
+    let versions = get_ci(application, "versions")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "RbxTransportEphemeralEarlyPublicKey has no versions array".to_string())?;
+    let selected = versions
+        .iter()
+        .find(|entry| get_ci(entry, "id").and_then(json_u16) == Some(send_version))
+        .ok_or_else(|| {
+            format!("RbxTransportEphemeralEarlyPublicKey send version {send_version} is absent")
+        })?;
+    if !get_ci(selected, "allowed")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "RbxTransportEphemeralEarlyPublicKey send version {send_version} is not production-allowed"
+        ));
+    }
+    let value = get_ci(selected, "value")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            format!("RbxTransportEphemeralEarlyPublicKey version {send_version} has no value")
+        })?;
+    let decoded = decode_base64(value).ok_or_else(|| {
+        format!("RbxTransportEphemeralEarlyPublicKey version {send_version} is not valid Base64")
+    })?;
+    let public_key: [u8; 32] = decoded.try_into().map_err(|decoded: Vec<u8>| {
+        format!(
+            "RbxTransportEphemeralEarlyPublicKey version {send_version} is {} bytes, not exactly 32",
+            decoded.len()
+        )
+    })?;
+    Ok(RbxTransportEarlyKeyMaterial {
+        source: "ClientPublicKeyData/RbxTransportEphemeralEarlyPublicKey".into(),
+        version: send_version,
+        public_key,
+    })
+}
+
+fn extract_rbx_transport_early_key(
+    config: &serde_json::Value,
+) -> Result<RbxTransportEarlyKeyMaterial, String> {
+    if let Some(ephemeral_value) = find_field_ci(config, "EphemeralEarlyPubKey", 0)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty())
+    {
+        let decoded_text = url_percent_decode(&ephemeral_value)?;
+        let decoded = decode_base64(&decoded_text)
+            .ok_or_else(|| "URL-decoded EphemeralEarlyPubKey is not valid Base64".to_string())?;
+        let public_key: [u8; 32] = decoded.try_into().map_err(|decoded: Vec<u8>| {
+            format!(
+                "URL-decoded EphemeralEarlyPubKey is {} bytes, not exactly 32",
+                decoded.len()
+            )
+        })?;
+        return Ok(RbxTransportEarlyKeyMaterial {
+            source: "URL-decoded EphemeralEarlyPubKey override".into(),
+            version: 1,
+            public_key,
+        });
+    }
+
+    parse_rbx_transport_key_ring_app(config)
+}
+
+fn extract_rbx_transport_connect_plan(
+    config: &serde_json::Value,
+) -> Result<RbxTransportConnectPlan, String> {
+    let all_endpoints = parse_all_join_endpoints(config);
+    let public_endpoint = prefer_public_endpoints(all_endpoints.clone())
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no public UDP/UDMUX endpoint found".to_string())?;
+    let rcc_endpoint = all_endpoints
+        .iter()
+        .find(|endpoint| is_internal_address(&endpoint.address))
+        .cloned()
+        .or_else(|| all_endpoints.first().cloned())
+        .ok_or_else(|| "no RCC endpoint found".to_string())?;
+    let rbx_transport_port = find_field_ci(config, "NetStackPort", 0)
+        .or_else(|| find_field_ci(config, "RbxTransportPort", 0))
+        .and_then(|value| as_port(&value))
+        .ok_or_else(|| "NetStackPort/RbxTransportPort absent or zero".to_string())?;
+    let token_value = find_field_ci(config, "NetStackTokenValue", 0)
+        .or_else(|| find_field_ci(config, "RbxTransportToken", 0))
+        .ok_or_else(|| "NetStackTokenValue/RbxTransportToken absent".to_string())?;
+    let token_text = token_value
+        .as_str()
+        .ok_or_else(|| "NetStackTokenValue/RbxTransportToken is not a string".to_string())?;
+    let token = decode_token_16(token_text).ok_or_else(|| {
+        "NetStackTokenValue/RbxTransportToken is not a 16-byte raw, hexadecimal, or Base64 token"
+            .to_string()
+    })?;
+    let early_key = extract_rbx_transport_early_key(config)?;
+    let game_fqdn = find_field_ci(config, "GameFqdn", 0)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|value| !value.trim().is_empty());
+    Ok(RbxTransportConnectPlan {
+        public_endpoint,
+        rcc_endpoint,
+        rbx_transport_port,
+        token,
+        token_shape: diagnostic_token_value_shape(&token_value),
+        early_key,
+        game_fqdn,
+    })
 }
 
 fn extract_rupp_probe_material(config: &serde_json::Value) -> Result<RuppProbeMaterial, String> {
@@ -1957,6 +2127,15 @@ pub fn probe_join_config_with_key_ring_revert(
             "\nCurrent normal-session seed metadata: RandomSeed1 {shape} (used only in bounded current-build seeded-KDF diagnostics when decodable; not applied to the proven 0.735 KX path)"
         ));
     }
+    if let Some(rcc_version) = find_field_ci(config, "RccVersion", 0)
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        heading.push_str(&format!("\nAdvertised RCC version: {rcc_version}"));
+    }
+    if let Ok(rbx_transport_plan) = extract_rbx_transport_connect_plan(config) {
+        heading.push_str(&rbx_transport_plan.summary());
+        return heading;
+    }
     let request2 = extract_request2_material_with_revert(config, key_ring_revert);
     match &request2 {
         Ok(material) => heading.push_str(&format!(
@@ -1981,11 +2160,6 @@ pub fn probe_join_config_with_key_ring_revert(
             material.auth.auth_blob.len()
         )),
         Err(reason) => heading.push_str(&format!("\nOpenRequest2 unavailable: {reason}")),
-    }
-    if let Some(rcc_version) = find_field_ci(config, "RccVersion", 0)
-        .and_then(|value| value.as_str().map(str::to_owned))
-    {
-        heading.push_str(&format!("\nAdvertised RCC version: {rcc_version}"));
     }
     if let Some(ephemeral_key) = find_field_ci(config, "EphemeralEarlyPubKey", 0)
         .and_then(|value| value.as_str().map(str::to_owned))
@@ -2157,6 +2331,60 @@ mod tests {
         assert_eq!(connected_header[1], RUPP_FLAG_DIRECT_SERVER_RETURN);
         assert_eq!(&connected_header[7..23], &connected.token);
         assert_eq!(&connected_header[23..], &[2, 6, 10, 32, 8, 208, 0xda, 0xc0]);
+    }
+
+    #[test]
+    fn rbx_transport_plan_uses_netstack_and_redacts_secrets() {
+        let key_ring = serde_json::json!({
+            "applications": {
+                "RbxTransportEphemeralEarlyPublicKey": {
+                    "versions": [
+                        {
+                            "id": 1,
+                            "value": "EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI=",
+                            "allowed": true
+                        }
+                    ],
+                    "send": 1,
+                    "revert": 1
+                }
+            }
+        });
+        let config = serde_json::json!({
+            "settings": {
+                "DirectServerReturn": true,
+                "TokenValue": "AAECAwQFBgcICQoLDA0ODw==",
+                "NetStackTokenValue": "ICEiIyQlJicoKSorLC0uLw==",
+                "NetStackPort": 56000,
+                "GameFqdn": "gamejoin.roblox.test",
+                "ClientPublicKeyData": key_ring.to_string(),
+                "ServerConnections": [
+                    { "Address": "10.32.8.208", "Port": 50704 }
+                ],
+                "UdmuxEndpoints": [
+                    { "Address": "128.116.54.33", "Port": 50704 }
+                ]
+            }
+        });
+
+        let plan = extract_rbx_transport_connect_plan(&config).unwrap();
+        assert_eq!(plan.public_endpoint.address, "128.116.54.33");
+        assert_eq!(plan.public_endpoint.port, 50704);
+        assert_eq!(plan.rcc_endpoint.address, "10.32.8.208");
+        assert_eq!(plan.rcc_endpoint.port, 50704);
+        assert_eq!(plan.rbx_transport_port, 56000);
+        assert_eq!(plan.token, [
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+            0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+        ]);
+        assert_eq!(plan.early_key.version, 1);
+        assert_eq!(plan.early_key.public_key.len(), 32);
+
+        let report = probe_join_config(&config, 3, 1);
+        assert!(report.contains("selectedTransport=RbxTransport"));
+        assert!(report.contains("Legacy RakNet connected packets are intentionally skipped"));
+        assert!(!report.contains("ICEiIyQl"));
+        assert!(!report.contains("AAECAw"));
     }
 
     #[test]

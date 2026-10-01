@@ -1855,21 +1855,21 @@ ui.label("Place ID:");
                             .as_ref()
                             .is_some_and(|cfg| !crate::team_create::parse_join_config(cfg).is_empty());
                         let probe = ui
-                            .add_enabled(can_probe, egui::Button::new("📡 Probe Rbx Handshake"))
+                            .add_enabled(can_probe, egui::Button::new("📡 Resolve Rbx Transport"))
                             .on_hover_text(if can_probe {
-                                "Runs the complete RUPP-routed encrypted 2022 open handshake. The join ticket is one-use, so this probe consumes the current config"
+                                "Maps the current Team Create config through the 0.741 transport selector. Legacy RakNet configs are probed; RbxTransport configs are preserved for the QUIC path. The join ticket is one-use."
                             } else {
-                                "Run Negotiate Join immediately before each probe; encrypted early-auth material is one-use"
+                                "Run Negotiate Join immediately before each transport probe; encrypted early-auth material is one-use"
                             });
                         if probe.clicked() {
                             // Request2 pre-auth MACs are replay-protected. Consume the
                             // config so a second click cannot silently reuse a ticket.
                             if let Some(cfg) = self.team_create_join_config.take() {
-                                self.status = "Probing customized RakNet handshake…".into();
+                                self.status = "Resolving Team Create transport…".into();
                                 let report = crate::team_create::probe_join_config(&cfg, 3, 2500);
-                                self.log_info(format!("Team Create Rbx handshake probe:\n{report}"));
+                                self.log_info(format!("Team Create transport probe:\n{report}"));
                                 self.team_create_response = report;
-                                self.status = "Rbx handshake probe finished — see panel output".into();
+                                self.status = "Team Create transport probe finished — see panel output".into();
                             }
                         }
                     });
@@ -5736,7 +5736,7 @@ ui.label("Place ID:");
                     // separate UI clicks.
                     if probe_immediately && !preemptive {
                         self.status =
-                            "Fresh join received — probing one-use ticket immediately…".into();
+                            "Fresh join received — resolving one-use transport immediately…".into();
                         let report = crate::team_create::probe_join_config_with_key_ring_revert(
                             &v,
                             3,
@@ -5749,13 +5749,13 @@ ui.label("Place ID:");
                             "normal send"
                         };
                         self.log_info(format!(
-                            "Team Create immediate Rbx handshake probe ({key_mode}):\n{report}"
+                            "Team Create immediate transport probe ({key_mode}):\n{report}"
                         ));
                         self.team_create_response = format!(
-                            "Fresh gamejoin config handed directly to the UDP handshake (no UI delay; {key_mode} key selection)\n{report}"
+                            "Fresh gamejoin config handed directly to the selected transport path (no UI delay; {key_mode} key selection)\n{report}"
                         );
                         self.status =
-                            "Immediate Rbx handshake probe finished — see panel output".into();
+                            "Immediate Team Create transport probe finished — see panel output".into();
                         return;
                     }
 
@@ -5777,17 +5777,17 @@ ui.label("Place ID:");
                 } else if all_null {
                     self.status = format!("Team Create {label} failed — empty response");
                     format!(
-                        "Team Create {label} returned only null/empty values; negotiation failed and the handshake probe remains disabled"
+                        "Team Create {label} returned only null/empty values; negotiation failed and the transport probe remains disabled"
                     )
                 } else if preemptive {
                     self.status = "Team Create warm-up accepted — negotiate join next".into();
                     String::from(
-                        "Server warm-up response received, but it has no server endpoint yet; run Negotiate Join. The handshake probe remains disabled",
+                        "Server warm-up response received, but it has no server endpoint yet; run Negotiate Join. The transport probe remains disabled",
                     )
                 } else {
                     self.status = "Team Create join returned no usable server endpoint".into();
                     String::from(
-                        "Join response has no usable Address/Port, ServerConnections, or UdmuxEndpoints; the handshake probe remains disabled",
+                        "Join response has no usable Address/Port, ServerConnections, or UdmuxEndpoints; the transport probe remains disabled",
                     )
                 };
 
