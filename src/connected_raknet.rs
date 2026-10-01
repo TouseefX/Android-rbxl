@@ -68,6 +68,7 @@ pub(crate) struct DiagnosticSessionKeyCandidate {
     pub cipher: SessionCipher,
 }
 
+#[derive(Clone)]
 pub(crate) struct ConnectedConfig {
     pub client_guid: u64,
     pub mtu: u16,
@@ -83,16 +84,16 @@ pub(crate) struct ConnectedConfig {
     pub diagnostic_session_key_candidates: Vec<DiagnosticSessionKeyCandidate>,
     pub rupp_prefix: Vec<u8>,
     /// Current OpenReply2 can carry the server's subtype-2 route token in its
-    /// outer RUPP header. Native RakPeer does not install that offline token
-    /// into the newly assigned remote; it starts online traffic with the
-    /// default subtype-1 header and accepts a token update only after the
-    /// online packet resolves that active remote. Retain the advertised value
-    /// solely for the post-native online route diagnostic.
+    /// outer RUPP header. Current connected captures use that token together
+    /// with the client's endpoint-bearing header and Reply2's zero flags, so
+    /// the connected path promotes it before the first online datagram when it
+    /// is available. The exact token-only Reply2 header is still retained as a
+    /// bounded fallback/diagnostic shape.
     pub deferred_reply2_rupp_token_type: Option<u8>,
     pub deferred_reply2_rupp_token: Option<[u8; 16]>,
-    /// Exact outer RUPP header returned with OpenReply2. It is retained only
-    /// for a late diagnostic; audited native traffic still starts with the
-    /// subtype-1 client header.
+    /// Exact outer RUPP header returned with OpenReply2. It is token-only, so it
+    /// is not the same byte string as the endpoint-bearing current connected
+    /// header.
     pub deferred_reply2_rupp_prefix: Option<Vec<u8>>,
     pub timeout_ms: u64,
 }
@@ -376,7 +377,7 @@ fn diagnostic_reply2_rupp_prefix(config: &ConnectedConfig) -> Result<Option<Vec<
 /// the Reply2 subtype-2 token and flags, plus the client's endpoint TLV. This
 /// differs from both exact Reply2 (23 bytes, no endpoint) and the 0.735 receive
 /// updater (31 bytes but retains the original subtype-1 header's flags).
-fn diagnostic_established_reply2_rupp_prefix(
+fn current_established_reply2_rupp_prefix(
     config: &ConnectedConfig,
 ) -> Result<Option<Vec<u8>>, String> {
     let Some(mut prefix) = diagnostic_reply2_rupp_prefix(config)? else {
@@ -386,7 +387,7 @@ fn diagnostic_established_reply2_rupp_prefix(
         return Ok(None);
     };
     if reply2_prefix.len() < 4 || reply2_prefix[0] != RUPP_PROTOCOL_RAKNET {
-        return Err("OpenReply2 exact RUPP header is unavailable for established-shape diagnostic".into());
+        return Err("OpenReply2 exact RUPP header is unavailable for current established route".into());
     }
     prefix[1] = reply2_prefix[1];
     Ok(Some(prefix))
@@ -1199,16 +1200,32 @@ pub(crate) fn establish_connected_session(
         })
         .collect();
     let (request_payload, request_time) = connection_request_payload(config.client_guid);
-    // Keep native subtype-1 traffic first. These alternatives are emitted
-    // only after several unanswered native retransmissions. Preserve the
-    // exact token-only outer header returned with Reply2 in addition to the
-    // receive-updater shape (refreshed token in the client endpoint-bearing
-    // header); those are observably different routed packets.
+    let original_rupp_prefix = config.rupp_prefix.clone();
+    let primary_established_prefix = current_established_reply2_rupp_prefix(&config)?;
+    let primary_route_label = if let Some(prefix) = primary_established_prefix {
+        // Current established captures use Reply2's subtype-2 token and zero
+        // flags with the client's endpoint-bearing header from the open route.
+        // Make that the actual first connected datagram instead of sending the
+        // older subtype-1/flags-1 route first and only trying this after the
+        // server has already rejected several packets on the flow.
+        config.rupp_prefix = prefix;
+        "current established subtype-2/flags-0"
+    } else {
+        "native subtype-1"
+    };
+    // After promoting the primary route, retain only bounded diagnostics that
+    // are observably different from the primary header. Preserve the exact
+    // token-only outer header returned with Reply2 and the refreshed-token
+    // endpoint-bearing shape for comparison when the server stays silent.
+    let mut original_route_config = config.clone();
+    original_route_config.rupp_prefix = original_rupp_prefix;
     let diagnostic_exact_reply2_prefix = config.deferred_reply2_rupp_prefix.clone();
-    let diagnostic_refreshed_prefix = diagnostic_reply2_rupp_prefix(&config)?;
-    let diagnostic_established_prefix = diagnostic_established_reply2_rupp_prefix(&config)?;
-    let diagnostic_original_flags_zero_prefix = diagnostic_original_flags_zero_rupp_prefix(&config)?;
-    let diagnostic_original_type2_prefix = diagnostic_original_token_promoted_type2_prefix(&config)?;
+    let diagnostic_refreshed_prefix = diagnostic_reply2_rupp_prefix(&original_route_config)?;
+    let diagnostic_established_prefix: Option<Vec<u8>> = None;
+    let diagnostic_original_flags_zero_prefix =
+        diagnostic_original_flags_zero_rupp_prefix(&original_route_config)?;
+    let diagnostic_original_type2_prefix =
+        diagnostic_original_token_promoted_type2_prefix(&original_route_config)?;
     let mut route_diagnostics_sent = false;
     let mut route_diagnostic_count = 0usize;
     let mut kdf_diagnostic_count = 0usize;
@@ -1250,7 +1267,7 @@ pub(crate) fn establish_connected_session(
         request_time,
     );
     send_traces.push(format!(
-        "native subtype-1 datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
+        "{primary_route_label} datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
         first_send.wire_bytes,
         first_send.extra_padding,
         hex_bytes(&first_send.nonce_suffix)
@@ -1272,9 +1289,10 @@ pub(crate) fn establish_connected_session(
             break;
         }
         if !request_acked && now >= next_retransmit {
-            // Keep retransmissions byte-for-byte native unless an avoided-size
-            // list is actually known. The capability only enables the u16
-            // padding-count field; it does not itself require padding. The old
+            // Keep retransmissions byte-for-byte on the selected primary route
+            // unless an avoided-size list is actually known. The capability
+            // only enables the u16 padding-count field; it does not itself
+            // require padding. The old
             // unconditional one-byte retry was a diagnostic experiment, not a
             // wire behavior established by the current build.
             let retry_padding = 0;
@@ -1296,7 +1314,7 @@ pub(crate) fn establish_connected_session(
             )?;
             last_wire_bytes = retransmit.wire_bytes;
             send_traces.push(format!(
-                "native subtype-1 datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
+                "{primary_route_label} datagram {next_datagram_number}, {} bytes, padding {}, nonce suffix [{}]",
                 retransmit.wire_bytes,
                 retransmit.extra_padding,
                 hex_bytes(&retransmit.nonce_suffix)
@@ -1306,9 +1324,9 @@ pub(crate) fn establish_connected_session(
             retransmissions += 1;
 
             // Send evidence-backed KDF and route alternatives once only after
-            // three unanswered native retransmissions. Any ACK distinguishes
+            // three unanswered primary-route retransmissions. Any ACK distinguishes
             // the relevant boundary; no diagnostic changes the retained
-            // native BLAKE2b/subtype-1 outbound state.
+            // primary BLAKE2b outbound state.
             if retransmissions == 3 && !route_diagnostics_sent {
                 route_diagnostics_sent = true;
 
@@ -2253,11 +2271,11 @@ pub(crate) fn establish_connected_session(
     );
     let route_state = match config.deferred_reply2_rupp_token_type {
         Some(token_type) => format!(
-            "native-matched route state: the initial subtype-1 GameService token remained on normal outbound online packets; OpenReply2 advertised outer token subtype {token_type} in a {}-byte exact header, whose installation is deferred until an online packet resolves the active remote; after native retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response",
+            "current route state: normal outbound online packets used {primary_route_label}; OpenReply2 advertised outer token subtype {token_type} in a {}-byte exact header; after primary-route retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response",
             config.deferred_reply2_rupp_prefix.as_ref().map(Vec::len).unwrap_or(0)
         ),
         None => format!(
-            "native-matched route state: the initial GameService token remained on normal outbound online packets; OpenReply2 advertised no outer token update; after native retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response"
+            "current route state: normal outbound online packets used {primary_route_label}; OpenReply2 advertised no outer token update; after primary-route retries failed, {route_diagnostic_count} one-shot online route diagnostic(s) also received no usable response"
         ),
     };
     Err(format!(
@@ -2346,7 +2364,7 @@ mod tests {
     }
 
     #[test]
-    fn established_reply2_diagnostic_combines_reply_flags_token_and_client_endpoint() {
+    fn current_established_reply2_prefix_combines_reply_flags_token_and_client_endpoint() {
         let mut client_prefix = vec![1, 1, 0, 31, 1, 17, 1];
         client_prefix.extend_from_slice(&[0x11; 16]);
         let endpoint = [2, 6, 10, 0, 0, 1, 0x1f, 0x90];
@@ -2369,7 +2387,7 @@ mod tests {
             deferred_reply2_rupp_prefix: Some(reply_prefix),
             timeout_ms: 5_000,
         };
-        let prefix = diagnostic_established_reply2_rupp_prefix(&config)
+        let prefix = current_established_reply2_rupp_prefix(&config)
             .unwrap()
             .unwrap();
         assert_eq!(prefix.len(), 31);

@@ -1767,16 +1767,13 @@ fn probe_endpoint_with_rupp(
                             },
                             started.elapsed().as_millis()
                         );
-                        // Current native RakPeer does not feed an offline
-                        // OpenReply2's DeserializationResult into the RUPP
-                        // token updater. A subtype-2 token is installed only
-                        // on a later online receive, after
-                        // ProcessNetworkPacket resolves the active remote.
-                        // However, Studio's Team Create payload path does pass
-                        // a separate NetStackTokenValue/NetStackPort into the
+                        // Studio's Team Create payload path can pass a
+                        // separate NetStackTokenValue/NetStackPort into the
                         // connected RUPP client configuration when present;
-                        // prefer that native connected route while preserving
-                        // the offline Reply2 header and token subtype.
+                        // prefer that endpoint-bearing connected route. The
+                        // connected session then promotes Reply2's subtype-2
+                        // token and zero flags into this header before the
+                        // first online datagram when Reply2 supplies them.
                         let connected_prefix = if let (Some(material), Some(token_type)) =
                             (rupp, selected_token_type)
                         {
