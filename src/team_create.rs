@@ -95,6 +95,47 @@ fn diagnostic_scalar(v: &serde_json::Value) -> String {
     }
 }
 
+fn diagnostic_number_with_hex(v: &serde_json::Value) -> String {
+    let value = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|text| text.trim().parse::<u64>().ok()));
+    match value {
+        Some(number) => format!("{number} (0x{number:08x})"),
+        None => diagnostic_scalar(v),
+    }
+}
+
+fn diagnostic_token_value_shape(v: &serde_json::Value) -> String {
+    match v.as_str() {
+        Some(text) => {
+            let mut shape = format!("string({} chars)", text.len());
+            if decode_token_16(text).is_some() {
+                shape.push_str(", resolves to redacted 16-byte token");
+            } else if let Some(decoded) = decode_base64(text) {
+                shape.push_str(&format!(", Base64-decodes {} bytes", decoded.len()));
+            } else {
+                shape.push_str(", does not decode as a 16-byte token");
+            }
+            shape
+        }
+        None => diagnostic_scalar(v),
+    }
+}
+
+fn diagnostic_base64_secret_shape(v: &serde_json::Value) -> String {
+    match v.as_str() {
+        Some(text) => match decode_base64(text) {
+            Some(decoded) => format!(
+                "string({} chars), Base64-decodes {} bytes",
+                text.len(),
+                decoded.len()
+            ),
+            None => format!("string({} chars), Base64 decode failed", text.len()),
+        },
+        None => diagnostic_scalar(v),
+    }
+}
+
 /// Collect endpoints from ONE object level: direct `Address`+`Port`,
 /// `MachineAddress`+`ServerPort` (classic join script), and the
 /// `UdmuxEndpoints` array (per-entry `Port` falling back to `ServerPort`).
@@ -1800,20 +1841,28 @@ pub fn probe_join_config_with_key_ring_revert(
         )),
         Err(reason) => heading.push_str(&format!("\nRUPP routing unavailable: {reason}")),
     }
+    let token_value = find_field_ci(config, "TokenValue", 0);
     let token_algorithm = find_field_ci(config, "TokenGenAlgorithm", 0);
     let pepper_id = find_field_ci(config, "PepperId", 0);
-    if token_algorithm.is_some() || pepper_id.is_some() {
+    if token_value.is_some() || token_algorithm.is_some() || pepper_id.is_some() {
         heading.push_str(&format!(
-            "\nCurrent RUPP token-generation metadata: algorithm {}, pepper {} (observed only; generator not yet applied)",
-            token_algorithm.as_ref().map(diagnostic_scalar).unwrap_or_else(|| "absent".into()),
-            pepper_id.as_ref().map(diagnostic_scalar).unwrap_or_else(|| "absent".into())
+            "\nCurrent RUPP token inputs: TokenValue {}; algorithm {}; pepper {} (safe metadata only; concrete generator not yet applied)",
+            token_value
+                .as_ref()
+                .map(diagnostic_token_value_shape)
+                .unwrap_or_else(|| "absent".into()),
+            token_algorithm
+                .as_ref()
+                .map(diagnostic_scalar)
+                .unwrap_or_else(|| "absent".into()),
+            pepper_id
+                .as_ref()
+                .map(diagnostic_number_with_hex)
+                .unwrap_or_else(|| "absent".into())
         ));
     }
     if let Some(seed) = find_field_ci(config, "RandomSeed1", 0) {
-        let shape = seed
-            .as_str()
-            .map(|value| format!("string({} chars)", value.len()))
-            .unwrap_or_else(|| diagnostic_scalar(&seed));
+        let shape = diagnostic_base64_secret_shape(&seed);
         heading.push_str(&format!(
             "\nCurrent normal-session seed metadata: RandomSeed1 {shape} (used only in bounded current-build seeded-KDF diagnostics when decodable; not applied to the proven 0.735 KX path)"
         ));
@@ -1915,6 +1964,29 @@ mod tests {
                 u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn safe_metadata_shapes_do_not_expose_secret_material() {
+        let token = serde_json::Value::String("AAECAwQFBgcICQoLDA0ODw==".into());
+        let token_shape = diagnostic_token_value_shape(&token);
+        assert_eq!(
+            token_shape,
+            "string(24 chars), resolves to redacted 16-byte token"
+        );
+        assert!(!token_shape.contains("AAECAw"));
+
+        let seed = serde_json::Value::String("AAECAwQFBgcICQoLDA0ODw==".into());
+        assert_eq!(
+            diagnostic_base64_secret_shape(&seed),
+            "string(24 chars), Base64-decodes 16 bytes"
+        );
+
+        let pepper = serde_json::json!(1790819129u64);
+        assert_eq!(
+            diagnostic_number_with_hex(&pepper),
+            "1790819129 (0x6abdbb39)"
+        );
     }
 
     #[test]

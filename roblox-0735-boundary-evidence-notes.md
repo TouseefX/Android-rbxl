@@ -250,6 +250,14 @@ One bounded RUPP-token gap remained in the diagnostics: all subtype-2 endpoint-b
 
 If the promoted-original-token matrix is also silent, the strongest remaining blockers are the concrete current-build RUPP token generator (`TokenGenAlgorithm=1`, `PepperId`) and/or matching-build SessionCrypto key installation/epoch rekey logic.
 
+### Fresh 0.741 no-delay live result after promoted-original-token diagnostics
+
+A fresh no-UI-delay session against RCC `0.741.0.7411056` authenticated Reply1/Reply2 again. Safe metadata was `TokenGenAlgorithm = 1`, `PepperId = 1790819129`, and `RandomSeed1 = string(88 chars)`; route was public UDMUX `128.116.50.33:60998` to private RCC `10.20.6.150:60998`. The first native connected packet was still the corrected 79-byte layout: 31-byte subtype-1/private-RCC RUPP with flags `0x01`, 30-byte plaintext, negotiated ChaCha20-Poly1305 trailer, first nonce suffix `[55 6e]`, request time `31353`, and password length 2.
+
+No connected ACK or accept arrived for any of the 43 datagrams. In particular, all ten promoted-original-token subtype-2 candidates were silent, including BLAKE2b, both SHA-512 digest-half orientations, AES-GCM/BLAKE2b, AES-GCM/SHA-512 orientations, and the four `RandomSeed1` seeded AES-GCM variants. This closes the remaining blind RUPP shape gap: preserving the original GameService token bytes while changing only flags/subtype/endpoint shape is still insufficient.
+
+Do not expand more route/cipher/KDF matrices from this point without new native evidence. The strongest remaining boundaries are now concrete current-build RUPP token generation (`TokenGenAlgorithm=1`, `PepperId`, and any configured value/lineage/endpoint inputs) and matching-build SessionCrypto key installation/epoch behavior. The implementation now reports only safe token/seed input shapes so live notes can compare current configurations without exposing token or seed bytes.
+
 ## 0.740 Windows Player recovery corrections
 
 The parsed 0.740 archive targets Windows Player `0.740.0.7400927`, not the exact `0.741.19.7411056` Studio build. Its broad disassembly range `fn_0x000142897340.asm` was initially labelled only from later string xrefs. The first real body in that range, **`0x142897340–0x142897555`**, is instead the Windows `RakNet::RakPeer::generateUdmuxToken` implementation:
