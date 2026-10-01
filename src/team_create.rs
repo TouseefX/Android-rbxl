@@ -448,10 +448,21 @@ const RUPP_TLV_IPV6: u8 = 3;
 const RUPP_TOKEN_VALUE_LENGTH: u8 = 17; // subtype byte + 16-byte token
 
 #[derive(Clone, Debug)]
+struct RuppConnectedRouteMaterial {
+    token: [u8; 16],
+    rcc_endpoint: Endpoint,
+}
+
+#[derive(Clone, Debug)]
 struct RuppProbeMaterial {
     token: [u8; 16],
     rcc_endpoint: Endpoint,
     direct_server_return: bool,
+    /// Native Team Create parses a separate `NetStackTokenValue` and
+    /// `NetStackPort` into the optional RbxTransport/RUPP client
+    /// configuration. OpenRequest1/OpenRequest2 still use `TokenValue`, but
+    /// connected traffic should prefer this route when the config supplies it.
+    connected_route: Option<RuppConnectedRouteMaterial>,
 }
 
 fn extract_rupp_probe_material(config: &serde_json::Value) -> Result<RuppProbeMaterial, String> {
@@ -471,18 +482,35 @@ fn extract_rupp_probe_material(config: &serde_json::Value) -> Result<RuppProbeMa
     let direct_server_return = find_field_ci(config, "DirectServerReturn", 0)
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let connected_route = match (
+        find_field_ci(config, "NetStackTokenValue", 0)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .and_then(|text| decode_token_16(&text)),
+        find_field_ci(config, "NetStackPort", 0).and_then(|v| as_port(&v)),
+    ) {
+        (Some(token), Some(port)) => Some(RuppConnectedRouteMaterial {
+            token,
+            rcc_endpoint: Endpoint {
+                address: rcc_endpoint.address.clone(),
+                port,
+            },
+        }),
+        _ => None,
+    };
     Ok(RuppProbeMaterial {
         token,
         rcc_endpoint,
         direct_server_return,
+        connected_route,
     })
 }
 
-/// Serialize the exact RUPP prefix built by 2022 RakPeer::setupRupp. Studio
-/// adds the token TLV first and the private RCC endpoint TLV second, then
-/// prepends this header to even the offline RbxOpenRequest1 packet.
-fn build_rupp_header(
-    material: &RuppProbeMaterial,
+/// Serialize the exact RUPP prefix built by RakPeer::setupRupp: token TLV
+/// first, private RCC endpoint TLV second, then a four-byte RUPP envelope.
+fn build_rupp_header_for(
+    token: &[u8; 16],
+    rcc_endpoint: &Endpoint,
+    direct_server_return: bool,
     token_type: u8,
 ) -> Result<Vec<u8>, String> {
     if !(1..=2).contains(&token_type) {
@@ -490,8 +518,8 @@ fn build_rupp_header(
     }
     let mut tlvs = Vec::with_capacity(27);
     tlvs.extend_from_slice(&[RUPP_TLV_TOKEN, RUPP_TOKEN_VALUE_LENGTH, token_type]);
-    tlvs.extend_from_slice(&material.token);
-    match material.rcc_endpoint.address.parse::<IpAddr>() {
+    tlvs.extend_from_slice(token);
+    match rcc_endpoint.address.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => {
             tlvs.extend_from_slice(&[RUPP_TLV_IPV4, 6]);
             tlvs.extend_from_slice(&ip.octets());
@@ -503,18 +531,18 @@ fn build_rupp_header(
         Err(_) => {
             return Err(format!(
                 "RUPP RCC endpoint must be an IP literal, got {}",
-                material.rcc_endpoint.address
+                rcc_endpoint.address
             ));
         }
     }
-    tlvs.extend_from_slice(&material.rcc_endpoint.port.to_be_bytes());
+    tlvs.extend_from_slice(&rcc_endpoint.port.to_be_bytes());
     let header_len = 4usize
         .checked_add(tlvs.len())
         .and_then(|n| u16::try_from(n).ok())
         .ok_or_else(|| "RUPP header is too long".to_string())?;
     let mut header = Vec::with_capacity(usize::from(header_len));
     header.push(RUPP_PROTOCOL_RAKNET);
-    header.push(if material.direct_server_return {
+    header.push(if direct_server_return {
         RUPP_FLAG_DIRECT_SERVER_RETURN
     } else {
         0
@@ -522,6 +550,39 @@ fn build_rupp_header(
     header.extend_from_slice(&header_len.to_be_bytes());
     header.extend_from_slice(&tlvs);
     Ok(header)
+}
+
+/// Serialize the RUPP prefix used by offline OpenRequest1/OpenRequest2.
+fn build_rupp_header(
+    material: &RuppProbeMaterial,
+    token_type: u8,
+) -> Result<Vec<u8>, String> {
+    build_rupp_header_for(
+        &material.token,
+        &material.rcc_endpoint,
+        material.direct_server_return,
+        token_type,
+    )
+}
+
+/// Serialize the native connected RUPP route. Team Create's 0.735 path reads
+/// `NetStackTokenValue`/`NetStackPort` separately for the RbxTransport client
+/// configuration; when absent, it falls back to the GameService TokenValue
+/// route used by the offline opener.
+fn build_connected_rupp_header(
+    material: &RuppProbeMaterial,
+    token_type: u8,
+) -> Result<Vec<u8>, String> {
+    if let Some(route) = &material.connected_route {
+        build_rupp_header_for(
+            &route.token,
+            &route.rcc_endpoint,
+            material.direct_server_return,
+            token_type,
+        )
+    } else {
+        build_rupp_header(material, token_type)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1708,14 +1769,23 @@ fn probe_endpoint_with_rupp(
                         );
                         // Current native RakPeer does not feed an offline
                         // OpenReply2's DeserializationResult into the RUPP
-                        // token updater. It assigns the default subtype-1
-                        // GameService RUPP object to the new remote and sends
-                        // ID_CONNECTION_REQUEST with that header. A subtype-2
-                        // token is installed only on a later online receive,
-                        // after ProcessNetworkPacket resolves the active
-                        // remote. Replacing the token here made the very first
-                        // online packet differ from native and was rejected by
-                        // the routed path without an ACK.
+                        // token updater. A subtype-2 token is installed only
+                        // on a later online receive, after
+                        // ProcessNetworkPacket resolves the active remote.
+                        // However, Studio's Team Create payload path does pass
+                        // a separate NetStackTokenValue/NetStackPort into the
+                        // connected RUPP client configuration when present;
+                        // prefer that native connected route while preserving
+                        // the offline Reply2 header and token subtype.
+                        let connected_prefix = if let (Some(material), Some(token_type)) =
+                            (rupp, selected_token_type)
+                        {
+                            build_connected_rupp_header(material, token_type).map_err(|error| {
+                                format!("{target}: failed to build connected RUPP route: {error}")
+                            })?
+                        } else {
+                            selected_prefix.clone()
+                        };
                         let common_capabilities =
                             reply2.server_capabilities & RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR;
                         match establish_connected_session(
@@ -1732,7 +1802,7 @@ fn probe_endpoint_with_rupp(
                                 sha512_session_second_half: reply2.sha512_session_second_half,
                                 diagnostic_session_key_candidates:
                                     reply2.diagnostic_session_key_candidates,
-                                rupp_prefix: selected_prefix.clone(),
+                                rupp_prefix: connected_prefix,
                                 deferred_reply2_rupp_token_type:
                                     reply2.returned_rupp_token_type,
                                 deferred_reply2_rupp_token: reply2.returned_rupp_token,
@@ -1835,21 +1905,44 @@ pub fn probe_join_config_with_key_ring_revert(
         ));
     }
     match &rupp {
-        Ok(material) => heading.push_str(&format!(
-            "\n2022 RUPP routing ready: token TLV + RCC {}",
-            material.rcc_endpoint.label()
-        )),
+        Ok(material) => {
+            heading.push_str(&format!(
+                "\n2022 RUPP routing ready: open TokenValue + RCC {}",
+                material.rcc_endpoint.label()
+            ));
+            if let Some(route) = &material.connected_route {
+                heading.push_str(&format!(
+                    "; connected NetStackTokenValue + RCC {}",
+                    route.rcc_endpoint.label()
+                ));
+            }
+        }
         Err(reason) => heading.push_str(&format!("\nRUPP routing unavailable: {reason}")),
     }
     let token_value = find_field_ci(config, "TokenValue", 0);
+    let netstack_token_value = find_field_ci(config, "NetStackTokenValue", 0);
+    let netstack_port = find_field_ci(config, "NetStackPort", 0);
     let token_algorithm = find_field_ci(config, "TokenGenAlgorithm", 0);
     let pepper_id = find_field_ci(config, "PepperId", 0);
-    if token_value.is_some() || token_algorithm.is_some() || pepper_id.is_some() {
+    if token_value.is_some()
+        || netstack_token_value.is_some()
+        || netstack_port.is_some()
+        || token_algorithm.is_some()
+        || pepper_id.is_some()
+    {
         heading.push_str(&format!(
-            "\nCurrent RUPP token inputs: TokenValue {}; algorithm {}; pepper {} (safe metadata only; concrete generator not yet applied)",
+            "\nCurrent RUPP token inputs: TokenValue {}; NetStackTokenValue {}; NetStackPort {}; algorithm {}; pepper {} (safe metadata only)",
             token_value
                 .as_ref()
                 .map(diagnostic_token_value_shape)
+                .unwrap_or_else(|| "absent".into()),
+            netstack_token_value
+                .as_ref()
+                .map(diagnostic_token_value_shape)
+                .unwrap_or_else(|| "absent".into()),
+            netstack_port
+                .as_ref()
+                .map(diagnostic_scalar)
                 .unwrap_or_else(|| "absent".into()),
             token_algorithm
                 .as_ref()
@@ -2032,6 +2125,41 @@ mod tests {
         assert_eq!(&packet[32..48], &OFFLINE_MAGIC);
         assert_eq!(packet[48], RBX_PROTOCOL_VERSION);
         assert!(packet[49..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn connected_rupp_prefers_netstack_token_and_port() {
+        let config = serde_json::json!({
+            "settings": {
+                "DirectServerReturn": true,
+                "TokenValue": "AAECAwQFBgcICQoLDA0ODw==",
+                "NetStackTokenValue": "ICEiIyQlJicoKSorLC0uLw==",
+                "NetStackPort": 56000,
+                "ServerConnections": [
+                    { "Address": "10.32.8.208", "Port": 50704 }
+                ],
+                "UdmuxEndpoints": [
+                    { "Address": "128.116.54.33", "Port": 50704 }
+                ]
+            }
+        });
+        let material = extract_rupp_probe_material(&config).unwrap();
+        let connected = material.connected_route.as_ref().unwrap();
+        assert_eq!(connected.token, [
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+            0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+        ]);
+        assert_eq!(connected.rcc_endpoint.address, "10.32.8.208");
+        assert_eq!(connected.rcc_endpoint.port, 56000);
+
+        let open_header = build_rupp_header(&material, 1).unwrap();
+        assert_eq!(&open_header[7..23], &material.token);
+        assert_eq!(&open_header[23..], &[2, 6, 10, 32, 8, 208, 0xc6, 0x10]);
+
+        let connected_header = build_connected_rupp_header(&material, 1).unwrap();
+        assert_eq!(connected_header[1], RUPP_FLAG_DIRECT_SERVER_RETURN);
+        assert_eq!(&connected_header[7..23], &connected.token);
+        assert_eq!(&connected_header[23..], &[2, 6, 10, 32, 8, 208, 0xda, 0xc0]);
     }
 
     #[test]

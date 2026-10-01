@@ -258,6 +258,14 @@ No connected ACK or accept arrived for any of the 43 datagrams. In particular, a
 
 Do not expand more route/cipher/KDF matrices from this point without new native evidence. The strongest remaining boundaries are now concrete current-build RUPP token generation (`TokenGenAlgorithm=1`, `PepperId`, and any configured value/lineage/endpoint inputs) and matching-build SessionCrypto key installation/epoch behavior. The implementation now reports only safe token/seed input shapes so live notes can compare current configurations without exposing token or seed bytes.
 
+### Fresh 0.741 no-delay live result after safe metadata reporting
+
+A fresh no-UI-delay session against RCC `0.741.0.7411056` authenticated Reply1/Reply2 again with safe metadata `TokenGenAlgorithm = 1`, `PepperId = 1790828046 (0x6abdde0e)`, `TokenValue = string(24 chars), resolves to redacted 16-byte token`, and `RandomSeed1 = string(88 chars), Base64-decodes 64 bytes`. Route was public UDMUX `128.116.50.33:54140` to private RCC `10.20.6.82:54140`; Reply2 selected ChaCha20-Poly1305 and returned the same token-only subtype-2 outer RUPP shape.
+
+The native first connected packet still used the normal subtype-1/private-RCC RUPP prefix, 30-byte plaintext, negotiated ChaCha20-Poly1305 trailer, and first nonce suffix `[55 6e]`. No connected ACK or accept arrived for any of the 43 datagrams, including the promoted-original-token subtype-2 matrix. This confirms the safe-metadata build was diagnostic only and should not be expanded into another blind route/cipher/KDF permutation.
+
+A subsequent focused 0.735 Studio inspection found a concrete, non-blind Team Create routing difference: the join payload parser decodes `TokenValue` into the ordinary GameService RUPP token, but separately decodes `NetStackTokenValue` and `NetStackPort` into the optional RbxTransport/RUPP client configuration passed to `Network::Client::playerConnect`. The connected path only enables that native RUPP client configuration when both optional port and optional token are present, then serializes the token plus the first server RCC address with the NetStack port. The implementation now preserves `TokenValue` for OpenRequest1/OpenRequest2 while preferring the `NetStackTokenValue`/`NetStackPort` route for connected RUPP traffic when those fields exist. This is an evidence-backed fix candidate, not another diagnostic matrix; token bytes remain redacted in output.
+
 ## 0.740 Windows Player recovery corrections
 
 The parsed 0.740 archive targets Windows Player `0.740.0.7400927`, not the exact `0.741.19.7411056` Studio build. Its broad disassembly range `fn_0x000142897340.asm` was initially labelled only from later string xrefs. The first real body in that range, **`0x142897340–0x142897555`**, is instead the Windows `RakNet::RakPeer::generateUdmuxToken` implementation:
