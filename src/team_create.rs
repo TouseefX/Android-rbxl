@@ -472,6 +472,16 @@ const RUPP_TLV_TOKEN: u8 = 1;
 const RUPP_TLV_IPV4: u8 = 6;
 const RUPP_TLV_IPV6: u8 = 7;
 const RUPP_TOKEN_VALUE_LENGTH: u8 = 17; // subtype byte + 16-byte token
+// Studio's 0.741 Team Create/RbxTransport join path constructs both
+// TokenValue and NetStackTokenValue as TokenTlv::Token(type=1).  The legacy
+// TokenGenAlgorithm/PepperId fields are useful diagnostics for the older
+// RakNet token generator, but they are not the NetStack RUPP token subtype.
+const RUPP_TOKEN_TYPE_GAME_SERVICE: u8 = 1;
+// Native defaults from QuicPeer.cpp: RbxTransportQuicHandshakeTimeoutMs=10000
+// and RbxTransportQuicInitialPtoMs=1000.  The UI's UDP probe timeout can be
+// shorter, but QUIC should use the native handshake budget rather than failing
+// after a single 2.5s probe window.
+const RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Debug)]
 struct RuppConnectedRouteMaterial {
@@ -529,6 +539,25 @@ struct RbxTransportConnectPlan {
     game_fqdn: Option<String>,
 }
 
+fn is_hex_field(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn game_fqdn_report_label(game_fqdn: &str) -> String {
+    let mut parts = game_fqdn.splitn(4, '.');
+    let is_rupp_encoded = match (parts.next(), parts.next(), parts.next()) {
+        (Some(token), Some(ipv4), Some(port)) => {
+            is_hex_field(token, 32) && is_hex_field(ipv4, 8) && is_hex_field(port, 4)
+        }
+        _ => false,
+    };
+    if is_rupp_encoded {
+        "redacted RUPP-encoded GameFqdn (token/ip/port SNI fields present)".into()
+    } else {
+        game_fqdn.to_string()
+    }
+}
+
 impl RbxTransportConnectPlan {
     fn summary(&self) -> String {
         let quic_endpoint = Endpoint {
@@ -549,6 +578,11 @@ impl RbxTransportConnectPlan {
             self.early_key.version,
             self.early_key.public_key.len(),
         );
+        text.push_str(&format!(
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, handshake timeout floor {} ms.",
+            RUPP_TOKEN_TYPE_GAME_SERVICE,
+            RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS
+        ));
         let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
         text.push_str(&format!(
             "\nRbxTransport BaseClient openSendChannel (0.741): application {}, channelId {}, reliability enum {}, priority {}; channel-control payloads recovered as OpenReliable {} bytes (type {}, app, channelId) and OpenUnreliable {} bytes (type {}, app, channelId, wireId).",
@@ -574,7 +608,10 @@ impl RbxTransportConnectPlan {
             )),
         }
         if let Some(game_fqdn) = &self.game_fqdn {
-            text.push_str(&format!("\nRbxTransport GameFqdn: {game_fqdn}"));
+            text.push_str(&format!(
+                "\nRbxTransport GameFqdn/SNI: {}",
+                game_fqdn_report_label(game_fqdn)
+            ));
         }
         text.push_str(
             "\nLegacy RakNet connected packets are intentionally skipped for this config; the app now attempts the RbxTransport QUIC/RPK/RUPP connection path instead of expanding RakNet route/KDF probes.",
@@ -694,11 +731,7 @@ fn extract_rbx_transport_connect_plan(
         "NetStackTokenValue/RbxTransportToken is not a 16-byte raw, hexadecimal, or Base64 token"
             .to_string()
     })?;
-    let token_type = find_field_ci(config, "TokenGenAlgorithm", 0)
-        .and_then(|value| json_u16(&value))
-        .and_then(|value| u8::try_from(value).ok())
-        .filter(|value| (1..=2).contains(value))
-        .unwrap_or(1);
+    let token_type = RUPP_TOKEN_TYPE_GAME_SERVICE;
     let direct_server_return = find_field_ci(config, "DirectServerReturn", 0)
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
@@ -1007,12 +1040,14 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC connected — target {}, local {}, ALPN {}, RUPP prefix {} bytes, RPK version {}, connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
+            "\n✅ RbxTransport QUIC connected — target {}, local {}, ALPN {}, RUPP prefix {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
             report.target,
             report.local_addr,
             report.alpn,
             report.rupp_prefix_len,
             report.rpk_version,
+            report.handshake_timeout_ms,
+            report.requested_timeout_ms,
             report.connected_ms,
             report.auth_version,
             report.preauth_len,
@@ -1034,6 +1069,8 @@ struct RbxTransportConnectionReport {
     alpn: String,
     rupp_prefix_len: usize,
     rpk_version: u16,
+    requested_timeout_ms: u64,
+    handshake_timeout_ms: u64,
     connected_ms: u128,
     auth_version: u8,
     preauth_len: usize,
@@ -1059,7 +1096,10 @@ async fn run_rbx_transport_connection_async(
     plan: &RbxTransportConnectPlan,
     timeout_ms: u64,
 ) -> Result<RbxTransportConnectionReport, String> {
-    let timeout = Duration::from_millis(timeout_ms.max(1_500));
+    let requested_timeout_ms = timeout_ms.max(1_500);
+    let handshake_timeout_ms = requested_timeout_ms.max(RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS);
+    let operation_timeout = Duration::from_millis(requested_timeout_ms);
+    let handshake_timeout = Duration::from_millis(handshake_timeout_ms);
     let quic_endpoint = rbx_transport_quic_endpoint(plan);
     let target_addr = resolve_endpoint(&quic_endpoint)?;
     let rupp_prefix = build_rbx_transport_rupp_header(plan)?;
@@ -1101,13 +1141,19 @@ async fn run_rbx_transport_connection_async(
     let connecting = endpoint
         .connect_with(client_config, target_addr, &server_name)
         .map_err(|error| format!("failed to start QUIC connection: {error}"))?;
-    let connection = tokio::time::timeout(timeout, connecting)
+    let connection = tokio::time::timeout(handshake_timeout, connecting)
         .await
-        .map_err(|_| format!("QUIC handshake timed out after {} ms", timeout.as_millis()))?
+        .map_err(|_| {
+            format!(
+                "QUIC handshake timed out after {} ms (native RbxTransport handshake budget; requested probe timeout {} ms)",
+                handshake_timeout.as_millis(),
+                requested_timeout_ms
+            )
+        })?
         .map_err(|error| format!("QUIC handshake failed: {error}"))?;
     let connected_ms = started.elapsed().as_millis();
 
-    let mut auth_stream = tokio::time::timeout(timeout, connection.open_uni())
+    let mut auth_stream = tokio::time::timeout(operation_timeout, connection.open_uni())
         .await
         .map_err(|_| "timed out opening early-auth QUIC stream".to_string())?
         .map_err(|error| format!("failed to open early-auth QUIC stream: {error}"))?;
@@ -1124,7 +1170,7 @@ async fn run_rbx_transport_connection_async(
         open.application,
         open.channel_id,
     );
-    let mut control_stream = tokio::time::timeout(timeout, connection.open_uni())
+    let mut control_stream = tokio::time::timeout(operation_timeout, connection.open_uni())
         .await
         .map_err(|_| "timed out opening BaseClient channel-control stream".to_string())?
         .map_err(|error| format!("failed to open BaseClient channel-control stream: {error}"))?;
@@ -1136,7 +1182,7 @@ async fn run_rbx_transport_connection_async(
         .finish()
         .map_err(|error| format!("failed to finish BaseClient channel-control stream: {error}"))?;
 
-    let inbound_summary = wait_for_rbx_transport_inbound(&connection, timeout).await;
+    let inbound_summary = wait_for_rbx_transport_inbound(&connection, operation_timeout).await;
     endpoint.close(quinn::VarInt::from_u32(0), b"rbxl-editor Team Create probe complete");
     Ok(RbxTransportConnectionReport {
         target: quic_endpoint.label(),
@@ -1144,6 +1190,8 @@ async fn run_rbx_transport_connection_async(
         alpn: String::from_utf8_lossy(RBX_TRANSPORT_ALPN).into_owned(),
         rupp_prefix_len: rupp_prefix.len(),
         rpk_version: plan.early_key.version,
+        requested_timeout_ms,
+        handshake_timeout_ms,
         connected_ms,
         auth_version: auth.auth_version,
         preauth_len: auth.preauth_blob.len(),
@@ -2895,6 +2943,7 @@ mod tests {
         let config = serde_json::json!({
             "settings": {
                 "DirectServerReturn": true,
+                "TokenGenAlgorithm": 2,
                 "TokenValue": "AAECAwQFBgcICQoLDA0ODw==",
                 "NetStackTokenValue": "ICEiIyQlJicoKSorLC0uLw==",
                 "NetStackPort": 56000,
@@ -2926,6 +2975,18 @@ mod tests {
     }
 
     #[test]
+    fn rbx_transport_redacts_rupp_encoded_game_fqdn() {
+        assert_eq!(
+            game_fqdn_report_label("00112233445566778899aabbccddeeff.0a14005e.dd48.roblox.com"),
+            "redacted RUPP-encoded GameFqdn (token/ip/port SNI fields present)"
+        );
+        assert_eq!(
+            game_fqdn_report_label("gamejoin.roblox.test"),
+            "gamejoin.roblox.test"
+        );
+    }
+
+    #[test]
     fn rbx_transport_plan_uses_netstack_and_redacts_secrets() {
         let key_ring = serde_json::json!({
             "applications": {
@@ -2945,6 +3006,7 @@ mod tests {
         let config = serde_json::json!({
             "settings": {
                 "DirectServerReturn": true,
+                "TokenGenAlgorithm": 2,
                 "TokenValue": "AAECAwQFBgcICQoLDA0ODw==",
                 "NetStackTokenValue": "ICEiIyQlJicoKSorLC0uLw==",
                 "NetStackPort": 56000,
@@ -2966,7 +3028,7 @@ mod tests {
         assert_eq!(plan.rcc_endpoint.address, "10.32.8.208");
         assert_eq!(plan.rcc_endpoint.port, 50704);
         assert_eq!(plan.rbx_transport_port, 56000);
-        assert_eq!(plan.token_type, 1);
+        assert_eq!(plan.token_type, RUPP_TOKEN_TYPE_GAME_SERVICE);
         assert!(plan.direct_server_return);
         assert_eq!(plan.token, [
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
@@ -2989,6 +3051,9 @@ mod tests {
         assert!(report.contains("selectedTransport=RbxTransport"));
         assert!(report.contains("RbxTransport QUIC UDP target: 128.116.54.33:56000"));
         assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.54.33:50704"));
+        assert!(report.contains("RbxTransport GameFqdn/SNI: gamejoin.roblox.test"));
+        assert!(report.contains("RUPP token subtype forced to Studio NetStack TokenTlv type 1"));
+        assert!(report.contains("handshake timeout floor 10000 ms"));
         assert!(report.contains("openSendChannel (0.741): application 1, channelId 0, reliability enum 2, priority 0"));
         assert!(report.contains("OpenReliable 6 bytes"));
         assert!(report.contains("OpenUnreliable 10 bytes"));
@@ -3041,7 +3106,7 @@ mod tests {
         assert_eq!(plan.public_endpoint.label(), "128.116.50.33:62638");
         assert_eq!(plan.rcc_endpoint.label(), "10.20.0.12:62638");
         assert_eq!(plan.rbx_transport_port, 58490);
-        assert_eq!(plan.token_type, 1);
+        assert_eq!(plan.token_type, RUPP_TOKEN_TYPE_GAME_SERVICE);
         assert!(!plan.direct_server_return);
         let early_auth = plan.early_auth.as_ref().unwrap();
         assert_eq!(early_auth.auth_version, 17);
