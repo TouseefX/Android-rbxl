@@ -464,13 +464,18 @@ const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES: usize = 10;
 // Exact current RUPP values from Studio 0.741's Rupp parser/serializer:
 // packet byte 0 is protocol 1/3/4, byte 1 carries flags, bytes 2..4 are the
 // big-endian header length, then one-byte-type/one-byte-length TLVs. Type 1 is
-// the 17-byte token TLV (subtype byte + 16-byte token); endpoint TLVs are type
-// 6 for IPv4 and type 7 for IPv6.
+// the 17-byte token TLV (subtype byte + 16-byte token); native endpoint TLVs
+// are type 2/3, while legacy reverse-endpoint TLVs are type 6/7.
 const RUPP_PROTOCOL_RAKNET: u8 = 1;
 const RUPP_FLAG_DIRECT_SERVER_RETURN: u8 = 1;
 const RUPP_TLV_TOKEN: u8 = 1;
-const RUPP_TLV_IPV4: u8 = 6;
-const RUPP_TLV_IPV6: u8 = 7;
+// Native ClientRuppGenerator::generateHeader uses the endpoint TLVs (2/3)
+// for RbxTransport/QUIC. The legacy RakNet OpenRequest route uses the
+// reverse-endpoint TLVs (6/7) that RakPeer expects.
+const RUPP_TLV_IPV4_ENDPOINT: u8 = 2;
+const RUPP_TLV_IPV6_ENDPOINT: u8 = 3;
+const RUPP_TLV_IPV4_REVERSE_ENDPOINT: u8 = 6;
+const RUPP_TLV_IPV6_REVERSE_ENDPOINT: u8 = 7;
 const RUPP_TOKEN_VALUE_LENGTH: u8 = 17; // subtype byte + 16-byte token
 // Studio's 0.741 Team Create/RbxTransport join path constructs both
 // TokenValue and NetStackTokenValue as TokenTlv::Token(type=1).  The legacy
@@ -579,8 +584,10 @@ impl RbxTransportConnectPlan {
             self.early_key.public_key.len(),
         );
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{}, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
+            RUPP_TLV_IPV4_ENDPOINT,
+            RUPP_TLV_IPV6_ENDPOINT,
             RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS
         ));
         let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
@@ -794,27 +801,46 @@ fn extract_rupp_probe_material(config: &serde_json::Value) -> Result<RuppProbeMa
     })
 }
 
-/// Serialize the exact RUPP prefix built by RakPeer::setupRupp: token TLV
-/// first, private RCC endpoint TLV second, then a four-byte RUPP envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuppEndpointTlvKind {
+    /// ClientRuppGenerator::generateHeader uses addIpv4EndpointTlv /
+    /// addIpv6EndpointTlv for RbxTransport/QUIC packet prefixes.
+    Endpoint,
+    /// RakPeer's legacy routed OpenRequest path uses reverse-endpoint TLVs.
+    ReverseEndpoint,
+}
+
+/// Serialize a RUPP prefix: token TLV first, RCC endpoint TLV second, then the
+/// four-byte RUPP envelope. The endpoint TLV number differs between native
+/// RbxTransport's ClientRuppGenerator (2/3) and legacy RakNet routed opens
+/// (6/7), so callers must choose the native path explicitly.
 fn build_rupp_header_for(
     token: &[u8; 16],
     rcc_endpoint: &Endpoint,
     direct_server_return: bool,
     token_type: u8,
+    endpoint_tlv_kind: RuppEndpointTlvKind,
 ) -> Result<Vec<u8>, String> {
     if !(1..=2).contains(&token_type) {
         return Err(format!("unsupported 2022 RUPP token subtype {token_type}"));
     }
+    let (ipv4_tlv, ipv6_tlv) = match endpoint_tlv_kind {
+        RuppEndpointTlvKind::Endpoint => (RUPP_TLV_IPV4_ENDPOINT, RUPP_TLV_IPV6_ENDPOINT),
+        RuppEndpointTlvKind::ReverseEndpoint => (
+            RUPP_TLV_IPV4_REVERSE_ENDPOINT,
+            RUPP_TLV_IPV6_REVERSE_ENDPOINT,
+        ),
+    };
     let mut tlvs = Vec::with_capacity(27);
     tlvs.extend_from_slice(&[RUPP_TLV_TOKEN, RUPP_TOKEN_VALUE_LENGTH, token_type]);
     tlvs.extend_from_slice(token);
     match rcc_endpoint.address.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => {
-            tlvs.extend_from_slice(&[RUPP_TLV_IPV4, 6]);
+            tlvs.extend_from_slice(&[ipv4_tlv, 6]);
             tlvs.extend_from_slice(&ip.octets());
         }
         Ok(IpAddr::V6(ip)) => {
-            tlvs.extend_from_slice(&[RUPP_TLV_IPV6, 18]);
+            tlvs.extend_from_slice(&[ipv6_tlv, 18]);
             tlvs.extend_from_slice(&ip.octets());
         }
         Err(_) => {
@@ -851,13 +877,15 @@ fn build_rupp_header(
         &material.rcc_endpoint,
         material.direct_server_return,
         token_type,
+        RuppEndpointTlvKind::ReverseEndpoint,
     )
 }
 
-/// Serialize the native connected RUPP route. Team Create's 0.735 path reads
-/// `NetStackTokenValue`/`NetStackPort` separately for the RbxTransport client
-/// configuration; when absent, it falls back to the GameService TokenValue
-/// route used by the offline opener.
+/// Serialize the legacy RakNet connected RUPP route. Team Create's native
+/// payload path reads `NetStackTokenValue`/`NetStackPort` separately, so the
+/// legacy connected probe can prefer that material when present. The
+/// RbxTransport/QUIC path does not call this helper because native
+/// ClientRuppGenerator uses endpoint TLVs 2/3 instead of reverse TLVs 6/7.
 fn build_connected_rupp_header(
     material: &RuppProbeMaterial,
     token_type: u8,
@@ -868,6 +896,7 @@ fn build_connected_rupp_header(
             &route.rcc_endpoint,
             material.direct_server_return,
             token_type,
+            RuppEndpointTlvKind::ReverseEndpoint,
         )
     } else {
         build_rupp_header(material, token_type)
@@ -1028,6 +1057,7 @@ fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec
         &rcc_endpoint,
         plan.direct_server_return,
         plan.token_type,
+        RuppEndpointTlvKind::Endpoint,
     )
 }
 
@@ -1977,16 +2007,35 @@ fn describe_received_rupp_prefix(prefix: &[u8]) -> String {
             (RUPP_TLV_TOKEN, [subtype, ..]) => {
                 format!("token(length {length}, subtype {subtype}, value redacted)")
             }
-            (RUPP_TLV_IPV4, [a, b, c, d, port_hi, port_lo]) => format!(
-                "ipv4(length 6, {}:{})",
-                std::net::Ipv4Addr::new(*a, *b, *c, *d),
-                u16::from_be_bytes([*port_hi, *port_lo])
-            ),
-            (RUPP_TLV_IPV6, value) if value.len() == 18 => {
+            (tlv, [a, b, c, d, port_hi, port_lo])
+                if tlv == RUPP_TLV_IPV4_ENDPOINT
+                    || tlv == RUPP_TLV_IPV4_REVERSE_ENDPOINT =>
+            {
+                let label = if tlv == RUPP_TLV_IPV4_ENDPOINT {
+                    "ipv4-endpoint"
+                } else {
+                    "ipv4-reverse-endpoint"
+                };
+                format!(
+                    "{label}(length 6, {}:{})",
+                    std::net::Ipv4Addr::new(*a, *b, *c, *d),
+                    u16::from_be_bytes([*port_hi, *port_lo])
+                )
+            }
+            (tlv, value)
+                if (tlv == RUPP_TLV_IPV6_ENDPOINT
+                    || tlv == RUPP_TLV_IPV6_REVERSE_ENDPOINT)
+                    && value.len() == 18 =>
+            {
+                let label = if tlv == RUPP_TLV_IPV6_ENDPOINT {
+                    "ipv6-endpoint"
+                } else {
+                    "ipv6-reverse-endpoint"
+                };
                 let mut address = [0u8; 16];
                 address.copy_from_slice(&value[..16]);
                 format!(
-                    "ipv6(length 18, [{}]:{})",
+                    "{label}(length 18, [{}]:{})",
                     std::net::Ipv6Addr::from(address),
                     u16::from_be_bytes([value[16], value[17]])
                 )
@@ -3034,6 +3083,20 @@ mod tests {
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
             0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
         ]);
+        let rbx_transport_rupp = build_rbx_transport_rupp_header(&plan).unwrap();
+        assert_eq!(rbx_transport_rupp.len(), 31);
+        assert_eq!(
+            &rbx_transport_rupp[..7],
+            &[RUPP_PROTOCOL_RAKNET, RUPP_FLAG_DIRECT_SERVER_RETURN, 0, 31, RUPP_TLV_TOKEN, 17, 1]
+        );
+        assert_eq!(&rbx_transport_rupp[7..23], &plan.token);
+        // Native ClientRuppGenerator::generateHeader calls addIpv4EndpointTlv
+        // for RbxTransport; the legacy RakNet route is the one that uses the
+        // reverse-endpoint TLV value 6.
+        assert_eq!(
+            &rbx_transport_rupp[23..],
+            &[RUPP_TLV_IPV4_ENDPOINT, 6, 10, 32, 8, 208, 0xda, 0xc0]
+        );
         assert_eq!(plan.early_key.version, 1);
         assert_eq!(plan.early_key.public_key.len(), 32);
         let early_auth = plan.early_auth.as_ref().unwrap();
@@ -3053,6 +3116,7 @@ mod tests {
         assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.54.33:50704"));
         assert!(report.contains("RbxTransport GameFqdn/SNI: gamejoin.roblox.test"));
         assert!(report.contains("RUPP token subtype forced to Studio NetStack TokenTlv type 1"));
+        assert!(report.contains("endpoint TLVs use ClientRuppGenerator types 2/3"));
         assert!(report.contains("handshake timeout floor 10000 ms"));
         assert!(report.contains("openSendChannel (0.741): application 1, channelId 0, reliability enum 2, priority 0"));
         assert!(report.contains("OpenReliable 6 bytes"));
@@ -3384,6 +3448,7 @@ mod tests {
                 port: 50_704,
             },
             direct_server_return: false,
+            connected_route: None,
         };
         let prefix = build_rupp_header(&rupp, 2).unwrap();
         let packet = build_rbx_open_request2(
