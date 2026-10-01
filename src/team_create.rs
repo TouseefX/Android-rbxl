@@ -33,7 +33,11 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce, Tag,
 };
 use sha2::Sha512;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::io::{self, IoSliceMut};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -457,14 +461,16 @@ const RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES: usize = 6;
 const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE: u8 = 2;
 const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES: usize = 10;
 
-// Exact current RUPP values from Rupp::{serialize,TokenTlv,Ipv4Tlv,Ipv6Tlv}. 0.735
-// retains the same wire values used by the earlier transport implementation.
-
+// Exact current RUPP values from Studio 0.741's Rupp parser/serializer:
+// packet byte 0 is protocol 1/3/4, byte 1 carries flags, bytes 2..4 are the
+// big-endian header length, then one-byte-type/one-byte-length TLVs. Type 1 is
+// the 17-byte token TLV (subtype byte + 16-byte token); endpoint TLVs are type
+// 6 for IPv4 and type 7 for IPv6.
 const RUPP_PROTOCOL_RAKNET: u8 = 1;
 const RUPP_FLAG_DIRECT_SERVER_RETURN: u8 = 1;
 const RUPP_TLV_TOKEN: u8 = 1;
-const RUPP_TLV_IPV4: u8 = 2;
-const RUPP_TLV_IPV6: u8 = 3;
+const RUPP_TLV_IPV4: u8 = 6;
+const RUPP_TLV_IPV6: u8 = 7;
 const RUPP_TOKEN_VALUE_LENGTH: u8 = 17; // subtype byte + 16-byte token
 
 #[derive(Clone, Debug)]
@@ -516,6 +522,8 @@ struct RbxTransportConnectPlan {
     rbx_transport_port: u16,
     token: [u8; 16],
     token_shape: String,
+    token_type: u8,
+    direct_server_return: bool,
     early_key: RbxTransportEarlyKeyMaterial,
     early_auth: Result<EarlyAuthData, String>,
     game_fqdn: Option<String>,
@@ -528,13 +536,15 @@ impl RbxTransportConnectPlan {
             port: self.rbx_transport_port,
         };
         let mut text = format!(
-            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public/UDMUX address with NetStackPort)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with NetStackPort {}, NetStackTokenValue {} ({} decoded bytes)\nRbxTransport early pubkey: {} version {}, {} bytes",
+            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public/UDMUX address with NetStackPort)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with NetStackPort {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
             quic_endpoint.label(),
             self.public_endpoint.label(),
             self.rcc_endpoint.label(),
             self.rbx_transport_port,
             self.token_shape,
             self.token.len(),
+            self.token_type,
+            self.direct_server_return,
             self.early_key.source,
             self.early_key.version,
             self.early_key.public_key.len(),
@@ -567,7 +577,7 @@ impl RbxTransportConnectPlan {
             text.push_str(&format!("\nRbxTransport GameFqdn: {game_fqdn}"));
         }
         text.push_str(
-            "\nLegacy RakNet connected packets are intentionally skipped for this config; the remaining implementation target is the RbxTransport QUIC/BaseClient auth, runtime channel allocation, and send/receive path, not another RakNet route/KDF matrix.",
+            "\nLegacy RakNet connected packets are intentionally skipped for this config; the app now attempts the RbxTransport QUIC/RPK/RUPP connection path instead of expanding RakNet route/KDF probes.",
         );
         text
     }
@@ -684,6 +694,14 @@ fn extract_rbx_transport_connect_plan(
         "NetStackTokenValue/RbxTransportToken is not a 16-byte raw, hexadecimal, or Base64 token"
             .to_string()
     })?;
+    let token_type = find_field_ci(config, "TokenGenAlgorithm", 0)
+        .and_then(|value| json_u16(&value))
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| (1..=2).contains(value))
+        .unwrap_or(1);
+    let direct_server_return = find_field_ci(config, "DirectServerReturn", 0)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let early_key = extract_rbx_transport_early_key(config)?;
     let early_auth = extract_client_ticket_early_auth(config);
     let game_fqdn = find_field_ci(config, "GameFqdn", 0)
@@ -695,6 +713,8 @@ fn extract_rbx_transport_connect_plan(
         rbx_transport_port,
         token,
         token_shape: diagnostic_token_value_shape(&token_value),
+        token_type,
+        direct_server_return,
         early_key,
         early_auth,
         game_fqdn,
@@ -887,7 +907,6 @@ fn extract_client_ticket_early_auth(config: &serde_json::Value) -> Result<EarlyA
     parse_early_auth_data(&client_ticket)
 }
 
-#[cfg(test)]
 fn build_rbx_transport_open_reliable_channel_control(application: u8, channel_id: u32) -> Vec<u8> {
     let mut payload = Vec::with_capacity(RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES);
     payload.push(RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE);
@@ -896,7 +915,7 @@ fn build_rbx_transport_open_reliable_channel_control(application: u8, channel_id
     payload
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 fn build_rbx_transport_open_unreliable_channel_control(
     application: u8,
     channel_id: u32,
@@ -920,7 +939,6 @@ fn rbx_transport_early_auth_payload_len(auth: &EarlyAuthData) -> usize {
     4 + auth.preauth_blob.len() + auth.auth_blob.len()
 }
 
-#[cfg(test)]
 fn build_rbx_transport_early_auth_payload(auth: &EarlyAuthData) -> Result<Vec<u8>, String> {
     let preauth_len = u8::try_from(auth.preauth_blob.len()).map_err(|_| {
         format!(
@@ -942,6 +960,444 @@ fn build_rbx_transport_early_auth_payload(auth: &EarlyAuthData) -> Result<Vec<u8
     payload.push(auth_len);
     payload.extend_from_slice(&auth.auth_blob);
     Ok(payload)
+}
+
+const RBX_TRANSPORT_ALPN: &[u8] = b"RbxTransport";
+const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+fn rbx_transport_quic_endpoint(plan: &RbxTransportConnectPlan) -> Endpoint {
+    Endpoint {
+        address: plan.public_endpoint.address.clone(),
+        port: plan.rbx_transport_port,
+    }
+}
+
+fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr, String> {
+    if let Ok(ip) = endpoint.address.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, endpoint.port));
+    }
+    (endpoint.address.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve {}: {error}", endpoint.label()))?
+        .next()
+        .ok_or_else(|| format!("failed to resolve {}: no addresses", endpoint.label()))
+}
+
+fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec<u8>, String> {
+    let rcc_endpoint = Endpoint {
+        address: plan.rcc_endpoint.address.clone(),
+        port: plan.rbx_transport_port,
+    };
+    build_rupp_header_for(
+        &plan.token,
+        &rcc_endpoint,
+        plan.direct_server_return,
+        plan.token_type,
+    )
+}
+
+#[cfg(test)]
+fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms: u64) -> String {
+    "\nRbxTransport connected-session attempt: skipped under unit tests (the app build performs the QUIC/RPK/RUPP connection and early-auth send).".into()
+}
+
+#[cfg(not(test))]
+fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
+    match run_rbx_transport_connection(plan, timeout_ms) {
+        Ok(report) => format!(
+            "\n✅ RbxTransport QUIC connected — target {}, local {}, ALPN {}, RUPP prefix {} bytes, RPK version {}, connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
+            report.target,
+            report.local_addr,
+            report.alpn,
+            report.rupp_prefix_len,
+            report.rpk_version,
+            report.connected_ms,
+            report.auth_version,
+            report.preauth_len,
+            report.auth_len,
+            report.early_auth_payload_len,
+            report.inbound_summary
+        ),
+        Err(reason) => format!(
+            "\nRbxTransport connected-session attempt failed before inbound Team Create traffic was accepted: {reason}"
+        ),
+    }
+}
+
+#[cfg(not(test))]
+#[derive(Debug)]
+struct RbxTransportConnectionReport {
+    target: String,
+    local_addr: SocketAddr,
+    alpn: String,
+    rupp_prefix_len: usize,
+    rpk_version: u16,
+    connected_ms: u128,
+    auth_version: u8,
+    preauth_len: usize,
+    auth_len: usize,
+    early_auth_payload_len: usize,
+    inbound_summary: String,
+}
+
+#[cfg(not(test))]
+fn run_rbx_transport_connection(
+    plan: &RbxTransportConnectPlan,
+    timeout_ms: u64,
+) -> Result<RbxTransportConnectionReport, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to create Tokio runtime for QUIC: {error}"))?;
+    runtime.block_on(async { run_rbx_transport_connection_async(plan, timeout_ms).await })
+}
+
+#[cfg(not(test))]
+async fn run_rbx_transport_connection_async(
+    plan: &RbxTransportConnectPlan,
+    timeout_ms: u64,
+) -> Result<RbxTransportConnectionReport, String> {
+    let timeout = Duration::from_millis(timeout_ms.max(1_500));
+    let quic_endpoint = rbx_transport_quic_endpoint(plan);
+    let target_addr = resolve_endpoint(&quic_endpoint)?;
+    let rupp_prefix = build_rbx_transport_rupp_header(plan)?;
+    let server_name = plan
+        .game_fqdn
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("roblox.com")
+        .to_string();
+    let auth = plan
+        .early_auth
+        .as_ref()
+        .map_err(|reason| format!("early-auth material unavailable: {reason}"))?;
+    let early_auth_payload = build_rbx_transport_early_auth_payload(auth)?;
+
+    let std_socket = std::net::UdpSocket::bind(quic_endpoint.bind_address())
+        .map_err(|error| format!("failed to bind QUIC UDP socket: {error}"))?;
+    std_socket
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to set QUIC UDP socket nonblocking: {error}"))?;
+
+    let quinn_runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+    let inner_socket = quinn_runtime
+        .wrap_udp_socket(std_socket)
+        .map_err(|error| format!("failed to wrap QUIC UDP socket: {error}"))?;
+    let socket = Arc::new(RuppUdpSocket::new(inner_socket, rupp_prefix.clone()));
+    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        quinn_runtime,
+    )
+    .map_err(|error| format!("failed to create QUIC endpoint: {error}"))?;
+    let local_addr = endpoint
+        .local_addr()
+        .map_err(|error| format!("failed to read local QUIC socket address: {error}"))?;
+    let client_config = build_rbx_transport_quic_client_config(plan)?;
+    let started = Instant::now();
+    let connecting = endpoint
+        .connect_with(client_config, target_addr, &server_name)
+        .map_err(|error| format!("failed to start QUIC connection: {error}"))?;
+    let connection = tokio::time::timeout(timeout, connecting)
+        .await
+        .map_err(|_| format!("QUIC handshake timed out after {} ms", timeout.as_millis()))?
+        .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+    let connected_ms = started.elapsed().as_millis();
+
+    let mut auth_stream = tokio::time::timeout(timeout, connection.open_uni())
+        .await
+        .map_err(|_| "timed out opening early-auth QUIC stream".to_string())?
+        .map_err(|error| format!("failed to open early-auth QUIC stream: {error}"))?;
+    auth_stream
+        .write_all(&early_auth_payload)
+        .await
+        .map_err(|error| format!("failed to send early-auth payload: {error}"))?;
+    auth_stream
+        .finish()
+        .map_err(|error| format!("failed to finish early-auth stream: {error}"))?;
+
+    let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
+    let open_reliable = build_rbx_transport_open_reliable_channel_control(
+        open.application,
+        open.channel_id,
+    );
+    let mut control_stream = tokio::time::timeout(timeout, connection.open_uni())
+        .await
+        .map_err(|_| "timed out opening BaseClient channel-control stream".to_string())?
+        .map_err(|error| format!("failed to open BaseClient channel-control stream: {error}"))?;
+    control_stream
+        .write_all(&open_reliable)
+        .await
+        .map_err(|error| format!("failed to send BaseClient OpenReliable control payload: {error}"))?;
+    control_stream
+        .finish()
+        .map_err(|error| format!("failed to finish BaseClient channel-control stream: {error}"))?;
+
+    let inbound_summary = wait_for_rbx_transport_inbound(&connection, timeout).await;
+    endpoint.close(quinn::VarInt::from_u32(0), b"rbxl-editor Team Create probe complete");
+    Ok(RbxTransportConnectionReport {
+        target: quic_endpoint.label(),
+        local_addr,
+        alpn: String::from_utf8_lossy(RBX_TRANSPORT_ALPN).into_owned(),
+        rupp_prefix_len: rupp_prefix.len(),
+        rpk_version: plan.early_key.version,
+        connected_ms,
+        auth_version: auth.auth_version,
+        preauth_len: auth.preauth_blob.len(),
+        auth_len: auth.auth_blob.len(),
+        early_auth_payload_len: early_auth_payload.len(),
+        inbound_summary,
+    })
+}
+
+#[cfg(not(test))]
+async fn wait_for_rbx_transport_inbound(
+    connection: &quinn::Connection,
+    timeout: Duration,
+) -> String {
+    tokio::select! {
+        result = connection.accept_uni() => match result {
+            Ok(recv) => format!("✅ RbxTransport inbound receive opened a unidirectional stream (stream id {:?}); connected receive path is live, schema/JoinData decode remains read-only next.", recv.id()),
+            Err(error) => format!("RbxTransport connection closed while waiting for inbound unidirectional stream: {error}"),
+        },
+        result = connection.accept_bi() => match result {
+            Ok((_send, recv)) => format!("✅ RbxTransport inbound receive opened a bidirectional stream (stream id {:?}); connected receive path is live, schema/JoinData decode remains read-only next.", recv.id()),
+            Err(error) => format!("RbxTransport connection closed while waiting for inbound bidirectional stream: {error}"),
+        },
+        result = connection.read_datagram() => match result {
+            Ok(bytes) => format!("✅ RbxTransport inbound receive got an application datagram ({} bytes redacted); connected receive path is live, schema/JoinData decode remains read-only next.", bytes.len()),
+            Err(error) => format!("RbxTransport datagram receive ended while waiting for inbound traffic: {error}"),
+        },
+        _ = tokio::time::sleep(timeout) => format!(
+            "RbxTransport QUIC handshake and early-auth writes completed, but no inbound stream/datagram arrived during the {} ms receive window; channel framing may need the recovered NetStream header/custom TLS capability extension before JoinData can be decoded.",
+            timeout.as_millis()
+        ),
+    }
+}
+
+#[cfg(not(test))]
+fn build_rbx_transport_quic_client_config(
+    plan: &RbxTransportConnectPlan,
+) -> Result<quinn::ClientConfig, String> {
+    let rustls = build_rbx_transport_rustls_config(plan)?;
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls))
+        .map_err(|error| format!("rustls config is not QUIC-compatible: {error:?}"))?;
+    let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(1 << 20));
+    transport.datagram_send_buffer_size(1 << 20);
+    transport.enable_segmentation_offload(false);
+    config.transport_config(Arc::new(transport));
+    Ok(config)
+}
+
+#[cfg(not(test))]
+fn build_rbx_transport_rustls_config(
+    plan: &RbxTransportConnectPlan,
+) -> Result<quinn::rustls::ClientConfig, String> {
+    let provider = Arc::new(quinn::rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(ExpectedRpkVerifier::new(plan.early_key.public_key));
+    let mut config = quinn::rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
+        .map_err(|error| format!("failed to configure TLS 1.3: {error}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![RBX_TRANSPORT_ALPN.to_vec()];
+    // SNI is only sent when Studio's join config supplies GameFqdn; otherwise
+    // the raw-public-key verifier authenticates the configured key directly.
+    config.enable_sni = plan.game_fqdn.is_some();
+    Ok(config)
+}
+
+#[cfg(not(test))]
+#[derive(Debug)]
+struct ExpectedRpkVerifier {
+    expected_raw: [u8; 32],
+    expected_spki_der: Vec<u8>,
+}
+
+#[cfg(not(test))]
+impl ExpectedRpkVerifier {
+    fn new(expected_raw: [u8; 32]) -> Self {
+        let mut expected_spki_der = Vec::with_capacity(ED25519_SPKI_DER_PREFIX.len() + 32);
+        expected_spki_der.extend_from_slice(&ED25519_SPKI_DER_PREFIX);
+        expected_spki_der.extend_from_slice(&expected_raw);
+        Self {
+            expected_raw,
+            expected_spki_der,
+        }
+    }
+
+    fn presented_rpk_matches(&self, presented: &[u8]) -> bool {
+        presented == self.expected_raw.as_slice() || presented == self.expected_spki_der.as_slice()
+    }
+
+    fn verify_ed25519_signature(
+        &self,
+        message: &[u8],
+        cert: &quinn::rustls::pki_types::CertificateDer<'_>,
+        dss: &quinn::rustls::DigitallySignedStruct,
+    ) -> Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error>
+    {
+        if dss.scheme != quinn::rustls::SignatureScheme::ED25519 {
+            return Err(quinn::rustls::Error::InvalidCertificate(
+                quinn::rustls::CertificateError::UnsupportedSignatureAlgorithm,
+            ));
+        }
+        if !self.presented_rpk_matches(cert.as_ref()) {
+            return Err(quinn::rustls::Error::InvalidCertificate(
+                quinn::rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &self.expected_raw)
+            .verify(message, dss.signature())
+            .map_err(|_| {
+                quinn::rustls::Error::InvalidCertificate(
+                    quinn::rustls::CertificateError::BadSignature,
+                )
+            })?;
+        Ok(quinn::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+}
+
+#[cfg(not(test))]
+impl quinn::rustls::client::danger::ServerCertVerifier for ExpectedRpkVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &quinn::rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[quinn::rustls::pki_types::CertificateDer<'_>],
+        _server_name: &quinn::rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: quinn::rustls::pki_types::UnixTime,
+    ) -> Result<quinn::rustls::client::danger::ServerCertVerified, quinn::rustls::Error> {
+        if self.presented_rpk_matches(end_entity.as_ref()) {
+            Ok(quinn::rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(quinn::rustls::Error::InvalidCertificate(
+                quinn::rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &quinn::rustls::pki_types::CertificateDer<'_>,
+        dss: &quinn::rustls::DigitallySignedStruct,
+    ) -> Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error>
+    {
+        self.verify_ed25519_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &quinn::rustls::pki_types::CertificateDer<'_>,
+        dss: &quinn::rustls::DigitallySignedStruct,
+    ) -> Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error>
+    {
+        self.verify_ed25519_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<quinn::rustls::SignatureScheme> {
+        vec![quinn::rustls::SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(not(test))]
+#[derive(Debug)]
+struct RuppUdpSocket {
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    outgoing_prefix: Vec<u8>,
+}
+
+#[cfg(not(test))]
+impl RuppUdpSocket {
+    fn new(inner: Arc<dyn quinn::AsyncUdpSocket>, outgoing_prefix: Vec<u8>) -> Self {
+        Self {
+            inner,
+            outgoing_prefix,
+        }
+    }
+
+    fn maybe_rupp_header_len(buf: &[u8], len: usize) -> Option<usize> {
+        if len < 4 || !matches!(buf.first().copied(), Some(1 | 3 | 4)) {
+            return None;
+        }
+        let header_len = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
+        (header_len >= 4 && header_len <= len).then_some(header_len)
+    }
+}
+
+#[cfg(not(test))]
+impl quinn::AsyncUdpSocket for RuppUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        self.inner.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+        if self.outgoing_prefix.is_empty() {
+            return self.inner.try_send(transmit);
+        }
+        let mut prefixed = Vec::with_capacity(self.outgoing_prefix.len() + transmit.contents.len());
+        prefixed.extend_from_slice(&self.outgoing_prefix);
+        prefixed.extend_from_slice(transmit.contents);
+        let prefixed_transmit = quinn::udp::Transmit {
+            destination: transmit.destination,
+            ecn: transmit.ecn,
+            contents: &prefixed,
+            segment_size: None,
+            src_ip: transmit.src_ip,
+        };
+        self.inner.try_send(&prefixed_transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        match self.inner.poll_recv(cx, bufs, meta) {
+            Poll::Ready(Ok(count)) => {
+                for index in 0..count.min(bufs.len()).min(meta.len()) {
+                    let len = meta[index].len;
+                    let buf: &mut [u8] = &mut *bufs[index];
+                    if let Some(header_len) = Self::maybe_rupp_header_len(buf, len) {
+                        buf.copy_within(header_len..len, 0);
+                        meta[index].len = len - header_len;
+                        meta[index].stride = meta[index].stride.saturating_sub(header_len);
+                    }
+                }
+                Poll::Ready(Ok(count))
+            }
+            other => other,
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
 }
 
 fn json_u16(value: &serde_json::Value) -> Option<u16> {
@@ -2269,6 +2725,7 @@ pub fn probe_join_config_with_key_ring_revert(
     }
     if let Some(rbx_transport_plan) = rbx_transport_plan {
         heading.push_str(&rbx_transport_plan.summary());
+        heading.push_str(&rbx_transport_connection_report(&rbx_transport_plan, timeout_ms));
         return heading;
     }
     let request2 = extract_request2_material_with_revert(config, key_ring_revert);
@@ -2422,7 +2879,7 @@ mod tests {
         assert_eq!(header.len(), 31);
         assert_eq!(&header[..7], &[1, 0, 0, 31, 1, 17, 2]);
         assert_eq!(&header[7..23], &material.token);
-        assert_eq!(&header[23..], &[2, 6, 10, 32, 8, 208, 0xc6, 0x10]);
+        assert_eq!(&header[23..], &[6, 6, 10, 32, 8, 208, 0xc6, 0x10]);
 
         let packet = build_rbx_open_request1_with_prefix(1200, &header).unwrap();
         assert_eq!(packet.len(), 1160);
@@ -2460,12 +2917,12 @@ mod tests {
 
         let open_header = build_rupp_header(&material, 1).unwrap();
         assert_eq!(&open_header[7..23], &material.token);
-        assert_eq!(&open_header[23..], &[2, 6, 10, 32, 8, 208, 0xc6, 0x10]);
+        assert_eq!(&open_header[23..], &[6, 6, 10, 32, 8, 208, 0xc6, 0x10]);
 
         let connected_header = build_connected_rupp_header(&material, 1).unwrap();
         assert_eq!(connected_header[1], RUPP_FLAG_DIRECT_SERVER_RETURN);
         assert_eq!(&connected_header[7..23], &connected.token);
-        assert_eq!(&connected_header[23..], &[2, 6, 10, 32, 8, 208, 0xda, 0xc0]);
+        assert_eq!(&connected_header[23..], &[6, 6, 10, 32, 8, 208, 0xda, 0xc0]);
     }
 
     #[test]
@@ -2509,6 +2966,8 @@ mod tests {
         assert_eq!(plan.rcc_endpoint.address, "10.32.8.208");
         assert_eq!(plan.rcc_endpoint.port, 50704);
         assert_eq!(plan.rbx_transport_port, 56000);
+        assert_eq!(plan.token_type, 1);
+        assert!(plan.direct_server_return);
         assert_eq!(plan.token, [
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
             0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
@@ -2536,6 +2995,7 @@ mod tests {
         assert!(report.contains("active connection send slot argument 1, frame tag 0xA8"));
         assert!(report.contains("wire payload 52 bytes"));
         assert!(report.contains("Legacy RakNet connected packets are intentionally skipped"));
+        assert!(report.contains("RbxTransport connected-session attempt: skipped under unit tests"));
         assert!(!report.contains("ICEiIyQl"));
         assert!(!report.contains("AAECAw"));
     }
@@ -2581,6 +3041,8 @@ mod tests {
         assert_eq!(plan.public_endpoint.label(), "128.116.50.33:62638");
         assert_eq!(plan.rcc_endpoint.label(), "10.20.0.12:62638");
         assert_eq!(plan.rbx_transport_port, 58490);
+        assert_eq!(plan.token_type, 1);
+        assert!(!plan.direct_server_return);
         let early_auth = plan.early_auth.as_ref().unwrap();
         assert_eq!(early_auth.auth_version, 17);
         assert_eq!(early_auth.preauth_blob.len(), 33);
