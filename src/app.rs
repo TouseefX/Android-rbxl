@@ -358,7 +358,7 @@ pub struct EditorApp {
     /// Output area of the Team Create session panel.
     team_create_response: String,
     /// Last successful join config from gamejoin (has the server endpoints);
-    /// enables the UDP probe button.
+    /// enables the transport-resolution button.
     team_create_join_config: Option<serde_json::Value>,
 
     // Per-property text buffers so number properties (float/int, and vector
@@ -1833,9 +1833,9 @@ ui.label("Place ID:");
                             self.team_create_negotiate(true, false, false);
                         }
                         if ui
-                            .button("🎯 Fresh Join + Probe")
+                            .button("🎯 Fresh Join + Resolve")
                             .on_hover_text(
-                                "Negotiates a brand-new one-use ticket and immediately probes with the normal KeyRing send version",
+                                "Negotiates a brand-new one-use ticket and immediately resolves the selected transport with the normal KeyRing send version",
                             )
                             .clicked()
                         {
@@ -1859,7 +1859,7 @@ ui.label("Place ID:");
                             .on_hover_text(if can_probe {
                                 "Maps the current Team Create config through the 0.741 transport selector. Legacy RakNet configs are probed; RbxTransport configs are preserved for the QUIC path. The join ticket is one-use."
                             } else {
-                                "Run Negotiate Join immediately before each transport probe; encrypted early-auth material is one-use"
+                                "Run Negotiate Join immediately before each transport resolution; encrypted early-auth material is one-use"
                             });
                         if probe.clicked() {
                             // Request2 pre-auth MACs are replay-protected. Consume the
@@ -1867,9 +1867,9 @@ ui.label("Place ID:");
                             if let Some(cfg) = self.team_create_join_config.take() {
                                 self.status = "Resolving Team Create transport…".into();
                                 let report = crate::team_create::probe_join_config(&cfg, 3, 2500);
-                                self.log_info(format!("Team Create transport probe:\n{report}"));
+                                self.log_info(format!("Team Create transport resolution:\n{report}"));
                                 self.team_create_response = report;
-                                self.status = "Team Create transport probe finished — see panel output".into();
+                                self.status = "Team Create transport resolution finished — see panel output".into();
                             }
                         }
                     });
@@ -5721,8 +5721,8 @@ ui.label("Place ID:");
             return;
         };
         let label = if preemptive { "warm-up" } else { "join negotiation" };
-        // Never leave the probe enabled with a stale config when a later
-        // negotiation fails or returns an all-null HTTP-200 response.
+        // Never leave the transport resolver enabled with a stale config when
+        // a later negotiation fails or returns an all-null HTTP-200 response.
         self.team_create_join_config = None;
         self.log_info(format!("Team Create {label} for place {}", self.open_cloud_place_id.trim()));
         match RobloxApiClient::team_create_join(&cookie, &self.open_cloud_place_id, preemptive) {
@@ -5749,13 +5749,13 @@ ui.label("Place ID:");
                             "normal send"
                         };
                         self.log_info(format!(
-                            "Team Create immediate transport probe ({key_mode}):\n{report}"
+                            "Team Create immediate transport resolution ({key_mode}):\n{report}"
                         ));
                         self.team_create_response = format!(
                             "Fresh gamejoin config handed directly to the selected transport path (no UI delay; {key_mode} key selection)\n{report}"
                         );
                         self.status =
-                            "Immediate Team Create transport probe finished — see panel output".into();
+                            "Immediate Team Create transport resolution finished — see panel output".into();
                         return;
                     }
 
@@ -5777,17 +5777,17 @@ ui.label("Place ID:");
                 } else if all_null {
                     self.status = format!("Team Create {label} failed — empty response");
                     format!(
-                        "Team Create {label} returned only null/empty values; negotiation failed and the transport probe remains disabled"
+                        "Team Create {label} returned only null/empty values; negotiation failed and the transport resolver remains disabled"
                     )
                 } else if preemptive {
                     self.status = "Team Create warm-up accepted — negotiate join next".into();
                     String::from(
-                        "Server warm-up response received, but it has no server endpoint yet; run Negotiate Join. The transport probe remains disabled",
+                        "Server warm-up response received, but it has no server endpoint yet; run Negotiate Join. The transport resolver remains disabled",
                     )
                 } else {
                     self.status = "Team Create join returned no usable server endpoint".into();
                     String::from(
-                        "Join response has no usable Address/Port, ServerConnections, or UdmuxEndpoints; the transport probe remains disabled",
+                        "Join response has no usable Address/Port, ServerConnections, or UdmuxEndpoints; the transport resolver remains disabled",
                     )
                 };
 

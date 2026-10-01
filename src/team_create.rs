@@ -483,6 +483,7 @@ struct RbxTransportConnectPlan {
     token: [u8; 16],
     token_shape: String,
     early_key: RbxTransportEarlyKeyMaterial,
+    early_auth: Result<EarlyAuthData, String>,
     game_fqdn: Option<String>,
 }
 
@@ -499,6 +500,18 @@ impl RbxTransportConnectPlan {
             self.early_key.version,
             self.early_key.public_key.len(),
         );
+        match &self.early_auth {
+            Ok(auth) => text.push_str(&format!(
+                "\nRbxTransport BaseClient early auth: channel 1 frame tag 0xA8, auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted)",
+                auth.auth_version,
+                auth.preauth_blob.len(),
+                auth.auth_blob.len(),
+                rbx_transport_early_auth_payload_len(auth)
+            )),
+            Err(reason) => text.push_str(&format!(
+                "\nRbxTransport BaseClient early auth unavailable: {reason}"
+            )),
+        }
         if let Some(game_fqdn) = &self.game_fqdn {
             text.push_str(&format!("\nRbxTransport GameFqdn: {game_fqdn}"));
         }
@@ -621,6 +634,7 @@ fn extract_rbx_transport_connect_plan(
             .to_string()
     })?;
     let early_key = extract_rbx_transport_early_key(config)?;
+    let early_auth = extract_client_ticket_early_auth(config);
     let game_fqdn = find_field_ci(config, "GameFqdn", 0)
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|value| !value.trim().is_empty());
@@ -631,6 +645,7 @@ fn extract_rbx_transport_connect_plan(
         token,
         token_shape: diagnostic_token_value_shape(&token_value),
         early_key,
+        early_auth,
         game_fqdn,
     })
 }
@@ -814,6 +829,46 @@ fn parse_early_auth_data(client_ticket: &str) -> Result<EarlyAuthData, String> {
     })
 }
 
+fn extract_client_ticket_early_auth(config: &serde_json::Value) -> Result<EarlyAuthData, String> {
+    let client_ticket = find_field_ci(config, "ClientTicket", 0)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| "join config has no ClientTicket for early authentication".to_string())?;
+    parse_early_auth_data(&client_ticket)
+}
+
+/// Exact Studio 0.741 `sendEarlyAuthData` (`0x145b78cb0..0x145b78f68`)
+/// writes this BaseClient frame on RbxTransport channel 1 after the connection
+/// object exists: tag `0xA8`, version, one-byte pre-auth length/blob, then
+/// one-byte auth length/blob. Callers may report the shape but must not print
+/// the ticket-derived blob bytes.
+fn rbx_transport_early_auth_payload_len(auth: &EarlyAuthData) -> usize {
+    4 + auth.preauth_blob.len() + auth.auth_blob.len()
+}
+
+#[cfg(test)]
+fn build_rbx_transport_early_auth_payload(auth: &EarlyAuthData) -> Result<Vec<u8>, String> {
+    let preauth_len = u8::try_from(auth.preauth_blob.len()).map_err(|_| {
+        format!(
+            "ClientTicket pre-auth blob is too large: {} bytes",
+            auth.preauth_blob.len()
+        )
+    })?;
+    let auth_len = u8::try_from(auth.auth_blob.len()).map_err(|_| {
+        format!(
+            "ClientTicket auth blob is too large: {} bytes",
+            auth.auth_blob.len()
+        )
+    })?;
+    let mut payload = Vec::with_capacity(rbx_transport_early_auth_payload_len(auth));
+    payload.push(0xA8);
+    payload.push(auth.auth_version);
+    payload.push(preauth_len);
+    payload.extend_from_slice(&auth.preauth_blob);
+    payload.push(auth_len);
+    payload.extend_from_slice(&auth.auth_blob);
+    Ok(payload)
+}
+
 fn json_u16(value: &serde_json::Value) -> Option<u16> {
     value
         .as_u64()
@@ -991,10 +1046,7 @@ fn extract_request2_material_with_revert(
             early_key.version
         ));
     }
-    let client_ticket = find_field_ci(config, "ClientTicket", 0)
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or_else(|| "join config has no ClientTicket for early authentication".to_string())?;
-    let auth = parse_early_auth_data(&client_ticket)?;
+    let auth = extract_client_ticket_early_auth(config)?;
     let normal_session_seed = find_field_ci(config, "RandomSeed1", 0)
         .and_then(|value| value.as_str().map(str::to_owned))
         .and_then(|text| decode_base64(&text))
@@ -2061,11 +2113,19 @@ pub fn probe_join_config_with_key_ring_revert(
         return "No server endpoints found in the join config (unexpected shape — check the raw JSON keys)".into();
     }
     let rupp = extract_rupp_probe_material(config);
-    let mut heading = format!(
-        "{} usable endpoint(s) in join config; probing {}…",
-        endpoints.len(),
-        endpoints.len().min(max)
-    );
+    let rbx_transport_plan = extract_rbx_transport_connect_plan(config).ok();
+    let mut heading = if rbx_transport_plan.is_some() {
+        format!(
+            "{} usable endpoint(s) in join config; resolving selected 0.741 transport branch (no legacy RakNet UDP probe)…",
+            endpoints.len()
+        )
+    } else {
+        format!(
+            "{} usable endpoint(s) in join config; probing {}…",
+            endpoints.len(),
+            endpoints.len().min(max)
+        )
+    };
     if internal_count > 0 && endpoints.iter().all(|e| !is_internal_address(&e.address)) {
         heading.push_str(&format!(
             " ({internal_count} private RCC address(es) used inside the RUPP route)"
@@ -2132,7 +2192,7 @@ pub fn probe_join_config_with_key_ring_revert(
     {
         heading.push_str(&format!("\nAdvertised RCC version: {rcc_version}"));
     }
-    if let Ok(rbx_transport_plan) = extract_rbx_transport_connect_plan(config) {
+    if let Some(rbx_transport_plan) = rbx_transport_plan {
         heading.push_str(&rbx_transport_plan.summary());
         return heading;
     }
@@ -2358,6 +2418,7 @@ mod tests {
                 "NetStackPort": 56000,
                 "GameFqdn": "gamejoin.roblox.test",
                 "ClientPublicKeyData": key_ring.to_string(),
+                "ClientTicket": "ticket-prefix;ignored;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=;oKGio6SlpqeoqaqrrK2urw==;6",
                 "ServerConnections": [
                     { "Address": "10.32.8.208", "Port": 50704 }
                 ],
@@ -2379,9 +2440,21 @@ mod tests {
         ]);
         assert_eq!(plan.early_key.version, 1);
         assert_eq!(plan.early_key.public_key.len(), 32);
+        let early_auth = plan.early_auth.as_ref().unwrap();
+        assert_eq!(early_auth.auth_version, 6);
+        assert_eq!(early_auth.preauth_blob.len(), 32);
+        assert_eq!(early_auth.auth_blob.len(), 16);
+        assert_eq!(rbx_transport_early_auth_payload_len(early_auth), 52);
+        assert_eq!(
+            build_rbx_transport_early_auth_payload(early_auth).unwrap()[..4],
+            [0xA8, 6, 32, 0]
+        );
 
         let report = probe_join_config(&config, 3, 1);
+        assert!(report.contains("resolving selected 0.741 transport branch"));
         assert!(report.contains("selectedTransport=RbxTransport"));
+        assert!(report.contains("channel 1 frame tag 0xA8"));
+        assert!(report.contains("wire payload 52 bytes"));
         assert!(report.contains("Legacy RakNet connected packets are intentionally skipped"));
         assert!(!report.contains("ICEiIyQl"));
         assert!(!report.contains("AAECAw"));

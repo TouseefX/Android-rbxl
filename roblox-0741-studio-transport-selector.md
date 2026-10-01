@@ -21,6 +21,7 @@ Scratch disassembly artifacts are outside the repository:
 - `/tmp/winstudio_uploaded/netstack_parser_snips.asm`
 - `/tmp/winstudio_uploaded/rbxtransport_full_remap.asm`
 - `/tmp/winstudio_uploaded/rbxtransport_client_funcs.asm`
+- `/tmp/winstudio_uploaded/send_early_auth_0741.asm`
 
 ## Selector conclusion
 
@@ -188,7 +189,35 @@ This is enough to prove selection and to keep the app on the RbxTransport branch
 | `0x14603daf0..0x14603e26b` | Receive/event dispatch for ACK/unknown receive channel state. |
 | `0x14603e4e0..0x14603e7a5` and `0x14603e370..0x14603e4d5` | Message send/queue paths before and after the receive channel is open. |
 
-Important implication for implementation: RbxTransport does not start with Roblox's RakNet `RbxOpenRequest1/2` packets. The native client creates a QUIC/RbxTransport connection first, waits for a connection-open event, then opens/ACKs channels before game data is sent. The app therefore now stops at a safe selector/config report until the QUIC connect configuration and channel wire format are recovered.
+Important implication for implementation: RbxTransport does not start with Roblox's RakNet `RbxOpenRequest1/2` packets. The native client creates a QUIC/RbxTransport connection first, waits for a connection-open event, then opens/ACKs channels before game data is sent.
+
+Exact 0.741 `sendEarlyAuthData` is mapped at `0x145b78cb0..0x145b78f68` (`/tmp/winstudio_uploaded/send_early_auth_0741.asm`). It checks the early-auth-present byte at client `+0x1210`, checks the active connection pointer (`+0xfe0` then subobject `+0x138`, or fallback `+0xfe8`), builds a `NetworkStream`, and writes the BaseClient early-auth application payload:
+
+| Write site | Payload component |
+|---|---|
+| `0x145b78df8..0x145b78e0a` | byte `0xA8` |
+| `0x145b78e0f..0x145b78e27` | one-byte auth version from client `+0x1208` |
+| `0x145b78e2c..0x145b78e44` | one-byte pre-auth length from `+0x11d8` |
+| `0x145b78e49..0x145b78e65` | pre-auth blob from string/storage at `+0x11c8`, length `+0x11d8` |
+| `0x145b78e6a..0x145b78e82` | one-byte auth length from `+0x11f8` |
+| `0x145b78e87..0x145b78ea3` | auth blob from string/storage at `+0x11e8`, length `+0x11f8` |
+| `0x145b78ef1..0x145b78f3a` | send through the active connection vtable with channel id `1` |
+
+The blobs come from `ClientTicket` fields 2 and 3, and the auth version is the final semicolon field. `src/team_create.rs` now reports only this frame's lengths and version; it still redacts the ticket contents and does not send the frame until the exact 0.741 QUIC/channel layer is implemented.
+
+The app therefore now stops at a safe selector/config/early-auth-frame report until the QUIC connect configuration and channel wire format are recovered.
+
+## Live validation after the RbxTransport pivot
+
+A fresh 0.741 Team Create join run through the committed transport selector resolved immediately to `selectedTransport=RbxTransport` with no UI delay. The live payload supplied:
+
+- public UDP/UDMUX target `128.116.54.33:61938`,
+- RCC/RUPP endpoint `10.32.1.158:61938`,
+- `NetStackPort = 58659`,
+- a 16-byte `NetStackTokenValue` (redacted in the app output), and
+- an `EphemeralEarlyPubKey` override decoded as version `1`, length `32` bytes.
+
+That run proves the app-side selector/config extraction follows the active Studio path for the current Team Create payload. It does **not** prove the remaining QUIC/BaseClient authentication or channel-open wire format yet.
 
 ## App behavior after the RbxTransport pivot
 
