@@ -282,6 +282,19 @@ The first connected packet now used the intended current established shape on da
 
 This closes the remaining first-packet route-order gap introduced by sending established subtype-2 only after native retransmissions. The failure is no longer explained by TokenValue vs NetStackTokenValue, NetStackPort endpoint selection, Reply2 token promotion timing, subtype/flags shape, password placement, connected plaintext layout, RUPP/encryption boundary, nonce suffix, or the already-tested simple route/KDF/cipher matrices. Do not add another route/cipher/KDF permutation without new native/current evidence. The remaining concrete targets are exact current-build normal-session key installation/epoch behavior, the packet-token/epoch-token generator behind `TokenGenAlgorithm=1` and `PepperId`, and proof of whether current Team Create is expected to take the RbxTransport/QUIC branch instead of RakNet.
 
+### Current 0.741 transport-branch audit
+
+The current public Studio app settings were rechecked after the `6381f30` live-negative run because 0.735 Studio is stale. The exact 0.741 WindowsStudio64 archive metadata is visible in `GuihongWang/rbxl_archive` as `WindowsStudio64-0.741.19.7411056` with `version-6b0e880a1a144428-RobloxStudio.zip`, but the sandbox still cannot fetch the release asset or the direct `setup.rbxcdn.com` ZIP due release-assets EOF / TLS failures. Therefore there is still no exact 0.741 Studio disassembly in hand.
+
+What can be proven from current public runtime data is narrower but important:
+
+- Current `PCStudioApp` and `MacStudioApp` public settings contain only RbxTransport debug/perf entries (`DFFlagDebugDisableRbxTransportQuicAddressValidation`, `DFFlagRbxTransportDisableIoEventLoopPerfScope`) among RbxTransport names. They do **not** publish `UseRbxTransportClient`, `RakNetConnectionFailureFallbackToRbxTransport`, `RbxTransportConnectionFailureFallbackToRakNet`, or `DFFlagRbxTransportFallbackStudio`.
+- Current `PCDesktopClient` does publish many RbxTransport rollout flags, including `DFFlagRbxTransportFallbackStudio`, `DFFlagRbxTransportDeprecateGenerateRccToken`, and QUIC/client/dummy-service flags. This comparison matters because the tracker is capable of surfacing RbxTransport rollout flags when an application has them; their absence from Studio is not just a grep bug.
+- The 0.735 Studio selector remains the only recovered Team Create selector body. Its branch condition first calls `RBX::Network::useRbxTransport()`. If that returns false, it records `selectedTransport=RakNet` and immediately invokes the RakNet lambda. The NetStack/RbxTransport preconditions (`valid port`, `valid address`, `valid pubkey`) are evaluated only when `useRbxTransport()` is true or the RakNet-to-RbxTransport fallback flag is enabled.
+- Consequently `NetStackTokenValue`, `NetStackPort`, and an RbxTransport client public key in the join config prove that the QUIC path could be configured, but they do **not** prove Studio selected it. With current public Studio settings, the evidence still points to RakNet-first Team Create, with no public fallback-to-RbxTransport enable.
+
+This does not rule out private fast flags or an uninspected exact 0.741 code change. It does rule out treating NetStack fields alone as proof that the current Team Create branch is RbxTransport/QUIC. Until an exact current disassembly or native transport log contradicts this, implementing QUIC would be a speculative rewrite rather than an evidence-backed fix.
+
 ## 0.740 Windows Player recovery corrections
 
 The parsed 0.740 archive targets Windows Player `0.740.0.7400927`, not the exact `0.741.19.7411056` Studio build. Its broad disassembly range `fn_0x000142897340.asm` was initially labelled only from later string xrefs. The first real body in that range, **`0x142897340–0x142897555`**, is instead the Windows `RakNet::RakPeer::generateUdmuxToken` implementation:
