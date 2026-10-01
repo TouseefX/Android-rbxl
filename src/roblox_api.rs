@@ -7,6 +7,7 @@ use rbx_dom_weak::{
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct LiveCatalogItem {
@@ -223,7 +224,9 @@ pub struct StudioPresenceReport {
     pub user_id: u64,
     pub username: String,
     pub browser_tracker_id: u64,
+    pub browser_tracker_source: String,
     pub client_status_sent: bool,
+    pub client_status_route: String,
     pub presence_type: Option<u64>,
     pub presence_label: Option<String>,
     pub last_location: Option<String>,
@@ -245,8 +248,14 @@ impl StudioPresenceReport {
             .map(|s| format!("; location: {s}"))
             .unwrap_or_default();
         format!(
-            "Roblox Studio presence bootstrap sent AppStarted for {} ({}) with browserTrackerId {}; current presence: {}{}",
-            self.username, self.user_id, self.browser_tracker_id, presence, location
+            "Roblox Studio presence bootstrap sent AppStarted for {} ({}) with browserTrackerId {} from {}; accepted by {}; current presence: {}{}",
+            self.username,
+            self.user_id,
+            self.browser_tracker_id,
+            self.browser_tracker_source,
+            self.client_status_route,
+            presence,
+            location
         )
     }
 }
@@ -261,10 +270,11 @@ fn studio_presence_channel() -> &'static (Sender<StudioPresenceResult>, Mutex<Re
     })
 }
 
-/// Send the same documented client-status heartbeat Studio emits on startup.
+/// Send the same client-status heartbeat Studio emits on startup.
 ///
-/// Native Studio 0.741 contains `UseMatchmakingApiClientStatus`, the
-/// `/matchmaking-api/v1/client-status` path, and the exact JSON shape
+/// Native Studio still carries the legacy `www.roblox.com/client-status/set`
+/// route while newer builds also expose the Matchmaking API Beta
+/// `/matchmaking-api/v1/client-status` shape
 /// `{"browserTrackerId":…, "status":"…"}`. At app start it sends
 /// `status = "AppStarted"`; Roblox then decides whether that session appears
 /// as Online/InStudio. We do this as a best-effort authenticated request and
@@ -3397,6 +3407,67 @@ fn get_curated_fallback(query: &str) -> Vec<LiveCatalogItem> {
 
 use std::collections::HashMap;
 
+fn percent_decode_ascii(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn percent_encode_query_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn extract_browser_tracker_id_from_value(value: &str) -> Option<u64> {
+    let decoded;
+    let values: [&str; 2] = if value.contains('%') {
+        decoded = percent_decode_ascii(value);
+        [value, decoded.as_str()]
+    } else {
+        [value, value]
+    };
+
+    for candidate in values {
+        for pair in candidate.split('&') {
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("browserid")
+                || name.eq_ignore_ascii_case("browserTrackerId")
+            {
+                if let Ok(id) = value.trim().parse::<u64>() {
+                    if id != 0 {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn extract_browser_tracker_id(raw_cookie_or_header: &str) -> Option<u64> {
     let mut candidates = Vec::new();
     for part in raw_cookie_or_header.split(';') {
@@ -3408,27 +3479,44 @@ fn extract_browser_tracker_id(raw_cookie_or_header: &str) -> Option<u64> {
         } else if lower.starts_with("browsertrackerid=") || lower.starts_with("browserid=") {
             if let Some((_, value)) = part.split_once('=') {
                 if let Ok(id) = value.trim().parse::<u64>() {
-                    return Some(id);
+                    if id != 0 {
+                        return Some(id);
+                    }
                 }
             }
         }
     }
 
-    for value in candidates {
-        for pair in value.split('&') {
-            let Some((name, value)) = pair.split_once('=') else {
-                continue;
-            };
-            if name.eq_ignore_ascii_case("browserid")
-                || name.eq_ignore_ascii_case("browserTrackerId")
-            {
-                if let Ok(id) = value.trim().parse::<u64>() {
-                    return Some(id);
-                }
-            }
-        }
+    candidates
+        .iter()
+        .find_map(|value| extract_browser_tracker_id_from_value(value))
+}
+
+fn synthesized_browser_tracker_id(user_id: u64) -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut mixed = nanos ^ user_id.rotate_left(17) ^ 0x5deece66d_u64;
+    // A tiny SplitMix64 round keeps nearby user/time values from producing
+    // visibly related IDs. The result is metadata only; it is not a secret.
+    mixed = mixed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    10_000_000_000 + (mixed % 90_000_000_000)
+}
+
+fn summarize_http_body(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 240;
+    let mut chars = compact.chars();
+    let prefix: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        compact
     }
-    None
 }
 
 fn find_u64_key_recursive(value: &serde_json::Value, wanted: &[&str]) -> Option<u64> {
@@ -3541,13 +3629,28 @@ impl WebClient {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        let text = self.send_json_text(url, method, body)?;
+        // Some develop endpoints (universe activate/deactivate) answer 200
+        // with an empty body — that's a success, not a JSON error.
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|e| format!("bad JSON from {url}: {e}"))
+    }
+
+    fn send_json_text(
+        &self,
+        url: &str,
+        method: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, String> {
         // First attempt (possibly without a token).
-        match self.try_send_json(url, method, body, self.csrf.borrow().clone()) {
+        match self.try_send_json_text(url, method, body, self.csrf.borrow().clone()) {
             Ok(v) => return Ok(v),
             Err(SendError::NeedsToken(new_token)) => {
                 // Server told us the correct token; cache and retry once.
                 *self.csrf.borrow_mut() = Some(new_token.clone());
-                self.try_send_json(url, method, body, Some(new_token))
+                self.try_send_json_text(url, method, body, Some(new_token))
                     .map_err(|e| match e {
                         SendError::Http(s) => s,
                         SendError::NeedsToken(_) => {
@@ -3559,19 +3662,19 @@ impl WebClient {
         }
     }
 
-    fn try_send_json(
+    fn try_send_json_text(
         &self,
         url: &str,
         method: &str,
         body: &serde_json::Value,
         csrf: Option<String>,
-    ) -> Result<serde_json::Value, SendError> {
+    ) -> Result<String, SendError> {
         let mut req = self
             .http
             .request(method.parse().map_err(|_| SendError::Http("bad method".into()))?, url)
             .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
+            .header("Accept", "application/json, text/plain, */*");
         if let Some(t) = csrf {
             req = req.header("X-CSRF-Token", t);
         }
@@ -3592,17 +3695,51 @@ impl WebClient {
             .text()
             .map_err(|e| SendError::Http(format!("read body: {e}")))?;
         if !status.is_success() {
-            return Err(SendError::Http(format!("{method} {url} → {status}: {text}")));
+            return Err(SendError::Http(format!(
+                "{method} {url} → {status}: {}",
+                summarize_http_body(&text)
+            )));
         }
-        // Some develop endpoints (universe activate/deactivate) answer 200
-        // with an empty body — that's a success, not a JSON error.
-        if text.trim().is_empty() {
-            return Ok(serde_json::Value::Null);
-        }
-        serde_json::from_str(&text)
-            .map_err(|e| SendError::Http(format!("bad JSON from {url}: {e}")))
+        Ok(text)
     }
 
+    fn get_text_authenticated(&self, url: &str) -> Result<String, String> {
+        let resp = self
+            .http
+            .get(url)
+            .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
+            .header("Accept", "text/plain, */*")
+            .send()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().map_err(|e| format!("read body: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "GET {url} → {status}: {}",
+                summarize_http_body(&text)
+            ));
+        }
+        Ok(text)
+    }
+
+    fn browser_tracker_id_from_homepage_cookie(&self) -> Option<u64> {
+        let resp = self
+            .http
+            .get("https://www.roblox.com/")
+            .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
+            .header("Accept", "text/html, */*")
+            .send()
+            .ok()?;
+        for value in resp.headers().get_all("set-cookie").iter() {
+            let Ok(cookie) = value.to_str() else {
+                continue;
+            };
+            if let Some(id) = extract_browser_tracker_id(cookie) {
+                return Some(id);
+            }
+        }
+        None
+    }
     // ---- High-level helpers ------------------------------------------------
 
     /// Fetch the currently authenticated user's id/username.
@@ -3613,39 +3750,87 @@ impl WebClient {
         Ok((id, name))
     }
 
-    /// Resolve the BrowserTrackerId Studio passes to the matchmaking
-    /// client-status endpoint. If the user pasted a whole Cookie header we can
-    /// parse `RBXEventTrackerV2`; otherwise ask Roblox's authenticated
-    /// app-launch-info endpoint and fall back to zero (the official request
-    /// shape accepts a numeric field, and native code sends the field even
-    /// when no browser value was recovered).
-    fn browser_tracker_id(&self, raw_cookie_or_header: &str) -> u64 {
-        extract_browser_tracker_id(raw_cookie_or_header)
-            .or_else(|| {
-                self.get_json("https://users.roblox.com/v1/users/authenticated/app-launch-info")
-                    .ok()
-                    .and_then(|value| {
-                        find_u64_key_recursive(
-                            &value,
-                            &["browserTrackerId", "suggestedBrowserTrackerId", "browserId"],
-                        )
-                    })
+    /// Resolve the BrowserTrackerId Studio passes to the client-status
+    /// endpoint. Native clients prefer the browser's RBXEventTrackerV2 cookie;
+    /// if the saved value is only a raw `.ROBLOSECURITY`, try authenticated
+    /// app-launch-info and the www.roblox.com Set-Cookie bootstrap before
+    /// synthesizing a non-zero per-launch id. Sending zero made the previous
+    /// implementation look accepted while not moving visible presence.
+    fn browser_tracker_id(&self, raw_cookie_or_header: &str, user_id: u64) -> (u64, String) {
+        if let Some(id) = extract_browser_tracker_id(raw_cookie_or_header) {
+            return (id, "cookie/header RBXEventTrackerV2".into());
+        }
+        if let Some(id) = self
+            .get_json("https://users.roblox.com/v1/users/authenticated/app-launch-info")
+            .ok()
+            .and_then(|value| {
+                find_u64_key_recursive(
+                    &value,
+                    &["browserTrackerId", "suggestedBrowserTrackerId", "browserId"],
+                )
             })
-            .unwrap_or(0)
+            .filter(|id| *id != 0)
+        {
+            return (id, "authenticated app-launch-info".into());
+        }
+        if let Some(id) = self.browser_tracker_id_from_homepage_cookie() {
+            return (id, "www.roblox.com Set-Cookie".into());
+        }
+        (
+            synthesized_browser_tracker_id(user_id),
+            "generated non-zero fallback".into(),
+        )
     }
 
-    /// POST Studio's startup client-status heartbeat. Native Studio 0.741 uses
-    /// `status = AppStarted`; connected play/join paths later send statuses
-    /// such as `JoiningGame`, `InGame`, and `LeftGame`.
-    fn set_client_status(&self, status: &str, browser_tracker_id: u64) -> Result<(), String> {
-        self.post_json(
+    /// POST Studio's startup client-status heartbeat. Studio still carries the
+    /// legacy `www.roblox.com/client-status/set` path in the status reporting
+    /// code path while newer builds also expose the Matchmaking API Beta
+    /// endpoint. Try the native/legacy forms first, then the Beta endpoint, and
+    /// treat any 2xx response as accepted because the legacy endpoint has
+    /// historically returned plain/empty bodies rather than JSON.
+    fn set_client_status(&self, status: &str, browser_tracker_id: u64) -> Result<String, String> {
+        let body = serde_json::json!({
+            "status": status,
+            "browserTrackerId": browser_tracker_id,
+        });
+        let mut accepted = Vec::new();
+        let mut errors = Vec::new();
+
+        match self.send_json_text(
+            "https://www.roblox.com/client-status/set",
+            "POST",
+            &body,
+        ) {
+            Ok(_) => accepted.push("www/client-status/set POST"),
+            Err(error) => errors.push(format!("legacy POST: {error}")),
+        }
+
+        let legacy_get = format!(
+            "https://www.roblox.com/client-status/set?browserTrackerId={browser_tracker_id}&status={}",
+            percent_encode_query_component(status)
+        );
+        match self.get_text_authenticated(&legacy_get) {
+            Ok(_) => accepted.push("www/client-status/set GET"),
+            Err(error) => errors.push(format!("legacy GET: {error}")),
+        }
+
+        match self.send_json_text(
             "https://apis.roblox.com/matchmaking-api/v1/client-status",
-            &serde_json::json!({
-                "status": status,
-                "browserTrackerId": browser_tracker_id,
-            }),
-        )?;
-        Ok(())
+            "POST",
+            &body,
+        ) {
+            Ok(_) => accepted.push("matchmaking-api client-status POST"),
+            Err(error) => errors.push(format!("matchmaking POST: {error}")),
+        }
+
+        if accepted.is_empty() {
+            Err(format!(
+                "all Studio client-status writes failed: {}",
+                errors.join(" | ")
+            ))
+        } else {
+            Ok(accepted.join(" + "))
+        }
     }
 
     /// Query Roblox's public presence endpoint for one user. This is a
@@ -3680,8 +3865,9 @@ impl WebClient {
         raw_cookie_or_header: &str,
     ) -> Result<StudioPresenceReport, String> {
         let (user_id, username) = self.whoami()?;
-        let browser_tracker_id = self.browser_tracker_id(raw_cookie_or_header);
-        self.set_client_status("AppStarted", browser_tracker_id)?;
+        let (browser_tracker_id, browser_tracker_source) =
+            self.browser_tracker_id(raw_cookie_or_header, user_id);
+        let client_status_route = self.set_client_status("AppStarted", browser_tracker_id)?;
         let (presence_type, presence_label, last_location) = self
             .query_presence(user_id)
             .unwrap_or((None, None, None));
@@ -3689,7 +3875,9 @@ impl WebClient {
             user_id,
             username,
             browser_tracker_id,
+            browser_tracker_source,
             client_status_sent: true,
+            client_status_route,
             presence_type,
             presence_label,
             last_location,
@@ -4112,4 +4300,27 @@ enum SendError {
     /// Server returned a 403 with a fresh CSRF token; retry with it.
     NeedsToken(String),
     Http(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_browser_tracker_id_from_plain_cookie_header() {
+        let header = ".ROBLOSECURITY=redacted; RBXEventTrackerV2=CreateDate=now&browserid=61448583721; Path=/";
+        assert_eq!(extract_browser_tracker_id(header), Some(61_448_583_721));
+    }
+
+    #[test]
+    fn extracts_browser_tracker_id_from_percent_encoded_cookie() {
+        let header = "RBXEventTrackerV2=CreateDate%3Dnow%26browserTrackerId%3D12345678901; Path=/";
+        assert_eq!(extract_browser_tracker_id(header), Some(12_345_678_901));
+    }
+
+    #[test]
+    fn percent_encodes_client_status_query_component() {
+        assert_eq!(percent_encode_query_component("AppStarted"), "AppStarted");
+        assert_eq!(percent_encode_query_component("Joining Game"), "Joining%20Game");
+    }
 }

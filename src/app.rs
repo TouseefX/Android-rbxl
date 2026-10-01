@@ -644,7 +644,7 @@ impl EditorApp {
             return;
         };
         self.studio_presence_status =
-            "Sending Studio AppStarted presence to Roblox…".into();
+            "Sending native Studio client-status presence to Roblox…".into();
         self.studio_presence_in_flight = true;
         roblox_api::start_studio_presence_async(cookie);
         self.log_info("Started Roblox Studio presence bootstrap");
@@ -6037,7 +6037,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
 
                 ui.group(|ui| {
                     ui.label(RichText::new("🟦 Roblox Studio profile presence").heading().color(Color32::from_rgb(100, 200, 255)));
-                    ui.label("On startup this app sends Studio's AppStarted client-status heartbeat to Roblox, then reads back your presence. Roblox may keep showing Online until Team Create is fully connected, but the startup heartbeat now matches Studio's documented client-status path.");
+                    ui.label("On startup this app sends Studio's AppStarted client-status heartbeat to Roblox using the native legacy client-status/set path plus the newer Matchmaking API path, then reads back your presence. Roblox may still keep showing Online until Team Create is fully connected.");
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(
