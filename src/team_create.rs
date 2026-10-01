@@ -439,6 +439,24 @@ const EARLY_AEAD_OVERHEAD: usize = 28; // 12-byte nonce + 16-byte detached tag
 // falsely negotiated server bits 19 and 25 in the latest live session.
 const RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR: u64 = 0x0000_0203_58b7_eafa;
 
+// Exact Studio 0.741 BaseClient open-send constants from
+// BaseClient::connect `0x14603bb70..0x14603c1e1` through wrapper
+// `0x14603da90`. The native call opens application 1, channel id 0,
+// reliability enum 2, priority 0 after the QUIC connection-open event.
+const RBX_TRANSPORT_BASECLIENT_APP: u8 = 1;
+const RBX_TRANSPORT_BASECLIENT_SEND_CHANNEL_ID: u32 = 0;
+const RBX_TRANSPORT_BASECLIENT_SEND_RELIABILITY: u32 = 2;
+const RBX_TRANSPORT_BASECLIENT_SEND_PRIORITY: u32 = 0;
+
+// Exact Studio 0.741 channel-control serializers:
+// OpenReliableChannelControl `0x1436b1980` writes 6 bytes, and
+// OpenUnreliableChannelControl `0x1436b1a40` writes 10 bytes. Dword writes
+// go through NetStream's host-to-network helper at `0x147393b20`.
+const RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE: u8 = 1;
+const RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES: usize = 6;
+const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE: u8 = 2;
+const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES: usize = 10;
+
 // Exact current RUPP values from Rupp::{serialize,TokenTlv,Ipv4Tlv,Ipv6Tlv}. 0.735
 // retains the same wire values used by the earlier transport implementation.
 
@@ -475,6 +493,22 @@ struct RbxTransportEarlyKeyMaterial {
     public_key: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RbxTransportBaseClientOpenSendChannel {
+    application: u8,
+    channel_id: u32,
+    reliability: u32,
+    priority: u32,
+}
+
+const RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL: RbxTransportBaseClientOpenSendChannel =
+    RbxTransportBaseClientOpenSendChannel {
+        application: RBX_TRANSPORT_BASECLIENT_APP,
+        channel_id: RBX_TRANSPORT_BASECLIENT_SEND_CHANNEL_ID,
+        reliability: RBX_TRANSPORT_BASECLIENT_SEND_RELIABILITY,
+        priority: RBX_TRANSPORT_BASECLIENT_SEND_PRIORITY,
+    };
+
 #[derive(Clone, Debug)]
 struct RbxTransportConnectPlan {
     public_endpoint: Endpoint,
@@ -505,9 +539,21 @@ impl RbxTransportConnectPlan {
             self.early_key.version,
             self.early_key.public_key.len(),
         );
+        let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
+        text.push_str(&format!(
+            "\nRbxTransport BaseClient openSendChannel (0.741): application {}, channelId {}, reliability enum {}, priority {}; channel-control payloads recovered as OpenReliable {} bytes (type {}, app, channelId) and OpenUnreliable {} bytes (type {}, app, channelId, wireId).",
+            open.application,
+            open.channel_id,
+            open.reliability,
+            open.priority,
+            RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES,
+            RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE,
+            RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES,
+            RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE
+        ));
         match &self.early_auth {
             Ok(auth) => text.push_str(&format!(
-                "\nRbxTransport BaseClient early auth: channel 1 frame tag 0xA8, auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted)",
+                "\nRbxTransport BaseClient early auth: active connection send slot argument 1, frame tag 0xA8, auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted)",
                 auth.auth_version,
                 auth.preauth_blob.len(),
                 auth.auth_blob.len(),
@@ -521,7 +567,7 @@ impl RbxTransportConnectPlan {
             text.push_str(&format!("\nRbxTransport GameFqdn: {game_fqdn}"));
         }
         text.push_str(
-            "\nLegacy RakNet connected packets are intentionally skipped for this config; the remaining implementation target is the RbxTransport QUIC/BaseClient auth + channel-open path, not another RakNet route/KDF matrix.",
+            "\nLegacy RakNet connected packets are intentionally skipped for this config; the remaining implementation target is the RbxTransport QUIC/BaseClient auth, runtime channel allocation, and send/receive path, not another RakNet route/KDF matrix.",
         );
         text
     }
@@ -841,11 +887,35 @@ fn extract_client_ticket_early_auth(config: &serde_json::Value) -> Result<EarlyA
     parse_early_auth_data(&client_ticket)
 }
 
+#[cfg(test)]
+fn build_rbx_transport_open_reliable_channel_control(application: u8, channel_id: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES);
+    payload.push(RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE);
+    payload.push(application);
+    payload.extend_from_slice(&channel_id.to_be_bytes());
+    payload
+}
+
+#[cfg(test)]
+fn build_rbx_transport_open_unreliable_channel_control(
+    application: u8,
+    channel_id: u32,
+    wire_channel_id: u32,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES);
+    payload.push(RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE);
+    payload.push(application);
+    payload.extend_from_slice(&channel_id.to_be_bytes());
+    payload.extend_from_slice(&wire_channel_id.to_be_bytes());
+    payload
+}
+
 /// Exact Studio 0.741 `sendEarlyAuthData` (`0x145b78cb0..0x145b78f68`)
-/// writes this BaseClient frame on RbxTransport channel 1 after the connection
-/// object exists: tag `0xA8`, version, one-byte pre-auth length/blob, then
-/// one-byte auth length/blob. Callers may report the shape but must not print
-/// the ticket-derived blob bytes.
+/// writes this BaseClient frame through active connection vtable `+0x30` with
+/// send-slot argument `1` after the connection object exists: tag `0xA8`,
+/// version, one-byte pre-auth length/blob, then one-byte auth length/blob.
+/// Callers may report the shape but must not print the ticket-derived blob
+/// bytes.
 fn rbx_transport_early_auth_payload_len(auth: &EarlyAuthData) -> usize {
     4 + auth.preauth_blob.len() + auth.auth_blob.len()
 }
@@ -2460,11 +2530,36 @@ mod tests {
         assert!(report.contains("selectedTransport=RbxTransport"));
         assert!(report.contains("RbxTransport QUIC UDP target: 128.116.54.33:56000"));
         assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.54.33:50704"));
-        assert!(report.contains("channel 1 frame tag 0xA8"));
+        assert!(report.contains("openSendChannel (0.741): application 1, channelId 0, reliability enum 2, priority 0"));
+        assert!(report.contains("OpenReliable 6 bytes"));
+        assert!(report.contains("OpenUnreliable 10 bytes"));
+        assert!(report.contains("active connection send slot argument 1, frame tag 0xA8"));
         assert!(report.contains("wire payload 52 bytes"));
         assert!(report.contains("Legacy RakNet connected packets are intentionally skipped"));
         assert!(!report.contains("ICEiIyQl"));
         assert!(!report.contains("AAECAw"));
+    }
+
+    #[test]
+    fn rbx_transport_channel_open_control_serializers_match_native_layout() {
+        let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
+        assert_eq!(open.application, 1);
+        assert_eq!(open.channel_id, 0);
+        assert_eq!(open.reliability, 2);
+        assert_eq!(open.priority, 0);
+
+        assert_eq!(
+            build_rbx_transport_open_reliable_channel_control(open.application, open.channel_id),
+            vec![0x01, 0x01, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            build_rbx_transport_open_unreliable_channel_control(
+                open.application,
+                open.channel_id,
+                0x0102_0304
+            ),
+            vec![0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04]
+        );
     }
 
     #[test]

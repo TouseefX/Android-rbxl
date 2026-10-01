@@ -21,6 +21,16 @@ Scratch disassembly artifacts are outside the repository:
 - `/tmp/winstudio_uploaded/netstack_parser_snips.asm`
 - `/tmp/winstudio_uploaded/rbxtransport_full_remap.asm`
 - `/tmp/winstudio_uploaded/rbxtransport_client_funcs.asm`
+- `/tmp/winstudio_uploaded/baseclient_connect_14603b920.asm`
+- `/tmp/winstudio_uploaded/baseclient_wait_14603eb70.asm`
+- `/tmp/winstudio_uploaded/baseclient_events_14603daf0.asm`
+- `/tmp/winstudio_uploaded/baseclient_send_14603e370.asm`
+- `/tmp/winstudio_uploaded/rtcio_open_send_1435f2200.asm`
+- `/tmp/winstudio_uploaded/connreg_open_send_1436a5800.asm`
+- `/tmp/winstudio_uploaded/handler_open_channel_1436b5e00.asm`
+- `/tmp/winstudio_uploaded/connreg_write_open_unrel_1436a8700.asm`
+- `/tmp/winstudio_uploaded/control_deser_1436b0f80.asm`
+- `/tmp/winstudio_uploaded/control_serialize_1436b18e0.asm`
 - `/tmp/winstudio_uploaded/send_early_auth_0741.asm`
 
 ## Selector conclusion
@@ -191,6 +201,28 @@ This is enough to prove selection and to keep the app on the RbxTransport branch
 
 Important implication for implementation: RbxTransport does not start with Roblox's RakNet `RbxOpenRequest1/2` packets. The native client creates a QUIC/RbxTransport connection first, waits for a connection-open event, then opens/ACKs channels before game data is sent.
 
+### BaseClient open-send channel and control framing
+
+The first BaseClient send channel now has exact 0.741 argument mapping. `BaseClient::connect` calls BaseClient vtable `+0x68` at `0x14603bf1d..0x14603bf23` after `0x14603eb70` reports the connection-open event. That vmethod is `0x14603da90..0x14603dae5`; it locks the BaseClient connection mutex and calls the active connection vtable `+0x70` with:
+
+| Argument | Native evidence | Value | Meaning |
+|---|---|---:|---|
+| `dl` | `0x14603dac4` (`lea edx, [r9-1]` after `r9d=2`) | `1` | application id |
+| `r8d` | `0x14603dac1` | `0` | send `ChannelId` |
+| `r9d` | `0x14603dabb` | `2` | reliability enum value |
+| stack byte/dword | `0x14603dab6` | `0` | priority/extra open option seen by the registration layer |
+
+The RtcIo/RnaExp wrapper at `0x1435f24f0..0x1435f2901` validates the channel id (`r8d`, accepting `"ctrl"` or `< 0x21`) and packages `application/channelId/reliability/priority` for the connection registration. `ConnectionRegistration::openSendChannel` at `0x1436a5aa0..0x1436a5c34` confirms the same mapping: it uses `dl` to look up the per-application registration via `0x1436a4af0`, forwards `r8d` as the channel id, forwards `r9d` as the reliability enum, and forwards the stack value as the extra open parameter into `0x1436b5eb0`.
+
+Exact channel-control payload serializers are also recovered:
+
+| Control | Serializer | Deserializer | Payload after QUIC/RbxTransport channel header | Length |
+|---|---:|---:|---|---:|
+| `OpenReliableChannelControl` | `0x1436b1980` | `0x1436b1060` | `type=0x01`, `application u8`, `channelId u32be` | 6 bytes |
+| `OpenUnreliableChannelControl` | `0x1436b1a40` | `0x1436b12a0` | `type=0x02`, `application u8`, `channelId u32be`, `wireChannelId u32be` | 10 bytes |
+
+The dword writes go through NetStream helper `0x147393b20`, which calls the host-to-network conversion before appending the four stored bytes. `OpenUnreliableChannelControl` serializes the absolute value of the object field at `+0x18`; that field is a runtime wire-channel id allocated by the transport/channel handler and should not be guessed from the join config. The app therefore reports the exact BaseClient open-send constants and safe control-frame shapes, but still does not send them until the remaining QUIC session/auth state and runtime wire id allocation are implemented.
+
 Exact 0.741 `sendEarlyAuthData` is mapped at `0x145b78cb0..0x145b78f68` (`/tmp/winstudio_uploaded/send_early_auth_0741.asm`). It checks the early-auth-present byte at client `+0x1210`, checks the active connection pointer (`+0xfe0` then subobject `+0x138`, or fallback `+0xfe8`), builds a `NetworkStream`, and writes the BaseClient early-auth application payload:
 
 | Write site | Payload component |
@@ -201,11 +233,11 @@ Exact 0.741 `sendEarlyAuthData` is mapped at `0x145b78cb0..0x145b78f68` (`/tmp/w
 | `0x145b78e49..0x145b78e65` | pre-auth blob from string/storage at `+0x11c8`, length `+0x11d8` |
 | `0x145b78e6a..0x145b78e82` | one-byte auth length from `+0x11f8` |
 | `0x145b78e87..0x145b78ea3` | auth blob from string/storage at `+0x11e8`, length `+0x11f8` |
-| `0x145b78ef1..0x145b78f3a` | send through the active connection vtable with channel id `1` |
+| `0x145b78ef1..0x145b78f3a` | send through the active connection vtable `+0x30` with send-slot argument `1` |
 
 The blobs come from `ClientTicket` fields 2 and 3, and the auth version is the final semicolon field. `src/team_create.rs` now reports only this frame's lengths and version; it still redacts the ticket contents and does not send the frame until the exact 0.741 QUIC/channel layer is implemented.
 
-The app therefore now stops at a safe selector/config/early-auth-frame report until the QUIC connect configuration and channel wire format are recovered.
+The app therefore now stops at a safe selector/config/early-auth/channel-open-shape report until the remaining QUIC session authentication, runtime channel id allocation, and send path are recovered.
 
 ## Live validation after the RbxTransport pivot
 
@@ -218,7 +250,7 @@ Fresh 0.741 Team Create joins run through the committed transport selector resol
 - an `EphemeralEarlyPubKey` override decoded as version `1`, length `32` bytes, and
 - BaseClient early-auth examples such as auth version `17`, pre-auth `33` bytes, auth `66` bytes, payload `103` bytes.
 
-Current reporting distinguishes the advertised public/UDMUX endpoint from the QUIC UDP target formed from the public address plus `NetStackPort`; the latest live output therefore reports `128.116.54.33:52054` as the QUIC UDP target while retaining `128.116.54.33:51996` as the advertised UDMUX endpoint/open-RUPP peer port. These runs prove the app-side selector/config extraction follows the active Studio path for the current Team Create payload. They do **not** prove the remaining QUIC/BaseClient authentication or channel-open wire format yet.
+Current reporting distinguishes the advertised public/UDMUX endpoint from the QUIC UDP target formed from the public address plus `NetStackPort`; the latest live output therefore reports `128.116.54.33:52054` as the QUIC UDP target while retaining `128.116.54.33:51996` as the advertised UDMUX endpoint/open-RUPP peer port. These runs prove the app-side selector/config extraction follows the active Studio path for the current Team Create payload. They do **not** prove the remaining QUIC/BaseClient authentication, runtime wire-channel allocation, or connected receive/send path yet.
 
 ## App behavior after the RbxTransport pivot
 
@@ -230,4 +262,4 @@ Current reporting distinguishes the advertised public/UDMUX endpoint from the QU
 - `NetStackTokenValue` or `RbxTransportToken` decoding to 16 bytes, and
 - a 32-byte RbxTransport early public key from either `EphemeralEarlyPubKey` or the `ClientPublicKeyData` application `RbxTransportEphemeralEarlyPublicKey`,
 
-it reports `selectedTransport=RbxTransport`, preserves only safe token/key metadata in the UI report, and intentionally skips the RakNet connected probe. This avoids burning a one-use Team Create config on the wrong transport now that the runtime flags are treated as RbxTransport-first. The actual QUIC/BaseClient auth and channel-open path still needs to be recovered before a live connected-client fix can be claimed; `0x145cc44c0` is now identified as the network-emulation configuration helper reached near the end of the RbxTransport path, not the QUIC handshake itself.
+it reports `selectedTransport=RbxTransport`, preserves only safe token/key metadata in the UI report, and intentionally skips the RakNet connected probe. This avoids burning a one-use Team Create config on the wrong transport now that the runtime flags are treated as RbxTransport-first. The actual QUIC/BaseClient auth, runtime channel allocation, and connected send/receive path still need to be recovered before a live connected-client fix can be claimed; `0x145cc44c0` is now identified as the network-emulation configuration helper reached near the end of the RbxTransport path, not the QUIC handshake itself.
