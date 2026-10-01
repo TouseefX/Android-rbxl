@@ -165,7 +165,7 @@ Additional structure recovered from the full `0x145b6a4b0` body in `/tmp/winstud
 | Native source offset in the selector handoff struct | Meaning recovered so far |
 |---:|---|
 | `+0x08` string, `+0x28` word/dword | RCC/server address and port. These are parsed with `0x143449960`; failure goes to `RbxTransport Client rccAddr parse error: %s`. |
-| `+0x78` optional string/endpoint, `+0x98` dword | UDMUX endpoint/address and port used by the `will connect to server {}|{}, udmux {}|{}` log. |
+| `+0x78` optional string/endpoint, `+0x98` dword | Public/RbxTransport endpoint copied to the outgoing connect configuration at stack `+0x118/+0x138`; this is the QUIC target. The app reports it as public address plus `NetStackPort` when the Team Create payload supplies a separate NetStack port. It is also used as the UDMUX side of the `will connect to server {}|{}, udmux {}|{}` log. |
 | `+0x122` byte | DirectServerReturn/RUPP flag copied into the RUPP config blob and logged as `DSR`. |
 | `+0x123` byte | RUPP token type logged by `RuppConfig = RCC {}:{}, DSR {}, Token type {}`. |
 | `+0x124..+0x133` bytes | 16-byte RbxTransport/RUPP token payload. Do not print. |
@@ -209,15 +209,16 @@ The app therefore now stops at a safe selector/config/early-auth-frame report un
 
 ## Live validation after the RbxTransport pivot
 
-A fresh 0.741 Team Create join run through the committed transport selector resolved immediately to `selectedTransport=RbxTransport` with no UI delay. The live payload supplied:
+Fresh 0.741 Team Create joins run through the committed transport selector resolve immediately to `selectedTransport=RbxTransport` with no UI delay. Live payloads have supplied:
 
-- public UDP/UDMUX target `128.116.54.33:61938`,
-- RCC/RUPP endpoint `10.32.1.158:61938`,
-- `NetStackPort = 58659`,
-- a 16-byte `NetStackTokenValue` (redacted in the app output), and
-- an `EphemeralEarlyPubKey` override decoded as version `1`, length `32` bytes.
+- public UDMUX address/endpoint such as `128.116.54.33:61938` and `128.116.50.33:65161`,
+- RCC/RUPP endpoints such as `10.32.1.158:61938` and `10.20.7.153:65161`,
+- separate `NetStackPort` values such as `58659` and `54020`,
+- a 16-byte `NetStackTokenValue` (redacted in the app output),
+- an `EphemeralEarlyPubKey` override decoded as version `1`, length `32` bytes, and
+- BaseClient early-auth examples such as auth version `17`, pre-auth `33` bytes, auth `66` bytes, payload `103` bytes.
 
-That run proves the app-side selector/config extraction follows the active Studio path for the current Team Create payload. It does **not** prove the remaining QUIC/BaseClient authentication or channel-open wire format yet.
+Current reporting distinguishes the advertised public/UDMUX endpoint from the QUIC UDP target formed from the public address plus `NetStackPort`. These runs prove the app-side selector/config extraction follows the active Studio path for the current Team Create payload. They do **not** prove the remaining QUIC/BaseClient authentication or channel-open wire format yet.
 
 ## App behavior after the RbxTransport pivot
 

@@ -489,8 +489,13 @@ struct RbxTransportConnectPlan {
 
 impl RbxTransportConnectPlan {
     fn summary(&self) -> String {
+        let quic_endpoint = Endpoint {
+            address: self.public_endpoint.address.clone(),
+            port: self.rbx_transport_port,
+        };
         let mut text = format!(
-            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport selected UDP/UDMUX target: {}\nRbxTransport RCC/RUPP config: RCC {} with NetStackPort {}, NetStackTokenValue {} ({} decoded bytes)\nRbxTransport early pubkey: {} version {}, {} bytes",
+            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public/UDMUX address with NetStackPort)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with NetStackPort {}, NetStackTokenValue {} ({} decoded bytes)\nRbxTransport early pubkey: {} version {}, {} bytes",
+            quic_endpoint.label(),
             self.public_endpoint.label(),
             self.rcc_endpoint.label(),
             self.rbx_transport_port,
@@ -2453,6 +2458,8 @@ mod tests {
         let report = probe_join_config(&config, 3, 1);
         assert!(report.contains("resolving selected 0.741 transport branch"));
         assert!(report.contains("selectedTransport=RbxTransport"));
+        assert!(report.contains("RbxTransport QUIC UDP target: 128.116.54.33:56000"));
+        assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.54.33:50704"));
         assert!(report.contains("channel 1 frame tag 0xA8"));
         assert!(report.contains("wire payload 52 bytes"));
         assert!(report.contains("Legacy RakNet connected packets are intentionally skipped"));
