@@ -211,14 +211,14 @@ The app therefore now stops at a safe selector/config/early-auth-frame report un
 
 Fresh 0.741 Team Create joins run through the committed transport selector resolve immediately to `selectedTransport=RbxTransport` with no UI delay. Live payloads have supplied:
 
-- public UDMUX address/endpoint such as `128.116.54.33:61938` and `128.116.50.33:65161`,
-- RCC/RUPP endpoints such as `10.32.1.158:61938` and `10.20.7.153:65161`,
-- separate `NetStackPort` values such as `58659` and `54020`,
+- public UDMUX address/endpoint such as `128.116.54.33:61938`, `128.116.50.33:65161`, and `128.116.54.33:51996`,
+- RCC/RUPP endpoints such as `10.32.1.158:61938`, `10.20.7.153:65161`, and `10.32.0.205:51996`,
+- separate `NetStackPort` values such as `58659`, `54020`, and `52054`,
 - a 16-byte `NetStackTokenValue` (redacted in the app output),
 - an `EphemeralEarlyPubKey` override decoded as version `1`, length `32` bytes, and
 - BaseClient early-auth examples such as auth version `17`, pre-auth `33` bytes, auth `66` bytes, payload `103` bytes.
 
-Current reporting distinguishes the advertised public/UDMUX endpoint from the QUIC UDP target formed from the public address plus `NetStackPort`. These runs prove the app-side selector/config extraction follows the active Studio path for the current Team Create payload. They do **not** prove the remaining QUIC/BaseClient authentication or channel-open wire format yet.
+Current reporting distinguishes the advertised public/UDMUX endpoint from the QUIC UDP target formed from the public address plus `NetStackPort`; the latest live output therefore reports `128.116.54.33:52054` as the QUIC UDP target while retaining `128.116.54.33:51996` as the advertised UDMUX endpoint/open-RUPP peer port. These runs prove the app-side selector/config extraction follows the active Studio path for the current Team Create payload. They do **not** prove the remaining QUIC/BaseClient authentication or channel-open wire format yet.
 
 ## App behavior after the RbxTransport pivot
 
