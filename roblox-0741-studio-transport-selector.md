@@ -250,7 +250,25 @@ Fresh 0.741 Team Create joins run through the committed transport selector resol
 - an `EphemeralEarlyPubKey` override decoded as version `1`, length `32` bytes, and
 - BaseClient early-auth examples such as auth version `17`, pre-auth `33` bytes, auth `66` bytes, payload `103` bytes.
 
-Current reporting distinguishes the advertised public/UDMUX endpoint from the QUIC UDP target formed from the public address plus `NetStackPort`; the latest live output therefore reports `128.116.54.33:52054` as the QUIC UDP target while retaining `128.116.54.33:51996` as the advertised UDMUX endpoint/open-RUPP peer port. These runs prove the app-side selector/config extraction follows the active Studio path for the current Team Create payload. They do **not** prove the remaining QUIC/BaseClient authentication, runtime wire-channel allocation, or connected receive/send path yet.
+Current reporting distinguishes the advertised public/UDMUX endpoint from the QUIC UDP target formed from the public address plus `NetStackPort`; one earlier live output therefore reported `128.116.54.33:52054` as the QUIC UDP target while retaining `128.116.54.33:51996` as the advertised UDMUX endpoint/open-RUPP peer port.
+
+Latest live validation adds an immediate-response case with no legacy RakNet wait:
+
+- QUIC UDP target: `128.116.50.33:58490` (`Address` plus `NetStackPort=58490`).
+- Advertised UDMUX endpoint/open peer: `128.116.50.33:62638`.
+- RCC/RUPP endpoint: `10.20.0.12:62638`.
+- RCC version: `0.741.0.7411056`.
+- `TokenGenAlgorithm=1`; `PepperId=1790880922 (0x6abeac9a)`; `RandomSeed1` is only reported by decoded length (`64` bytes); `TokenValue`/`NetStackTokenValue` remain redacted but shape-checked.
+- RbxTransport early public key override: version `1`, length `32` bytes.
+- BaseClient early-auth metadata: tag `0xA8`, auth version `17`, pre-auth `33` bytes, auth `66` bytes, total payload `103` bytes.
+
+The app handed the fresh gamejoin config directly to the selected RbxTransport path and produced the selector/channel/open-auth report immediately; the missing former ~5 second UI stall is useful branch proof that the legacy RakNet probe is no longer being attempted first. These runs prove the app-side selector/config extraction follows the active Studio path for the current Team Create payload. They do **not** prove the remaining QUIC/BaseClient authentication, runtime wire-channel allocation, or connected receive/send path yet.
+
+## Roblox Studio profile/client-status presence
+
+The public `presence.roblox.com` documentation exposes the read-only `POST /v1/presence/users` query endpoint, whose enum maps `InStudio` to value `3`. No public `presence.roblox.com` setter/register endpoint was found. Static 0.741 Studio strings instead show the `UseMatchmakingApiClientStatus` path and the documented Beta endpoint `POST https://apis.roblox.com/matchmaking-api/v1/client-status`, with the exact JSON shape `{"browserTrackerId":…, "status":"…"}`. Recovered native status strings include `AppStarted`, `JoiningGame`, `InGame`, and `LeftGame`; the startup path sends `AppStarted`.
+
+`src/roblox_api.rs` now mirrors that safe Studio startup heartbeat when the app opens with a saved `.ROBLOSECURITY` cookie: it resolves a BrowserTrackerId from a pasted full cookie header or authenticated app-launch-info when possible, posts `status="AppStarted"`, then queries `POST /v1/presence/users` for the authenticated user and reports whether Roblox currently returns `InStudio=3`. The app does not claim success if Roblox still reports Online; full InStudio presence may still depend on the later Team Create connected session.
 
 ## App behavior after the RbxTransport pivot
 

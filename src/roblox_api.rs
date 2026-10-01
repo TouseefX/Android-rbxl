@@ -210,6 +210,81 @@ pub fn try_recv_model_result() -> Option<ModelUploadResult> {
     rx.lock().ok().and_then(|r| r.try_recv().ok())
 }
 
+/// Result of the Studio-style client-status/presence bootstrap.
+///
+/// This intentionally reports only metadata. It never echoes authentication
+/// cookies or CSRF tokens into the UI/output log.
+pub struct StudioPresenceResult {
+    pub result: Result<StudioPresenceReport, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StudioPresenceReport {
+    pub user_id: u64,
+    pub username: String,
+    pub browser_tracker_id: u64,
+    pub client_status_sent: bool,
+    pub presence_type: Option<u64>,
+    pub presence_label: Option<String>,
+    pub last_location: Option<String>,
+}
+
+impl StudioPresenceReport {
+    pub fn summary(&self) -> String {
+        let presence = match (&self.presence_label, self.presence_type) {
+            (Some(label), Some(kind)) => format!("{label} ({kind})"),
+            (Some(label), None) => label.clone(),
+            (None, Some(kind)) => format!("type {kind}"),
+            (None, None) => "not returned".into(),
+        };
+        let location = self
+            .last_location
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("; location: {s}"))
+            .unwrap_or_default();
+        format!(
+            "Roblox Studio presence bootstrap sent AppStarted for {} ({}) with browserTrackerId {}; current presence: {}{}",
+            self.username, self.user_id, self.browser_tracker_id, presence, location
+        )
+    }
+}
+
+static STUDIO_PRESENCE_CHANNEL: OnceLock<(Sender<StudioPresenceResult>, Mutex<Receiver<StudioPresenceResult>>)> =
+    OnceLock::new();
+
+fn studio_presence_channel() -> &'static (Sender<StudioPresenceResult>, Mutex<Receiver<StudioPresenceResult>>) {
+    STUDIO_PRESENCE_CHANNEL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+/// Send the same documented client-status heartbeat Studio emits on startup.
+///
+/// Native Studio 0.741 contains `UseMatchmakingApiClientStatus`, the
+/// `/matchmaking-api/v1/client-status` path, and the exact JSON shape
+/// `{"browserTrackerId":…, "status":"…"}`. At app start it sends
+/// `status = "AppStarted"`; Roblox then decides whether that session appears
+/// as Online/InStudio. We do this as a best-effort authenticated request and
+/// follow it with a read-only presence query so the UI can tell the user what
+/// Roblox currently reports.
+pub fn start_studio_presence_async(cookie: String) {
+    let tx = studio_presence_channel().0.clone();
+    std::thread::spawn(move || {
+        let result = WebClient::new_with_raw_cookie(&cookie)
+            .and_then(|client| client.bootstrap_studio_presence(&cookie));
+        let _ = tx.send(StudioPresenceResult { result });
+    });
+}
+
+/// Poll for a finished Studio presence bootstrap (called from the UI thread).
+pub fn try_recv_studio_presence_result() -> Option<StudioPresenceResult> {
+    let (_, rx) = studio_presence_channel();
+    rx.lock().ok().and_then(|r| r.try_recv().ok())
+}
+
 /// Auth for the Assets API, in either flavor: Open Cloud (`x-api-key`) or
 /// user-auth (`.ROBLOSECURITY` cookie + `X-CSRF-TOKEN`).
 #[derive(Clone)]
@@ -3322,6 +3397,74 @@ fn get_curated_fallback(query: &str) -> Vec<LiveCatalogItem> {
 
 use std::collections::HashMap;
 
+fn extract_browser_tracker_id(raw_cookie_or_header: &str) -> Option<u64> {
+    let mut candidates = Vec::new();
+    for part in raw_cookie_or_header.split(';') {
+        let part = part.trim();
+        let lower = part.to_ascii_lowercase();
+        if lower.starts_with("rbxeventtrackerv2=") {
+            let value = part.split_once('=').map(|(_, value)| value).unwrap_or_default();
+            candidates.push(value.to_string());
+        } else if lower.starts_with("browsertrackerid=") || lower.starts_with("browserid=") {
+            if let Some((_, value)) = part.split_once('=') {
+                if let Ok(id) = value.trim().parse::<u64>() {
+                    return Some(id);
+                }
+            }
+        }
+    }
+
+    for value in candidates {
+        for pair in value.split('&') {
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("browserid")
+                || name.eq_ignore_ascii_case("browserTrackerId")
+            {
+                if let Ok(id) = value.trim().parse::<u64>() {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_u64_key_recursive(value: &serde_json::Value, wanted: &[&str]) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if wanted.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)) {
+                    if let Some(number) = child
+                        .as_u64()
+                        .or_else(|| child.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    {
+                        return Some(number);
+                    }
+                }
+            }
+            map.values()
+                .find_map(|child| find_u64_key_recursive(child, wanted))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_u64_key_recursive(child, wanted)),
+        _ => None,
+    }
+}
+
+fn presence_label(kind: u64) -> &'static str {
+    match kind {
+        0 => "Offline",
+        1 => "Online",
+        2 => "InGame",
+        3 => "InStudio",
+        4 => "Invisible",
+        _ => "Unknown",
+    }
+}
+
 /// A minimal CSRF-token-aware Roblox web client. All requests carry the
 /// `.ROBLOSECURITY` cookie; POSTs transparently fetch and retry with the
 /// `X-CSRF-Token` returned from a 403 challenge.
@@ -3333,13 +3476,25 @@ pub struct WebClient {
 
 impl WebClient {
     pub fn new(cookie: impl Into<String>) -> Result<Self, String> {
+        let cookie = cookie.into();
+        Self::new_with_raw_cookie(&cookie)
+    }
+
+    /// Build a cookie-authenticated web client while accepting either a raw
+    /// `.ROBLOSECURITY` value or a pasted browser `Cookie:` header.
+    pub fn new_with_raw_cookie(cookie: &str) -> Result<Self, String> {
+        let cookie = if cookie.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_roblosecurity_cookie(cookie)?
+        };
         let http = reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0 rbxl-editor")
+            .user_agent("RobloxStudio/WinInet rbxl-editor")
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(|e| format!("HTTP client build: {e}"))?;
         Ok(Self {
-            cookie: cookie.into(),
+            cookie,
             csrf: std::cell::RefCell::new(None),
             http,
         })
@@ -3456,6 +3611,89 @@ impl WebClient {
         let id = v["id"].as_u64().ok_or("missing id")?;
         let name = v["name"].as_str().unwrap_or("").to_string();
         Ok((id, name))
+    }
+
+    /// Resolve the BrowserTrackerId Studio passes to the matchmaking
+    /// client-status endpoint. If the user pasted a whole Cookie header we can
+    /// parse `RBXEventTrackerV2`; otherwise ask Roblox's authenticated
+    /// app-launch-info endpoint and fall back to zero (the official request
+    /// shape accepts a numeric field, and native code sends the field even
+    /// when no browser value was recovered).
+    fn browser_tracker_id(&self, raw_cookie_or_header: &str) -> u64 {
+        extract_browser_tracker_id(raw_cookie_or_header)
+            .or_else(|| {
+                self.get_json("https://users.roblox.com/v1/users/authenticated/app-launch-info")
+                    .ok()
+                    .and_then(|value| {
+                        find_u64_key_recursive(
+                            &value,
+                            &["browserTrackerId", "suggestedBrowserTrackerId", "browserId"],
+                        )
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    /// POST Studio's startup client-status heartbeat. Native Studio 0.741 uses
+    /// `status = AppStarted`; connected play/join paths later send statuses
+    /// such as `JoiningGame`, `InGame`, and `LeftGame`.
+    fn set_client_status(&self, status: &str, browser_tracker_id: u64) -> Result<(), String> {
+        self.post_json(
+            "https://apis.roblox.com/matchmaking-api/v1/client-status",
+            &serde_json::json!({
+                "status": status,
+                "browserTrackerId": browser_tracker_id,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Query Roblox's public presence endpoint for one user. This is a
+    /// read-only verification of what the website/profile currently reports.
+    fn query_presence(&self, user_id: u64) -> Result<(Option<u64>, Option<String>, Option<String>), String> {
+        let value = self.post_json(
+            "https://presence.roblox.com/v1/presence/users",
+            &serde_json::json!({ "userIds": [user_id] }),
+        )?;
+        let Some(entry) = value
+            .get("userPresences")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+        else {
+            return Ok((None, None, None));
+        };
+        let kind = entry.get("userPresenceType").and_then(|v| v.as_u64());
+        let label = kind.map(|kind| presence_label(kind).to_string());
+        let last_location = entry
+            .get("lastLocation")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        Ok((kind, label, last_location))
+    }
+
+    /// Best-effort Studio profile-status bootstrap used when the app opens.
+    /// Roblox ultimately owns whether the account appears as Online or
+    /// InStudio; we send the supported Studio startup status and report the
+    /// current presence back to the UI.
+    pub fn bootstrap_studio_presence(
+        &self,
+        raw_cookie_or_header: &str,
+    ) -> Result<StudioPresenceReport, String> {
+        let (user_id, username) = self.whoami()?;
+        let browser_tracker_id = self.browser_tracker_id(raw_cookie_or_header);
+        self.set_client_status("AppStarted", browser_tracker_id)?;
+        let (presence_type, presence_label, last_location) = self
+            .query_presence(user_id)
+            .unwrap_or((None, None, None));
+        Ok(StudioPresenceReport {
+            user_id,
+            username,
+            browser_tracker_id,
+            client_status_sent: true,
+            presence_type,
+            presence_label,
+            last_location,
+        })
     }
 
     /// Download a place/universe's `.rbxl` (or `.rbxlx`) as raw bytes by

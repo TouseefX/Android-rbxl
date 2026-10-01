@@ -231,6 +231,9 @@ pub struct EditorApp {
     /// Place ID typed in the toolbar "🌐 Open from Roblox" field.
     open_place_id_input: String,
     roblosecurity_cookie: String,
+    /// Studio-style Roblox presence/client-status bootstrap shown in Settings.
+    studio_presence_status: String,
+    studio_presence_in_flight: bool,
     discovered_assets: Vec<DiscoveredAsset>,
 
     // Open Cloud State
@@ -444,6 +447,8 @@ impl Default for EditorApp {
             direct_asset_id_input: "47433".into(),
             open_place_id_input: String::new(),
             roblosecurity_cookie: saved_settings.roblosecurity_cookie,
+            studio_presence_status: String::new(),
+            studio_presence_in_flight: false,
             discovered_assets: Vec::new(),
             open_cloud_api_key: saved_settings.open_cloud_api_key,
             open_cloud_universe_id: saved_settings.open_cloud_universe_id,
@@ -519,6 +524,12 @@ impl Default for EditorApp {
             "Loaded {} installed plugin(s)",
             app.plugin_index.plugins.len()
         ));
+        if !app.roblosecurity_cookie.trim().is_empty() {
+            app.start_studio_presence_bootstrap();
+        } else {
+            app.studio_presence_status =
+                "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
+        }
         RobloxApiClient::fetch_live_catalog_async("sword".into());
         app.is_searching_live = true;
         app
@@ -623,6 +634,20 @@ impl EditorApp {
             message: msg.into(),
             time: "now".into(),
         });
+    }
+
+    fn start_studio_presence_bootstrap(&mut self) {
+        let Some(cookie) = self.roblosecurity_cookie() else {
+            self.studio_presence_status =
+                "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
+            self.studio_presence_in_flight = false;
+            return;
+        };
+        self.studio_presence_status =
+            "Sending Studio AppStarted presence to Roblox…".into();
+        self.studio_presence_in_flight = true;
+        roblox_api::start_studio_presence_async(cookie);
+        self.log_info("Started Roblox Studio presence bootstrap");
     }
 }
 
@@ -4658,6 +4683,31 @@ ui.label("Place ID:");
             }
         }
 
+        // Pick up Studio-style client-status / profile presence bootstrap results.
+        while let Some(res) = roblox_api::try_recv_studio_presence_result() {
+            self.studio_presence_in_flight = false;
+            match res.result {
+                Ok(report) => {
+                    let summary = report.summary();
+                    self.studio_presence_status = summary.clone();
+                    self.status = summary.clone();
+                    if report.presence_type == Some(3) {
+                        self.log_info(format!("✅ {summary}"));
+                    } else {
+                        self.log_info(format!(
+                            "{summary}. Roblox may not show InStudio until Team Create is fully connected."
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.studio_presence_status =
+                        format!("Studio presence bootstrap failed: {error}");
+                    self.status = "Studio presence bootstrap failed".into();
+                    self.log_error(format!("Studio presence bootstrap failed: {error}"));
+                }
+            }
+        }
+
         // Any plugin downloads that finished on a background thread.
         for install in jni_bridge::try_recv_plugins() {
             match install.result {
@@ -5970,6 +6020,9 @@ ui.label("Place ID:");
 
 if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             self.roblosecurity_cookie.clear();
+                            self.studio_presence_status =
+                                "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
+                            self.studio_presence_in_flight = false;
                         }
                     });
 
@@ -5978,6 +6031,35 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                     } else {
                         ui.label(RichText::new("ℹ️ No cookie set: Using high-fidelity asset synthesizers and unauthenticated endpoints").color(Color32::from_rgb(200, 200, 100)));
                     }
+                });
+
+                ui.add_space(8.0);
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("🟦 Roblox Studio profile presence").heading().color(Color32::from_rgb(100, 200, 255)));
+                    ui.label("On startup this app sends Studio's AppStarted client-status heartbeat to Roblox, then reads back your presence. Roblox may keep showing Online until Team Create is fully connected, but the startup heartbeat now matches Studio's documented client-status path.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.studio_presence_in_flight && !self.roblosecurity_cookie.trim().is_empty(),
+                                egui::Button::new("Send Studio presence now"),
+                            )
+                            .clicked()
+                        {
+                            self.start_studio_presence_bootstrap();
+                        }
+                        if self.studio_presence_in_flight {
+                            ui.spinner();
+                        }
+                    });
+                    let color = if self.studio_presence_status.contains("InStudio") {
+                        Color32::from_rgb(120, 255, 120)
+                    } else if self.studio_presence_status.contains("failed") {
+                        Color32::from_rgb(255, 140, 120)
+                    } else {
+                        Color32::from_rgb(200, 220, 255)
+                    };
+                    ui.label(RichText::new(&self.studio_presence_status).color(color));
                 });
 
                 ui.add_space(8.0);
@@ -6063,6 +6145,9 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             Ok(_) => {
                                 self.status = "✅ Settings saved successfully to persistent storage!".into();
                                 self.log_info("Saved credentials and viewport preferences");
+                                if !self.roblosecurity_cookie.trim().is_empty() {
+                                    self.start_studio_presence_bootstrap();
+                                }
                             }
                             Err(e) => {
                                 self.status = format!("Save error: {e}");
@@ -6073,6 +6158,9 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
 
                     if ui.button(RichText::new("🗑️ Clear All Credentials").color(Color32::from_rgb(255, 100, 100))).clicked() {
                         self.roblosecurity_cookie.clear();
+                        self.studio_presence_status =
+                            "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
+                        self.studio_presence_in_flight = false;
                         self.open_cloud_api_key.clear();
                         self.open_cloud_universe_id.clear();
                         self.open_cloud_place_id.clear();

@@ -2541,6 +2541,68 @@ mod tests {
     }
 
     #[test]
+    fn latest_live_rbx_transport_validation_reports_quic_target_and_safe_metadata() {
+        let key_ring = serde_json::json!({
+            "applications": {
+                "RbxTransportEphemeralEarlyPublicKey": {
+                    "versions": [
+                        {
+                            "id": 1,
+                            "value": "EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI=",
+                            "allowed": true
+                        }
+                    ],
+                    "send": 1,
+                    "revert": 1
+                }
+            }
+        });
+        let config = serde_json::json!({
+            "settings": {
+                "TokenGenAlgorithm": 1,
+                "PepperId": 1790880922u64,
+                "RandomSeed1": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==",
+                "TokenValue": "AAECAwQFBgcICQoLDA0ODw==",
+                "NetStackTokenValue": "ICEiIyQlJicoKSorLC0uLw==",
+                "NetStackPort": 58490,
+                "RccVersion": "0.741.0.7411056",
+                "ClientPublicKeyData": key_ring.to_string(),
+                "ClientTicket": "ticket-prefix;ignored;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4CB;17",
+                "ServerConnections": [
+                    { "Address": "10.20.0.12", "Port": 62638 }
+                ],
+                "UdmuxEndpoints": [
+                    { "Address": "128.116.50.33", "Port": 62638 }
+                ]
+            }
+        });
+
+        let plan = extract_rbx_transport_connect_plan(&config).unwrap();
+        assert_eq!(plan.public_endpoint.label(), "128.116.50.33:62638");
+        assert_eq!(plan.rcc_endpoint.label(), "10.20.0.12:62638");
+        assert_eq!(plan.rbx_transport_port, 58490);
+        let early_auth = plan.early_auth.as_ref().unwrap();
+        assert_eq!(early_auth.auth_version, 17);
+        assert_eq!(early_auth.preauth_blob.len(), 33);
+        assert_eq!(early_auth.auth_blob.len(), 66);
+        assert_eq!(rbx_transport_early_auth_payload_len(early_auth), 103);
+
+        let report = probe_join_config(&config, 3, 1);
+        assert!(report.contains("selectedTransport=RbxTransport"));
+        assert!(report.contains("RbxTransport QUIC UDP target: 128.116.50.33:58490"));
+        assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.50.33:62638"));
+        assert!(report.contains("RbxTransport RCC/RUPP config: RCC 10.20.0.12:62638 with NetStackPort 58490"));
+        assert!(report.contains("algorithm 1"));
+        assert!(report.contains("pepper 1790880922 (0x6abeac9a)"));
+        assert!(report.contains("RandomSeed1 string(88 chars), Base64-decodes 64 bytes"));
+        assert!(report.contains("Advertised RCC version: 0.741.0.7411056"));
+        assert!(report.contains("RbxTransport early pubkey: ClientPublicKeyData/RbxTransportEphemeralEarlyPublicKey version 1, 32 bytes"));
+        assert!(report.contains("auth version 17, pre-auth 33 bytes, auth 66 bytes, wire payload 103 bytes"));
+        assert!(!report.contains("QEFCQ0"));
+        assert!(!report.contains("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"));
+    }
+
+    #[test]
     fn rbx_transport_channel_open_control_serializers_match_native_layout() {
         let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
         assert_eq!(open.application, 1);
