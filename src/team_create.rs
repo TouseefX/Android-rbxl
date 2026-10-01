@@ -549,18 +549,69 @@ fn is_hex_field(text: &str, len: usize) -> bool {
 }
 
 fn game_fqdn_report_label(game_fqdn: &str) -> String {
-    let mut parts = game_fqdn.splitn(4, '.');
-    let is_rupp_encoded = match (parts.next(), parts.next(), parts.next()) {
+    let first_label = game_fqdn.split('.').next().unwrap_or_default();
+    let mut hyphen_parts = first_label.split('-');
+    let is_native_qdmux_encoded = match (
+        hyphen_parts.next(),
+        hyphen_parts.next(),
+        hyphen_parts.next(),
+        hyphen_parts.next(),
+    ) {
+        (Some(token), Some(ipv4), Some(port), None) => {
+            is_hex_field(token, 32) && is_hex_field(ipv4, 8) && is_hex_field(port, 4)
+        }
+        _ => false,
+    };
+
+    // Older notes used a dot-separated sketch. Keep redacting it too so a
+    // pasted diagnostic cannot leak a Team Create token.
+    let mut dot_parts = game_fqdn.splitn(4, '.');
+    let is_legacy_dot_encoded = match (dot_parts.next(), dot_parts.next(), dot_parts.next()) {
         (Some(token), Some(ipv4), Some(port)) => {
             is_hex_field(token, 32) && is_hex_field(ipv4, 8) && is_hex_field(port, 4)
         }
         _ => false,
     };
-    if is_rupp_encoded {
+
+    if is_native_qdmux_encoded || is_legacy_dot_encoded {
         "redacted RUPP-encoded GameFqdn (token/ip/port SNI fields present)".into()
     } else {
         game_fqdn.to_string()
     }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Native Studio has a debug/pure-QUIC branch that formats qdmux SNI as
+/// `{token}-{rccIpv4}-{rccPort}.{qdmuxVip}.qdmux.roblox.com`, and the server
+/// side `parseQuicSni` consumes those token/IP/port fields.  When the join
+/// config omits `GameFqdn`, derive the same *shape* from the NetStack token,
+/// RCC endpoint, and advertised public UDMUX VIP.  The returned value contains
+/// the redacted-by-policy Team Create token; callers must never print it.
+fn derive_qdmux_game_fqdn(plan: &RbxTransportConnectPlan) -> Option<String> {
+    let rcc_ipv4 = match plan.rcc_endpoint.address.parse::<IpAddr>().ok()? {
+        IpAddr::V4(ip) => ip.octets(),
+        IpAddr::V6(_) => return None,
+    };
+    let qdmux_vip = match plan.public_endpoint.address.parse::<IpAddr>().ok()? {
+        IpAddr::V4(ip) => ip.octets(),
+        IpAddr::V6(_) => return None,
+    };
+    Some(format!(
+        "{}-{}-{}.{}.qdmux.roblox.com",
+        hex_lower(&plan.token),
+        hex_lower(&rcc_ipv4),
+        hex_lower(&plan.rbx_transport_port.to_be_bytes()),
+        hex_lower(&qdmux_vip)
+    ))
 }
 
 impl RbxTransportConnectPlan {
@@ -619,6 +670,10 @@ impl RbxTransportConnectPlan {
                 "\nRbxTransport GameFqdn/SNI: {}",
                 game_fqdn_report_label(game_fqdn)
             ));
+        } else if derive_qdmux_game_fqdn(self).is_some() {
+            text.push_str(
+                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app tries this pure-QUIC/SNI route before falling back to the RUPP-prefixed route.",
+            );
         }
         text.push_str(
             "\nLegacy RakNet connected packets are intentionally skipped for this config; the app now attempts the RbxTransport QUIC/RPK/RUPP connection path instead of expanding RakNet route/KDF probes.",
@@ -1070,7 +1125,8 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC connected — target {}, local {}, ALPN {}, RUPP prefix {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
+            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
+            report.route_label,
             report.target,
             report.local_addr,
             report.alpn,
@@ -1094,6 +1150,7 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
 #[cfg(not(test))]
 #[derive(Debug)]
 struct RbxTransportConnectionReport {
+    route_label: String,
     target: String,
     local_addr: SocketAddr,
     alpn: String,
@@ -1107,6 +1164,82 @@ struct RbxTransportConnectionReport {
     auth_len: usize,
     early_auth_payload_len: usize,
     inbound_summary: String,
+}
+
+#[cfg(not(test))]
+#[derive(Debug)]
+struct RbxTransportQuicRoute {
+    target_endpoint: Endpoint,
+    outgoing_prefix: Vec<u8>,
+    server_name: String,
+    enable_sni: bool,
+    route_label: String,
+}
+
+#[cfg(not(test))]
+fn build_rbx_transport_quic_routes(
+    plan: &RbxTransportConnectPlan,
+) -> Result<Vec<RbxTransportQuicRoute>, String> {
+    let target_endpoint = rbx_transport_quic_endpoint(plan);
+    let mut routes = Vec::new();
+
+    if let Some(game_fqdn) = plan
+        .game_fqdn
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        routes.push(RbxTransportQuicRoute {
+            target_endpoint: target_endpoint.clone(),
+            outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
+            server_name: game_fqdn.to_string(),
+            enable_sni: true,
+            route_label: format!(
+                "native RUPP prefix with join GameFqdn/SNI {}",
+                game_fqdn_report_label(game_fqdn)
+            ),
+        });
+        routes.push(RbxTransportQuicRoute {
+            target_endpoint,
+            outgoing_prefix: Vec::new(),
+            server_name: game_fqdn.to_string(),
+            enable_sni: true,
+            route_label: format!(
+                "pure QUIC fallback with join GameFqdn/SNI {}",
+                game_fqdn_report_label(game_fqdn)
+            ),
+        });
+    } else if let Some(generated_game_fqdn) = derive_qdmux_game_fqdn(plan) {
+        // The latest native-prefix path timed out before any TLS/RPK error.
+        // Try the pure qdmux/SNI routing shape first: it matches Studio's
+        // recovered DebugRbxTransportGenerateGameFqdn formatter and the server
+        // parseQuicSni token/IP/port fields, while avoiding a leading RUPP
+        // prefix on deployments that expect a QUIC long header at byte zero.
+        routes.push(RbxTransportQuicRoute {
+            target_endpoint: target_endpoint.clone(),
+            outgoing_prefix: Vec::new(),
+            server_name: generated_game_fqdn,
+            enable_sni: true,
+            route_label:
+                "pure QUIC with generated qdmux GameFqdn/SNI (token/ip/port redacted)".into(),
+        });
+        routes.push(RbxTransportQuicRoute {
+            target_endpoint,
+            outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
+            server_name: "roblox.com".into(),
+            enable_sni: false,
+            route_label: "native ClientRuppGenerator RUPP prefix without SNI fallback".into(),
+        });
+    } else {
+        routes.push(RbxTransportQuicRoute {
+            target_endpoint,
+            outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
+            server_name: "roblox.com".into(),
+            enable_sni: false,
+            route_label: "native ClientRuppGenerator RUPP prefix without SNI".into(),
+        });
+    }
+
+    Ok(routes)
 }
 
 #[cfg(not(test))]
@@ -1130,22 +1263,53 @@ async fn run_rbx_transport_connection_async(
     let handshake_timeout_ms = requested_timeout_ms.max(RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS);
     let operation_timeout = Duration::from_millis(requested_timeout_ms);
     let handshake_timeout = Duration::from_millis(handshake_timeout_ms);
-    let quic_endpoint = rbx_transport_quic_endpoint(plan);
-    let target_addr = resolve_endpoint(&quic_endpoint)?;
-    let rupp_prefix = build_rbx_transport_rupp_header(plan)?;
-    let server_name = plan
-        .game_fqdn
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("roblox.com")
-        .to_string();
     let auth = plan
         .early_auth
         .as_ref()
         .map_err(|reason| format!("early-auth material unavailable: {reason}"))?;
     let early_auth_payload = build_rbx_transport_early_auth_payload(auth)?;
+    let routes = build_rbx_transport_quic_routes(plan)?;
+    let mut failures = Vec::new();
 
-    let std_socket = std::net::UdpSocket::bind(quic_endpoint.bind_address())
+    for route in routes {
+        let route_label = route.route_label.clone();
+        match attempt_rbx_transport_connection_async(
+            plan,
+            auth,
+            &early_auth_payload,
+            route,
+            requested_timeout_ms,
+            handshake_timeout_ms,
+            operation_timeout,
+            handshake_timeout,
+        )
+        .await
+        {
+            Ok(report) => return Ok(report),
+            Err(reason) => failures.push(format!("{route_label} => {reason}")),
+        }
+    }
+
+    Err(format!(
+        "all RbxTransport QUIC route attempts failed: {}",
+        failures.join("; ")
+    ))
+}
+
+#[cfg(not(test))]
+async fn attempt_rbx_transport_connection_async(
+    plan: &RbxTransportConnectPlan,
+    auth: &EarlyAuthData,
+    early_auth_payload: &[u8],
+    route: RbxTransportQuicRoute,
+    requested_timeout_ms: u64,
+    handshake_timeout_ms: u64,
+    operation_timeout: Duration,
+    handshake_timeout: Duration,
+) -> Result<RbxTransportConnectionReport, String> {
+    let target_addr = resolve_endpoint(&route.target_endpoint)?;
+
+    let std_socket = std::net::UdpSocket::bind(route.target_endpoint.bind_address())
         .map_err(|error| format!("failed to bind QUIC UDP socket: {error}"))?;
     std_socket
         .set_nonblocking(true)
@@ -1155,7 +1319,10 @@ async fn run_rbx_transport_connection_async(
     let inner_socket = quinn_runtime
         .wrap_udp_socket(std_socket)
         .map_err(|error| format!("failed to wrap QUIC UDP socket: {error}"))?;
-    let socket = Arc::new(RuppUdpSocket::new(inner_socket, rupp_prefix.clone()));
+    let socket = Arc::new(RuppUdpSocket::new(
+        inner_socket,
+        route.outgoing_prefix.clone(),
+    ));
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         None,
@@ -1166,10 +1333,10 @@ async fn run_rbx_transport_connection_async(
     let local_addr = endpoint
         .local_addr()
         .map_err(|error| format!("failed to read local QUIC socket address: {error}"))?;
-    let client_config = build_rbx_transport_quic_client_config(plan)?;
+    let client_config = build_rbx_transport_quic_client_config(plan, route.enable_sni)?;
     let started = Instant::now();
     let connecting = endpoint
-        .connect_with(client_config, target_addr, &server_name)
+        .connect_with(client_config, target_addr, &route.server_name)
         .map_err(|error| format!("failed to start QUIC connection: {error}"))?;
     let connection = tokio::time::timeout(handshake_timeout, connecting)
         .await
@@ -1188,7 +1355,7 @@ async fn run_rbx_transport_connection_async(
         .map_err(|_| "timed out opening early-auth QUIC stream".to_string())?
         .map_err(|error| format!("failed to open early-auth QUIC stream: {error}"))?;
     auth_stream
-        .write_all(&early_auth_payload)
+        .write_all(early_auth_payload)
         .await
         .map_err(|error| format!("failed to send early-auth payload: {error}"))?;
     auth_stream
@@ -1215,10 +1382,11 @@ async fn run_rbx_transport_connection_async(
     let inbound_summary = wait_for_rbx_transport_inbound(&connection, operation_timeout).await;
     endpoint.close(quinn::VarInt::from_u32(0), b"rbxl-editor Team Create probe complete");
     Ok(RbxTransportConnectionReport {
-        target: quic_endpoint.label(),
+        route_label: route.route_label,
+        target: route.target_endpoint.label(),
         local_addr,
         alpn: String::from_utf8_lossy(RBX_TRANSPORT_ALPN).into_owned(),
-        rupp_prefix_len: rupp_prefix.len(),
+        rupp_prefix_len: route.outgoing_prefix.len(),
         rpk_version: plan.early_key.version,
         requested_timeout_ms,
         handshake_timeout_ms,
@@ -1259,8 +1427,9 @@ async fn wait_for_rbx_transport_inbound(
 #[cfg(not(test))]
 fn build_rbx_transport_quic_client_config(
     plan: &RbxTransportConnectPlan,
+    enable_sni: bool,
 ) -> Result<quinn::ClientConfig, String> {
-    let rustls = build_rbx_transport_rustls_config(plan)?;
+    let rustls = build_rbx_transport_rustls_config(plan, enable_sni)?;
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls))
         .map_err(|error| format!("rustls config is not QUIC-compatible: {error:?}"))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
@@ -1275,6 +1444,7 @@ fn build_rbx_transport_quic_client_config(
 #[cfg(not(test))]
 fn build_rbx_transport_rustls_config(
     plan: &RbxTransportConnectPlan,
+    enable_sni: bool,
 ) -> Result<quinn::rustls::ClientConfig, String> {
     let provider = Arc::new(quinn::rustls::crypto::ring::default_provider());
     let verifier = Arc::new(ExpectedRpkVerifier::new(plan.early_key.public_key));
@@ -1285,9 +1455,11 @@ fn build_rbx_transport_rustls_config(
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     config.alpn_protocols = vec![RBX_TRANSPORT_ALPN.to_vec()];
-    // SNI is only sent when Studio's join config supplies GameFqdn; otherwise
-    // the raw-public-key verifier authenticates the configured key directly.
-    config.enable_sni = plan.game_fqdn.is_some();
+    // SNI is route-specific: the native-prefix route can run without it, while
+    // the pure qdmux fallback must expose the token/IP/port GameFqdn shape for
+    // server-side parseQuicSni routing. The verifier still authenticates the
+    // configured raw public key directly.
+    config.enable_sni = enable_sni;
     Ok(config)
 }
 
@@ -3026,6 +3198,10 @@ mod tests {
     #[test]
     fn rbx_transport_redacts_rupp_encoded_game_fqdn() {
         assert_eq!(
+            game_fqdn_report_label("00112233445566778899aabbccddeeff-0a14005e-dd48.80743621.qdmux.roblox.com"),
+            "redacted RUPP-encoded GameFqdn (token/ip/port SNI fields present)"
+        );
+        assert_eq!(
             game_fqdn_report_label("00112233445566778899aabbccddeeff.0a14005e.dd48.roblox.com"),
             "redacted RUPP-encoded GameFqdn (token/ip/port SNI fields present)"
         );
@@ -3083,6 +3259,15 @@ mod tests {
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
             0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
         ]);
+        let derived_qdmux = derive_qdmux_game_fqdn(&plan).unwrap();
+        assert_eq!(
+            derived_qdmux,
+            "202122232425262728292a2b2c2d2e2f-0a2008d0-dac0.80743621.qdmux.roblox.com"
+        );
+        assert_eq!(
+            game_fqdn_report_label(&derived_qdmux),
+            "redacted RUPP-encoded GameFqdn (token/ip/port SNI fields present)"
+        );
         let rbx_transport_rupp = build_rbx_transport_rupp_header(&plan).unwrap();
         assert_eq!(rbx_transport_rupp.len(), 31);
         assert_eq!(
