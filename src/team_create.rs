@@ -650,7 +650,7 @@ impl RbxTransportConnectPlan {
             self.early_key.public_key.len(),
         );
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{}, outgoing/incoming QUIC datagrams use the recovered native {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{}, QUIC first-flight packet protection now follows the native +0x2d enabler evidence instead of forcing the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer on every route, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
@@ -688,7 +688,7 @@ impl RbxTransportConnectPlan {
             ));
         } else if derive_qdmux_game_fqdn(self).is_some() {
             text.push_str(
-                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app tries this SNI route with the native protected RUPP/QUIC trailer before falling back to the RUPP-prefixed route.",
+                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app now keeps the first QUIC Initial visible on this SNI route because the native 18-byte trailer helper is gated by the +0x2d state flag and the latest forced-trailer build timed out.",
             );
         }
         text.push_str(
@@ -1211,48 +1211,50 @@ fn build_rbx_transport_quic_routes(
     {
         routes.push(RbxTransportQuicRoute {
             target_endpoint: target_endpoint.clone(),
-            outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
+            outgoing_prefix: Vec::new(),
             server_name: game_fqdn.to_string(),
             enable_sni: true,
-            native_quic_packet_protection: true,
+            native_quic_packet_protection: false,
             route_label: format!(
-                "native protected RUPP prefix/trailer with join GameFqdn/SNI {}",
+                "qdmux-visible pure QUIC with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
                 game_fqdn_report_label(game_fqdn)
             ),
         });
         routes.push(RbxTransportQuicRoute {
             target_endpoint,
-            outgoing_prefix: Vec::new(),
+            outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
             server_name: game_fqdn.to_string(),
             enable_sni: true,
-            native_quic_packet_protection: true,
+            native_quic_packet_protection: false,
             route_label: format!(
-                "native protected pure-QUIC/trailer fallback with join GameFqdn/SNI {}",
+                "ClientRuppGenerator RUPP prefix with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
                 game_fqdn_report_label(game_fqdn)
             ),
         });
     } else if let Some(generated_game_fqdn) = derive_qdmux_game_fqdn(plan) {
-        // The latest native-prefix path timed out before any TLS/RPK error.
-        // Try the pure qdmux/SNI routing shape first: it matches Studio's
-        // recovered DebugRbxTransportGenerateGameFqdn formatter and the server
-        // parseQuicSni token/IP/port fields, while avoiding a leading RUPP
-        // prefix on deployments that expect a QUIC long header at byte zero.
+        // The forced-trailer qdmux attempt reached the corrected public UDMUX
+        // port but still timed out. Native send-side evidence gates the
+        // 18-byte protector behind state byte +0x2d; the initial qdmux SNI
+        // route must keep QUIC byte zero visible so the token/IP/port SNI
+        // demux path can observe the first flight. Try that enabler-correct
+        // shape first, then the same no-forced-trailer ClientRuppGenerator
+        // RUPP-prefix shape.
         routes.push(RbxTransportQuicRoute {
             target_endpoint: target_endpoint.clone(),
             outgoing_prefix: Vec::new(),
             server_name: generated_game_fqdn,
             enable_sni: true,
-            native_quic_packet_protection: true,
+            native_quic_packet_protection: false,
             route_label:
-                "native protected pure QUIC with generated qdmux GameFqdn/SNI (token/ip/port redacted)".into(),
+                "qdmux-visible pure QUIC with generated GameFqdn/SNI and native +0x2d trailer gate not forced (token/ip/port redacted)".into(),
         });
         routes.push(RbxTransportQuicRoute {
             target_endpoint,
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
             server_name: "roblox.com".into(),
             enable_sni: false,
-            native_quic_packet_protection: true,
-            route_label: "native protected ClientRuppGenerator RUPP prefix/trailer without SNI fallback".into(),
+            native_quic_packet_protection: false,
+            route_label: "ClientRuppGenerator RUPP prefix without SNI and native +0x2d trailer gate not forced fallback".into(),
         });
     } else {
         routes.push(RbxTransportQuicRoute {
@@ -1260,8 +1262,8 @@ fn build_rbx_transport_quic_routes(
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
             server_name: "roblox.com".into(),
             enable_sni: false,
-            native_quic_packet_protection: true,
-            route_label: "native protected ClientRuppGenerator RUPP prefix/trailer without SNI".into(),
+            native_quic_packet_protection: false,
+            route_label: "ClientRuppGenerator RUPP prefix without SNI and native +0x2d trailer gate not forced".into(),
         });
     }
 
