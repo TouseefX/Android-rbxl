@@ -28,9 +28,6 @@ use blake2::{
     digest::{consts::U32, Mac},
     Blake2b512, Blake2bMac, Digest,
 };
-use aes_gcm_siv::{
-    Aes256GcmSiv, Key as AesGcmSivKey, Nonce as AesGcmSivNonce, Tag as AesGcmSivTag,
-};
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce, Tag,
@@ -656,7 +653,7 @@ impl RbxTransportConnectPlan {
             self.early_key.public_key.len(),
         );
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{}, outgoing/incoming QUIC datagrams use the recovered native {}-byte AES-GCM-SIV RUPP/QUIC CID trailer, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{}, outgoing/incoming QUIC datagrams use the recovered native {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
@@ -1631,10 +1628,8 @@ impl RuppUdpSocket {
         (header_len >= 4 && header_len <= len).then_some(header_len)
     }
 
-    fn native_quic_cipher() -> Aes256GcmSiv {
-        Aes256GcmSiv::new(AesGcmSivKey::<Aes256GcmSiv>::from_slice(
-            &RBX_TRANSPORT_NATIVE_QUIC_PROTECTION_KEY,
-        ))
+    fn native_quic_cipher() -> ChaCha20Poly1305 {
+        ChaCha20Poly1305::new(Key::from_slice(&RBX_TRANSPORT_NATIVE_QUIC_PROTECTION_KEY))
     }
 
     fn native_quic_nonce(counter_value: u64) -> [u8; RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES] {
@@ -1661,7 +1656,7 @@ impl RuppUdpSocket {
         let counter_value = self.outbound_native_quic_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = Self::native_quic_nonce(counter_value);
         let tag = Self::native_quic_cipher()
-            .encrypt_in_place_detached(AesGcmSivNonce::from_slice(&nonce), b"", payload.as_mut_slice())
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), b"", payload.as_mut_slice())
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1683,7 +1678,7 @@ impl RuppUdpSocket {
         trailer.copy_from_slice(&buf[body_len..len]);
         let mut tag_bytes = [0u8; RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES];
         tag_bytes.copy_from_slice(&trailer[2..2 + RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES]);
-        let tag = AesGcmSivTag::from_slice(&tag_bytes);
+        let tag = Tag::from_slice(&tag_bytes);
         for suffix in [
             &RBX_TRANSPORT_NATIVE_QUIC_NONCE_SUFFIX,
             &RBX_TRANSPORT_NATIVE_QUIC_INBOUND_NONCE_SUFFIX_FALLBACK,
@@ -1692,7 +1687,7 @@ impl RuppUdpSocket {
             let mut candidate = buf[..body_len].to_vec();
             if Self::native_quic_cipher()
                 .decrypt_in_place_detached(
-                    AesGcmSivNonce::from_slice(&nonce),
+                    Nonce::from_slice(&nonce),
                     b"",
                     candidate.as_mut_slice(),
                     tag,
