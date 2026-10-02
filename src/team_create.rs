@@ -28,6 +28,9 @@ use blake2::{
     digest::{consts::U32, Mac},
     Blake2b512, Blake2bMac, Digest,
 };
+use aes_gcm_siv::{
+    Aes256GcmSiv, Key as AesGcmSivKey, Nonce as AesGcmSivNonce, Tag as AesGcmSivTag,
+};
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce, Tag,
@@ -36,7 +39,10 @@ use sha2::Sha512;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -487,6 +493,21 @@ const RUPP_TOKEN_TYPE_GAME_SERVICE: u8 = 1;
 // shorter, but QUIC should use the native handshake budget rather than failing
 // after a single 2.5s probe window.
 const RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+// Studio's QUIC send path constructs the RUPP/QUIC packet protector with the
+// built-in 32-byte fallback key when the dynamic CID key-ring flag is not set
+// (`0x143427b30`).  The key is public native client material, not user/session
+// authentication data; never log derived packet tags or nonce values.
+const RBX_TRANSPORT_NATIVE_QUIC_PROTECTION_KEY: [u8; 32] = [
+    0xd3, 0x71, 0xcb, 0x6e, 0x10, 0x7c, 0xcf, 0xc3, 0xaa, 0xe7, 0xee, 0xe4, 0x7b, 0x4b, 0x6d,
+    0x8b, 0x66, 0x5c, 0x59, 0x43, 0x6e, 0x2f, 0x83, 0x41, 0x7b, 0xfa, 0xbe, 0x29, 0xa1, 0xc6,
+    0x46, 0x3d,
+];
+const RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES: usize = 18;
+const RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES: usize = 16;
+const RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES: usize = 12;
+const RBX_TRANSPORT_NATIVE_QUIC_COUNTER_INITIAL: u64 = u64::from_le_bytes(*b"UniqueNu");
+const RBX_TRANSPORT_NATIVE_QUIC_NONCE_SUFFIX: [u8; 10] = *b"iqueNumbeR";
+const RBX_TRANSPORT_NATIVE_QUIC_INBOUND_NONCE_SUFFIX_FALLBACK: [u8; 10] = *b"iqueNumber";
 
 #[derive(Clone, Debug)]
 struct RuppConnectedRouteMaterial {
@@ -635,10 +656,11 @@ impl RbxTransportConnectPlan {
             self.early_key.public_key.len(),
         );
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{}, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{}, outgoing/incoming QUIC datagrams use the recovered native {}-byte AES-GCM-SIV RUPP/QUIC CID trailer, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
+            RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES,
             RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS
         ));
         let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
@@ -672,7 +694,7 @@ impl RbxTransportConnectPlan {
             ));
         } else if derive_qdmux_game_fqdn(self).is_some() {
             text.push_str(
-                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app tries this pure-QUIC/SNI route before falling back to the RUPP-prefixed route.",
+                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app tries this SNI route with the native protected RUPP/QUIC trailer before falling back to the RUPP-prefixed route.",
             );
         }
         text.push_str(
@@ -1125,12 +1147,13 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
+            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
             report.route_label,
             report.target,
             report.local_addr,
             report.alpn,
             report.rupp_prefix_len,
+            report.native_quic_cid_trailer_len,
             report.rpk_version,
             report.handshake_timeout_ms,
             report.requested_timeout_ms,
@@ -1155,6 +1178,7 @@ struct RbxTransportConnectionReport {
     local_addr: SocketAddr,
     alpn: String,
     rupp_prefix_len: usize,
+    native_quic_cid_trailer_len: usize,
     rpk_version: u16,
     requested_timeout_ms: u64,
     handshake_timeout_ms: u64,
@@ -1173,6 +1197,7 @@ struct RbxTransportQuicRoute {
     outgoing_prefix: Vec<u8>,
     server_name: String,
     enable_sni: bool,
+    native_quic_packet_protection: bool,
     route_label: String,
 }
 
@@ -1193,8 +1218,9 @@ fn build_rbx_transport_quic_routes(
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
             server_name: game_fqdn.to_string(),
             enable_sni: true,
+            native_quic_packet_protection: true,
             route_label: format!(
-                "native RUPP prefix with join GameFqdn/SNI {}",
+                "native protected RUPP prefix/trailer with join GameFqdn/SNI {}",
                 game_fqdn_report_label(game_fqdn)
             ),
         });
@@ -1203,8 +1229,9 @@ fn build_rbx_transport_quic_routes(
             outgoing_prefix: Vec::new(),
             server_name: game_fqdn.to_string(),
             enable_sni: true,
+            native_quic_packet_protection: true,
             route_label: format!(
-                "pure QUIC fallback with join GameFqdn/SNI {}",
+                "native protected pure-QUIC/trailer fallback with join GameFqdn/SNI {}",
                 game_fqdn_report_label(game_fqdn)
             ),
         });
@@ -1219,15 +1246,17 @@ fn build_rbx_transport_quic_routes(
             outgoing_prefix: Vec::new(),
             server_name: generated_game_fqdn,
             enable_sni: true,
+            native_quic_packet_protection: true,
             route_label:
-                "pure QUIC with generated qdmux GameFqdn/SNI (token/ip/port redacted)".into(),
+                "native protected pure QUIC with generated qdmux GameFqdn/SNI (token/ip/port redacted)".into(),
         });
         routes.push(RbxTransportQuicRoute {
             target_endpoint,
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
             server_name: "roblox.com".into(),
             enable_sni: false,
-            route_label: "native ClientRuppGenerator RUPP prefix without SNI fallback".into(),
+            native_quic_packet_protection: true,
+            route_label: "native protected ClientRuppGenerator RUPP prefix/trailer without SNI fallback".into(),
         });
     } else {
         routes.push(RbxTransportQuicRoute {
@@ -1235,7 +1264,8 @@ fn build_rbx_transport_quic_routes(
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
             server_name: "roblox.com".into(),
             enable_sni: false,
-            route_label: "native ClientRuppGenerator RUPP prefix without SNI".into(),
+            native_quic_packet_protection: true,
+            route_label: "native protected ClientRuppGenerator RUPP prefix/trailer without SNI".into(),
         });
     }
 
@@ -1319,9 +1349,11 @@ async fn attempt_rbx_transport_connection_async(
     let inner_socket = quinn_runtime
         .wrap_udp_socket(std_socket)
         .map_err(|error| format!("failed to wrap QUIC UDP socket: {error}"))?;
+    let native_quic_packet_protection = route.native_quic_packet_protection;
     let socket = Arc::new(RuppUdpSocket::new(
         inner_socket,
         route.outgoing_prefix.clone(),
+        native_quic_packet_protection,
     ));
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
@@ -1387,6 +1419,11 @@ async fn attempt_rbx_transport_connection_async(
         local_addr,
         alpn: String::from_utf8_lossy(RBX_TRANSPORT_ALPN).into_owned(),
         rupp_prefix_len: route.outgoing_prefix.len(),
+        native_quic_cid_trailer_len: if native_quic_packet_protection {
+            RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES
+        } else {
+            0
+        },
         rpk_version: plan.early_key.version,
         requested_timeout_ms,
         handshake_timeout_ms,
@@ -1567,14 +1604,22 @@ impl quinn::rustls::client::danger::ServerCertVerifier for ExpectedRpkVerifier {
 struct RuppUdpSocket {
     inner: Arc<dyn quinn::AsyncUdpSocket>,
     outgoing_prefix: Vec<u8>,
+    native_quic_packet_protection: bool,
+    outbound_native_quic_counter: AtomicU64,
 }
 
 #[cfg(not(test))]
 impl RuppUdpSocket {
-    fn new(inner: Arc<dyn quinn::AsyncUdpSocket>, outgoing_prefix: Vec<u8>) -> Self {
+    fn new(
+        inner: Arc<dyn quinn::AsyncUdpSocket>,
+        outgoing_prefix: Vec<u8>,
+        native_quic_packet_protection: bool,
+    ) -> Self {
         Self {
             inner,
             outgoing_prefix,
+            native_quic_packet_protection,
+            outbound_native_quic_counter: AtomicU64::new(RBX_TRANSPORT_NATIVE_QUIC_COUNTER_INITIAL),
         }
     }
 
@@ -1585,6 +1630,81 @@ impl RuppUdpSocket {
         let header_len = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
         (header_len >= 4 && header_len <= len).then_some(header_len)
     }
+
+    fn native_quic_cipher() -> Aes256GcmSiv {
+        Aes256GcmSiv::new(AesGcmSivKey::<Aes256GcmSiv>::from_slice(
+            &RBX_TRANSPORT_NATIVE_QUIC_PROTECTION_KEY,
+        ))
+    }
+
+    fn native_quic_nonce(counter_value: u64) -> [u8; RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES] {
+        let mut nonce = [0u8; RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES];
+        nonce[..8].copy_from_slice(&counter_value.to_le_bytes());
+        nonce[8..].copy_from_slice(b"mbeR");
+        nonce
+    }
+
+    fn native_quic_nonce_from_trailer(
+        trailer: &[u8],
+        suffix: &[u8; 10],
+    ) -> Option<[u8; RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES]> {
+        if trailer.len() != RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES {
+            return None;
+        }
+        let mut nonce = [0u8; RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES];
+        nonce[..2].copy_from_slice(&trailer[..2]);
+        nonce[2..].copy_from_slice(suffix);
+        Some(nonce)
+    }
+
+    fn protect_native_quic_payload(&self, payload: &mut Vec<u8>) -> io::Result<()> {
+        let counter_value = self.outbound_native_quic_counter.fetch_add(1, Ordering::Relaxed);
+        let nonce = Self::native_quic_nonce(counter_value);
+        let tag = Self::native_quic_cipher()
+            .encrypt_in_place_detached(AesGcmSivNonce::from_slice(&nonce), b"", payload.as_mut_slice())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "failed to apply native RbxTransport QUIC packet protection",
+                )
+            })?;
+        payload.reserve(RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES);
+        payload.extend_from_slice(&nonce[..2]);
+        payload.extend_from_slice(tag.as_slice());
+        Ok(())
+    }
+
+    fn decrypt_native_quic_payload(buf: &mut [u8], len: usize) -> Option<usize> {
+        if len < RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES {
+            return None;
+        }
+        let body_len = len - RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES;
+        let mut trailer = [0u8; RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES];
+        trailer.copy_from_slice(&buf[body_len..len]);
+        let mut tag_bytes = [0u8; RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES];
+        tag_bytes.copy_from_slice(&trailer[2..2 + RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES]);
+        let tag = AesGcmSivTag::from_slice(&tag_bytes);
+        for suffix in [
+            &RBX_TRANSPORT_NATIVE_QUIC_NONCE_SUFFIX,
+            &RBX_TRANSPORT_NATIVE_QUIC_INBOUND_NONCE_SUFFIX_FALLBACK,
+        ] {
+            let nonce = Self::native_quic_nonce_from_trailer(&trailer, suffix)?;
+            let mut candidate = buf[..body_len].to_vec();
+            if Self::native_quic_cipher()
+                .decrypt_in_place_detached(
+                    AesGcmSivNonce::from_slice(&nonce),
+                    b"",
+                    candidate.as_mut_slice(),
+                    tag,
+                )
+                .is_ok()
+            {
+                buf[..body_len].copy_from_slice(&candidate);
+                return Some(body_len);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(not(test))]
@@ -1594,12 +1714,26 @@ impl quinn::AsyncUdpSocket for RuppUdpSocket {
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
-        if self.outgoing_prefix.is_empty() {
+        if self.outgoing_prefix.is_empty() && !self.native_quic_packet_protection {
             return self.inner.try_send(transmit);
         }
-        let mut prefixed = Vec::with_capacity(self.outgoing_prefix.len() + transmit.contents.len());
+
+        let mut protected = Vec::with_capacity(
+            transmit.contents.len()
+                + if self.native_quic_packet_protection {
+                    RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES
+                } else {
+                    0
+                },
+        );
+        protected.extend_from_slice(transmit.contents);
+        if self.native_quic_packet_protection {
+            self.protect_native_quic_payload(&mut protected)?;
+        }
+
+        let mut prefixed = Vec::with_capacity(self.outgoing_prefix.len() + protected.len());
         prefixed.extend_from_slice(&self.outgoing_prefix);
-        prefixed.extend_from_slice(transmit.contents);
+        prefixed.extend_from_slice(&protected);
         let prefixed_transmit = quinn::udp::Transmit {
             destination: transmit.destination,
             ecn: transmit.ecn,
@@ -1619,12 +1753,21 @@ impl quinn::AsyncUdpSocket for RuppUdpSocket {
         match self.inner.poll_recv(cx, bufs, meta) {
             Poll::Ready(Ok(count)) => {
                 for index in 0..count.min(bufs.len()).min(meta.len()) {
-                    let len = meta[index].len;
+                    let mut len = meta[index].len;
                     let buf: &mut [u8] = &mut *bufs[index];
                     if let Some(header_len) = Self::maybe_rupp_header_len(buf, len) {
                         buf.copy_within(header_len..len, 0);
-                        meta[index].len = len - header_len;
+                        len -= header_len;
+                        meta[index].len = len;
                         meta[index].stride = meta[index].stride.saturating_sub(header_len);
+                    }
+                    if self.native_quic_packet_protection {
+                        if let Some(body_len) = Self::decrypt_native_quic_payload(buf, len) {
+                            meta[index].len = body_len;
+                            meta[index].stride = meta[index]
+                                .stride
+                                .saturating_sub(len.saturating_sub(body_len));
+                        }
                     }
                 }
                 Poll::Ready(Ok(count))
