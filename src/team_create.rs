@@ -634,12 +634,9 @@ fn derive_qdmux_game_fqdn(plan: &RbxTransportConnectPlan) -> Option<String> {
 
 impl RbxTransportConnectPlan {
     fn summary(&self) -> String {
-        let quic_endpoint = Endpoint {
-            address: self.public_endpoint.address.clone(),
-            port: self.rbx_transport_port,
-        };
+        let quic_endpoint = rbx_transport_quic_endpoint(self);
         let mut text = format!(
-            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public/UDMUX address with NetStackPort)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with NetStackPort {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
+            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public/UDMUX endpoint; NetStackPort is carried in qdmux/RUPP routing metadata)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with NetStackPort {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
             quic_endpoint.label(),
             self.public_endpoint.label(),
             self.rcc_endpoint.label(),
@@ -1104,10 +1101,12 @@ const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
 ];
 
 fn rbx_transport_quic_endpoint(plan: &RbxTransportConnectPlan) -> Endpoint {
-    Endpoint {
-        address: plan.public_endpoint.address.clone(),
-        port: plan.rbx_transport_port,
-    }
+    // Native PlayerConfigurer passes MachineAddress/ServerPort as the UDP
+    // connect target and carries NetStackPort separately in the RbxTransport
+    // optional RUPP configuration.  The public UDMUX endpoint remains the
+    // socket destination; NetStackPort is encoded inside qdmux/RUPP routing
+    // metadata, not used as the public UDP port.
+    plan.public_endpoint.clone()
 }
 
 fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr, String> {
@@ -3435,7 +3434,7 @@ mod tests {
         let report = probe_join_config(&config, 3, 1);
         assert!(report.contains("resolving selected 0.741 transport branch"));
         assert!(report.contains("selectedTransport=RbxTransport"));
-        assert!(report.contains("RbxTransport QUIC UDP target: 128.116.54.33:56000"));
+        assert!(report.contains("RbxTransport QUIC UDP target: 128.116.54.33:50704"));
         assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.54.33:50704"));
         assert!(report.contains("RbxTransport GameFqdn/SNI: gamejoin.roblox.test"));
         assert!(report.contains("RUPP token subtype forced to Studio NetStack TokenTlv type 1"));
@@ -3503,7 +3502,7 @@ mod tests {
 
         let report = probe_join_config(&config, 3, 1);
         assert!(report.contains("selectedTransport=RbxTransport"));
-        assert!(report.contains("RbxTransport QUIC UDP target: 128.116.50.33:58490"));
+        assert!(report.contains("RbxTransport QUIC UDP target: 128.116.50.33:62638"));
         assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.50.33:62638"));
         assert!(report.contains("RbxTransport RCC/RUPP config: RCC 10.20.0.12:62638 with NetStackPort 58490"));
         assert!(report.contains("algorithm 1"));
