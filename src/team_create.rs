@@ -566,7 +566,7 @@ fn is_hex_field(text: &str, len: usize) -> bool {
     text.len() == len && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn game_fqdn_report_label(game_fqdn: &str) -> String {
+fn game_fqdn_has_qdmux_token_ip_port_fields(game_fqdn: &str) -> bool {
     let first_label = game_fqdn.split('.').next().unwrap_or_default();
     let mut hyphen_parts = first_label.split('-');
     let is_native_qdmux_encoded = match (
@@ -591,7 +591,11 @@ fn game_fqdn_report_label(game_fqdn: &str) -> String {
         _ => false,
     };
 
-    if is_native_qdmux_encoded || is_legacy_dot_encoded {
+    is_native_qdmux_encoded || is_legacy_dot_encoded
+}
+
+fn game_fqdn_report_label(game_fqdn: &str) -> String {
+    if game_fqdn_has_qdmux_token_ip_port_fields(game_fqdn) {
         "redacted RUPP-encoded GameFqdn (token/ip/port SNI fields present)".into()
     } else {
         game_fqdn.to_string()
@@ -630,6 +634,48 @@ fn derive_qdmux_game_fqdn(plan: &RbxTransportConnectPlan) -> Option<String> {
         hex_lower(&plan.rbx_transport_port.to_be_bytes()),
         hex_lower(&qdmux_vip)
     ))
+}
+
+const RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_BYTES: usize = 20;
+const RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_ENTROPY_BYTES: usize = 13;
+const RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_PREFIX: u8 = 0xd1;
+
+fn build_native_qdmux_initial_dcid_with_entropy(
+    rcc_ipv4: [u8; 4],
+    rcc_port: u16,
+    entropy: [u8; RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_ENTROPY_BYTES],
+) -> Vec<u8> {
+    // Recovered Studio generator shape (0x14757f850):
+    //   byte 0     = 0xd1
+    //   bytes 1-4  = parsed qdmux/RCC IPv4 bytes
+    //   bytes 5-6  = parsed qdmux/RCC NetStack port bytes
+    //   bytes 7-19 = native generator entropy/counter material
+    let mut cid = Vec::with_capacity(RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_BYTES);
+    cid.push(RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_PREFIX);
+    cid.extend_from_slice(&rcc_ipv4);
+    cid.extend_from_slice(&rcc_port.to_be_bytes());
+    cid.extend_from_slice(&entropy);
+    cid
+}
+
+#[cfg(not(test))]
+fn derive_native_qdmux_initial_dcid(
+    plan: &RbxTransportConnectPlan,
+) -> Result<Option<Vec<u8>>, String> {
+    let rcc_ipv4 = match plan.rcc_endpoint.address.parse::<IpAddr>().ok() {
+        Some(IpAddr::V4(ip)) => ip.octets(),
+        Some(IpAddr::V6(_)) | None => return Ok(None),
+    };
+    let mut entropy = [0u8; RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_ENTROPY_BYTES];
+    let rng = ring::rand::SystemRandom::new();
+    ring::rand::SecureRandom::fill(&rng, &mut entropy).map_err(|error| {
+        format!("failed to generate native qdmux initial DCID entropy: {error:?}")
+    })?;
+    Ok(Some(build_native_qdmux_initial_dcid_with_entropy(
+        rcc_ipv4,
+        plan.rbx_transport_port,
+        entropy,
+    )))
 }
 
 impl RbxTransportConnectPlan {
@@ -688,7 +734,7 @@ impl RbxTransportConnectPlan {
             ));
         } else if derive_qdmux_game_fqdn(self).is_some() {
             text.push_str(
-                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app now keeps the first QUIC Initial visible on this SNI route because the native 18-byte trailer helper is gated by the +0x2d state flag and the latest forced-trailer build timed out.",
+                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app now also supplies Quinn with the recovered 20-byte native qdmux initial destination-CID shape (0xd1/RCC IPv4/NetStackPort/entropy, bytes redacted) while keeping the first QUIC Initial visible because the 18-byte trailer helper is gated by native state.",
             );
         }
         text.push_str(
@@ -1143,12 +1189,13 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
+            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
             report.route_label,
             report.target,
             report.local_addr,
             report.alpn,
             report.rupp_prefix_len,
+            report.initial_dst_cid_len,
             report.native_quic_cid_trailer_len,
             report.rpk_version,
             report.handshake_timeout_ms,
@@ -1174,6 +1221,7 @@ struct RbxTransportConnectionReport {
     local_addr: SocketAddr,
     alpn: String,
     rupp_prefix_len: usize,
+    initial_dst_cid_len: usize,
     native_quic_cid_trailer_len: usize,
     rpk_version: u16,
     requested_timeout_ms: u64,
@@ -1193,6 +1241,7 @@ struct RbxTransportQuicRoute {
     outgoing_prefix: Vec<u8>,
     server_name: String,
     enable_sni: bool,
+    initial_dst_cid: Option<Vec<u8>>,
     native_quic_packet_protection: bool,
     route_label: String,
 }
@@ -1209,14 +1258,32 @@ fn build_rbx_transport_quic_routes(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
+        let use_qdmux_initial_dcid = game_fqdn_has_qdmux_token_ip_port_fields(game_fqdn);
+        let pure_initial_dcid = if use_qdmux_initial_dcid {
+            derive_native_qdmux_initial_dcid(plan)?
+        } else {
+            None
+        };
+        let rupp_initial_dcid = if use_qdmux_initial_dcid {
+            derive_native_qdmux_initial_dcid(plan)?
+        } else {
+            None
+        };
+        let cid_label = if pure_initial_dcid.is_some() && rupp_initial_dcid.is_some() {
+            " with native 0xd1 qdmux initial DCID"
+        } else {
+            ""
+        };
+
         routes.push(RbxTransportQuicRoute {
             target_endpoint: target_endpoint.clone(),
             outgoing_prefix: Vec::new(),
             server_name: game_fqdn.to_string(),
             enable_sni: true,
+            initial_dst_cid: pure_initial_dcid,
             native_quic_packet_protection: false,
             route_label: format!(
-                "qdmux-visible pure QUIC with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
+                "qdmux-visible pure QUIC{cid_label} with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
                 game_fqdn_report_label(game_fqdn)
             ),
         });
@@ -1225,36 +1292,40 @@ fn build_rbx_transport_quic_routes(
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
             server_name: game_fqdn.to_string(),
             enable_sni: true,
+            initial_dst_cid: rupp_initial_dcid,
             native_quic_packet_protection: false,
             route_label: format!(
-                "ClientRuppGenerator RUPP prefix with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
+                "ClientRuppGenerator RUPP prefix{cid_label} with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
                 game_fqdn_report_label(game_fqdn)
             ),
         });
     } else if let Some(generated_game_fqdn) = derive_qdmux_game_fqdn(plan) {
-        // The forced-trailer qdmux attempt reached the corrected public UDMUX
-        // port but still timed out. Native send-side evidence gates the
-        // 18-byte protector behind state byte +0x2d; the initial qdmux SNI
-        // route must keep QUIC byte zero visible so the token/IP/port SNI
-        // demux path can observe the first flight. Try that enabler-correct
-        // shape first, then the same no-forced-trailer ClientRuppGenerator
-        // RUPP-prefix shape.
+        // Native QuicConnectionIdGenerator::generate emits a 20-byte initial
+        // qdmux CID with prefix 0xd1, RCC IPv4, RCC/NetStack port, and opaque
+        // entropy/counter bytes before QUIC tries to use SNI. The earlier
+        // visible-SNI-only route had a random Quinn Initial DCID and still
+        // timed out at the public UDMUX target, so the generated-qdmux path now
+        // supplies the recovered initial DCID while keeping QUIC byte zero
+        // visible (the native 18-byte protector remains gated by +0x2d state).
         routes.push(RbxTransportQuicRoute {
             target_endpoint: target_endpoint.clone(),
             outgoing_prefix: Vec::new(),
-            server_name: generated_game_fqdn,
+            server_name: generated_game_fqdn.clone(),
             enable_sni: true,
+            initial_dst_cid: derive_native_qdmux_initial_dcid(plan)?,
             native_quic_packet_protection: false,
             route_label:
-                "qdmux-visible pure QUIC with generated GameFqdn/SNI and native +0x2d trailer gate not forced (token/ip/port redacted)".into(),
+                "qdmux-visible pure QUIC with generated GameFqdn/SNI, native 0xd1 qdmux initial DCID, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
         });
         routes.push(RbxTransportQuicRoute {
             target_endpoint,
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
-            server_name: "roblox.com".into(),
-            enable_sni: false,
+            server_name: generated_game_fqdn,
+            enable_sni: true,
+            initial_dst_cid: derive_native_qdmux_initial_dcid(plan)?,
             native_quic_packet_protection: false,
-            route_label: "ClientRuppGenerator RUPP prefix without SNI and native +0x2d trailer gate not forced fallback".into(),
+            route_label:
+                "ClientRuppGenerator RUPP prefix with generated GameFqdn/SNI, native 0xd1 qdmux initial DCID, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
         });
     } else {
         routes.push(RbxTransportQuicRoute {
@@ -1262,6 +1333,7 @@ fn build_rbx_transport_quic_routes(
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
             server_name: "roblox.com".into(),
             enable_sni: false,
+            initial_dst_cid: None,
             native_quic_packet_protection: false,
             route_label: "ClientRuppGenerator RUPP prefix without SNI and native +0x2d trailer gate not forced".into(),
         });
@@ -1363,7 +1435,12 @@ async fn attempt_rbx_transport_connection_async(
     let local_addr = endpoint
         .local_addr()
         .map_err(|error| format!("failed to read local QUIC socket address: {error}"))?;
-    let client_config = build_rbx_transport_quic_client_config(plan, route.enable_sni)?;
+    let initial_dst_cid_len = route.initial_dst_cid.as_ref().map_or(0, Vec::len);
+    let client_config = build_rbx_transport_quic_client_config(
+        plan,
+        route.enable_sni,
+        route.initial_dst_cid.clone(),
+    )?;
     let started = Instant::now();
     let connecting = endpoint
         .connect_with(client_config, target_addr, &route.server_name)
@@ -1417,6 +1494,7 @@ async fn attempt_rbx_transport_connection_async(
         local_addr,
         alpn: String::from_utf8_lossy(RBX_TRANSPORT_ALPN).into_owned(),
         rupp_prefix_len: route.outgoing_prefix.len(),
+        initial_dst_cid_len,
         native_quic_cid_trailer_len: if native_quic_packet_protection {
             RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES
         } else {
@@ -1463,11 +1541,24 @@ async fn wait_for_rbx_transport_inbound(
 fn build_rbx_transport_quic_client_config(
     plan: &RbxTransportConnectPlan,
     enable_sni: bool,
+    initial_dst_cid: Option<Vec<u8>>,
 ) -> Result<quinn::ClientConfig, String> {
     let rustls = build_rbx_transport_rustls_config(plan, enable_sni)?;
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls))
         .map_err(|error| format!("rustls config is not QUIC-compatible: {error:?}"))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    if let Some(initial_dst_cid) = initial_dst_cid {
+        if initial_dst_cid.len() < 8 {
+            return Err(format!(
+                "native qdmux initial DCID candidate is {} bytes, below QUIC's 8-byte Initial minimum",
+                initial_dst_cid.len()
+            ));
+        }
+        let initial_dst_cid = Arc::new(initial_dst_cid);
+        config.initial_dst_cid_provider(Arc::new(move || {
+            quinn::ConnectionId::new(initial_dst_cid.as_slice())
+        }));
+    }
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(1 << 20));
     transport.datagram_send_buffer_size(1 << 20);
@@ -3407,6 +3498,22 @@ mod tests {
             game_fqdn_report_label(&derived_qdmux),
             "redacted RUPP-encoded GameFqdn (token/ip/port SNI fields present)"
         );
+        assert!(game_fqdn_has_qdmux_token_ip_port_fields(&derived_qdmux));
+        let cid_entropy = [
+            0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa,
+            0xab, 0xac,
+        ];
+        let qdmux_initial_dcid = build_native_qdmux_initial_dcid_with_entropy(
+            [10, 32, 8, 208],
+            plan.rbx_transport_port,
+            cid_entropy,
+        );
+        assert_eq!(qdmux_initial_dcid.len(), 20);
+        assert_eq!(
+            &qdmux_initial_dcid[..7],
+            &[0xd1, 10, 32, 8, 208, 0xda, 0xc0]
+        );
+        assert_eq!(&qdmux_initial_dcid[7..], cid_entropy.as_slice());
         let rbx_transport_rupp = build_rbx_transport_rupp_header(&plan).unwrap();
         assert_eq!(rbx_transport_rupp.len(), 31);
         assert_eq!(
