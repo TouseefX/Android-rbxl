@@ -955,7 +955,7 @@ fn extract_rbx_transport_connect_plan(
         .filter(|value| !value.trim().is_empty());
     let qdmux_vip = find_field_ci(config, "QdmuxVip", 0)
         .or_else(|| find_field_ci(config, "DebugRbxTransportQdmuxVip", 0))
-        .and_then(as_addr)
+        .and_then(|value| as_addr(&value))
         .filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok());
     Ok(RbxTransportConnectPlan {
         public_endpoint,
