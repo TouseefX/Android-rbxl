@@ -696,14 +696,14 @@ fn fill_native_qdmux_tail(
     let rng = ring::rand::SystemRandom::new();
     if config.server_rupp_config_empty {
         // Native init sets generator byte +0x20 when ServerRuppConfiguration
-        // offset +0x10 is empty. In that mode generate() keeps only the first
-        // five bytes from the inner QUIC CID generator and writes the generator
-        // counter (wrapper-initialized to 1) as the final eight bytes,
-        // big-endian, at output offsets 12..19.
-        ring::rand::SecureRandom::fill(&rng, &mut entropy[..5]).map_err(|error| {
+        // offset +0x10 is empty. In that mode generate() keeps eight bytes
+        // from the inner QUIC CID generator, then writes the low 40 bits of
+        // the generator counter (wrapper-initialized to 1) big-endian at
+        // output offsets 15..19.
+        ring::rand::SecureRandom::fill(&rng, &mut entropy[..8]).map_err(|error| {
             format!("failed to generate native qdmux CID entropy: {error:?}")
         })?;
-        entropy[5..].copy_from_slice(&counter.to_be_bytes());
+        entropy[8..].copy_from_slice(&counter.to_be_bytes()[3..]);
     } else {
         ring::rand::SecureRandom::fill(&rng, &mut entropy)
             .map_err(|error| format!("failed to generate native qdmux CID entropy: {error:?}"))?;
@@ -1381,26 +1381,43 @@ fn build_rbx_transport_quic_routes(
                 game_fqdn_report_label(game_fqdn)
             ),
         });
+        let (rupp_server_name, rupp_enable_sni, rupp_route_label) = if use_qdmux_initial_dcid {
+            (
+                "roblox.com".to_string(),
+                false,
+                format!(
+                    "ClientRuppGenerator RUPP prefix without SNI{cid_label} paired with join qdmux GameFqdn {} and native +0x2d trailer gate not forced",
+                    game_fqdn_report_label(game_fqdn)
+                ),
+            )
+        } else {
+            (
+                game_fqdn.to_string(),
+                true,
+                format!(
+                    "ClientRuppGenerator RUPP prefix{cid_label} with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
+                    game_fqdn_report_label(game_fqdn)
+                ),
+            )
+        };
         routes.push(RbxTransportQuicRoute {
             target_endpoint,
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
-            server_name: game_fqdn.to_string(),
-            enable_sni: true,
+            server_name: rupp_server_name,
+            enable_sni: rupp_enable_sni,
             initial_dst_cid: rupp_initial_dcid,
             native_quic_packet_protection: false,
-            route_label: format!(
-                "ClientRuppGenerator RUPP prefix{cid_label} with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
-                game_fqdn_report_label(game_fqdn)
-            ),
+            route_label: rupp_route_label,
         });
     } else if let Some(generated_game_fqdn) = derive_qdmux_game_fqdn(plan) {
         // Native QuicConnectionIdGenerator::generate emits a 20-byte initial
-        // qdmux CID with prefix 0xd1, RCC IPv4, RCC/NetStack port, and opaque
-        // entropy/counter bytes before QUIC tries to use SNI. The earlier
-        // visible-SNI-only route had a random Quinn Initial DCID and still
-        // timed out at the public UDMUX target, so the generated-qdmux path now
-        // supplies the recovered initial DCID while keeping QUIC byte zero
-        // visible (the native 18-byte protector remains gated by +0x2d state).
+        // qdmux CID with prefix 0xd1, RCC IPv4, RCC/NetStack port, and inner
+        // CID/counter bytes before QUIC connects. The DebugRbxTransport
+        // generated-GameFqdn path clears the RUPP config for a pure qdmux/SNI
+        // route; the normal ClientRuppGenerator route keeps the RUPP prefix and
+        // runs without SNI. Both shapes get the recovered qdmux CID family while
+        // keeping QUIC byte zero visible (the native 18-byte protector remains
+        // gated by +0x2d state).
         routes.push(RbxTransportQuicRoute {
             target_endpoint: target_endpoint.clone(),
             outgoing_prefix: Vec::new(),
@@ -1414,12 +1431,12 @@ fn build_rbx_transport_quic_routes(
         routes.push(RbxTransportQuicRoute {
             target_endpoint,
             outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
-            server_name: generated_game_fqdn,
-            enable_sni: true,
+            server_name: "roblox.com".into(),
+            enable_sni: false,
             initial_dst_cid: derive_native_qdmux_initial_dcid(plan, false)?,
             native_quic_packet_protection: false,
             route_label:
-                "ClientRuppGenerator RUPP prefix with generated GameFqdn/SNI, native 0xd1 qdmux initial DCID, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
+                "ClientRuppGenerator RUPP prefix without SNI, native 0xd1 qdmux initial DCID, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
         });
     } else {
         routes.push(RbxTransportQuicRoute {
