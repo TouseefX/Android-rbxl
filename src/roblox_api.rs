@@ -270,6 +270,21 @@ fn studio_presence_channel() -> &'static (Sender<StudioPresenceResult>, Mutex<Re
     })
 }
 
+fn studio_presence_panic_summary(payload: &(dyn std::any::Any + Send)) -> &'static str {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    match message {
+        Some(message)
+            if message.contains("BorrowMutError") || message.contains("already borrowed") =>
+        {
+            "internal CSRF-state borrow conflict"
+        }
+        _ => "unexpected worker panic; details suppressed",
+    }
+}
+
 /// Send the same client-status heartbeat Studio emits on startup.
 ///
 /// Native Studio still carries the legacy `www.roblox.com/client-status/set`
@@ -283,11 +298,16 @@ fn studio_presence_channel() -> &'static (Sender<StudioPresenceResult>, Mutex<Re
 pub fn start_studio_presence_async(cookie: String) {
     let tx = studio_presence_channel().0.clone();
     std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(|| {
+        let result = match std::panic::catch_unwind(|| {
             WebClient::new_studio_presence_client(&cookie)
                 .and_then(|client| client.bootstrap_studio_presence(&cookie))
-        })
-        .unwrap_or_else(|_| Err("Studio presence worker panicked before returning a result".into()));
+        }) {
+            Ok(result) => result,
+            Err(payload) => Err(format!(
+                "Studio presence worker panicked ({})",
+                studio_presence_panic_summary(payload.as_ref())
+            )),
+        };
         let _ = tx.send(StudioPresenceResult { result });
     });
 }
@@ -766,40 +786,19 @@ impl RobloxApiClient {
         Ok(id)
     }
 
-    /// Publish (overwrite) an EXISTING place through the same hidden
-    /// endpoint: `Data/Upload.ashx?assetid={placeId}&type=Place` with the
-    /// raw `.rbxl` as the body — the way `rojo upload` and older bots pushed
-    /// places for years (roblox-cookie-upload-endpoints.md §4). Cookie-only:
-    /// no Open Cloud API key needed, but the account must have edit access
-    /// to the place. Returns a human-readable success message.
+    /// Compatibility stub for the retired cookie-based place upload path.
+    /// Roblox announced that `data.roblox.com/Data/Upload.ashx` would reject
+    /// place-file uploads starting June 24, 2024; a fresh CSRF token cannot
+    /// override that endpoint policy. Use `publish_place_open_cloud` instead.
+    #[deprecated(note = "Roblox retired place-file uploads through Upload.ashx; use publish_place_open_cloud")]
     pub fn publish_place_legacy(
-        cookie: &str,
-        place_id: &str,
-        rbxl_bytes: &[u8],
+        _cookie: &str,
+        _place_id: &str,
+        _rbxl_bytes: &[u8],
     ) -> Result<String, String> {
-        let pid = place_id.trim();
-        if pid.is_empty() || pid.parse::<u64>().is_err() {
-            return Err("Enter a valid numeric Place ID first.".into());
-        }
-        let url = format!(
-            "https://data.roblox.com/Data/Upload.ashx?json=1&assetid={pid}&type=Place&genreTypeId=1"
-        );
-        let text = Self::post_upload_ashx(cookie, &url, rbxl_bytes)?;
-        // Success body is a version/asset id (bare or {"id":...}); any 2xx
-        // means the new version was accepted.
-        let version = serde_json::from_str::<serde_json::Value>(text.trim())
-            .ok()
-            .and_then(|v| v.get("id").and_then(|x| x.as_u64()))
-            .map(|id| format!(" (version id {id})"))
-            .unwrap_or_else(|| {
-                let t = text.trim();
-                if t.is_empty() || t.parse::<u64>().is_err() {
-                    String::new()
-                } else {
-                    format!(" (version id {t})")
-                }
-            });
-        Ok(format!("Place {pid} updated via Upload.ashx{version}"))
+        Err(
+            "Roblox no longer accepts place-file uploads through Upload.ashx (disabled June 24, 2024), regardless of the X-CSRF token. Configure an Open Cloud API key with universe-places write permission and publish through the Place Publishing API.".into(),
+        )
     }
 
     /// Shared POST to the hidden `Data/Upload.ashx` endpoint with full CSRF
@@ -3663,21 +3662,30 @@ impl WebClient {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<String, String> {
-        // First attempt (possibly without a token).
-        match self.try_send_json_text(url, method, body, self.csrf.borrow().clone()) {
-            Ok(v) => return Ok(v),
+        self.send_json_text_with_retry(|csrf| {
+            self.try_send_json_text(url, method, body, csrf)
+        })
+    }
+
+    /// Keep the cached-token RefCell borrow out of the `match` scrutinee.
+    /// Match scrutinee temporaries live through their arms; borrowing the cell
+    /// there and then calling `borrow_mut` after a CSRF challenge panics with
+    /// `BorrowMutError` instead of retrying the request.
+    fn send_json_text_with_retry(
+        &self,
+        mut send: impl FnMut(Option<String>) -> Result<String, SendError>,
+    ) -> Result<String, String> {
+        let cached_csrf = { self.csrf.borrow().clone() };
+        match send(cached_csrf) {
+            Ok(value) => Ok(value),
             Err(SendError::NeedsToken(new_token)) => {
-                // Server told us the correct token; cache and retry once.
                 *self.csrf.borrow_mut() = Some(new_token.clone());
-                self.try_send_json_text(url, method, body, Some(new_token))
-                    .map_err(|e| match e {
-                        SendError::Http(s) => s,
-                        SendError::NeedsToken(_) => {
-                            "CSRF token rejected on retry".to_string()
-                        }
-                    })
+                send(Some(new_token)).map_err(|error| match error {
+                    SendError::Http(message) => message,
+                    SendError::NeedsToken(_) => "CSRF token rejected on retry".to_string(),
+                })
             }
-            Err(SendError::Http(s)) => Err(s),
+            Err(SendError::Http(message)) => Err(message),
         }
     }
 
@@ -4339,5 +4347,51 @@ mod tests {
     fn percent_encodes_client_status_query_component() {
         assert_eq!(percent_encode_query_component("AppStarted"), "AppStarted");
         assert_eq!(percent_encode_query_component("Joining Game"), "Joining%20Game");
+    }
+
+    #[test]
+    fn csrf_challenge_refreshes_cached_token_without_refcell_panic() {
+        let client = WebClient::new_with_raw_cookie_timeout(
+            "",
+            std::time::Duration::from_secs(1),
+        )
+        .expect("test HTTP client should build");
+        *client.csrf.borrow_mut() = Some("stale-token".into());
+
+        let mut seen_tokens = Vec::new();
+        let mut attempts = 0;
+        let result = client.send_json_text_with_retry(|token| {
+            attempts += 1;
+            seen_tokens.push(token.clone());
+            if attempts == 1 {
+                Err(SendError::NeedsToken("fresh-token".into()))
+            } else {
+                Ok("accepted".into())
+            }
+        });
+
+        assert_eq!(result.as_deref(), Ok("accepted"));
+        assert_eq!(
+            seen_tokens,
+            vec![Some("stale-token".into()), Some("fresh-token".into())]
+        );
+        assert_eq!(client.csrf.borrow().as_deref(), Some("fresh-token"));
+    }
+
+    #[test]
+    fn studio_presence_panic_summary_is_safe_and_specific_for_csrf_borrow() {
+        let csrf_panic: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("already borrowed: BorrowMutError"));
+        assert_eq!(
+            studio_presence_panic_summary(csrf_panic.as_ref()),
+            "internal CSRF-state borrow conflict"
+        );
+
+        let sensitive_panic: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("cookie=do-not-print"));
+        assert_eq!(
+            studio_presence_panic_summary(sensitive_panic.as_ref()),
+            "unexpected worker panic; details suppressed"
+        );
     }
 }

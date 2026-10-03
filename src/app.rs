@@ -1658,9 +1658,9 @@ ui.label("Place ID:");
                 // Section 2: Direct Place Publishing
                 ui.group(|ui| {
                     ui.label(RichText::new("🚀 Publish Active Place to Live Universe").heading().color(Color32::from_rgb(120, 255, 120)));
-                    ui.label("Serializes the active .rbxl in memory and streams it to Roblox. Uses the Open Cloud API when a key is set; otherwise (or if Open Cloud fails) it falls back to the cookie-authenticated Upload.ashx endpoint — only the Place ID is needed for that path.");
+                    ui.label("Serializes the active .rbxl in memory and publishes through Roblox Open Cloud. Requires an API key with universe-places write permission for this universe, plus the correct Universe ID and Place ID. Roblox disabled place-file uploads through cookie-based Upload.ashx on June 24, 2024; a CSRF token cannot restore that retired path.");
 
-                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published; Upload.ashx fallback always goes live)");
+                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published; unchecked saves a version only)");
 
                     if ui.button(RichText::new("⚡ Publish Place Now").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
                         self.publish_place_to_roblox();
@@ -6496,30 +6496,32 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         });
     }
 
-    /// Publish the currently-open place to Roblox using Open Cloud (the
-    /// only currently-supported upload path). The legacy ashx cookie
-    /// gateway is gone, so this always talks to apis.roblox.com with the
-    /// API key from Settings.
+    /// Publish the currently-open place through Roblox's supported Open
+    /// Cloud Place Publishing API. Cookie-based Upload.ashx place uploads were
+    /// retired by Roblox and must not be attempted as a fallback.
     fn publish_place_to_roblox(&mut self) {
         let Some(dom) = &self.dom else {
             self.status = "Open a place first".into();
             return;
         };
         let api_key = self.open_cloud_api_key.trim().to_string();
-        let cookie = self.roblosecurity_cookie();
-        if api_key.is_empty() && cookie.is_none() {
-            self.status =
-                "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first".into();
-            self.log_error("Publish requires an Open Cloud API key or a cookie");
+        if api_key.is_empty() {
+            self.status = "Place publishing requires an Open Cloud API key with universe-places write permission".into();
+            self.log_error("Place publishing requires an Open Cloud API key; Upload.ashx no longer accepts place files");
+            return;
+        }
+        let universe = self.open_cloud_universe_id.trim().to_string();
+        if universe.is_empty() || universe.parse::<u64>().is_err() {
+            self.status = "Enter a numeric Universe ID in the Open Cloud tab first".into();
             return;
         }
         let place = self.open_cloud_place_id.trim().to_string();
-        if place.is_empty() {
-            self.status = "Enter the Place ID in the Open Cloud tab first".into();
+        if place.is_empty() || place.parse::<u64>().is_err() {
+            self.status = "Enter a numeric Place ID in the Open Cloud tab first".into();
             return;
         }
-        // Both paths only accept binary .rbxl; force binary serialization
-        // regardless of the on-disk format.
+        // The supported Place Publishing API accepts binary .rbxl; force
+        // binary serialization regardless of the on-disk format.
         let bytes = match rbxl::save_place(dom) {
             Ok(b) => b,
             Err(e) => {
@@ -6528,52 +6530,29 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 return;
             }
         };
-        let universe = self.open_cloud_universe_id.trim().to_string();
         let publish_live = self.open_cloud_publish_live;
-        self.status = "Publishing place…".into();
+        self.status = "Publishing place through Open Cloud…".into();
         self.log_info(format!(
-            "Publishing place {place} (universe {universe}) — Open Cloud{}",
-            if cookie.is_some() { ", falling back to cookie Upload.ashx" } else { "" }
+            "Publishing place {place} (universe {universe}) through Open Cloud"
         ));
         std::thread::spawn(move || {
-            let mut errors: Vec<String> = Vec::new();
-            // 1) Open Cloud place-publishing API when a key is configured.
-            if !api_key.is_empty() {
-                match roblox_api::RobloxApiClient::publish_place_open_cloud(
-                    &api_key,
-                    &universe,
-                    &place,
-                    &bytes,
-                    publish_live,
-                ) {
-                    Ok(_msg) => {
-                        jni_bridge::queue_publish_result(
-                            format!("place {place} (Open Cloud)"),
-                            Ok(()),
-                        );
-                        return;
-                    }
-                    Err(e) => errors.push(format!("Open Cloud: {e}")),
-                }
-            }
-            // 2) Legacy cookie fallback: overwrite the place through the
-            //    hidden Data/Upload.ashx endpoint (§4 of the endpoints doc).
-            if let Some(cookie) = cookie.as_deref() {
-                match roblox_api::RobloxApiClient::publish_place_legacy(cookie, &place, &bytes) {
-                    Ok(_msg) => {
-                        jni_bridge::queue_publish_result(
-                            format!("place {place} (cookie Upload.ashx)"),
-                            Ok(()),
-                        );
-                        return;
-                    }
-                    Err(e) => errors.push(format!("Upload.ashx: {e}")),
-                }
-            }
-            jni_bridge::queue_publish_result(
-                format!("place {place}"),
-                Err(errors.join(" — also tried ")),
+            let result = roblox_api::RobloxApiClient::publish_place_open_cloud(
+                &api_key,
+                &universe,
+                &place,
+                &bytes,
+                publish_live,
             );
+            match result {
+                Ok(_message) => jni_bridge::queue_publish_result(
+                    format!("place {place} (Open Cloud)"),
+                    Ok(()),
+                ),
+                Err(error) => jni_bridge::queue_publish_result(
+                    format!("place {place} (Open Cloud)"),
+                    Err(format!("Open Cloud: {error}")),
+                ),
+            }
         });
     }
 

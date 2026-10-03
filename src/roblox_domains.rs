@@ -44,11 +44,12 @@ pub const SUBDOMAINS: &[&str] = &[
     "users.roblox.com",
 ];
 
-// Note on publishing: as of 2025 the legacy assetgame.roblox.com/Asset/
-// .ashx gateway is retired for third-party uploads. The supported path is
-// Open Cloud:
+// Place publishing: Roblox announced that data.roblox.com/Data/Upload.ashx
+// would reject place-file uploads starting June 24, 2024. A CSRF token cannot
+// override that policy. Use Open Cloud:
 //   POST https://apis.roblox.com/universes/v1/{universeId}/places/{placeId}/versions?versionType=Published|Saved
-// with header `x-api-key: <open-cloud-key>` and an octet-stream body.
+// with a key granted universe-places:write permission and an octet-stream body.
+// Announcement: https://devforum.roblox.com/t/official-list-of-deprecated-web-endpoints/62889/62
 
 pub const OPEN_CLOUD_BASE: &str = "https://apis.roblox.com";
 pub const ASSET_DELIVERY: &str = "https://assetdelivery.roblox.com";
