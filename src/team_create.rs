@@ -778,7 +778,7 @@ impl RbxTransportConnectPlan {
     fn summary(&self) -> String {
         let quic_endpoint = rbx_transport_quic_endpoint(self);
         let mut text = format!(
-            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public/UDMUX endpoint; NetStackPort is carried in qdmux/RUPP routing metadata)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with NetStackPort {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
+            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public/UDMUX endpoint; native RUPP/qdmux routing fields use the RCC/server endpoint port)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with separate NetStackPort metadata {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
             quic_endpoint.label(),
             self.public_endpoint.label(),
             self.rcc_endpoint.label(),
@@ -792,7 +792,7 @@ impl RbxTransportConnectPlan {
             self.early_key.public_key.len(),
         );
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{}, QUIC first-flight packet protection now follows the native +0x2d enabler evidence instead of forcing the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer on every route, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, QUIC first-flight packet protection now follows the native +0x2d enabler evidence instead of forcing the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer on every route, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
@@ -1248,11 +1248,11 @@ const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
 ];
 
 fn rbx_transport_quic_endpoint(plan: &RbxTransportConnectPlan) -> Endpoint {
-    // Native PlayerConfigurer passes MachineAddress/ServerPort as the UDP
-    // connect target and carries NetStackPort separately in the RbxTransport
-    // optional RUPP configuration.  The public UDMUX endpoint remains the
-    // socket destination; NetStackPort is encoded inside qdmux/RUPP routing
-    // metadata, not used as the public UDP port.
+    // Native PlayerConfigurer passes MachineAddress/ServerPort as the logical
+    // server endpoint and the advertised UDMUX/public endpoint as the UDP
+    // socket destination. NetStackPort remains separate selector/config
+    // metadata; the native ClientRuppConfiguration and qdmux fields use the
+    // RCC/server endpoint port.
     plan.public_endpoint.clone()
 }
 
@@ -1268,9 +1268,14 @@ fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr, String> {
 }
 
 fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec<u8>, String> {
+    // Native NetworkClient fills ClientRuppConfiguration from the same
+    // FinalConnectionArgs server address/port used in the "will connect to
+    // server {}|{}, udmux {}|{}" log, not from NetStackPort. NetStackPort is
+    // still parsed and reported as separate metadata, but the RUPP endpoint TLV
+    // must carry the RCC/server port.
     let rcc_endpoint = Endpoint {
         address: plan.rcc_endpoint.address.clone(),
-        port: plan.rbx_transport_port,
+        port: plan.rcc_endpoint.port,
     };
     build_rupp_header_for(
         &plan.token,
@@ -1393,7 +1398,7 @@ fn build_rbx_transport_quic_routes(
                 "roblox.com".to_string(),
                 false,
                 format!(
-                    "ClientRuppGenerator RUPP prefix without SNI{cid_label} paired with join qdmux GameFqdn {} and native +0x2d trailer gate not forced",
+                    "ClientRuppGenerator RUPP prefix with RCC server-port endpoint TLV and without SNI{cid_label} paired with join qdmux GameFqdn {} and native +0x2d trailer gate not forced",
                     game_fqdn_report_label(game_fqdn)
                 ),
             )
@@ -1402,7 +1407,7 @@ fn build_rbx_transport_quic_routes(
                 game_fqdn.to_string(),
                 true,
                 format!(
-                    "ClientRuppGenerator RUPP prefix{cid_label} with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
+                    "ClientRuppGenerator RUPP prefix with RCC server-port endpoint TLV{cid_label} and join GameFqdn/SNI {} plus native +0x2d trailer gate not forced",
                     game_fqdn_report_label(game_fqdn)
                 ),
             )
@@ -1443,7 +1448,7 @@ fn build_rbx_transport_quic_routes(
             initial_dst_cid: derive_native_qdmux_initial_dcid(plan, false)?,
             native_quic_packet_protection: false,
             route_label:
-                "ClientRuppGenerator RUPP prefix without SNI, native 0xd1 qdmux initial DCID using RCC server-port field, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
+                "ClientRuppGenerator RUPP prefix with RCC server-port endpoint TLV, without SNI, native 0xd1 qdmux initial DCID using RCC server-port field, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
         });
     } else {
         routes.push(RbxTransportQuicRoute {
@@ -1453,7 +1458,7 @@ fn build_rbx_transport_quic_routes(
             enable_sni: false,
             initial_dst_cid: None,
             native_quic_packet_protection: false,
-            route_label: "ClientRuppGenerator RUPP prefix without SNI and native +0x2d trailer gate not forced".into(),
+            route_label: "ClientRuppGenerator RUPP prefix with RCC server-port endpoint TLV, without SNI, and native +0x2d trailer gate not forced".into(),
         });
     }
 
@@ -3656,7 +3661,7 @@ mod tests {
         // reverse-endpoint TLV value 6.
         assert_eq!(
             &rbx_transport_rupp[23..],
-            &[RUPP_TLV_IPV4_ENDPOINT, 6, 10, 32, 8, 208, 0xda, 0xc0]
+            &[RUPP_TLV_IPV4_ENDPOINT, 6, 10, 32, 8, 208, 0xc6, 0x10]
         );
         assert_eq!(plan.early_key.version, 1);
         assert_eq!(plan.early_key.public_key.len(), 32);
@@ -3743,7 +3748,7 @@ mod tests {
         assert!(report.contains("selectedTransport=RbxTransport"));
         assert!(report.contains("RbxTransport QUIC UDP target: 128.116.50.33:62638"));
         assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.50.33:62638"));
-        assert!(report.contains("RbxTransport RCC/RUPP config: RCC 10.20.0.12:62638 with NetStackPort 58490"));
+        assert!(report.contains("RbxTransport RCC/RUPP config: RCC 10.20.0.12:62638 with separate NetStackPort metadata 58490"));
         assert!(report.contains("algorithm 1"));
         assert!(report.contains("pepper 1790880922 (0x6abeac9a)"));
         assert!(report.contains("RandomSeed1 string(88 chars), Base64-decodes 64 bytes"));

@@ -15,6 +15,7 @@ use rbx_dom_weak::{
 use crate::settings::EditorSettings;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 /// One indentation level, as spaces.
 ///
@@ -234,6 +235,11 @@ pub struct EditorApp {
     /// Studio-style Roblox presence/client-status bootstrap shown in Settings.
     studio_presence_status: String,
     studio_presence_in_flight: bool,
+    /// Local UI watchdog for the Studio presence worker. Network requests run
+    /// on a background thread; this keeps the Settings panel from being stuck
+    /// on "Sending…" forever if Android networking wedges below reqwest's
+    /// normal timeout layer.
+    studio_presence_started_at: Option<Instant>,
     discovered_assets: Vec<DiscoveredAsset>,
 
     // Open Cloud State
@@ -449,6 +455,7 @@ impl Default for EditorApp {
             roblosecurity_cookie: saved_settings.roblosecurity_cookie,
             studio_presence_status: String::new(),
             studio_presence_in_flight: false,
+            studio_presence_started_at: None,
             discovered_assets: Vec::new(),
             open_cloud_api_key: saved_settings.open_cloud_api_key,
             open_cloud_universe_id: saved_settings.open_cloud_universe_id,
@@ -641,11 +648,13 @@ impl EditorApp {
             self.studio_presence_status =
                 "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
             self.studio_presence_in_flight = false;
+            self.studio_presence_started_at = None;
             return;
         };
         self.studio_presence_status =
             "Sending native Studio client-status presence to Roblox…".into();
         self.studio_presence_in_flight = true;
+        self.studio_presence_started_at = Some(Instant::now());
         roblox_api::start_studio_presence_async(cookie);
         self.log_info("Started Roblox Studio presence bootstrap");
     }
@@ -4686,6 +4695,7 @@ ui.label("Place ID:");
         // Pick up Studio-style client-status / profile presence bootstrap results.
         while let Some(res) = roblox_api::try_recv_studio_presence_result() {
             self.studio_presence_in_flight = false;
+            self.studio_presence_started_at = None;
             match res.result {
                 Ok(report) => {
                     let summary = report.summary();
@@ -4704,6 +4714,17 @@ ui.label("Place ID:");
                         format!("Studio presence bootstrap failed: {error}");
                     self.status = "Studio presence bootstrap failed".into();
                     self.log_error(format!("Studio presence bootstrap failed: {error}"));
+                }
+            }
+        }
+        if self.studio_presence_in_flight {
+            if let Some(started) = self.studio_presence_started_at {
+                if started.elapsed() >= Duration::from_secs(45) {
+                    self.studio_presence_in_flight = false;
+                    self.studio_presence_started_at = None;
+                    self.studio_presence_status = "Studio presence bootstrap timed out locally after 45 seconds; Roblox did not answer all status/presence requests. You can retry without restarting the editor.".into();
+                    self.status = "Studio presence bootstrap timed out".into();
+                    self.log_error("Studio presence bootstrap timed out locally after 45 seconds");
                 }
             }
         }
@@ -6023,6 +6044,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             self.studio_presence_status =
                                 "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
                             self.studio_presence_in_flight = false;
+                            self.studio_presence_started_at = None;
                         }
                     });
 
@@ -6037,7 +6059,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
 
                 ui.group(|ui| {
                     ui.label(RichText::new("🟦 Roblox Studio profile presence").heading().color(Color32::from_rgb(100, 200, 255)));
-                    ui.label("On startup this app sends Studio's AppStarted client-status heartbeat to Roblox using the native legacy client-status/set path plus the newer Matchmaking API path, then reads back your presence. Roblox may still keep showing Online until Team Create is fully connected.");
+                    ui.label("On startup this app sends Studio's AppStarted client-status heartbeat to Roblox. It tries the native legacy client-status/set route first, falls back to the newer Matchmaking API route if needed, then reads back your presence. Roblox may still keep showing Online until Team Create is fully connected.");
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(
@@ -6054,7 +6076,9 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                     });
                     let color = if self.studio_presence_status.contains("InStudio") {
                         Color32::from_rgb(120, 255, 120)
-                    } else if self.studio_presence_status.contains("failed") {
+                    } else if self.studio_presence_status.contains("failed")
+                        || self.studio_presence_status.contains("timed out")
+                    {
                         Color32::from_rgb(255, 140, 120)
                     } else {
                         Color32::from_rgb(200, 220, 255)
@@ -6161,6 +6185,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                         self.studio_presence_status =
                             "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
                         self.studio_presence_in_flight = false;
+                        self.studio_presence_started_at = None;
                         self.open_cloud_api_key.clear();
                         self.open_cloud_universe_id.clear();
                         self.open_cloud_place_id.clear();

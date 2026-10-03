@@ -283,8 +283,11 @@ fn studio_presence_channel() -> &'static (Sender<StudioPresenceResult>, Mutex<Re
 pub fn start_studio_presence_async(cookie: String) {
     let tx = studio_presence_channel().0.clone();
     std::thread::spawn(move || {
-        let result = WebClient::new_with_raw_cookie(&cookie)
-            .and_then(|client| client.bootstrap_studio_presence(&cookie));
+        let result = std::panic::catch_unwind(|| {
+            WebClient::new_studio_presence_client(&cookie)
+                .and_then(|client| client.bootstrap_studio_presence(&cookie))
+        })
+        .unwrap_or_else(|_| Err("Studio presence worker panicked before returning a result".into()));
         let _ = tx.send(StudioPresenceResult { result });
     });
 }
@@ -3571,6 +3574,21 @@ impl WebClient {
     /// Build a cookie-authenticated web client while accepting either a raw
     /// `.ROBLOSECURITY` value or a pasted browser `Cookie:` header.
     pub fn new_with_raw_cookie(cookie: &str) -> Result<Self, String> {
+        Self::new_with_raw_cookie_timeout(cookie, std::time::Duration::from_secs(20))
+    }
+
+    /// Build the short-deadline client used by the Settings-panel Studio
+    /// presence bootstrap. That path is only a small status heartbeat plus a
+    /// read-back query; using the longer asset/config timeout made the UI look
+    /// permanently stuck on Android when one Roblox edge endpoint black-holed.
+    fn new_studio_presence_client(cookie: &str) -> Result<Self, String> {
+        Self::new_with_raw_cookie_timeout(cookie, std::time::Duration::from_secs(8))
+    }
+
+    fn new_with_raw_cookie_timeout(
+        cookie: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self, String> {
         let cookie = if cookie.trim().is_empty() {
             String::new()
         } else {
@@ -3578,7 +3596,8 @@ impl WebClient {
         };
         let http = reqwest::blocking::Client::builder()
             .user_agent("RobloxStudio/WinInet rbxl-editor")
-            .timeout(std::time::Duration::from_secs(20))
+            .connect_timeout(timeout)
+            .timeout(timeout)
             .build()
             .map_err(|e| format!("HTTP client build: {e}"))?;
         Ok(Self {
@@ -3785,33 +3804,35 @@ impl WebClient {
     /// POST Studio's startup client-status heartbeat. Studio still carries the
     /// legacy `www.roblox.com/client-status/set` path in the status reporting
     /// code path while newer builds also expose the Matchmaking API Beta
-    /// endpoint. Try the native/legacy forms first, then the Beta endpoint, and
-    /// treat any 2xx response as accepted because the legacy endpoint has
-    /// historically returned plain/empty bodies rather than JSON.
+    /// endpoint. The Settings-panel worker uses short HTTP deadlines; try the
+    /// native/legacy GET first because it avoids the CSRF challenge and is the
+    /// exact URL shape present in older native error/status paths, then fall
+    /// back through the JSON legacy POST and Beta endpoint. Return as soon as
+    /// one route is accepted so a slow secondary endpoint cannot leave the UI
+    /// stuck on "Sending…".
     fn set_client_status(&self, status: &str, browser_tracker_id: u64) -> Result<String, String> {
         let body = serde_json::json!({
             "status": status,
             "browserTrackerId": browser_tracker_id,
         });
-        let mut accepted = Vec::new();
         let mut errors = Vec::new();
-
-        match self.send_json_text(
-            "https://www.roblox.com/client-status/set",
-            "POST",
-            &body,
-        ) {
-            Ok(_) => accepted.push("www/client-status/set POST"),
-            Err(error) => errors.push(format!("legacy POST: {error}")),
-        }
 
         let legacy_get = format!(
             "https://www.roblox.com/client-status/set?browserTrackerId={browser_tracker_id}&status={}",
             percent_encode_query_component(status)
         );
         match self.get_text_authenticated(&legacy_get) {
-            Ok(_) => accepted.push("www/client-status/set GET"),
+            Ok(_) => return Ok("www/client-status/set GET".into()),
             Err(error) => errors.push(format!("legacy GET: {error}")),
+        }
+
+        match self.send_json_text(
+            "https://www.roblox.com/client-status/set",
+            "POST",
+            &body,
+        ) {
+            Ok(_) => return Ok("www/client-status/set POST".into()),
+            Err(error) => errors.push(format!("legacy POST: {error}")),
         }
 
         match self.send_json_text(
@@ -3819,18 +3840,14 @@ impl WebClient {
             "POST",
             &body,
         ) {
-            Ok(_) => accepted.push("matchmaking-api client-status POST"),
+            Ok(_) => return Ok("matchmaking-api client-status POST".into()),
             Err(error) => errors.push(format!("matchmaking POST: {error}")),
         }
 
-        if accepted.is_empty() {
-            Err(format!(
-                "all Studio client-status writes failed: {}",
-                errors.join(" | ")
-            ))
-        } else {
-            Ok(accepted.join(" + "))
-        }
+        Err(format!(
+            "all Studio client-status writes failed: {}",
+            errors.join(" | ")
+        ))
     }
 
     /// Query Roblox's public presence endpoint for one user. This is a
