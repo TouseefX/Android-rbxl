@@ -620,6 +620,13 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// RCC endpoint, and advertised public UDMUX VIP.  The returned value contains
 /// the redacted-by-policy Team Create token; callers must never print it.
 fn derive_qdmux_game_fqdn(plan: &RbxTransportConnectPlan) -> Option<String> {
+    derive_qdmux_game_fqdn_for_port(plan, plan.rcc_endpoint.port)
+}
+
+fn derive_qdmux_game_fqdn_for_port(
+    plan: &RbxTransportConnectPlan,
+    qdmux_rcc_port: u16,
+) -> Option<String> {
     let rcc_ipv4 = match plan.rcc_endpoint.address.parse::<IpAddr>().ok()? {
         IpAddr::V4(ip) => ip.octets(),
         IpAddr::V6(_) => return None,
@@ -636,7 +643,7 @@ fn derive_qdmux_game_fqdn(plan: &RbxTransportConnectPlan) -> Option<String> {
         "{}-{}-{}.{}.qdmux.roblox.com",
         hex_lower(&plan.token),
         hex_lower(&rcc_ipv4),
-        hex_lower(&plan.rbx_transport_port.to_be_bytes()),
+        hex_lower(&qdmux_rcc_port.to_be_bytes()),
         hex_lower(&qdmux_vip)
     ))
 }
@@ -653,7 +660,7 @@ fn build_native_qdmux_initial_dcid_with_entropy(
     // Recovered Studio generator shape (0x14757f850):
     //   byte 0     = 0xd1
     //   bytes 1-4  = parsed qdmux/RCC IPv4 bytes
-    //   bytes 5-6  = parsed qdmux/RCC NetStack port bytes
+    //   bytes 5-6  = parsed qdmux/RCC server-port bytes
     //   bytes 7-19 = native inner-CID entropy/counter material
     let mut cid = Vec::with_capacity(RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_BYTES);
     cid.push(RBX_TRANSPORT_NATIVE_QDMUX_INITIAL_DCID_PREFIX);
@@ -682,7 +689,7 @@ fn native_qdmux_cid_config(
     };
     Some(NativeQdmuxCidConfig {
         rcc_ipv4,
-        rcc_port: plan.rbx_transport_port,
+        rcc_port: plan.rcc_endpoint.port,
         server_rupp_config_empty,
     })
 }
@@ -823,7 +830,7 @@ impl RbxTransportConnectPlan {
             ));
         } else if derive_qdmux_game_fqdn(self).is_some() {
             text.push_str(
-                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app now also supplies Quinn with the recovered 20-byte native qdmux initial destination-CID shape (0xd1/RCC IPv4/NetStackPort/inner-CID entropy or counter, bytes redacted) while keeping the first QUIC Initial visible because the 18-byte trailer helper is gated by native state.",
+                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app now also supplies Quinn with the recovered 20-byte native qdmux initial destination-CID shape (0xd1/RCC IPv4/RCC server port/inner-CID entropy or counter, bytes redacted) while keeping the first QUIC Initial visible because the 18-byte trailer helper is gated by native state.",
             );
         }
         text.push_str(
@@ -1364,7 +1371,7 @@ fn build_rbx_transport_quic_routes(
             None
         };
         let cid_label = if pure_initial_dcid.is_some() && rupp_initial_dcid.is_some() {
-            " with native 0xd1 qdmux initial DCID"
+            " with native 0xd1 qdmux initial DCID using RCC server-port field"
         } else {
             ""
         };
@@ -1411,7 +1418,7 @@ fn build_rbx_transport_quic_routes(
         });
     } else if let Some(generated_game_fqdn) = derive_qdmux_game_fqdn(plan) {
         // Native QuicConnectionIdGenerator::generate emits a 20-byte initial
-        // qdmux CID with prefix 0xd1, RCC IPv4, RCC/NetStack port, and inner
+        // qdmux CID with prefix 0xd1, RCC IPv4, RCC server port, and inner
         // CID/counter bytes before QUIC connects. The DebugRbxTransport
         // generated-GameFqdn path clears the RUPP config for a pure qdmux/SNI
         // route; the normal ClientRuppGenerator route keeps the RUPP prefix and
@@ -1426,7 +1433,7 @@ fn build_rbx_transport_quic_routes(
             initial_dst_cid: derive_native_qdmux_initial_dcid(plan, true)?,
             native_quic_packet_protection: false,
             route_label:
-                "qdmux-visible pure QUIC with generated GameFqdn/SNI, native 0xd1 qdmux initial DCID, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
+                "qdmux-visible pure QUIC with generated GameFqdn/SNI, native 0xd1 qdmux initial DCID using RCC server-port field, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
         });
         routes.push(RbxTransportQuicRoute {
             target_endpoint,
@@ -1436,7 +1443,7 @@ fn build_rbx_transport_quic_routes(
             initial_dst_cid: derive_native_qdmux_initial_dcid(plan, false)?,
             native_quic_packet_protection: false,
             route_label:
-                "ClientRuppGenerator RUPP prefix without SNI, native 0xd1 qdmux initial DCID, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
+                "ClientRuppGenerator RUPP prefix without SNI, native 0xd1 qdmux initial DCID using RCC server-port field, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
         });
     } else {
         routes.push(RbxTransportQuicRoute {
@@ -3615,7 +3622,7 @@ mod tests {
         let derived_qdmux = derive_qdmux_game_fqdn(&plan).unwrap();
         assert_eq!(
             derived_qdmux,
-            "202122232425262728292a2b2c2d2e2f-0a2008d0-dac0.80743621.qdmux.roblox.com"
+            "202122232425262728292a2b2c2d2e2f-0a2008d0-c610.80743621.qdmux.roblox.com"
         );
         assert_eq!(
             game_fqdn_report_label(&derived_qdmux),
@@ -3628,13 +3635,13 @@ mod tests {
         ];
         let qdmux_initial_dcid = build_native_qdmux_initial_dcid_with_entropy(
             [10, 32, 8, 208],
-            plan.rbx_transport_port,
+            plan.rcc_endpoint.port,
             cid_entropy,
         );
         assert_eq!(qdmux_initial_dcid.len(), 20);
         assert_eq!(
             &qdmux_initial_dcid[..7],
-            &[0xd1, 10, 32, 8, 208, 0xda, 0xc0]
+            &[0xd1, 10, 32, 8, 208, 0xc6, 0x10]
         );
         assert_eq!(&qdmux_initial_dcid[7..], cid_entropy.as_slice());
         let rbx_transport_rupp = build_rbx_transport_rupp_header(&plan).unwrap();
