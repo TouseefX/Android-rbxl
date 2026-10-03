@@ -790,14 +790,14 @@ impl RobloxApiClient {
     /// Roblox announced that `data.roblox.com/Data/Upload.ashx` would reject
     /// place-file uploads starting June 24, 2024; a fresh CSRF token cannot
     /// override that endpoint policy. Use `publish_place_open_cloud` instead.
-    #[deprecated(note = "Roblox retired place-file uploads through Upload.ashx; use publish_place_open_cloud")]
+    #[deprecated(note = "Roblox retired place-file uploads through Upload.ashx; use publish_place_open_cloud or publish_place_with_cookie")]
     pub fn publish_place_legacy(
         _cookie: &str,
         _place_id: &str,
         _rbxl_bytes: &[u8],
     ) -> Result<String, String> {
         Err(
-            "Roblox no longer accepts place-file uploads through Upload.ashx (disabled June 24, 2024), regardless of the X-CSRF token. Configure an Open Cloud API key with universe-places write permission and publish through the Place Publishing API.".into(),
+            "Roblox no longer accepts place-file uploads through Upload.ashx (disabled June 24, 2024), regardless of the X-CSRF token. Use the Place Versions API with either an Open Cloud key or your Roblox session cookie.".into(),
         )
     }
 
@@ -1618,7 +1618,7 @@ impl RobloxApiClient {
         }
 
         let version_type = if is_published { "Published" } else { "Saved" };
-        let url = crate::roblox_domains::open_cloud_publish_url(
+        let url = crate::roblox_domains::place_versions_url(
             u_id.parse().map_err(|_| "Universe ID must be numeric")?,
             p_id.parse().map_err(|_| "Place ID must be numeric")?,
             is_published,
@@ -1659,6 +1659,134 @@ impl RobloxApiClient {
             }
             Err(format!("Roblox Open Cloud error (HTTP {status}): {resp_body}"))
         }
+    }
+
+    /// Publish a place through Cookie auth on the Place Versions API. Roblox's
+    /// API reference lists Cookie as an authentication method for this POST;
+    /// the request uses `.ROBLOSECURITY` plus X-CSRF-TOKEN and needs no Open
+    /// Cloud key. This is not the retired Data/Upload.ashx route.
+    pub fn publish_place_with_cookie(
+        cookie: &str,
+        universe_id_str: &str,
+        place_id_str: &str,
+        rbxl_bytes: &[u8],
+        is_published: bool,
+    ) -> Result<String, String> {
+        let cookie = normalize_roblosecurity_cookie(cookie)?;
+        if rbxl_bytes.is_empty() {
+            return Err("Nothing to publish (empty .rbxl data).".into());
+        }
+        let universe_id = universe_id_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "Enter a valid numeric Universe ID first.".to_string())?;
+        let place_id = place_id_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "Enter a valid numeric Place ID first.".to_string())?;
+        let version_type = if is_published { "Published" } else { "Saved" };
+        let url = crate::roblox_domains::place_versions_url(
+            universe_id,
+            place_id,
+            is_published,
+        );
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("Roblox/WinInet")
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|error| format!("HTTP client initialization error: {error}"))?;
+
+        let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
+            let mut request = http
+                .post(&url)
+                .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
+                .header("Content-Type", "application/octet-stream")
+                .header("Accept", "application/json")
+                .body(rbxl_bytes.to_vec());
+            if let Some(token) = csrf {
+                request = request.header("X-CSRF-TOKEN", token);
+            }
+            request
+                .send()
+                .map_err(|error| format!("Cookie-auth place publish network error: {error}"))
+        };
+
+        let mut csrf: Option<String> = None;
+        let mut tried_logout_handshake = false;
+        let mut last_failure: Option<(reqwest::StatusCode, String)> = None;
+        for attempt in 1..=4 {
+            let response = send(csrf.as_deref())?;
+            let status = response.status();
+            let challenged_token = response
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|token| token.to_str().ok())
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned);
+            let body = response.text().unwrap_or_default();
+
+            if status.is_success() {
+                let version_number = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("versionNumber").cloned())
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+                    });
+                return Ok(match version_number {
+                    Some(version) => format!(
+                        "Successfully published place {place_id} through cookie-auth Place Publishing API: version {version} ({version_type})"
+                    ),
+                    None => format!(
+                        "Place {place_id} accepted through cookie-auth Place Publishing API ({version_type}): {}",
+                        snippet(&body)
+                    ),
+                });
+            }
+
+            last_failure = Some((status, body));
+            if attempt == 4 {
+                break;
+            }
+
+            if let Some(token) = challenged_token {
+                if csrf.as_deref() != Some(token.as_str()) {
+                    csrf = Some(token);
+                    continue;
+                }
+            }
+
+            // Some edge responses omit the challenge header. Fall back once
+            // to Roblox's standard logout CSRF handshake, then retry this
+            // same place endpoint with the same cookie.
+            if !tried_logout_handshake {
+                tried_logout_handshake = true;
+                if let Ok(token) = Self::fetch_csrf_token(&cookie) {
+                    if csrf.as_deref() != Some(token.as_str()) {
+                        csrf = Some(token);
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+
+        let (status, body) = last_failure
+            .unwrap_or((reqwest::StatusCode::INTERNAL_SERVER_ERROR, String::new()));
+        let server_message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("message").and_then(|message| message.as_str()).map(str::to_owned));
+        Err(match server_message {
+            Some(message) => format!(
+                "Cookie-auth place publish failed (HTTP {status}): {message}"
+            ),
+            None => format!(
+                "Cookie-auth place publish failed (HTTP {status}): {}",
+                snippet(&body)
+            ),
+        })
     }
 
     /// Read entry from Roblox Open Cloud DataStore API using native in-process HTTP client

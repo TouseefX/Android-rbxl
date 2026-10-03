@@ -45,11 +45,14 @@ pub const SUBDOMAINS: &[&str] = &[
 ];
 
 // Place publishing: Roblox announced that data.roblox.com/Data/Upload.ashx
-// would reject place-file uploads starting June 24, 2024. A CSRF token cannot
-// override that policy. Use Open Cloud:
+// would reject place-file uploads starting June 24, 2024. Use the Place
+// Versions API instead, which supports either an Open Cloud API key or cookie
+// authentication (the latter is what allows Studio-style publishing without a
+// separate Open Cloud key):
 //   POST https://apis.roblox.com/universes/v1/{universeId}/places/{placeId}/versions?versionType=Published|Saved
-// with a key granted universe-places:write permission and an octet-stream body.
-// Announcement: https://devforum.roblox.com/t/official-list-of-deprecated-web-endpoints/62889/62
+// with an octet-stream body; cookie-auth POSTs also follow X-CSRF-TOKEN.
+// References: https://devforum.roblox.com/t/official-list-of-deprecated-web-endpoints/62889/62
+// https://create.roblox.com/docs/cloud/reference/domains/apis
 
 pub const OPEN_CLOUD_BASE: &str = "https://apis.roblox.com";
 pub const ASSET_DELIVERY: &str = "https://assetdelivery.roblox.com";
@@ -64,8 +67,8 @@ pub const GROUPS: &str = "https://groups.roblox.com";
 pub const ECONOMY: &str = "https://economy.roblox.com";
 pub const CATALOG: &str = "https://catalog.roblox.com";
 
-/// Build an Open Cloud place-publish URL.
-pub fn open_cloud_publish_url(universe_id: u64, place_id: u64, published: bool) -> String {
+/// Build the Place Versions API URL (API-key or session-cookie auth).
+pub fn place_versions_url(universe_id: u64, place_id: u64, published: bool) -> String {
     let version_type = if published { "Published" } else { "Saved" };
     format!(
         "{OPEN_CLOUD_BASE}/universes/v1/{universe_id}/places/{place_id}/versions?versionType={version_type}"
