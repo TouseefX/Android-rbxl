@@ -7,6 +7,7 @@ use rbx_dom_weak::{
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct LiveCatalogItem {
@@ -187,6 +188,216 @@ pub fn try_recv_anim_result() -> Option<AnimUploadResult> {
     rx.lock().ok().and_then(|r| r.try_recv().ok())
 }
 
+/// Result of a background `upload_model_async` (Creator Store) call.
+/// `result` is the new model asset id on success, or the error string.
+pub struct ModelUploadResult {
+    pub name: String,
+    pub result: Result<u64, String>,
+}
+
+static MODEL_CHANNEL: OnceLock<(Sender<ModelUploadResult>, Mutex<Receiver<ModelUploadResult>>)> =
+    OnceLock::new();
+
+fn model_channel() -> &'static (Sender<ModelUploadResult>, Mutex<Receiver<ModelUploadResult>>) {
+    MODEL_CHANNEL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+/// Poll for a finished Creator Store model upload (called from the UI thread).
+pub fn try_recv_model_result() -> Option<ModelUploadResult> {
+    let (_, rx) = model_channel();
+    rx.lock().ok().and_then(|r| r.try_recv().ok())
+}
+
+/// Result of the Studio-style client-status/presence bootstrap.
+///
+/// This intentionally reports only metadata. It never echoes authentication
+/// cookies or CSRF tokens into the UI/output log.
+pub struct StudioPresenceResult {
+    pub result: Result<StudioPresenceReport, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StudioPresenceReport {
+    pub user_id: u64,
+    pub username: String,
+    pub browser_tracker_id: u64,
+    pub browser_tracker_source: String,
+    pub client_status_sent: bool,
+    pub client_status_route: String,
+    pub presence_type: Option<u64>,
+    pub presence_label: Option<String>,
+    pub last_location: Option<String>,
+}
+
+impl StudioPresenceReport {
+    pub fn summary(&self) -> String {
+        let presence = match (&self.presence_label, self.presence_type) {
+            (Some(label), Some(kind)) => format!("{label} ({kind})"),
+            (Some(label), None) => label.clone(),
+            (None, Some(kind)) => format!("type {kind}"),
+            (None, None) => "not returned".into(),
+        };
+        let location = self
+            .last_location
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("; location: {s}"))
+            .unwrap_or_default();
+        format!(
+            "Roblox Studio presence bootstrap sent AppStarted for {} ({}) with browserTrackerId {} from {}; accepted by {}; current presence: {}{}",
+            self.username,
+            self.user_id,
+            self.browser_tracker_id,
+            self.browser_tracker_source,
+            self.client_status_route,
+            presence,
+            location
+        )
+    }
+}
+
+static STUDIO_PRESENCE_CHANNEL: OnceLock<(Sender<StudioPresenceResult>, Mutex<Receiver<StudioPresenceResult>>)> =
+    OnceLock::new();
+
+fn studio_presence_channel() -> &'static (Sender<StudioPresenceResult>, Mutex<Receiver<StudioPresenceResult>>) {
+    STUDIO_PRESENCE_CHANNEL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+/// Send the same client-status heartbeat Studio emits on startup.
+///
+/// Native Studio still carries the legacy `www.roblox.com/client-status/set`
+/// route while newer builds also expose the Matchmaking API Beta
+/// `/matchmaking-api/v1/client-status` shape
+/// `{"browserTrackerId":…, "status":"…"}`. At app start it sends
+/// `status = "AppStarted"`; Roblox then decides whether that session appears
+/// as Online/InStudio. We do this as a best-effort authenticated request and
+/// follow it with a read-only presence query so the UI can tell the user what
+/// Roblox currently reports.
+pub fn start_studio_presence_async(cookie: String) {
+    let tx = studio_presence_channel().0.clone();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(|| {
+            WebClient::new_studio_presence_client(&cookie)
+                .and_then(|client| client.bootstrap_studio_presence(&cookie))
+        })
+        .unwrap_or_else(|_| Err("Studio presence worker panicked before returning a result".into()));
+        let _ = tx.send(StudioPresenceResult { result });
+    });
+}
+
+/// Poll for a finished Studio presence bootstrap (called from the UI thread).
+pub fn try_recv_studio_presence_result() -> Option<StudioPresenceResult> {
+    let (_, rx) = studio_presence_channel();
+    rx.lock().ok().and_then(|r| r.try_recv().ok())
+}
+
+/// Auth for the Assets API, in either flavor: Open Cloud (`x-api-key`) or
+/// user-auth (`.ROBLOSECURITY` cookie + `X-CSRF-TOKEN`).
+#[derive(Clone)]
+struct AssetsAuth {
+    api_key: Option<String>,
+    cookie: Option<String>,
+    csrf: Option<String>,
+}
+
+impl AssetsAuth {
+    fn apply(&self, mut req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+        if let Some(key) = &self.api_key {
+            req = req.header("x-api-key", key);
+        }
+        if let Some(cookie) = &self.cookie {
+            req = req.header("Cookie", format!(".ROBLOSECURITY={cookie}"));
+        }
+        if let Some(token) = &self.csrf {
+            req = req.header("X-CSRF-TOKEN", token);
+        }
+        req
+    }
+}
+
+/// Random-enough v4-shaped UUID for `gameJoinAttemptId` (a fresh one per
+/// join attempt, exactly like Studio's CloudEditConnectionModel) without
+/// pulling in a uuid crate: mixes the nanosecond clock through two rounds
+/// of splitmix64.
+fn pseudo_uuid() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut x = (nanos as u64) ^ ((nanos >> 64) as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut mix = || {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    };
+    let a = mix();
+    let b = mix();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        (a >> 16) as u16,
+        (a as u16) & 0x0fff,
+        ((b >> 48) as u16 & 0x3fff) | 0x8000,
+        b & 0x0000_ffff_ffff_ffff,
+    )
+}
+
+/// Minimal percent-encoding for URL query values (RFC 3986 unreserved set
+/// passes through, everything else becomes %XX).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Accept either the raw browser-cookie value or a pasted Cookie header and
+/// return only the `.ROBLOSECURITY` value. Sending
+/// `.ROBLOSECURITY=.ROBLOSECURITY=...` makes Roblox treat the request as a
+/// different/anonymous session, which in turn makes an otherwise fresh CSRF
+/// token look invalid.
+fn normalize_roblosecurity_cookie(raw: &str) -> Result<String, String> {
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err("A .ROBLOSECURITY cookie is required.".into());
+    }
+
+    let lower = input.to_ascii_lowercase();
+    let mut value = if let Some(start) = lower.find(".roblosecurity=") {
+        let start = start + ".roblosecurity=".len();
+        input[start..].split(';').next().unwrap_or_default().trim()
+    } else {
+        input
+    };
+    if value.len() >= 2 {
+        let quoted = (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\''));
+        if quoted {
+            value = &value[1..value.len() - 1];
+        }
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("The .ROBLOSECURITY cookie value is empty.".into());
+    }
+    Ok(value.to_string())
+}
+
 /// Truncate a response body to a short snippet for error messages.
 fn snippet(s: &str) -> String {
     s.chars().take(400).collect::<String>()
@@ -242,18 +453,128 @@ impl RobloxApiClient {
         name: &str,
         rbxm_bytes: &[u8],
     ) -> Result<u64, String> {
+        Self::upload_asset_open_cloud(api_key, creator_id, is_group, "Animation", name, rbxm_bytes)
+    }
+
+    /// Upload a `.rbxm` model (any subtree — Scripts, ModuleScripts, Folders,
+    /// Models) to the Creator Store as a new Model asset via the Open Cloud
+    /// Assets API. Same flow as `upload_animation`, just `assetType:"Model"`.
+    pub fn upload_model(
+        api_key: &str,
+        creator_id: &str,
+        is_group: bool,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        Self::upload_asset_open_cloud(api_key, creator_id, is_group, "Model", name, rbxm_bytes)
+    }
+
+    /// Open Cloud (`x-api-key`) flavor of the Assets API upload.
+    fn upload_asset_open_cloud(
+        api_key: &str,
+        creator_id: &str,
+        is_group: bool,
+        asset_type: &str,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
         let key = api_key.trim();
-        let creator = creator_id.trim().trim_matches('"');
         if key.is_empty() {
             return Err(
                 "An Open Cloud API key (asset Read+Write) is required. Set it in the Open Cloud tab.".into(),
             );
         }
+        let auth = AssetsAuth { api_key: Some(key.to_string()), cookie: None, csrf: None };
+        Self::upload_asset_via_assets_api(
+            "https://apis.roblox.com/assets/v1",
+            &auth,
+            creator_id,
+            is_group,
+            asset_type,
+            name,
+            rbxm_bytes,
+        )
+    }
+
+    /// Cookie (`user-auth`) flavor of the Assets API upload — the same
+    /// endpoint shape as Open Cloud but authenticated with the account's
+    /// `.ROBLOSECURITY` cookie + X-CSRF-TOKEN (the path Rojo uses; see
+    /// roblox-cookie-upload-endpoints.md §2). No API key needed.
+    fn upload_asset_user_auth(
+        cookie: &str,
+        creator_id: &str,
+        is_group: bool,
+        asset_type: &str,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        if cookie.trim().is_empty() {
+            return Err("A .ROBLOSECURITY cookie is required.".into());
+        }
+        // Pre-fetch a CSRF token via the standard logout handshake; if it's
+        // stale the create call's own 403-retry refreshes it anyway.
+        let csrf = Self::fetch_csrf_token(cookie).ok();
+        let auth = AssetsAuth {
+            api_key: None,
+            cookie: Some(cookie.trim().to_string()),
+            csrf,
+        };
+        Self::upload_asset_via_assets_api(
+            "https://apis.roblox.com/assets/user-auth/v1",
+            &auth,
+            creator_id,
+            is_group,
+            asset_type,
+            name,
+            rbxm_bytes,
+        )
+    }
+
+    /// Standard CSRF handshake: POST auth.roblox.com/v2/logout with the
+    /// cookie, read the fresh token from the 403 response's x-csrf-token
+    /// header (roblox-cookie-upload-endpoints.md §0).
+    fn fetch_csrf_token(cookie: &str) -> Result<String, String> {
+        let cookie = normalize_roblosecurity_cookie(cookie)?;
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("rbxl-editor")
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
+        let resp = http
+            .post("https://auth.roblox.com/v2/logout")
+            .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
+            .header("Content-Length", "0")
+            .send()
+            .map_err(|e| format!("CSRF handshake error: {e}"))?;
+        resp.headers()
+            .get("x-csrf-token")
+            .and_then(|t| t.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| "No x-csrf-token header in handshake response".into())
+    }
+
+    /// Shared Assets API upload used by BOTH auth flavors (see
+    /// roblox-cookie-upload-endpoints.md §2): create the asset, poll the
+    /// operation, return the new asset id. `asset_type` is the asset type
+    /// string ("Animation", "Model", …).
+    ///
+    /// - Open Cloud:  base `assets/v1`,        auth = `x-api-key`
+    /// - user-auth:   base `assets/user-auth/v1`, auth = cookie + X-CSRF-TOKEN
+    fn upload_asset_via_assets_api(
+        base_url: &str,
+        auth: &AssetsAuth,
+        creator_id: &str,
+        is_group: bool,
+        asset_type: &str,
+        name: &str,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        let creator = creator_id.trim().trim_matches('"');
         if creator.is_empty() || creator.parse::<u64>().is_err() {
             return Err("Enter a valid numeric Creator User ID (or Group ID).".into());
         }
         if rbxm_bytes.is_empty() {
-            return Err("Nothing to upload (empty animation data).".into());
+            return Err("Nothing to upload (empty asset data).".into());
         }
 
         let http = reqwest::blocking::Client::builder()
@@ -267,25 +588,42 @@ impl RobloxApiClient {
         let creator_key = if is_group { "groupId" } else { "userId" };
         let name_json = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());
         let request_json = format!(
-            "{{\"assetType\":\"Animation\",\"displayName\":{name_json},\"creationContext\":{{\"creator\":{{\"{creator_key}\":\"{creator}\"}}}}}}"
+            "{{\"assetType\":\"{asset_type}\",\"displayName\":{name_json},\"creationContext\":{{\"creator\":{{\"{creator_key}\":\"{creator}\"}}}}}}"
         );
 
         let boundary = "----rbxlEditorBoundary5b9f0c2e7d11";
         let body = build_assets_multipart(boundary, &request_json, rbxm_bytes);
 
         // 1) Create the asset -> returns {"path":"operations/{opId}"}.
-        let resp = http
-            .post("https://apis.roblox.com/assets/v1/assets")
-            .header("x-api-key", key)
-            .header(
-                "Content-Type",
-                format!("multipart/form-data; boundary={boundary}"),
-            )
-            .body(body)
-            .send()
-            .map_err(|e| format!("Upload network error: {e}"))?;
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
+        // With cookie auth Roblox may answer 403 + a fresh x-csrf-token
+        // header (the standard CSRF challenge) — retry once with it.
+        let mut auth = auth.clone();
+        let mut attempt = 0;
+        let (status, text) = loop {
+            attempt += 1;
+            let resp = auth
+                .apply(http.post(format!("{base_url}/assets")))
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body.clone())
+                .send()
+                .map_err(|e| format!("Upload network error: {e}"))?;
+            let status = resp.status();
+            if attempt == 1 && auth.cookie.is_some() && !status.is_success() {
+                if let Some(token) = resp
+                    .headers()
+                    .get("x-csrf-token")
+                    .and_then(|t| t.to_str().ok())
+                {
+                    auth.csrf = Some(token.to_string());
+                    continue;
+                }
+            }
+            let text = resp.text().unwrap_or_default();
+            break (status, text);
+        };
         if !status.is_success() {
             let msg = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
@@ -308,11 +646,11 @@ impl RobloxApiClient {
         }
 
         // 2) Poll the operation until done, then read response.assetId.
-        let op_url = format!("https://apis.roblox.com/assets/v1/operations/{op_id}");
+        let op_url = format!("{base_url}/operations/{op_id}");
         let mut last = String::new();
         for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(750));
-            let resp = match http.get(&op_url).header("x-api-key", key).send() {
+            let resp = match auth.apply(http.get(&op_url)).send() {
                 Ok(r) => r,
                 Err(e) => return Err(format!("Operation poll error: {e}")),
             };
@@ -340,7 +678,7 @@ impl RobloxApiClient {
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("unknown error");
-                return Err(format!("Roblox rejected the animation: {msg}"));
+                return Err(format!("Roblox rejected the {asset_type}: {msg}"));
             }
             let response = match v.get("response") {
                 Some(r) => r,
@@ -358,7 +696,7 @@ impl RobloxApiClient {
                 .and_then(|s| s.as_str())
             {
                 if state.contains("REJECTED") || state.contains("BANNED") {
-                    return Err(format!("Animation was moderated ({state}) and not published."));
+                    return Err(format!("{asset_type} was moderated ({state}) and not published."));
                 }
             }
             let id_str = response
@@ -376,9 +714,347 @@ impl RobloxApiClient {
             return Ok(id);
         }
         Err(format!(
-            "Animation upload timed out waiting for Roblox to finish processing. Last status: {}",
+            "{asset_type} upload timed out waiting for Roblox to finish processing. Last status: {}",
             snippet(&last)
         ))
+    }
+
+    /// Upload a `.rbxm` as a Model asset through the LEGACY cookie-based
+    /// endpoint (`data.roblox.com/Data/Upload.ashx`) — the same endpoint old
+    /// Studio plugins used. Needs only a `.ROBLOSECURITY` cookie (no Open
+    /// Cloud key) and handles Roblox's X-CSRF-TOKEN challenge: the first POST
+    /// gets a 403 carrying the token, then we retry once with it attached.
+    /// The response body on success is the new asset id.
+    pub fn upload_model_legacy(
+        cookie: &str,
+        name: &str,
+        group_id: Option<&str>,
+        rbxm_bytes: &[u8],
+    ) -> Result<u64, String> {
+        // json=1 -> {"id":...} JSON instead of a bare assetVersionId; groupId
+        // uploads the model into a group's inventory instead of the user's.
+        let mut url = format!(
+            "https://data.roblox.com/Data/Upload.ashx?json=1&assetid=0&type=Model&genreTypeId=1&name={}&description={}&ispublic=False&allowComments=False",
+            urlencode(name),
+            urlencode("Uploaded from Android rbxl editor"),
+        );
+        if let Some(gid) = group_id {
+            if !gid.trim().is_empty() {
+                url.push_str(&format!("&groupId={}", urlencode(gid.trim())));
+            }
+        }
+        let text = Self::post_upload_ashx(cookie, &url, rbxm_bytes)?;
+        // json=1 -> {"id":...}; be liberal and also accept a bare number.
+        let id = serde_json::from_str::<serde_json::Value>(text.trim())
+            .ok()
+            .and_then(|v| {
+                v.get("id")
+                    .or_else(|| v.get("assetId"))
+                    .or_else(|| v.get("AssetId"))
+                    .and_then(|x| {
+                        x.as_u64()
+                            .or_else(|| x.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
+            })
+            .or_else(|| text.trim().parse::<u64>().ok())
+            .ok_or_else(|| {
+                format!("Legacy upload returned an unexpected response: {}", snippet(&text))
+            })?;
+        if id == 0 {
+            return Err("Legacy upload returned asset id 0.".into());
+        }
+        Ok(id)
+    }
+
+    /// Publish (overwrite) an EXISTING place through the same hidden
+    /// endpoint: `Data/Upload.ashx?assetid={placeId}&type=Place` with the
+    /// raw `.rbxl` as the body — the way `rojo upload` and older bots pushed
+    /// places for years (roblox-cookie-upload-endpoints.md §4). Cookie-only:
+    /// no Open Cloud API key needed, but the account must have edit access
+    /// to the place. Returns a human-readable success message.
+    pub fn publish_place_legacy(
+        cookie: &str,
+        place_id: &str,
+        rbxl_bytes: &[u8],
+    ) -> Result<String, String> {
+        let pid = place_id.trim();
+        if pid.is_empty() || pid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Place ID first.".into());
+        }
+        let url = format!(
+            "https://data.roblox.com/Data/Upload.ashx?json=1&assetid={pid}&type=Place&genreTypeId=1"
+        );
+        let text = Self::post_upload_ashx(cookie, &url, rbxl_bytes)?;
+        // Success body is a version/asset id (bare or {"id":...}); any 2xx
+        // means the new version was accepted.
+        let version = serde_json::from_str::<serde_json::Value>(text.trim())
+            .ok()
+            .and_then(|v| v.get("id").and_then(|x| x.as_u64()))
+            .map(|id| format!(" (version id {id})"))
+            .unwrap_or_else(|| {
+                let t = text.trim();
+                if t.is_empty() || t.parse::<u64>().is_err() {
+                    String::new()
+                } else {
+                    format!(" (version id {t})")
+                }
+            });
+        Ok(format!("Place {pid} updated via Upload.ashx{version}"))
+    }
+
+    /// Shared POST to the hidden `Data/Upload.ashx` endpoint with full CSRF
+    /// challenge handling. The token must come from the session represented
+    /// by the exact Cookie header sent to this endpoint. Ask Upload.ashx for
+    /// its own challenge first, then follow every replacement token it sends
+    /// for a few attempts (Roblox can intermittently rotate/reject a token).
+    /// This endpoint's broken error page can answer HTTP 500 instead of 403
+    /// while still returning the usable `x-csrf-token` response header.
+    fn post_upload_ashx(cookie: &str, url: &str, bytes: &[u8]) -> Result<String, String> {
+        if bytes.is_empty() {
+            return Err("Nothing to upload (empty data).".into());
+        }
+        let cookie = normalize_roblosecurity_cookie(cookie)?;
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("Roblox/WinInet")
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
+
+        let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
+            let mut req = http
+                .post(url)
+                .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
+                .header("Requester", "Client")
+                .header("Content-Type", "application/xml")
+                .body(bytes.to_vec());
+            if let Some(token) = csrf {
+                req = req.header("X-CSRF-TOKEN", token);
+            }
+            req.send().map_err(|e| format!("Upload network error: {e}"))
+        };
+
+        // Deliberately begin without a token. Unlike a logout-prefetched
+        // token, the challenge returned here is guaranteed to correspond to
+        // this upload host, Cookie header, and request flow.
+        let mut csrf: Option<String> = None;
+        let mut tried_logout_fallback = false;
+        let mut last_failure: Option<(reqwest::StatusCode, String)> = None;
+        for attempt in 1..=4 {
+            let resp = send(csrf.as_deref())?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp.text().unwrap_or_default());
+            }
+
+            // Read this before consuming the response body. Follow a fresh
+            // token regardless of 403 vs 500: Upload.ashx is known to emit
+            // the wrong status when rendering its CSRF error page.
+            let challenged_token = resp
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|t| t.to_str().ok())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            let text = resp.text().unwrap_or_default();
+            last_failure = Some((status, text));
+
+            if attempt < 4 {
+                if let Some(token) = challenged_token {
+                    csrf = Some(token);
+                    continue;
+                }
+
+                // Very old/broken Upload.ashx responses occasionally omit
+                // the challenge header. Keep the standard logout handshake
+                // as a one-time fallback, but never prefer it over the token
+                // challenged by the actual upload request.
+                if !tried_logout_fallback {
+                    tried_logout_fallback = true;
+                    if let Ok(token) = Self::fetch_csrf_token(&cookie) {
+                        csrf = Some(token);
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+
+        let (status, text) = last_failure
+            .unwrap_or((reqwest::StatusCode::INTERNAL_SERVER_ERROR, String::new()));
+        Err(format!(
+            "Upload.ashx failed after CSRF refresh (HTTP {status}): {}",
+            snippet(&text)
+        ))
+    }
+
+    /// Team Create join negotiation (team-create-sessions-explained.md §1b):
+    /// `POST gamejoin.roblox.com/v1/team-create` (or `…/team-create-preemptive`
+    /// to warm the cloud-edit server up early) with
+    /// `{placeId, gameJoinAttemptId}` — the same request Studio's
+    /// CloudEditConnectionModel::constructTeamCreateGameJoinRequest builds.
+    /// The response is the join CONFIG: either `Address`/`Port` or a
+    /// `ServerPort` + `UdmuxEndpoints` list — i.e. where the UDP replication
+    /// socket would connect. We return the raw JSON for inspection; actually
+    /// speaking the RakNet replication protocol is the (future) engine part.
+    pub fn team_create_join(
+        cookie: &str,
+        place_id: &str,
+        preemptive: bool,
+    ) -> Result<serde_json::Value, String> {
+        let pid = place_id.trim();
+        let pid_num = pid
+            .parse::<u64>()
+            .map_err(|_| "Enter a valid numeric Place ID first.".to_string())?;
+        let url = if preemptive {
+            "https://gamejoin.roblox.com/v1/team-create-preemptive"
+        } else {
+            "https://gamejoin.roblox.com/v1/team-create"
+        };
+        // gamejoin endpoints check the User-Agent — use the client one.
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("Roblox/WinInet")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("HTTP client build error: {e}"))?;
+        let attempt_id = pseudo_uuid();
+        let body = serde_json::json!({
+            "placeId": pid_num,
+            "gameJoinAttemptId": attempt_id,
+        });
+
+        let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
+            let mut req = http
+                .post(url)
+                .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .json(&body);
+            if let Some(token) = csrf {
+                req = req.header("X-CSRF-TOKEN", token);
+            }
+            req.send().map_err(|e| format!("gamejoin network error: {e}"))
+        };
+
+        let mut resp = match Self::fetch_csrf_token(cookie) {
+            Ok(token) => send(Some(&token))?,
+            Err(_) => send(None)?,
+        };
+        if !resp.status().is_success() {
+            let token = resp
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|t| t.to_str().ok())
+                .map(str::to_string);
+            if let Some(token) = token {
+                resp = send(Some(&token))?;
+            }
+        }
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "Join negotiation failed (HTTP {status}): {}",
+                snippet(&text)
+            ));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| format!("gamejoin returned non-JSON ({e}): {}", snippet(&text)))
+    }
+
+    /// Fire-and-forget background Creator Store upload. Tries the Open Cloud
+    /// Assets API first when an API key is configured (auto-resolving the
+    /// user id from the cookie if no creator id was entered), then falls back
+    /// to the legacy cookie-authenticated upload endpoint. The result is
+    /// delivered through the model channel and picked up in `drain_events`.
+    pub fn upload_model_async(
+        api_key: Option<String>,
+        creator_id: String,
+        is_group: bool,
+        cookie_opt: Option<String>,
+        name: String,
+        rbxm_bytes: Vec<u8>,
+    ) {
+        let tx = model_channel().0.clone();
+        std::thread::spawn(move || {
+            let mut errors: Vec<String> = Vec::new();
+
+            // Resolve the creator id once: explicit entry wins, otherwise a
+            // group upload requires the Group ID, otherwise auto-detect the
+            // User ID from the cookie (whoami).
+            let creator: Result<String, String> = if !creator_id.trim().is_empty() {
+                Ok(creator_id.trim().to_string())
+            } else if is_group {
+                Err("Enter the Group ID for group uploads.".into())
+            } else if let Some(cookie) = cookie_opt.as_deref() {
+                WebClient::new(cookie)
+                    .and_then(|c| c.whoami())
+                    .map(|(uid, _)| uid.to_string())
+                    .map_err(|e| {
+                        format!("could not determine your User ID from the cookie: {e}")
+                    })
+            } else {
+                Err("enter a Creator User ID or set your .ROBLOSECURITY cookie".into())
+            };
+
+            // 1) Open Cloud Assets API (x-api-key) when an API key is set.
+            if let Some(key) = api_key.as_deref() {
+                match &creator {
+                    Ok(creator) => {
+                        match RobloxApiClient::upload_model(key, creator, is_group, &name, &rbxm_bytes)
+                        {
+                            Ok(id) => {
+                                let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
+                                return;
+                            }
+                            Err(e) => errors.push(format!("Open Cloud: {e}")),
+                        }
+                    }
+                    Err(e) => errors.push(format!("Open Cloud: {e}")),
+                }
+            }
+
+            // 2) Cookie user-auth Assets API — same pipeline, no key needed.
+            if let Some(cookie) = cookie_opt.as_deref() {
+                match &creator {
+                    Ok(creator) => {
+                        match RobloxApiClient::upload_asset_user_auth(
+                            cookie, creator, is_group, "Model", &name, &rbxm_bytes,
+                        ) {
+                            Ok(id) => {
+                                let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
+                                return;
+                            }
+                            Err(e) => errors.push(format!("user-auth API: {e}")),
+                        }
+                    }
+                    Err(e) => errors.push(format!("user-auth API: {e}")),
+                }
+
+                // 3) Last resort: the classic hidden Upload.ashx endpoint
+                //    (supports group uploads via &groupId=).
+                let group_id = if is_group { creator.as_deref().ok() } else { None };
+                if !is_group || group_id.is_some() {
+                    match RobloxApiClient::upload_model_legacy(cookie, &name, group_id, &rbxm_bytes)
+                    {
+                        Ok(id) => {
+                            let _ = tx.send(ModelUploadResult { name, result: Ok(id) });
+                            return;
+                        }
+                        Err(e) => errors.push(format!("Upload.ashx: {e}")),
+                    }
+                }
+            }
+
+            if errors.is_empty() {
+                errors.push(
+                    "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first."
+                        .into(),
+                );
+            }
+            errors.dedup();
+            let _ = tx.send(ModelUploadResult { name, result: Err(errors.join(" — also tried ")) });
+        });
     }
 
     /// Fire-and-forget background wrapper around `upload_animation`. The
@@ -2734,6 +3410,152 @@ fn get_curated_fallback(query: &str) -> Vec<LiveCatalogItem> {
 
 use std::collections::HashMap;
 
+fn percent_decode_ascii(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn percent_encode_query_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn extract_browser_tracker_id_from_value(value: &str) -> Option<u64> {
+    let decoded;
+    let values: [&str; 2] = if value.contains('%') {
+        decoded = percent_decode_ascii(value);
+        [value, decoded.as_str()]
+    } else {
+        [value, value]
+    };
+
+    for candidate in values {
+        for pair in candidate.split('&') {
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("browserid")
+                || name.eq_ignore_ascii_case("browserTrackerId")
+            {
+                if let Ok(id) = value.trim().parse::<u64>() {
+                    if id != 0 {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_browser_tracker_id(raw_cookie_or_header: &str) -> Option<u64> {
+    let mut candidates = Vec::new();
+    for part in raw_cookie_or_header.split(';') {
+        let part = part.trim();
+        let lower = part.to_ascii_lowercase();
+        if lower.starts_with("rbxeventtrackerv2=") {
+            let value = part.split_once('=').map(|(_, value)| value).unwrap_or_default();
+            candidates.push(value.to_string());
+        } else if lower.starts_with("browsertrackerid=") || lower.starts_with("browserid=") {
+            if let Some((_, value)) = part.split_once('=') {
+                if let Ok(id) = value.trim().parse::<u64>() {
+                    if id != 0 {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+    }
+
+    candidates
+        .iter()
+        .find_map(|value| extract_browser_tracker_id_from_value(value))
+}
+
+fn synthesized_browser_tracker_id(user_id: u64) -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut mixed = nanos ^ user_id.rotate_left(17) ^ 0x5deece66d_u64;
+    // A tiny SplitMix64 round keeps nearby user/time values from producing
+    // visibly related IDs. The result is metadata only; it is not a secret.
+    mixed = mixed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    10_000_000_000 + (mixed % 90_000_000_000)
+}
+
+fn summarize_http_body(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 240;
+    let mut chars = compact.chars();
+    let prefix: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        compact
+    }
+}
+
+fn find_u64_key_recursive(value: &serde_json::Value, wanted: &[&str]) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if wanted.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)) {
+                    if let Some(number) = child
+                        .as_u64()
+                        .or_else(|| child.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    {
+                        return Some(number);
+                    }
+                }
+            }
+            map.values()
+                .find_map(|child| find_u64_key_recursive(child, wanted))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_u64_key_recursive(child, wanted)),
+        _ => None,
+    }
+}
+
+fn presence_label(kind: u64) -> &'static str {
+    match kind {
+        0 => "Offline",
+        1 => "Online",
+        2 => "InGame",
+        3 => "InStudio",
+        4 => "Invisible",
+        _ => "Unknown",
+    }
+}
+
 /// A minimal CSRF-token-aware Roblox web client. All requests carry the
 /// `.ROBLOSECURITY` cookie; POSTs transparently fetch and retry with the
 /// `X-CSRF-Token` returned from a 403 challenge.
@@ -2745,13 +3567,41 @@ pub struct WebClient {
 
 impl WebClient {
     pub fn new(cookie: impl Into<String>) -> Result<Self, String> {
+        let cookie = cookie.into();
+        Self::new_with_raw_cookie(&cookie)
+    }
+
+    /// Build a cookie-authenticated web client while accepting either a raw
+    /// `.ROBLOSECURITY` value or a pasted browser `Cookie:` header.
+    pub fn new_with_raw_cookie(cookie: &str) -> Result<Self, String> {
+        Self::new_with_raw_cookie_timeout(cookie, std::time::Duration::from_secs(20))
+    }
+
+    /// Build the short-deadline client used by the Settings-panel Studio
+    /// presence bootstrap. That path is only a small status heartbeat plus a
+    /// read-back query; using the longer asset/config timeout made the UI look
+    /// permanently stuck on Android when one Roblox edge endpoint black-holed.
+    fn new_studio_presence_client(cookie: &str) -> Result<Self, String> {
+        Self::new_with_raw_cookie_timeout(cookie, std::time::Duration::from_secs(8))
+    }
+
+    fn new_with_raw_cookie_timeout(
+        cookie: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self, String> {
+        let cookie = if cookie.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_roblosecurity_cookie(cookie)?
+        };
         let http = reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0 rbxl-editor")
-            .timeout(std::time::Duration::from_secs(20))
+            .user_agent("RobloxStudio/WinInet rbxl-editor")
+            .connect_timeout(timeout)
+            .timeout(timeout)
             .build()
             .map_err(|e| format!("HTTP client build: {e}"))?;
         Ok(Self {
-            cookie: cookie.into(),
+            cookie,
             csrf: std::cell::RefCell::new(None),
             http,
         })
@@ -2798,13 +3648,28 @@ impl WebClient {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        let text = self.send_json_text(url, method, body)?;
+        // Some develop endpoints (universe activate/deactivate) answer 200
+        // with an empty body — that's a success, not a JSON error.
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|e| format!("bad JSON from {url}: {e}"))
+    }
+
+    fn send_json_text(
+        &self,
+        url: &str,
+        method: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, String> {
         // First attempt (possibly without a token).
-        match self.try_send_json(url, method, body, self.csrf.borrow().clone()) {
+        match self.try_send_json_text(url, method, body, self.csrf.borrow().clone()) {
             Ok(v) => return Ok(v),
             Err(SendError::NeedsToken(new_token)) => {
                 // Server told us the correct token; cache and retry once.
                 *self.csrf.borrow_mut() = Some(new_token.clone());
-                self.try_send_json(url, method, body, Some(new_token))
+                self.try_send_json_text(url, method, body, Some(new_token))
                     .map_err(|e| match e {
                         SendError::Http(s) => s,
                         SendError::NeedsToken(_) => {
@@ -2816,19 +3681,19 @@ impl WebClient {
         }
     }
 
-    fn try_send_json(
+    fn try_send_json_text(
         &self,
         url: &str,
         method: &str,
         body: &serde_json::Value,
         csrf: Option<String>,
-    ) -> Result<serde_json::Value, SendError> {
+    ) -> Result<String, SendError> {
         let mut req = self
             .http
             .request(method.parse().map_err(|_| SendError::Http("bad method".into()))?, url)
             .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
+            .header("Accept", "application/json, text/plain, */*");
         if let Some(t) = csrf {
             req = req.header("X-CSRF-Token", t);
         }
@@ -2849,12 +3714,51 @@ impl WebClient {
             .text()
             .map_err(|e| SendError::Http(format!("read body: {e}")))?;
         if !status.is_success() {
-            return Err(SendError::Http(format!("{method} {url} → {status}: {text}")));
+            return Err(SendError::Http(format!(
+                "{method} {url} → {status}: {}",
+                summarize_http_body(&text)
+            )));
         }
-        serde_json::from_str(&text)
-            .map_err(|e| SendError::Http(format!("bad JSON from {url}: {e}")))
+        Ok(text)
     }
 
+    fn get_text_authenticated(&self, url: &str) -> Result<String, String> {
+        let resp = self
+            .http
+            .get(url)
+            .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
+            .header("Accept", "text/plain, */*")
+            .send()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().map_err(|e| format!("read body: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "GET {url} → {status}: {}",
+                summarize_http_body(&text)
+            ));
+        }
+        Ok(text)
+    }
+
+    fn browser_tracker_id_from_homepage_cookie(&self) -> Option<u64> {
+        let resp = self
+            .http
+            .get("https://www.roblox.com/")
+            .header("Cookie", format!(".ROBLOSECURITY={}", self.cookie))
+            .header("Accept", "text/html, */*")
+            .send()
+            .ok()?;
+        for value in resp.headers().get_all("set-cookie").iter() {
+            let Ok(cookie) = value.to_str() else {
+                continue;
+            };
+            if let Some(id) = extract_browser_tracker_id(cookie) {
+                return Some(id);
+            }
+        }
+        None
+    }
     // ---- High-level helpers ------------------------------------------------
 
     /// Fetch the currently authenticated user's id/username.
@@ -2865,11 +3769,265 @@ impl WebClient {
         Ok((id, name))
     }
 
+    /// Resolve the BrowserTrackerId Studio passes to the client-status
+    /// endpoint. Native clients prefer the browser's RBXEventTrackerV2 cookie;
+    /// if the saved value is only a raw `.ROBLOSECURITY`, try authenticated
+    /// app-launch-info and the www.roblox.com Set-Cookie bootstrap before
+    /// synthesizing a non-zero per-launch id. Sending zero made the previous
+    /// implementation look accepted while not moving visible presence.
+    fn browser_tracker_id(&self, raw_cookie_or_header: &str, user_id: u64) -> (u64, String) {
+        if let Some(id) = extract_browser_tracker_id(raw_cookie_or_header) {
+            return (id, "cookie/header RBXEventTrackerV2".into());
+        }
+        if let Some(id) = self
+            .get_json("https://users.roblox.com/v1/users/authenticated/app-launch-info")
+            .ok()
+            .and_then(|value| {
+                find_u64_key_recursive(
+                    &value,
+                    &["browserTrackerId", "suggestedBrowserTrackerId", "browserId"],
+                )
+            })
+            .filter(|id| *id != 0)
+        {
+            return (id, "authenticated app-launch-info".into());
+        }
+        if let Some(id) = self.browser_tracker_id_from_homepage_cookie() {
+            return (id, "www.roblox.com Set-Cookie".into());
+        }
+        (
+            synthesized_browser_tracker_id(user_id),
+            "generated non-zero fallback".into(),
+        )
+    }
+
+    /// POST Studio's startup client-status heartbeat. Studio still carries the
+    /// legacy `www.roblox.com/client-status/set` path in the status reporting
+    /// code path while newer builds also expose the Matchmaking API Beta
+    /// endpoint. The Settings-panel worker uses short HTTP deadlines; try the
+    /// native/legacy GET first because it avoids the CSRF challenge and is the
+    /// exact URL shape present in older native error/status paths, then fall
+    /// back through the JSON legacy POST and Beta endpoint. Return as soon as
+    /// one route is accepted so a slow secondary endpoint cannot leave the UI
+    /// stuck on "Sending…".
+    fn set_client_status(&self, status: &str, browser_tracker_id: u64) -> Result<String, String> {
+        let body = serde_json::json!({
+            "status": status,
+            "browserTrackerId": browser_tracker_id,
+        });
+        let mut errors = Vec::new();
+
+        let legacy_get = format!(
+            "https://www.roblox.com/client-status/set?browserTrackerId={browser_tracker_id}&status={}",
+            percent_encode_query_component(status)
+        );
+        match self.get_text_authenticated(&legacy_get) {
+            Ok(_) => return Ok("www/client-status/set GET".into()),
+            Err(error) => errors.push(format!("legacy GET: {error}")),
+        }
+
+        match self.send_json_text(
+            "https://www.roblox.com/client-status/set",
+            "POST",
+            &body,
+        ) {
+            Ok(_) => return Ok("www/client-status/set POST".into()),
+            Err(error) => errors.push(format!("legacy POST: {error}")),
+        }
+
+        match self.send_json_text(
+            "https://apis.roblox.com/matchmaking-api/v1/client-status",
+            "POST",
+            &body,
+        ) {
+            Ok(_) => return Ok("matchmaking-api client-status POST".into()),
+            Err(error) => errors.push(format!("matchmaking POST: {error}")),
+        }
+
+        Err(format!(
+            "all Studio client-status writes failed: {}",
+            errors.join(" | ")
+        ))
+    }
+
+    /// Query Roblox's public presence endpoint for one user. This is a
+    /// read-only verification of what the website/profile currently reports.
+    fn query_presence(&self, user_id: u64) -> Result<(Option<u64>, Option<String>, Option<String>), String> {
+        let value = self.post_json(
+            "https://presence.roblox.com/v1/presence/users",
+            &serde_json::json!({ "userIds": [user_id] }),
+        )?;
+        let Some(entry) = value
+            .get("userPresences")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+        else {
+            return Ok((None, None, None));
+        };
+        let kind = entry.get("userPresenceType").and_then(|v| v.as_u64());
+        let label = kind.map(|kind| presence_label(kind).to_string());
+        let last_location = entry
+            .get("lastLocation")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        Ok((kind, label, last_location))
+    }
+
+    /// Best-effort Studio profile-status bootstrap used when the app opens.
+    /// Roblox ultimately owns whether the account appears as Online or
+    /// InStudio; we send the supported Studio startup status and report the
+    /// current presence back to the UI.
+    pub fn bootstrap_studio_presence(
+        &self,
+        raw_cookie_or_header: &str,
+    ) -> Result<StudioPresenceReport, String> {
+        let (user_id, username) = self.whoami()?;
+        let (browser_tracker_id, browser_tracker_source) =
+            self.browser_tracker_id(raw_cookie_or_header, user_id);
+        let client_status_route = self.set_client_status("AppStarted", browser_tracker_id)?;
+        let (presence_type, presence_label, last_location) = self
+            .query_presence(user_id)
+            .unwrap_or((None, None, None));
+        Ok(StudioPresenceReport {
+            user_id,
+            username,
+            browser_tracker_id,
+            browser_tracker_source,
+            client_status_sent: true,
+            client_status_route,
+            presence_type,
+            presence_label,
+            last_location,
+        })
+    }
+
     /// Download a place/universe's `.rbxl` (or `.rbxlx`) as raw bytes by
     /// place asset ID. Same endpoint Studio uses; requires the cookie to have
     /// edit permission for the place.
     pub fn download_place(&self, place_id: u64) -> Result<Vec<u8>, String> {
         RobloxApiClient::fetch_asset_payload_sync(place_id, Some(&self.cookie))
+    }
+
+    // ---- Game (experience) configuration ------------------------------------
+
+    /// Public game info for a universe (name, description, playing, visits,
+    /// maxPlayers, …) — `games.roblox.com/v1/games?universeIds=`.
+    pub fn get_game_info(&self, universe_id: &str) -> Result<serde_json::Value, String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        let v = self.get_json(&format!(
+            "https://games.roblox.com/v1/games?universeIds={uid}"
+        ))?;
+        v.get("data")
+            .and_then(|d| d.get(0))
+            .cloned()
+            .ok_or_else(|| format!("Universe {uid} not found (empty games response)"))
+    }
+
+    /// Edit the universe (experience) configuration through the
+    /// cookie-authenticated develop API: `PATCH
+    /// develop.roblox.com/v2/universes/{id}/configuration`, falling back to
+    /// the older v1 route if v2 rejects the request. Only the fields present
+    /// in `body` are changed (e.g. {"name": "...", "description": "..."}).
+    pub fn update_universe_configuration(
+        &self,
+        universe_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        match self.patch_json(
+            &format!("https://develop.roblox.com/v2/universes/{uid}/configuration"),
+            body,
+        ) {
+            Ok(v) => Ok(v),
+            Err(e2) => self
+                .patch_json(
+                    &format!("https://develop.roblox.com/v1/universes/{uid}/configuration"),
+                    body,
+                )
+                .map_err(|e1| format!("v2: {e2} — v1 fallback: {e1}")),
+        }
+    }
+
+    /// Edit a place's configuration (name, description, maxPlayerCount,
+    /// allowCopying, …) via `PATCH develop.roblox.com/v2/places/{placeId}`.
+    pub fn update_place_configuration(
+        &self,
+        place_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let pid = place_id.trim();
+        if pid.is_empty() || pid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Place ID first.".into());
+        }
+        self.patch_json(&format!("https://develop.roblox.com/v2/places/{pid}"), body)
+    }
+
+    /// Make the experience public (activate) or private (deactivate):
+    /// `POST develop.roblox.com/v1/universes/{id}/activate|deactivate`.
+    pub fn set_universe_active(&self, universe_id: &str, active: bool) -> Result<(), String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        let action = if active { "activate" } else { "deactivate" };
+        self.post_json(
+            &format!("https://develop.roblox.com/v1/universes/{uid}/{action}"),
+            &serde_json::json!({}),
+        )?;
+        Ok(())
+    }
+
+    // ---- Team Create (cloud edit) REST control plane -------------------------
+    // These are the exact routes Studio's ApiTeamCreateUrlConstruction builds
+    // (team-create-sessions-explained.md §1a) — Stage 0 of a Team Create
+    // client: session status, membership, and the on/off switch.
+
+    /// Is Team Create enabled for this universe?
+    /// `GET develop.roblox.com/v1/universes/{id}/teamcreate` → {"isEnabled":bool}
+    pub fn team_create_status(&self, universe_id: &str) -> Result<serde_json::Value, String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        self.get_json(&format!(
+            "https://develop.roblox.com/v1/universes/{uid}/teamcreate"
+        ))
+    }
+
+    /// Turn Team Create on or off for a universe:
+    /// `PATCH develop.roblox.com/v1/universes/{id}/teamcreate` {"isEnabled":…}.
+    pub fn team_create_set_enabled(
+        &self,
+        universe_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let uid = universe_id.trim();
+        if uid.is_empty() || uid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Universe ID first.".into());
+        }
+        self.patch_json(
+            &format!("https://develop.roblox.com/v1/universes/{uid}/teamcreate"),
+            &serde_json::json!({ "isEnabled": enabled }),
+        )?;
+        Ok(())
+    }
+
+    /// Who is in the ACTIVE cloud-edit session of a place right now:
+    /// `GET develop.roblox.com/v1/places/{placeId}/teamcreate/active_session/members`.
+    pub fn team_create_members(&self, place_id: &str) -> Result<serde_json::Value, String> {
+        let pid = place_id.trim();
+        if pid.is_empty() || pid.parse::<u64>().is_err() {
+            return Err("Enter a valid numeric Place ID first.".into());
+        }
+        self.get_json(&format!(
+            "https://develop.roblox.com/v1/places/{pid}/teamcreate/active_session/members"
+        ))
     }
 
     // ---- Avatar editing ----------------------------------------------------
@@ -3159,4 +4317,27 @@ enum SendError {
     /// Server returned a 403 with a fresh CSRF token; retry with it.
     NeedsToken(String),
     Http(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_browser_tracker_id_from_plain_cookie_header() {
+        let header = ".ROBLOSECURITY=redacted; RBXEventTrackerV2=CreateDate=now&browserid=61448583721; Path=/";
+        assert_eq!(extract_browser_tracker_id(header), Some(61_448_583_721));
+    }
+
+    #[test]
+    fn extracts_browser_tracker_id_from_percent_encoded_cookie() {
+        let header = "RBXEventTrackerV2=CreateDate%3Dnow%26browserTrackerId%3D12345678901; Path=/";
+        assert_eq!(extract_browser_tracker_id(header), Some(12_345_678_901));
+    }
+
+    #[test]
+    fn percent_encodes_client_status_query_component() {
+        assert_eq!(percent_encode_query_component("AppStarted"), "AppStarted");
+        assert_eq!(percent_encode_query_component("Joining Game"), "Joining%20Game");
+    }
 }

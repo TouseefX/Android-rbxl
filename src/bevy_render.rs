@@ -1850,6 +1850,15 @@ pub fn project_world_point(cam: &OrbitCam, point_studs: [f32; 3], aspect: f32)
 pub fn pick_part(scene: &ViewportScene, cam: &OrbitCam, screen: [f32; 2], aspect: f32)
     -> Option<rbx_dom_weak::types::Ref>
 {
+    pick_part_distance(scene, cam, screen, aspect).map(|(referent, _)| referent)
+}
+
+/// Like `pick_part`, but also returns the hit distance from the camera eye in
+/// STUDS so callers can run proper depth tests (e.g. billboard occlusion:
+/// geometry BEHIND an adorn must not swallow it).
+pub fn pick_part_distance(scene: &ViewportScene, cam: &OrbitCam, screen: [f32; 2], aspect: f32)
+    -> Option<(rbx_dom_weak::types::Ref, f32)>
+{
     let (eye, target) = orbit_eye_target(cam);
     let forward = (target - eye).normalize_or_zero();
     let right = forward.cross(BVec3::Y).normalize_or_zero();
@@ -1868,7 +1877,7 @@ pub fn pick_part(scene: &ViewportScene, cam: &OrbitCam, screen: [f32; 2], aspect
             .filter_map(|triangle| ray_triangle(origin, direction, *triangle))
             .min_by(f32::total_cmp)?;
         Some((distance, part.referent))
-    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, referent)| referent)
+    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(distance, referent)| (referent, distance / STUD_TO_METER))
 }
 
 /// Two-sided Möller–Trumbore ray/triangle intersection. Roblox parts and

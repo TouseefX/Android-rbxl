@@ -15,6 +15,7 @@ use rbx_dom_weak::{
 use crate::settings::EditorSettings;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 /// One indentation level, as spaces.
 ///
@@ -231,6 +232,14 @@ pub struct EditorApp {
     /// Place ID typed in the toolbar "🌐 Open from Roblox" field.
     open_place_id_input: String,
     roblosecurity_cookie: String,
+    /// Studio-style Roblox presence/client-status bootstrap shown in Settings.
+    studio_presence_status: String,
+    studio_presence_in_flight: bool,
+    /// Local UI watchdog for the Studio presence worker. Network requests run
+    /// on a background thread; this keeps the Settings panel from being stuck
+    /// on "Sending…" forever if Android networking wedges below reqwest's
+    /// normal timeout layer.
+    studio_presence_started_at: Option<Instant>,
     discovered_assets: Vec<DiscoveredAsset>,
 
     // Open Cloud State
@@ -328,6 +337,39 @@ pub struct EditorApp {
     anim_creator_id: String,
     anim_use_group: bool,
 
+    // Multi-select, reparenting, and Creator Store upload state.
+    /// Extra selected instances (multi-select). `selected` stays the primary.
+    selected_multi: Vec<Ref>,
+    /// When on, taps in the Explorer toggle rows in/out of the selection set
+    /// (Android has no Ctrl key; on desktop Ctrl+click also works).
+    multi_select_mode: bool,
+    /// When on, Explorer rows can be dragged onto a new parent. Off by
+    /// default so touch-scrolling the tree keeps working.
+    drag_reparent_mode: bool,
+    /// "Move to…" mode: the next tap on an Explorer row reparents the current
+    /// selection under that row instead of selecting it.
+    reparent_pick_mode: bool,
+    /// Text buffer for the Properties tab "Parent" path editor.
+    parent_path_buffer: String,
+    /// Whether the Creator Store upload panel is open in the Explorer.
+    show_model_upload: bool,
+    model_upload_name: String,
+    model_creator_id: String,
+    model_use_group: bool,
+    is_uploading_model: bool,
+
+    // Game (experience) configuration editor state (Open Cloud tab; uses
+    // the cookie-authenticated develop.roblox.com endpoints).
+    game_cfg_name: String,
+    game_cfg_desc: String,
+    game_cfg_max_players: String,
+    game_cfg_response: String,
+    /// Output area of the Team Create session panel.
+    team_create_response: String,
+    /// Last successful join config from gamejoin (has the server endpoints);
+    /// enables the transport-resolution button.
+    team_create_join_config: Option<serde_json::Value>,
+
     // Per-property text buffers so number properties (float/int, and vector
     // components) can be TYPED exactly like Studio instead of only dragged.
     // Keyed by property name (vector components use "Name.X"/".Y"/".Z").
@@ -411,6 +453,9 @@ impl Default for EditorApp {
             direct_asset_id_input: "47433".into(),
             open_place_id_input: String::new(),
             roblosecurity_cookie: saved_settings.roblosecurity_cookie,
+            studio_presence_status: String::new(),
+            studio_presence_in_flight: false,
+            studio_presence_started_at: None,
             discovered_assets: Vec::new(),
             open_cloud_api_key: saved_settings.open_cloud_api_key,
             open_cloud_universe_id: saved_settings.open_cloud_universe_id,
@@ -460,6 +505,22 @@ impl Default for EditorApp {
             is_uploading_anim: false,
             anim_creator_id: String::new(),
             anim_use_group: false,
+            selected_multi: Vec::new(),
+            multi_select_mode: false,
+            drag_reparent_mode: false,
+            reparent_pick_mode: false,
+            parent_path_buffer: String::new(),
+            show_model_upload: false,
+            model_upload_name: String::new(),
+            model_creator_id: String::new(),
+            model_use_group: false,
+            is_uploading_model: false,
+            game_cfg_name: String::new(),
+            game_cfg_desc: String::new(),
+            game_cfg_max_players: String::new(),
+            game_cfg_response: String::new(),
+            team_create_response: String::new(),
+            team_create_join_config: None,
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
@@ -470,6 +531,12 @@ impl Default for EditorApp {
             "Loaded {} installed plugin(s)",
             app.plugin_index.plugins.len()
         ));
+        if !app.roblosecurity_cookie.trim().is_empty() {
+            app.start_studio_presence_bootstrap();
+        } else {
+            app.studio_presence_status =
+                "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
+        }
         RobloxApiClient::fetch_live_catalog_async("sword".into());
         app.is_searching_live = true;
         app
@@ -574,6 +641,22 @@ impl EditorApp {
             message: msg.into(),
             time: "now".into(),
         });
+    }
+
+    fn start_studio_presence_bootstrap(&mut self) {
+        let Some(cookie) = self.roblosecurity_cookie() else {
+            self.studio_presence_status =
+                "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
+            self.studio_presence_in_flight = false;
+            self.studio_presence_started_at = None;
+            return;
+        };
+        self.studio_presence_status =
+            "Sending native Studio client-status presence to Roblox…".into();
+        self.studio_presence_in_flight = true;
+        self.studio_presence_started_at = Some(Instant::now());
+        roblox_api::start_studio_presence_async(cookie);
+        self.log_info("Started Roblox Studio presence bootstrap");
     }
 }
 
@@ -1555,40 +1638,290 @@ ui.label("Place ID:");
                 // Section 2: Direct Place Publishing
                 ui.group(|ui| {
                     ui.label(RichText::new("🚀 Publish Active Place to Live Universe").heading().color(Color32::from_rgb(120, 255, 120)));
-                    ui.label("Serializes the active .rbxl in memory and streams it directly to Roblox Open Cloud API via memory pipe (no /tmp file).");
+                    ui.label("Serializes the active .rbxl in memory and streams it to Roblox. Uses the Open Cloud API when a key is set; otherwise (or if Open Cloud fails) it falls back to the cookie-authenticated Upload.ashx endpoint — only the Place ID is needed for that path.");
 
-                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published)");
+                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published; Upload.ashx fallback always goes live)");
 
                     if ui.button(RichText::new("⚡ Publish Place Now").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
-                        if let Some(dom) = &self.dom {
-                            match rbxl::save_place(dom) {
-                                Ok(bytes) => {
-                                    self.log_info("Serializing place in memory for Open Cloud publish...");
-                                    match RobloxApiClient::publish_place_open_cloud(
-                                        &self.open_cloud_api_key,
-                                        &self.open_cloud_universe_id,
-                                        &self.open_cloud_place_id,
-                                        &bytes,
-                                        self.open_cloud_publish_live,
-                                    ) {
-                                        Ok(res) => {
-                                            self.status = "✅ Place published successfully via Open Cloud!".into();
-                                            self.log_info(format!("Publish success: {res}"));
+                        self.publish_place_to_roblox();
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Section 2b: Game (experience) configuration via cookie.
+                ui.group(|ui| {
+                    ui.label(RichText::new("⚙️ Game Configuration").heading().color(Color32::from_rgb(255, 170, 120)));
+                    ui.label("Edit the live experience settings with your .ROBLOSECURITY cookie (Settings tab). Uses the Universe/Place IDs above.");
+
+                    ui.horizontal(|ui| {
+                        if ui.button("🔄 Load current").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.get_game_info(&self.open_cloud_universe_id)) {
+                                Ok(info) => {
+                                    self.game_cfg_name = info.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                                    self.game_cfg_desc = info.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                                    self.game_cfg_max_players = info
+                                        .get("maxPlayers")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|n| n.to_string())
+                                        .unwrap_or_default();
+                                    let playing = info.get("playing").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let visits = info.get("visits").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let creator = info
+                                        .get("creator")
+                                        .and_then(|c| c.get("name"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+                                    self.game_cfg_response = format!(
+                                        "Loaded. creator: {creator} — playing: {playing} — visits: {visits}"
+                                    );
+                                    self.status = "Game configuration loaded".into();
+                                }
+                                Err(e) => {
+                                    self.game_cfg_response = format!("Error: {e}");
+                                    self.log_error(format!("Game config load: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("🟢 Make Public").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.set_universe_active(&self.open_cloud_universe_id, true)) {
+                                Ok(()) => {
+                                    self.game_cfg_response = "Experience activated (public)".into();
+                                    self.status = "✅ Experience is now public".into();
+                                }
+                                Err(e) => {
+                                    self.game_cfg_response = format!("Error: {e}");
+                                    self.log_error(format!("Universe activate: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("🔴 Make Private").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.set_universe_active(&self.open_cloud_universe_id, false)) {
+                                Ok(()) => {
+                                    self.game_cfg_response = "Experience deactivated (private)".into();
+                                    self.status = "✅ Experience is now private".into();
+                                }
+                                Err(e) => {
+                                    self.game_cfg_response = format!("Error: {e}");
+                                    self.log_error(format!("Universe deactivate: {e}"));
+                                }
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.add(egui::TextEdit::singleline(&mut self.game_cfg_name).desired_width(220.0));
+                    });
+                    ui.label("Description:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.game_cfg_desc)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Max players (place):");
+                        ui.add(egui::TextEdit::singleline(&mut self.game_cfg_max_players).desired_width(60.0));
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 Save Name & Description").clicked() {
+                            let body = serde_json::json!({
+                                "name": self.game_cfg_name.trim(),
+                                "description": self.game_cfg_desc.trim(),
+                            });
+                            match self.game_cfg_client().and_then(|c| c.update_universe_configuration(&self.open_cloud_universe_id, &body)) {
+                                Ok(_) => {
+                                    self.game_cfg_response = "Universe name/description updated".into();
+                                    self.status = "✅ Game configuration saved".into();
+                                    self.log_info("Universe configuration updated");
+                                }
+                                Err(e) => {
+                                    self.game_cfg_response = format!("Error: {e}");
+                                    self.log_error(format!("Universe config save: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("💾 Save Max Players").clicked() {
+                            match self.game_cfg_max_players.trim().parse::<u64>() {
+                                Ok(n) if n > 0 => {
+                                    let body = serde_json::json!({ "maxPlayerCount": n });
+                                    match self.game_cfg_client().and_then(|c| c.update_place_configuration(&self.open_cloud_place_id, &body)) {
+                                        Ok(_) => {
+                                            self.game_cfg_response = format!("Place max players set to {n}");
+                                            self.status = "✅ Place configuration saved".into();
+                                            self.log_info(format!("Place maxPlayerCount set to {n}"));
                                         }
                                         Err(e) => {
-                                            self.status = format!("Publish error: {e}");
-                                            self.log_error(format!("Open Cloud publish error: {e}"));
+                                            self.game_cfg_response = format!("Error: {e}");
+                                            self.log_error(format!("Place config save: {e}"));
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    self.status = format!("Serialization error: {e}");
-                                    self.log_error(format!("Serialization error: {e}"));
+                                _ => {
+                                    self.game_cfg_response = "Enter a positive number for max players".into();
                                 }
                             }
-                        } else {
-                            self.status = "Open a place file first".into();
                         }
+                    });
+
+                    if !self.game_cfg_response.is_empty() {
+                        ui.label(RichText::new(&self.game_cfg_response).monospace().color(Color32::from_rgb(255, 220, 180)));
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Section 2c: Team Create (cloud edit) session control plane —
+                // the REST routes Studio's ApiTeamCreateUrlConstruction builds
+                // (see team-create-sessions-explained.md §1a/§1b). The live
+                // replication client (UDP/RakNet) is a future stage.
+                ui.group(|ui| {
+                    ui.label(RichText::new("👥 Team Create Sessions").heading().color(Color32::from_rgb(120, 200, 255)));
+                    ui.label("Cookie-auth control plane: check/enable Team Create, see who's in the cloud-edit session, and negotiate a join (returns the session server's address). Uses the Universe/Place IDs above.");
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("🔄 Check Status").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.team_create_status(&self.open_cloud_universe_id)) {
+                                Ok(v) => {
+                                    let enabled = v.get("isEnabled").and_then(|b| b.as_bool()).unwrap_or(false);
+                                    self.team_create_response = format!(
+                                        "Team Create is {} for universe {}",
+                                        if enabled { "ENABLED ✅" } else { "disabled ❌" },
+                                        self.open_cloud_universe_id.trim()
+                                    );
+                                    self.status = "Team Create status fetched".into();
+                                }
+                                Err(e) => {
+                                    self.team_create_response = format!("Error: {e}");
+                                    self.log_error(format!("Team Create status: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("🟢 Enable").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.team_create_set_enabled(&self.open_cloud_universe_id, true)) {
+                                Ok(()) => {
+                                    self.team_create_response = "Team Create enabled".into();
+                                    self.status = "✅ Team Create enabled".into();
+                                    self.log_info("Team Create enabled");
+                                }
+                                Err(e) => {
+                                    self.team_create_response = format!("Error: {e}");
+                                    self.log_error(format!("Team Create enable: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("🔴 Disable").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.team_create_set_enabled(&self.open_cloud_universe_id, false)) {
+                                Ok(()) => {
+                                    self.team_create_response = "Team Create disabled".into();
+                                    self.status = "✅ Team Create disabled".into();
+                                    self.log_info("Team Create disabled");
+                                }
+                                Err(e) => {
+                                    self.team_create_response = format!("Error: {e}");
+                                    self.log_error(format!("Team Create disable: {e}"));
+                                }
+                            }
+                        }
+                        if ui.button("👥 Session Members").clicked() {
+                            match self.game_cfg_client().and_then(|c| c.team_create_members(&self.open_cloud_place_id)) {
+                                Ok(v) => {
+                                    let names: Vec<String> = v
+                                        .get("data")
+                                        .and_then(|d| d.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .map(|m| {
+                                                    m.get("name")
+                                                        .or_else(|| m.get("displayName"))
+                                                        .and_then(|n| n.as_str())
+                                                        .map(str::to_string)
+                                                        .unwrap_or_else(|| {
+                                                            m.get("id").map(|i| i.to_string()).unwrap_or_default()
+                                                        })
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    self.team_create_response = if names.is_empty() {
+                                        "No one is in the cloud-edit session right now".into()
+                                    } else {
+                                        format!("In session ({}): {}", names.len(), names.join(", "))
+                                    };
+                                    self.status = "Session members fetched".into();
+                                }
+                                Err(e) => {
+                                    self.team_create_response = format!("Error: {e}");
+                                    self.log_error(format!("Team Create members: {e}"));
+                                }
+                            }
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("🎫 Negotiate Join").clicked() {
+                            self.team_create_negotiate(false, false, false);
+                        }
+                        if ui.button("⚡ Warm Up Server").clicked() {
+                            self.team_create_negotiate(true, false, false);
+                        }
+                        if ui
+                            .button("🎯 Fresh Join + Resolve")
+                            .on_hover_text(
+                                "Negotiates a brand-new one-use ticket and immediately resolves the selected transport with the normal KeyRing send version",
+                            )
+                            .clicked()
+                        {
+                            self.team_create_negotiate(false, true, false);
+                        }
+                        if ui
+                            .button("🛟 Fresh Revert-Key Probe")
+                            .on_hover_text(
+                                "Negotiates another fresh ticket and models native DFFlag::KeyRingRevert selection; use when send and revert versions differ",
+                            )
+                            .clicked()
+                        {
+                            self.team_create_negotiate(false, true, true);
+                        }
+                        let can_probe = self
+                            .team_create_join_config
+                            .as_ref()
+                            .is_some_and(|cfg| !crate::team_create::parse_join_config(cfg).is_empty());
+                        let probe = ui
+                            .add_enabled(can_probe, egui::Button::new("📡 Resolve Rbx Transport"))
+                            .on_hover_text(if can_probe {
+                                "Maps the current Team Create config through the 0.741 transport selector. Legacy RakNet configs are probed; RbxTransport configs are preserved for the QUIC path. The join ticket is one-use."
+                            } else {
+                                "Run Negotiate Join immediately before each transport resolution; encrypted early-auth material is one-use"
+                            });
+                        if probe.clicked() {
+                            // Request2 pre-auth MACs are replay-protected. Consume the
+                            // config so a second click cannot silently reuse a ticket.
+                            if let Some(cfg) = self.team_create_join_config.take() {
+                                self.status = "Resolving Team Create transport…".into();
+                                let report = crate::team_create::probe_join_config(&cfg, 3, 2500);
+                                self.log_info(format!("Team Create transport resolution:\n{report}"));
+                                self.team_create_response = report;
+                                self.status = "Team Create transport resolution finished — see panel output".into();
+                            }
+                        }
+                    });
+
+                    if !self.team_create_response.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Handshake Output").strong());
+                            if ui.button("📋 Copy Output").clicked() {
+                                jni_bridge::trigger_copy_to_clipboard(&self.team_create_response);
+                                self.status = "Copied Team Create output to Android clipboard".into();
+                            }
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt("team_create_response_scroll")
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(&self.team_create_response).monospace().color(Color32::from_rgb(170, 220, 255)));
+                            });
                     }
                 });
 
@@ -1706,12 +2039,67 @@ ui.label("Place ID:");
             }
         });
 
-        // Context actions for selected instance
+        // Selection / reparent mode toggles.
+        ui.horizontal_wrapped(|ui| {
+            let multi_resp = ui
+                .toggle_value(&mut self.multi_select_mode, "☑ Multi")
+                .on_hover_text("Multi-select: tap rows to add/remove them (Ctrl+click also works)");
+            if multi_resp.changed() {
+                if self.multi_select_mode {
+                    self.selected_multi = self.selected.into_iter().collect();
+                } else {
+                    self.selected_multi.clear();
+                }
+            }
+            ui.toggle_value(&mut self.drag_reparent_mode, "🖐 Drag")
+                .on_hover_text("Drag a row onto another row to reparent it");
+            if self.reparent_pick_mode {
+                ui.colored_label(
+                    Color32::from_rgb(255, 200, 100),
+                    "Tap the new parent in the tree…",
+                );
+                if ui.button("✖ Cancel").clicked() {
+                    self.reparent_pick_mode = false;
+                }
+            }
+        });
+
+        // Context actions for selected instance(s).
         let selected_info = self.dom.as_ref().and_then(|dom| {
             self.selected.and_then(|r| dom.get_by_ref(r)).map(|inst| (inst.name.clone(), inst.class.to_string()))
         });
+        let multi_count = if self.multi_select_mode { self.selected_multi.len() } else { 0 };
 
-        if let Some((name, class)) = selected_info {
+        if multi_count > 1 {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("Selected: {multi_count} instances"))
+                        .strong()
+                        .color(Color32::from_rgb(255, 210, 120)),
+                );
+                if ui.button("📋 Duplicate").clicked() {
+                    self.duplicate_selected();
+                }
+                if ui.button("🗑️ Delete").clicked() {
+                    self.delete_selected();
+                }
+                if ui.button("💾 Save .rbxm").clicked() {
+                    self.export_selected_rbxm();
+                }
+                if ui.button("☁ Creator Store").clicked() {
+                    self.show_model_upload = !self.show_model_upload;
+                }
+                if ui.button("📦 Move to…").clicked() {
+                    self.reparent_pick_mode = true;
+                    self.status = "Tap the new parent in the Explorer tree".into();
+                }
+                if ui.button("✖ Clear").clicked() {
+                    self.selected_multi.clear();
+                    self.selected = None;
+                }
+            });
+        } else if let Some((name, class)) = selected_info {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(format!("Selected: {name}")).strong().color(Color32::from_rgb(100, 200, 255)));
@@ -1743,34 +2131,162 @@ ui.label("Place ID:");
                 if ui.button("🗑️ Delete").clicked() {
                     self.delete_selected();
                 }
+                if ui.button("💾 Save .rbxm").clicked() {
+                    self.export_selected_rbxm();
+                }
+                if ui.button("☁ Creator Store").clicked() {
+                    self.show_model_upload = !self.show_model_upload;
+                }
+                if ui.button("📦 Move to…").clicked() {
+                    self.reparent_pick_mode = true;
+                    self.status = "Tap the new parent in the Explorer tree".into();
+                }
+            });
+        }
+
+        if self.show_model_upload {
+            ui.separator();
+            ui.label(
+                RichText::new("☁ Upload to Creator Store")
+                    .strong()
+                    .color(Color32::from_rgb(100, 200, 255)),
+            );
+            ui.label(
+                RichText::new(
+                    "Scripts, LocalScripts, ModuleScripts, Folders and Models only. \
+                     Uses your Open Cloud API key (Open Cloud tab) or .ROBLOSECURITY cookie (Settings).",
+                )
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.model_upload_name)
+                        .hint_text("defaults to instance name")
+                        .desired_width(160.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.model_use_group, "Group");
+                ui.label(if self.model_use_group { "Group ID:" } else { "Creator User ID:" });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.model_creator_id)
+                        .hint_text(if self.model_use_group { "e.g. 1234567" } else { "auto from cookie if empty" })
+                        .desired_width(140.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                if self.is_uploading_model {
+                    ui.spinner();
+                    ui.label("Uploading…");
+                } else if ui.button("⬆ Upload selection").clicked() {
+                    self.upload_selection_to_creator_store();
+                }
+                if ui.button("✖ Close").clicked() {
+                    self.show_model_upload = false;
+                }
             });
         }
 
         ui.separator();
 
+        let mut tree_actions: Vec<explorer::TreeAction> = Vec::new();
         egui::ScrollArea::both()
             .id_salt("explorer_tree_scroll")
             .show(ui, |ui| {
                 if let Some(dom) = &self.dom {
                     let root = dom.root_ref();
-                    let prev_selected = self.selected;
-                    explorer::show_tree_filtered(ui, dom, root, &mut self.selected, &self.explorer_search);
-                    if self.selected != prev_selected {
-                        if let Some(r) = self.selected {
-                            if let Some(inst) = dom.get_by_ref(r) {
-                                self.rename_buffer = inst.name.clone();
-                                if matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
-                                    || inst.properties.contains_key(&rbx_dom_weak::Ustr::from("Source"))
-                                {
-                                    self.open_script_tab(r);
-                                }
-                            }
-                        }
-                    }
+                    tree_actions = explorer::show_tree_filtered(
+                        ui,
+                        dom,
+                        root,
+                        self.selected,
+                        &self.selected_multi,
+                        self.multi_select_mode,
+                        self.drag_reparent_mode,
+                        &self.explorer_search,
+                    );
                 } else {
                     ui.label("Open a place file (.rbxl) using the toolbar above.");
                 }
             });
+        self.apply_tree_actions(tree_actions);
+    }
+
+    /// Apply the interactions collected while rendering the Explorer tree
+    /// (done after rendering so the DOM isn't borrowed during UI layout).
+    fn apply_tree_actions(&mut self, actions: Vec<explorer::TreeAction>) {
+        for action in actions {
+            match action {
+                explorer::TreeAction::Select(r) => {
+                    if self.reparent_pick_mode {
+                        self.reparent_pick_mode = false;
+                        self.reparent_selection_to(r);
+                        continue;
+                    }
+                    let changed = self.selected != Some(r);
+                    self.selected = Some(r);
+                    if self.multi_select_mode {
+                        self.selected_multi = vec![r];
+                    } else {
+                        self.selected_multi.clear();
+                    }
+                    if changed {
+                        self.on_explorer_selected(r);
+                    }
+                }
+                explorer::TreeAction::ToggleMulti(r) => {
+                    if self.reparent_pick_mode {
+                        self.reparent_pick_mode = false;
+                        self.reparent_selection_to(r);
+                        continue;
+                    }
+                    // Ctrl+click outside multi mode turns multi mode on so
+                    // the selection set stays visible and usable.
+                    if !self.multi_select_mode {
+                        self.multi_select_mode = true;
+                        self.selected_multi = self.selected.into_iter().collect();
+                    }
+                    if let Some(pos) = self.selected_multi.iter().position(|x| *x == r) {
+                        self.selected_multi.remove(pos);
+                        self.selected = self.selected_multi.last().copied();
+                    } else {
+                        self.selected_multi.push(r);
+                        let changed = self.selected != Some(r);
+                        self.selected = Some(r);
+                        if changed {
+                            self.on_explorer_selected(r);
+                        }
+                    }
+                }
+                explorer::TreeAction::Reparent { child, new_parent } => {
+                    // Dragging one row of a multi-selection moves the whole
+                    // selection; dragging an unselected row moves just it.
+                    let sel = self.selection_refs();
+                    if sel.len() > 1 && sel.contains(&child) {
+                        self.reparent_selection_to(new_parent);
+                    } else {
+                        self.reparent_refs_to(vec![child], new_parent);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Post-selection bookkeeping shared by all Explorer selection paths:
+    /// refresh the rename buffer and auto-open scripts in the editor.
+    fn on_explorer_selected(&mut self, r: Ref) {
+        let mut open_script = false;
+        if let Some(dom) = &self.dom {
+            if let Some(inst) = dom.get_by_ref(r) {
+                self.rename_buffer = inst.name.clone();
+                open_script = matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
+                    || inst.properties.contains_key(&rbx_dom_weak::Ustr::from("Source"));
+            }
+        }
+        if open_script {
+            self.open_script_tab(r);
+        }
     }
 
     fn open_script_tab(&mut self, referent: Ref) {
@@ -2873,12 +3389,14 @@ ui.label("Place ID:");
         if self.prop_num_sel != Some(r) {
             self.prop_num_buf.clear();
             self.prop_num_sel = Some(r);
+            // Seed the Parent path editor with the current parent's path.
+            self.parent_path_buffer = rbxl::instance_path(dom, inst.parent());
         }
 
         let inst_name = inst.name.clone();
         let inst_class = inst.class.to_string();
         let properties = inst.properties.clone();
-        let parent_str = format!("{}", inst.parent());
+        let parent_path = rbxl::instance_path(dom, inst.parent());
         let children_count = inst.children().len();
 
         ui.horizontal(|ui| {
@@ -2905,7 +3423,50 @@ ui.label("Place ID:");
                     }
                 });
 
-                ui.label(format!("Parent: {parent_str}"));
+                // Parent: editable path (type a new path and Set), or pick the
+                // new parent directly in the Explorer tree.
+                ui.horizontal(|ui| {
+                    ui.label("Parent:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.parent_path_buffer)
+                            .hint_text("game.Workspace.Model")
+                            .desired_width(200.0),
+                    );
+                    if ui.button("Set").clicked() {
+                        let path = self.parent_path_buffer.clone();
+                        let target = self
+                            .dom
+                            .as_ref()
+                            .and_then(|d| rbxl::resolve_path(d, &path));
+                        match target {
+                            Some(t) => {
+                                if let Some(dom) = self.dom.as_mut() {
+                                    match rbxl::reparent_instance(dom, r, t) {
+                                        Ok(()) => {
+                                            self.needs_3d_rebuild = true;
+                                            self.status =
+                                                format!("Moved {inst_name} under {path}");
+                                        }
+                                        Err(e) => self.status = format!("Move failed: {e}"),
+                                    }
+                                }
+                            }
+                            None => self.status = format!("No instance found at '{path}'"),
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Current: {parent_path}")).weak());
+                    if ui.button("🎯 Pick new parent in Explorer").clicked() {
+                        self.selected = Some(r);
+                        if self.multi_select_mode {
+                            self.selected_multi = vec![r];
+                        }
+                        self.reparent_pick_mode = true;
+                        self.active_tab = ActiveTab::Explorer;
+                        self.status = "Tap the new parent in the Explorer tree".into();
+                    }
+                });
                 ui.label(format!("Children: {children_count}"));
 
                 ui.separator();
@@ -3777,39 +4338,217 @@ ui.label("Place ID:");
         }
     }
 
+    /// The instances an action should apply to: the multi-selection set when
+    /// multi-select mode is active, otherwise just the primary selection.
+    /// Stale refs (already deleted) are filtered out.
+    fn selection_refs(&self) -> Vec<Ref> {
+        if self.multi_select_mode && !self.selected_multi.is_empty() {
+            let mut refs = self.selected_multi.clone();
+            if let Some(dom) = &self.dom {
+                refs.retain(|r| dom.get_by_ref(*r).is_some());
+            }
+            refs
+        } else {
+            self.selected.into_iter().collect()
+        }
+    }
+
+    /// `selection_refs`, minus any ref whose ancestor is also selected —
+    /// duplicating/deleting/exporting an ancestor already covers its
+    /// descendants, so acting on both would double them (or panic).
+    fn pruned_selection_refs(&self) -> Vec<Ref> {
+        let refs = self.selection_refs();
+        let Some(dom) = &self.dom else { return refs };
+        refs.iter()
+            .copied()
+            .filter(|r| {
+                !refs
+                    .iter()
+                    .any(|a| a != r && rbxl::is_self_or_descendant(dom, *a, *r))
+            })
+            .collect()
+    }
+
     fn duplicate_selected(&mut self) {
-        let (Some(dom), Some(r)) = (self.dom.as_mut(), self.selected) else {
+        let refs = self.pruned_selection_refs();
+        if refs.is_empty() || self.dom.is_none() {
             return;
-        };
-        match rbxl::duplicate_instance(dom, r) {
-            Ok(new_ref) => {
-                self.selected = Some(new_ref);
-                self.status = "Duplicated instance".into();
-                self.log_info("Duplicated instance");
+        }
+        let mut new_refs: Vec<Ref> = Vec::new();
+        let mut last_err: Option<String> = None;
+        for r in refs {
+            let Some(dom) = self.dom.as_mut() else { break };
+            match rbxl::duplicate_instance(dom, r) {
+                Ok(new_ref) => new_refs.push(new_ref),
+                Err(e) => last_err = Some(e.to_string()),
             }
-            Err(e) => {
-                self.status = format!("Duplicate failed: {e}");
-                self.log_error(format!("Duplicate failed: {e}"));
+        }
+        if let Some(&last) = new_refs.last() {
+            self.selected = Some(last);
+            if self.multi_select_mode {
+                self.selected_multi = new_refs.clone();
             }
+            self.needs_3d_rebuild = true;
+            self.status = format!("Duplicated {} instance(s)", new_refs.len());
+            self.log_info(format!("Duplicated {} instance(s)", new_refs.len()));
+        } else if let Some(e) = last_err {
+            self.status = format!("Duplicate failed: {e}");
+            self.log_error(format!("Duplicate failed: {e}"));
         }
     }
 
     fn delete_selected(&mut self) {
-        let (Some(dom), Some(r)) = (self.dom.as_mut(), self.selected) else {
+        let refs = self.pruned_selection_refs();
+        if refs.is_empty() || self.dom.is_none() {
             return;
-        };
-        match rbxl::delete_instance(dom, r) {
-            Ok(_) => {
-                self.open_tabs.retain(|t| t.referent != r);
-                self.selected = None;
-                self.status = "Deleted instance".into();
-                self.log_info("Deleted instance");
-            }
-            Err(e) => {
-                self.status = format!("Delete failed: {e}");
-                self.log_error(format!("Delete failed: {e}"));
+        }
+        let mut deleted = 0usize;
+        let mut last_err: Option<String> = None;
+        for r in &refs {
+            let Some(dom) = self.dom.as_mut() else { break };
+            match rbxl::delete_instance(dom, *r) {
+                Ok(_) => deleted += 1,
+                Err(e) => last_err = Some(e.to_string()),
             }
         }
+        // Close script tabs whose instance is gone (including descendants of
+        // the deleted subtrees).
+        if let Some(dom) = &self.dom {
+            self.open_tabs.retain(|t| dom.get_by_ref(t.referent).is_some());
+            if self.active_script_idx >= self.open_tabs.len() {
+                self.active_script_idx = self.open_tabs.len().saturating_sub(1);
+            }
+        }
+        self.selected = None;
+        self.selected_multi.clear();
+        if deleted > 0 {
+            self.needs_3d_rebuild = true;
+            self.status = format!("Deleted {deleted} instance(s)");
+            self.log_info(format!("Deleted {deleted} instance(s)"));
+        }
+        if let Some(e) = last_err {
+            if deleted == 0 {
+                self.status = format!("Delete failed: {e}");
+            }
+            self.log_error(format!("Delete failed: {e}"));
+        }
+    }
+
+    /// Move a set of instances under `new_parent`, with per-instance safety
+    /// checks (no cycles, no services, no place root) done in `rbxl`.
+    fn reparent_refs_to(&mut self, refs: Vec<Ref>, new_parent: Ref) {
+        let Some(dom) = self.dom.as_mut() else { return };
+        let target_name = dom
+            .get_by_ref(new_parent)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| "?".into());
+        let mut moved = 0usize;
+        let mut last_err: Option<String> = None;
+        for r in refs {
+            if r == new_parent {
+                continue;
+            }
+            match rbxl::reparent_instance(dom, r, new_parent) {
+                Ok(()) => moved += 1,
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if moved > 0 {
+            self.needs_3d_rebuild = true;
+            self.status = format!("Moved {moved} instance(s) under {target_name}");
+            self.log_info(format!("Moved {moved} instance(s) under {target_name}"));
+        }
+        if let Some(e) = last_err {
+            if moved == 0 {
+                self.status = format!("Move failed: {e}");
+            }
+            self.log_error(format!("Move failed: {e}"));
+        }
+    }
+
+    /// Move the current selection (multi-aware) under `new_parent`.
+    fn reparent_selection_to(&mut self, new_parent: Ref) {
+        let refs = self.pruned_selection_refs();
+        if refs.is_empty() {
+            self.status = "Nothing selected to move".into();
+            return;
+        }
+        self.reparent_refs_to(refs, new_parent);
+    }
+
+    /// Upload the current selection to the Creator Store as a Model asset.
+    /// Only Scripts, LocalScripts, ModuleScripts, Folders and Models may be
+    /// uploaded; the whole (pruned) selection is serialized into one .rbxm.
+    fn upload_selection_to_creator_store(&mut self) {
+        let refs = self.pruned_selection_refs();
+        let Some(dom) = &self.dom else {
+            self.status = "Open a place file first".into();
+            return;
+        };
+        if refs.is_empty() {
+            self.status = "Select something to upload first".into();
+            return;
+        }
+        for r in &refs {
+            if let Some(inst) = dom.get_by_ref(*r) {
+                if !matches!(
+                    inst.class.as_str(),
+                    "Script" | "LocalScript" | "ModuleScript" | "Folder" | "Model"
+                ) {
+                    self.status = format!(
+                        "'{}' is a {} — only Scripts, LocalScripts, ModuleScripts, Folders and Models can be uploaded",
+                        inst.name, inst.class
+                    );
+                    return;
+                }
+            }
+        }
+        let api_key = {
+            let k = self.open_cloud_api_key.trim();
+            if k.is_empty() { None } else { Some(k.to_string()) }
+        };
+        let cookie = self.roblosecurity_cookie();
+        if api_key.is_none() && cookie.is_none() {
+            self.status =
+                "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first".into();
+            return;
+        }
+        if self.model_use_group && self.model_creator_id.trim().is_empty() {
+            self.status = "Enter the Group ID".into();
+            return;
+        }
+        let first_name = dom
+            .get_by_ref(refs[0])
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| "Model".into());
+        let name = if self.model_upload_name.trim().is_empty() {
+            first_name
+        } else {
+            self.model_upload_name.trim().to_string()
+        };
+        let bytes = match rbxl::export_subtrees_rbxm(dom, &refs) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Serialize failed: {e}");
+                self.log_error(format!("Creator Store serialize: {e}"));
+                return;
+            }
+        };
+        self.is_uploading_model = true;
+        self.status = format!("Uploading '{name}' to the Creator Store…");
+        self.log_info(format!(
+            "Uploading {} instance(s) as '{name}' ({} bytes) to the Creator Store",
+            refs.len(),
+            bytes.len()
+        ));
+        RobloxApiClient::upload_model_async(
+            api_key,
+            self.model_creator_id.trim().to_string(),
+            self.model_use_group,
+            cookie,
+            name,
+            bytes,
+        );
     }
 
     fn is_script_selected(&self) -> bool {
@@ -3931,6 +4670,61 @@ ui.label("Place ID:");
                 Err(e) => {
                     self.status = format!("Animation upload failed: {e}");
                     self.log_error(format!("Animation upload failed: {e}"));
+                }
+            }
+        }
+
+        // Pick up finished Creator Store (model) uploads.
+        while let Some(res) = roblox_api::try_recv_model_result() {
+            self.is_uploading_model = false;
+            match res.result {
+                Ok(id) => {
+                    self.status = format!("✅ Uploaded to Creator Store! Asset ID: {id}");
+                    self.log_info(format!(
+                        "'{}' uploaded to the Creator Store — asset id {id} (https://create.roblox.com/store/asset/{id})",
+                        res.name
+                    ));
+                }
+                Err(e) => {
+                    self.status = format!("Creator Store upload failed: {e}");
+                    self.log_error(format!("Creator Store upload of '{}' failed: {e}", res.name));
+                }
+            }
+        }
+
+        // Pick up Studio-style client-status / profile presence bootstrap results.
+        while let Some(res) = roblox_api::try_recv_studio_presence_result() {
+            self.studio_presence_in_flight = false;
+            self.studio_presence_started_at = None;
+            match res.result {
+                Ok(report) => {
+                    let summary = report.summary();
+                    self.studio_presence_status = summary.clone();
+                    self.status = summary.clone();
+                    if report.presence_type == Some(3) {
+                        self.log_info(format!("✅ {summary}"));
+                    } else {
+                        self.log_info(format!(
+                            "{summary}. Roblox may not show InStudio until Team Create is fully connected."
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.studio_presence_status =
+                        format!("Studio presence bootstrap failed: {error}");
+                    self.status = "Studio presence bootstrap failed".into();
+                    self.log_error(format!("Studio presence bootstrap failed: {error}"));
+                }
+            }
+        }
+        if self.studio_presence_in_flight {
+            if let Some(started) = self.studio_presence_started_at {
+                if started.elapsed() >= Duration::from_secs(45) {
+                    self.studio_presence_in_flight = false;
+                    self.studio_presence_started_at = None;
+                    self.studio_presence_status = "Studio presence bootstrap timed out locally after 45 seconds; Roblox did not answer all status/presence requests. You can retry without restarting the editor.".into();
+                    self.status = "Studio presence bootstrap timed out".into();
+                    self.log_error("Studio presence bootstrap timed out locally after 45 seconds");
                 }
             }
         }
@@ -4982,6 +5776,122 @@ ui.label("Place ID:");
     }
 
     /// Build a read-only cookie Option for background threads.
+    /// Team Create join negotiation (or preemptive server warm-up): POST the
+    /// gamejoin request and summarize the returned server config — the
+    /// address/port the UDP replication client would connect to. Proves the
+    /// whole cookie → session → server pipeline works from this device.
+    fn team_create_negotiate(
+        &mut self,
+        preemptive: bool,
+        probe_immediately: bool,
+        key_ring_revert: bool,
+    ) {
+        let Some(cookie) = self.roblosecurity_cookie() else {
+            self.team_create_response =
+                "Set your .ROBLOSECURITY cookie in the Settings tab first".into();
+            return;
+        };
+        let label = if preemptive { "warm-up" } else { "join negotiation" };
+        // Never leave the transport resolver enabled with a stale config when
+        // a later negotiation fails or returns an all-null HTTP-200 response.
+        self.team_create_join_config = None;
+        self.log_info(format!("Team Create {label} for place {}", self.open_cloud_place_id.trim()));
+        match RobloxApiClient::team_create_join(&cookie, &self.open_cloud_place_id, preemptive) {
+            Ok(v) => {
+                let endpoints = crate::team_create::parse_join_config(&v);
+                let all_null = crate::team_create::join_response_is_all_null(&v);
+                let summary = if let Some(first) = endpoints.first() {
+                    // Native Studio consumes early-auth material immediately
+                    // after gamejoin returns. The combined action does the
+                    // same, avoiding expiry or accidental reuse between two
+                    // separate UI clicks.
+                    if probe_immediately && !preemptive {
+                        self.status =
+                            "Fresh join received — resolving one-use transport immediately…".into();
+                        let report = crate::team_create::probe_join_config_with_key_ring_revert(
+                            &v,
+                            3,
+                            2500,
+                            key_ring_revert,
+                        );
+                        let key_mode = if key_ring_revert {
+                            "KeyRingRevert"
+                        } else {
+                            "normal send"
+                        };
+                        self.log_info(format!(
+                            "Team Create immediate transport resolution ({key_mode}):\n{report}"
+                        ));
+                        self.team_create_response = format!(
+                            "Fresh gamejoin config handed directly to the selected transport path (no UI delay; {key_mode} key selection)\n{report}"
+                        );
+                        self.status =
+                            "Immediate Team Create transport resolution finished — see panel output".into();
+                        return;
+                    }
+
+                    // Only a config with an actual socket target may enable
+                    // the separate handshake button. The parser handles
+                    // settings, joinTicket, joinScript, and nested wrappers.
+                    self.team_create_join_config = Some(v.clone());
+                    let mut text = if preemptive {
+                        String::from("Server warm-up config received")
+                    } else {
+                        String::from("Join config received")
+                    };
+                    text.push_str(&format!(" — server {}", first.label()));
+                    if endpoints.len() > 1 {
+                        text.push_str(&format!(" (+{} more endpoint(s))", endpoints.len() - 1));
+                    }
+                    self.status = format!("✅ Team Create {label} returned a server endpoint");
+                    text
+                } else if all_null {
+                    self.status = format!("Team Create {label} failed — empty response");
+                    format!(
+                        "Team Create {label} returned only null/empty values; negotiation failed and the transport resolver remains disabled"
+                    )
+                } else if preemptive {
+                    self.status = "Team Create warm-up accepted — negotiate join next".into();
+                    String::from(
+                        "Server warm-up response received, but it has no server endpoint yet; run Negotiate Join. The transport resolver remains disabled",
+                    )
+                } else {
+                    self.status = "Team Create join returned no usable server endpoint".into();
+                    String::from(
+                        "Join response has no usable Address/Port, ServerConnections, or UdmuxEndpoints; the transport resolver remains disabled",
+                    )
+                };
+
+                let full_raw = v.to_string();
+                let mut raw: String = full_raw.chars().take(700).collect();
+                if raw.chars().count() < full_raw.chars().count() {
+                    raw.push('…');
+                }
+                self.team_create_response = format!("{summary}\n{raw}");
+                if endpoints.is_empty() {
+                    self.log_error(format!("Team Create {label}: {summary}"));
+                } else {
+                    self.log_info(format!("Team Create {label}: {summary}"));
+                }
+            }
+            Err(e) => {
+                self.team_create_join_config = None;
+                self.team_create_response = format!("Error: {e}");
+                self.status = format!("Team Create {label} failed");
+                self.log_error(format!("Team Create {label}: {e}"));
+            }
+        }
+    }
+
+    /// Cookie-authenticated web client for the game-configuration endpoints
+    /// (develop.roblox.com / games.roblox.com).
+    fn game_cfg_client(&self) -> Result<roblox_api::WebClient, String> {
+        let cookie = self
+            .roblosecurity_cookie()
+            .ok_or_else(|| "Set your .ROBLOSECURITY cookie in the Settings tab first".to_string())?;
+        roblox_api::WebClient::new(cookie)
+    }
+
     fn roblosecurity_cookie(&self) -> Option<String> {
         let c = self.roblosecurity_cookie.trim();
         if c.is_empty() { None } else { Some(c.to_string()) }
@@ -5131,6 +6041,10 @@ ui.label("Place ID:");
 
 if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             self.roblosecurity_cookie.clear();
+                            self.studio_presence_status =
+                                "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
+                            self.studio_presence_in_flight = false;
+                            self.studio_presence_started_at = None;
                         }
                     });
 
@@ -5139,6 +6053,37 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                     } else {
                         ui.label(RichText::new("ℹ️ No cookie set: Using high-fidelity asset synthesizers and unauthenticated endpoints").color(Color32::from_rgb(200, 200, 100)));
                     }
+                });
+
+                ui.add_space(8.0);
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("🟦 Roblox Studio profile presence").heading().color(Color32::from_rgb(100, 200, 255)));
+                    ui.label("On startup this app sends Studio's AppStarted client-status heartbeat to Roblox. It tries the native legacy client-status/set route first, falls back to the newer Matchmaking API route if needed, then reads back your presence. Roblox may still keep showing Online until Team Create is fully connected.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.studio_presence_in_flight && !self.roblosecurity_cookie.trim().is_empty(),
+                                egui::Button::new("Send Studio presence now"),
+                            )
+                            .clicked()
+                        {
+                            self.start_studio_presence_bootstrap();
+                        }
+                        if self.studio_presence_in_flight {
+                            ui.spinner();
+                        }
+                    });
+                    let color = if self.studio_presence_status.contains("InStudio") {
+                        Color32::from_rgb(120, 255, 120)
+                    } else if self.studio_presence_status.contains("failed")
+                        || self.studio_presence_status.contains("timed out")
+                    {
+                        Color32::from_rgb(255, 140, 120)
+                    } else {
+                        Color32::from_rgb(200, 220, 255)
+                    };
+                    ui.label(RichText::new(&self.studio_presence_status).color(color));
                 });
 
                 ui.add_space(8.0);
@@ -5224,6 +6169,9 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             Ok(_) => {
                                 self.status = "✅ Settings saved successfully to persistent storage!".into();
                                 self.log_info("Saved credentials and viewport preferences");
+                                if !self.roblosecurity_cookie.trim().is_empty() {
+                                    self.start_studio_presence_bootstrap();
+                                }
                             }
                             Err(e) => {
                                 self.status = format!("Save error: {e}");
@@ -5234,6 +6182,10 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
 
                     if ui.button(RichText::new("🗑️ Clear All Credentials").color(Color32::from_rgb(255, 100, 100))).clicked() {
                         self.roblosecurity_cookie.clear();
+                        self.studio_presence_status =
+                            "Set your .ROBLOSECURITY cookie to send Roblox Studio presence".into();
+                        self.studio_presence_in_flight = false;
+                        self.studio_presence_started_at = None;
                         self.open_cloud_api_key.clear();
                         self.open_cloud_universe_id.clear();
                         self.open_cloud_place_id.clear();
@@ -5266,14 +6218,31 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         }
     }
 
+    /// Save the current selection (single instance or the whole multi-select
+    /// set) as one self-contained `.rbxm` model file.
     fn export_selected_rbxm(&mut self) {
-        let (Some(dom), Some(selected)) = (&self.dom, self.selected) else {
+        let refs = self.pruned_selection_refs();
+        let Some(dom) = &self.dom else {
             self.status = "Select a folder, item, script, or animation first".into();
             return;
         };
-        match rbxl::export_subtree_rbxm(dom, selected) {
+        if refs.is_empty() {
+            self.status = "Select a folder, item, script, or animation first".into();
+            return;
+        }
+        match rbxl::export_subtrees_rbxm(dom, &refs) {
             Ok(bytes) => {
-                let name = dom.get_by_ref(selected).map(|i| i.name.clone()).unwrap_or_else(|| "model".into());
+                let first = dom
+                    .get_by_ref(refs[0])
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| "model".into());
+                let mut name = if refs.len() == 1 {
+                    first
+                } else {
+                    format!("{first}_and_{}_more", refs.len() - 1)
+                };
+                // Keep the suggested filename filesystem-safe.
+                name = name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
                 self.pending_document_bytes = Some((bytes, name.clone()));
                 jni_bridge::trigger_create_document(&format!("{name}.rbxm"));
                 self.status = format!("Choose where to save {name}.rbxm");
@@ -5347,12 +6316,20 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             self.status = "Open a place first".into();
             return;
         };
-        if self.open_cloud_api_key.trim().is_empty() {
-            self.status = "Set your Open Cloud API key in the Open Cloud tab".into();
-            self.log_error("Publish requires an Open Cloud API key");
+        let api_key = self.open_cloud_api_key.trim().to_string();
+        let cookie = self.roblosecurity_cookie();
+        if api_key.is_empty() && cookie.is_none() {
+            self.status =
+                "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first".into();
+            self.log_error("Publish requires an Open Cloud API key or a cookie");
             return;
         }
-        // Open Cloud only accepts binary .rbxl; force binary serialization
+        let place = self.open_cloud_place_id.trim().to_string();
+        if place.is_empty() {
+            self.status = "Enter the Place ID in the Open Cloud tab first".into();
+            return;
+        }
+        // Both paths only accept binary .rbxl; force binary serialization
         // regardless of the on-disk format.
         let bytes = match rbxl::save_place(dom) {
             Ok(b) => b,
@@ -5362,26 +6339,52 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 return;
             }
         };
-        let api_key = self.open_cloud_api_key.trim().to_string();
         let universe = self.open_cloud_universe_id.trim().to_string();
-        let place = self.open_cloud_place_id.trim().to_string();
         let publish_live = self.open_cloud_publish_live;
-        self.status = "Publishing place via Open Cloud...".into();
+        self.status = "Publishing place…".into();
         self.log_info(format!(
-            "Publishing place {place} (universe {universe}) via Open Cloud"
+            "Publishing place {place} (universe {universe}) — Open Cloud{}",
+            if cookie.is_some() { ", falling back to cookie Upload.ashx" } else { "" }
         ));
         std::thread::spawn(move || {
-            let result = roblox_api::RobloxApiClient::publish_place_open_cloud(
-                &api_key,
-                &universe,
-                &place,
-                &bytes,
-                publish_live,
-            );
-            match result {
-                Ok(_msg) => jni_bridge::queue_publish_result(format!("place {place}"), Ok(())),
-                Err(e) => jni_bridge::queue_publish_result(format!("place {place}"), Err(e)),
+            let mut errors: Vec<String> = Vec::new();
+            // 1) Open Cloud place-publishing API when a key is configured.
+            if !api_key.is_empty() {
+                match roblox_api::RobloxApiClient::publish_place_open_cloud(
+                    &api_key,
+                    &universe,
+                    &place,
+                    &bytes,
+                    publish_live,
+                ) {
+                    Ok(_msg) => {
+                        jni_bridge::queue_publish_result(
+                            format!("place {place} (Open Cloud)"),
+                            Ok(()),
+                        );
+                        return;
+                    }
+                    Err(e) => errors.push(format!("Open Cloud: {e}")),
+                }
             }
+            // 2) Legacy cookie fallback: overwrite the place through the
+            //    hidden Data/Upload.ashx endpoint (§4 of the endpoints doc).
+            if let Some(cookie) = cookie.as_deref() {
+                match roblox_api::RobloxApiClient::publish_place_legacy(cookie, &place, &bytes) {
+                    Ok(_msg) => {
+                        jni_bridge::queue_publish_result(
+                            format!("place {place} (cookie Upload.ashx)"),
+                            Ok(()),
+                        );
+                        return;
+                    }
+                    Err(e) => errors.push(format!("Upload.ashx: {e}")),
+                }
+            }
+            jni_bridge::queue_publish_result(
+                format!("place {place}"),
+                Err(errors.join(" — also tried ")),
+            );
         });
     }
 
