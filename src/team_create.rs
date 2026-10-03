@@ -455,6 +455,14 @@ const RBX_TRANSPORT_BASECLIENT_SEND_CHANNEL_ID: u32 = 0;
 const RBX_TRANSPORT_BASECLIENT_SEND_RELIABILITY: u32 = 2;
 const RBX_TRANSPORT_BASECLIENT_SEND_PRIORITY: u32 = 0;
 
+// Per-stream RbxTransport envelope recovered from Studio's receive path:
+// magic 0x06, version 0x01, application byte, then a big-endian channel ID.
+const RBX_TRANSPORT_STREAM_HEADER_MAGIC: u8 = 0x06;
+const RBX_TRANSPORT_STREAM_HEADER_VERSION: u8 = 0x01;
+const RBX_TRANSPORT_STREAM_HEADER_BYTES: usize = 7;
+const RBX_TRANSPORT_CONTROL_APPLICATION: u8 = 0;
+const RBX_TRANSPORT_CONTROL_CHANNEL_ID: u32 = u32::MAX; // native signed -1
+
 // Exact Studio 0.741 channel-control serializers:
 // OpenReliableChannelControl `0x1436b1980` writes 6 bytes, and
 // OpenUnreliableChannelControl `0x1436b1a40` writes 10 bytes. Dword writes
@@ -463,6 +471,10 @@ const RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE: u8 = 1;
 const RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES: usize = 6;
 const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE: u8 = 2;
 const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES: usize = 10;
+const RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE: u8 = 3;
+const RBX_TRANSPORT_MAX_CONTROL_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(not(test))]
+const RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS: usize = 24;
 
 // Exact current RUPP values from Studio 0.741's Rupp parser/serializer:
 // packet byte 0 is protocol 1/3/4, byte 1 carries flags, bytes 2..4 are the
@@ -801,7 +813,7 @@ impl RbxTransportConnectPlan {
         ));
         let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
         text.push_str(&format!(
-            "\nRbxTransport BaseClient openSendChannel (0.741): application {}, channelId {}, reliability enum {}, priority {}; channel-control payloads recovered as OpenReliable {} bytes (type {}, app, channelId) and OpenUnreliable {} bytes (type {}, app, channelId, wireId).",
+            "\nRbxTransport BaseClient openSendChannel (0.741): application {}, channelId {}, reliability enum {}, priority {}; observed control layouts are OpenReliable {} bytes (type {}, app, channelId) and OpenUnreliable {} bytes (type {}, app, channelId, wireId). The BaseClient reliability-2 wire-channel assignment is unresolved, so the probe does not emit a guessed open-control frame.",
             open.application,
             open.channel_id,
             open.reliability,
@@ -813,7 +825,7 @@ impl RbxTransportConnectPlan {
         ));
         match &self.early_auth {
             Ok(auth) => text.push_str(&format!(
-                "\nRbxTransport BaseClient early auth: active connection send slot argument 1, frame tag 0xA8, auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted)",
+                "\nRbxTransport BaseClient early auth material: native sendEarlyAuthData uses active connection send slot argument 1, frame tag 0xA8; auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted). It is staged for diagnostics but not sent until the reliability-2 channel/wire-ID route is verified.",
                 auth.auth_version,
                 auth.preauth_blob.len(),
                 auth.auth_blob.len(),
@@ -1187,6 +1199,7 @@ fn extract_client_ticket_early_auth(config: &serde_json::Value) -> Result<EarlyA
     parse_early_auth_data(&client_ticket)
 }
 
+#[allow(dead_code)]
 fn build_rbx_transport_open_reliable_channel_control(application: u8, channel_id: u32) -> Vec<u8> {
     let mut payload = Vec::with_capacity(RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES);
     payload.push(RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE);
@@ -1242,6 +1255,214 @@ fn build_rbx_transport_early_auth_payload(auth: &EarlyAuthData) -> Result<Vec<u8
     Ok(payload)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RbxTransportStreamHeader {
+    application: u8,
+    channel_id: u32,
+}
+
+impl RbxTransportStreamHeader {
+    fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < RBX_TRANSPORT_STREAM_HEADER_BYTES {
+            return Err(format!(
+                "stream header is {} bytes; expected at least {}",
+                bytes.len(),
+                RBX_TRANSPORT_STREAM_HEADER_BYTES
+            ));
+        }
+        if bytes[0] != RBX_TRANSPORT_STREAM_HEADER_MAGIC {
+            return Err(format!(
+                "stream header magic 0x{:02x}; expected 0x{:02x}",
+                bytes[0], RBX_TRANSPORT_STREAM_HEADER_MAGIC
+            ));
+        }
+        if bytes[1] != RBX_TRANSPORT_STREAM_HEADER_VERSION {
+            return Err(format!(
+                "stream header version 0x{:02x}; expected 0x{:02x}",
+                bytes[1], RBX_TRANSPORT_STREAM_HEADER_VERSION
+            ));
+        }
+        Ok(Self {
+            application: bytes[2],
+            channel_id: u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]),
+        })
+    }
+
+    #[allow(dead_code)]
+    fn encode(self) -> [u8; RBX_TRANSPORT_STREAM_HEADER_BYTES] {
+        let channel_id = self.channel_id.to_be_bytes();
+        [
+            RBX_TRANSPORT_STREAM_HEADER_MAGIC,
+            RBX_TRANSPORT_STREAM_HEADER_VERSION,
+            self.application,
+            channel_id[0],
+            channel_id[1],
+            channel_id[2],
+            channel_id[3],
+        ]
+    }
+
+    fn is_control_channel(self) -> bool {
+        self.application == RBX_TRANSPORT_CONTROL_APPLICATION
+            && self.channel_id == RBX_TRANSPORT_CONTROL_CHANNEL_ID
+    }
+
+    fn channel_id_label(self) -> String {
+        if self.channel_id == RBX_TRANSPORT_CONTROL_CHANNEL_ID {
+            "-1".into()
+        } else {
+            self.channel_id.to_string()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RbxTransportControlMessage {
+    OpenReliable { application: u8, channel_id: u32 },
+    OpenUnreliable {
+        application: u8,
+        channel_id: u32,
+        wire_channel_id: u32,
+    },
+    /// Native type 3 is three QUIC-style variable-length integers. Their
+    /// exact semantic names are intentionally left unspecified here.
+    CloseUnreliable { fields: [u64; 3] },
+    Unknown { tag: u8 },
+}
+
+#[derive(Default)]
+struct RbxTransportControlDecoder {
+    pending: Vec<u8>,
+    desynchronized: bool,
+}
+
+impl RbxTransportControlDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<RbxTransportControlMessage>, String> {
+        if self.desynchronized {
+            return Ok(Vec::new());
+        }
+        let pending_len = self
+            .pending
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| "control-stream buffer length overflow".to_string())?;
+        if pending_len > RBX_TRANSPORT_MAX_CONTROL_BUFFER_BYTES {
+            return Err(format!(
+                "control-stream buffer exceeded {} bytes",
+                RBX_TRANSPORT_MAX_CONTROL_BUFFER_BYTES
+            ));
+        }
+        self.pending.extend_from_slice(bytes);
+        Ok(self.decode_available())
+    }
+
+    fn decode_available(&mut self) -> Vec<RbxTransportControlMessage> {
+        let mut messages = Vec::new();
+        loop {
+            let Some(&tag) = self.pending.first() else {
+                break;
+            };
+            let decoded = match tag {
+                RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE => {
+                    if self.pending.len() < RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES {
+                        break;
+                    }
+                    Some((
+                        RbxTransportControlMessage::OpenReliable {
+                            application: self.pending[1],
+                            channel_id: u32::from_be_bytes([
+                                self.pending[2],
+                                self.pending[3],
+                                self.pending[4],
+                                self.pending[5],
+                            ]),
+                        },
+                        RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES,
+                    ))
+                }
+                RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE => {
+                    if self.pending.len() < RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES {
+                        break;
+                    }
+                    Some((
+                        RbxTransportControlMessage::OpenUnreliable {
+                            application: self.pending[1],
+                            channel_id: u32::from_be_bytes([
+                                self.pending[2],
+                                self.pending[3],
+                                self.pending[4],
+                                self.pending[5],
+                            ]),
+                            wire_channel_id: u32::from_be_bytes([
+                                self.pending[6],
+                                self.pending[7],
+                                self.pending[8],
+                                self.pending[9],
+                            ]),
+                        },
+                        RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES,
+                    ))
+                }
+                RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE => {
+                    let mut fields = [0u64; 3];
+                    let mut offset = 1usize;
+                    let mut complete = true;
+                    for field in &mut fields {
+                        let Some((value, encoded_len)) = decode_rbx_transport_varint(
+                            &self.pending[offset..],
+                        ) else {
+                            complete = false;
+                            break;
+                        };
+                        *field = value;
+                        offset += encoded_len;
+                    }
+                    if !complete {
+                        break;
+                    }
+                    Some((
+                        RbxTransportControlMessage::CloseUnreliable { fields },
+                        offset,
+                    ))
+                }
+                _ => {
+                    // Unknown control tags have no verified length. Stop
+                    // dispatching this stream rather than guessing where the
+                    // next frame begins after the unknown record.
+                    self.pending.clear();
+                    self.desynchronized = true;
+                    messages.push(RbxTransportControlMessage::Unknown { tag });
+                    return messages;
+                }
+            };
+            let Some((message, consumed)) = decoded else {
+                break;
+            };
+            self.pending.drain(..consumed);
+            messages.push(message);
+        }
+        messages
+    }
+}
+
+fn decode_rbx_transport_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let first = *bytes.first()?;
+    let encoded_len = match first >> 6 {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    if bytes.len() < encoded_len {
+        return None;
+    }
+    let mut value = u64::from(first & 0x3f);
+    for byte in bytes.iter().take(encoded_len).skip(1) {
+        value = (value << 8) | u64::from(*byte);
+    }
+    Some((value, encoded_len))
+}
+
 const RBX_TRANSPORT_ALPN: &[u8] = b"RbxTransport";
 const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
@@ -1288,14 +1509,14 @@ fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec
 
 #[cfg(test)]
 fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms: u64) -> String {
-    "\nRbxTransport connected-session attempt: skipped under unit tests (the app build performs the QUIC/RPK/RUPP connection and early-auth send).".into()
+    "\nRbxTransport connected-session attempt: skipped under unit tests (the app build performs a bounded QUIC/RPK/RUPP receive/dispatch window; early auth remains unsent until channel routing is verified).".into()
 }
 
 #[cfg(not(test))]
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n✅ BaseClient early auth sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted)\n{}",
+            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified\n{}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1490,7 +1711,10 @@ async fn run_rbx_transport_connection_async(
         .early_auth
         .as_ref()
         .map_err(|reason| format!("early-auth material unavailable: {reason}"))?;
-    let early_auth_payload = build_rbx_transport_early_auth_payload(auth)?;
+    // Keep the exact native 0xA8 frame length for the report, but do not send
+    // it on a guessed QUIC stream. BaseClient opens reliability enum 2 and the
+    // assigned WireChannelId/data route is not yet verified.
+    let early_auth_payload_len = build_rbx_transport_early_auth_payload(auth)?.len();
     let routes = build_rbx_transport_quic_routes(plan)?;
     let mut failures = Vec::new();
 
@@ -1499,7 +1723,7 @@ async fn run_rbx_transport_connection_async(
         match attempt_rbx_transport_connection_async(
             plan,
             auth,
-            &early_auth_payload,
+            early_auth_payload_len,
             route,
             requested_timeout_ms,
             handshake_timeout_ms,
@@ -1523,7 +1747,7 @@ async fn run_rbx_transport_connection_async(
 async fn attempt_rbx_transport_connection_async(
     plan: &RbxTransportConnectPlan,
     auth: &EarlyAuthData,
-    early_auth_payload: &[u8],
+    early_auth_payload_len: usize,
     route: RbxTransportQuicRoute,
     requested_timeout_ms: u64,
     handshake_timeout_ms: u64,
@@ -1592,37 +1816,12 @@ async fn attempt_rbx_transport_connection_async(
         .map_err(|error| format!("QUIC handshake failed: {error}"))?;
     let connected_ms = started.elapsed().as_millis();
 
-    let mut auth_stream = tokio::time::timeout(operation_timeout, connection.open_uni())
-        .await
-        .map_err(|_| "timed out opening early-auth QUIC stream".to_string())?
-        .map_err(|error| format!("failed to open early-auth QUIC stream: {error}"))?;
-    auth_stream
-        .write_all(early_auth_payload)
-        .await
-        .map_err(|error| format!("failed to send early-auth payload: {error}"))?;
-    auth_stream
-        .finish()
-        .map_err(|error| format!("failed to finish early-auth stream: {error}"))?;
-
-    let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
-    let open_reliable = build_rbx_transport_open_reliable_channel_control(
-        open.application,
-        open.channel_id,
-    );
-    let mut control_stream = tokio::time::timeout(operation_timeout, connection.open_uni())
-        .await
-        .map_err(|_| "timed out opening BaseClient channel-control stream".to_string())?
-        .map_err(|error| format!("failed to open BaseClient channel-control stream: {error}"))?;
-    control_stream
-        .write_all(&open_reliable)
-        .await
-        .map_err(|error| format!("failed to send BaseClient OpenReliable control payload: {error}"))?;
-    control_stream
-        .finish()
-        .map_err(|error| format!("failed to finish BaseClient channel-control stream: {error}"))?;
-
-    let inbound_summary = wait_for_rbx_transport_inbound(&connection, operation_timeout).await;
-    endpoint.close(quinn::VarInt::from_u32(0), b"rbxl-editor Team Create probe complete");
+    // No auth/open-control bytes are sent yet: the native BaseClient request
+    // is reliability enum 2, while the reliable and unreliable control paths
+    // differ and the native WireChannelId allocator/final writer are still
+    // unresolved. Sending the prior raw uni-stream probe here was unframed.
+    let inbound_summary = receive_rbx_transport_session(&connection, operation_timeout).await;
+    endpoint.close(quinn::VarInt::from_u32(0), b"rbxl-editor Team Create receive window complete");
     Ok(RbxTransportConnectionReport {
         route_label: route.route_label,
         target: route.target_endpoint.label(),
@@ -1642,34 +1841,436 @@ async fn attempt_rbx_transport_connection_async(
         auth_version: auth.auth_version,
         preauth_len: auth.preauth_blob.len(),
         auth_len: auth.auth_blob.len(),
-        early_auth_payload_len: early_auth_payload.len(),
+        early_auth_payload_len,
         inbound_summary,
     })
 }
 
 #[cfg(not(test))]
-async fn wait_for_rbx_transport_inbound(
+#[derive(Clone, Default)]
+struct RbxTransportReceiveStats {
+    accepted_uni_streams: usize,
+    accepted_bi_streams: usize,
+    datagrams: usize,
+    datagram_bytes: usize,
+    valid_stream_headers: usize,
+    malformed_stream_headers: usize,
+    control_streams: usize,
+    application_streams: usize,
+    stream_payload_bytes: usize,
+    control_messages: usize,
+    reliable_open_on_control: usize,
+    unreliable_opens: usize,
+    unreliable_closes: usize,
+    unknown_control_tags: usize,
+    reliable_stream_open_prefixes: usize,
+    stream_read_errors: usize,
+    events: Vec<String>,
+}
+
+#[cfg(not(test))]
+fn update_rbx_transport_receive_stats(
+    stats: &Arc<std::sync::Mutex<RbxTransportReceiveStats>>,
+    update: impl FnOnce(&mut RbxTransportReceiveStats),
+) {
+    if let Ok(mut stats) = stats.lock() {
+        update(&mut stats);
+    }
+}
+
+#[cfg(not(test))]
+fn add_rbx_transport_receive_event(
+    stats: &Arc<std::sync::Mutex<RbxTransportReceiveStats>>,
+    event: String,
+) {
+    update_rbx_transport_receive_stats(stats, |stats| {
+        if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+            stats.events.push(event);
+        }
+    });
+}
+
+#[cfg(not(test))]
+async fn read_rbx_transport_stream_header(
+    recv: &mut quinn::RecvStream,
+    timeout: Duration,
+) -> Result<RbxTransportStreamHeader, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut raw = [0u8; RBX_TRANSPORT_STREAM_HEADER_BYTES];
+    let mut filled = 0usize;
+    while filled < raw.len() {
+        let chunk = tokio::time::timeout_at(
+            deadline,
+            recv.read_chunk(raw.len() - filled, true),
+        )
+        .await
+        .map_err(|_| format!("timed out after {filled}/{} header bytes", raw.len()))?
+        .map_err(|error| format!("failed while reading stream header: {error}"))?;
+        let Some(chunk) = chunk else {
+            return Err(format!(
+                "stream ended after {filled}/{} header bytes",
+                raw.len()
+            ));
+        };
+        if chunk.bytes.is_empty() {
+            continue;
+        }
+        let count = chunk.bytes.len().min(raw.len() - filled);
+        raw[filled..filled + count].copy_from_slice(&chunk.bytes[..count]);
+        filled += count;
+    }
+    RbxTransportStreamHeader::parse(&raw)
+}
+
+#[cfg(not(test))]
+fn dispatch_rbx_transport_control_message(
+    stats: &Arc<std::sync::Mutex<RbxTransportReceiveStats>>,
+    stream_id: &str,
+    message: RbxTransportControlMessage,
+) {
+    update_rbx_transport_receive_stats(stats, |stats| {
+        stats.control_messages += 1;
+        let event = match message {
+            RbxTransportControlMessage::OpenReliable {
+                application,
+                channel_id,
+            } => {
+                stats.reliable_open_on_control += 1;
+                format!(
+                    "stream {stream_id}: type-1 OpenReliable(app={application}, channel={channel_id}) appeared on the special control stream; native control dispatch treats type 1 as unknown"
+                )
+            }
+            RbxTransportControlMessage::OpenUnreliable {
+                application,
+                channel_id,
+                wire_channel_id,
+            } => {
+                stats.unreliable_opens += 1;
+                format!(
+                    "stream {stream_id}: OpenUnreliable(app={application}, channel={channel_id}, wire={wire_channel_id})"
+                )
+            }
+            RbxTransportControlMessage::CloseUnreliable { fields } => {
+                stats.unreliable_closes += 1;
+                format!(
+                    "stream {stream_id}: type-3 close-unreliable fields [{}, {}, {}] (field semantics unconfirmed)",
+                    fields[0], fields[1], fields[2]
+                )
+            }
+            RbxTransportControlMessage::Unknown { tag } => {
+                stats.unknown_control_tags += 1;
+                format!(
+                    "stream {stream_id}: unknown control tag 0x{tag:02x}; dispatch for this control stream stopped"
+                )
+            }
+        };
+        if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+            stats.events.push(event);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn account_rbx_transport_application_stream_bytes(
+    stats: &Arc<std::sync::Mutex<RbxTransportReceiveStats>>,
+    stream_id: &str,
+    header: RbxTransportStreamHeader,
+    pending_open: &mut Vec<u8>,
+    open_prefix_checked: &mut bool,
+    bytes: &[u8],
+) {
+    if *open_prefix_checked {
+        update_rbx_transport_receive_stats(stats, |stats| {
+            stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(bytes.len());
+        });
+        return;
+    }
+
+    pending_open.extend_from_slice(bytes);
+    let Some(&tag) = pending_open.first() else {
+        return;
+    };
+    if tag != RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE {
+        *open_prefix_checked = true;
+        let payload_bytes = pending_open.len();
+        update_rbx_transport_receive_stats(stats, |stats| {
+            stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(payload_bytes);
+            if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+                stats.events.push(format!(
+                    "stream {stream_id}: body did not start with an OpenReliable prefix; counting it as opaque application data (app {}, channel {})",
+                    header.application,
+                    header.channel_id_label()
+                ));
+            }
+        });
+        pending_open.clear();
+        return;
+    }
+    if pending_open.len() < RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES {
+        return;
+    }
+
+    let application = pending_open[1];
+    let channel_id = u32::from_be_bytes([
+        pending_open[2],
+        pending_open[3],
+        pending_open[4],
+        pending_open[5],
+    ]);
+    let payload_bytes = pending_open.len() - RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES;
+    *open_prefix_checked = true;
+    update_rbx_transport_receive_stats(stats, |stats| {
+        stats.reliable_stream_open_prefixes += 1;
+        stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(payload_bytes);
+        if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+            stats.events.push(format!(
+                "stream {stream_id}: reliable-stream OpenReliable prefix app={application}, channel={channel_id}; outer header app={}, channel={} (channel identities are reported separately)",
+                header.application,
+                header.channel_id_label()
+            ));
+        }
+    });
+    pending_open.clear();
+}
+
+#[cfg(not(test))]
+async fn read_rbx_transport_stream(
+    mut recv: quinn::RecvStream,
+    header_timeout: Duration,
+    stats: Arc<std::sync::Mutex<RbxTransportReceiveStats>>,
+) {
+    let stream_id = format!("{:?}", recv.id());
+    let header = match read_rbx_transport_stream_header(&mut recv, header_timeout).await {
+        Ok(header) => header,
+        Err(error) => {
+            update_rbx_transport_receive_stats(&stats, |stats| {
+                stats.malformed_stream_headers += 1;
+                if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+                    stats.events.push(format!(
+                        "stream {stream_id}: rejected RbxTransport header: {error}"
+                    ));
+                }
+            });
+            return;
+        }
+    };
+
+    let control_stream = header.is_control_channel();
+    update_rbx_transport_receive_stats(&stats, |stats| {
+        stats.valid_stream_headers += 1;
+        if control_stream {
+            stats.control_streams += 1;
+        } else {
+            stats.application_streams += 1;
+        }
+        if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+            stats.events.push(format!(
+                "stream {stream_id}: header app={}, channel={}{}",
+                header.application,
+                header.channel_id_label(),
+                if control_stream { " (control)" } else { "" }
+            ));
+        }
+    });
+
+    let mut control_decoder = RbxTransportControlDecoder::default();
+    let mut pending_open = Vec::new();
+    let mut open_prefix_checked = false;
+    loop {
+        match recv.read_chunk(64 * 1024, true).await {
+            Ok(Some(chunk)) => {
+                if control_stream {
+                    match control_decoder.push(&chunk.bytes) {
+                        Ok(messages) => {
+                            for message in messages {
+                                dispatch_rbx_transport_control_message(
+                                    &stats,
+                                    &stream_id,
+                                    message,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            update_rbx_transport_receive_stats(&stats, |stats| {
+                                stats.stream_read_errors += 1;
+                                if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+                                    stats.events.push(format!(
+                                        "stream {stream_id}: stopped control dispatch: {error}"
+                                    ));
+                                }
+                            });
+                            break;
+                        }
+                    }
+                } else {
+                    account_rbx_transport_application_stream_bytes(
+                        &stats,
+                        &stream_id,
+                        header,
+                        &mut pending_open,
+                        &mut open_prefix_checked,
+                        &chunk.bytes,
+                    );
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                update_rbx_transport_receive_stats(&stats, |stats| {
+                    stats.stream_read_errors += 1;
+                    if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+                        stats.events.push(format!(
+                            "stream {stream_id}: body read stopped: {error}"
+                        ));
+                    }
+                });
+                break;
+            }
+        }
+    }
+
+    if !control_decoder.pending.is_empty() {
+        add_rbx_transport_receive_event(
+            &stats,
+            format!(
+                "stream {stream_id}: stream ended with {} incomplete control-frame byte(s)",
+                control_decoder.pending.len()
+            ),
+        );
+    }
+    if !pending_open.is_empty() && !open_prefix_checked {
+        add_rbx_transport_receive_event(
+            &stats,
+            format!(
+                "stream {stream_id}: stream ended with an incomplete OpenReliable prefix ({} byte(s))",
+                pending_open.len()
+            ),
+        );
+    }
+}
+
+#[cfg(not(test))]
+async fn receive_rbx_transport_session(
     connection: &quinn::Connection,
     timeout: Duration,
 ) -> String {
-    tokio::select! {
-        result = connection.accept_uni() => match result {
-            Ok(recv) => format!("✅ RbxTransport inbound receive opened a unidirectional stream (stream id {:?}); connected receive path is live, schema/JoinData decode remains read-only next.", recv.id()),
-            Err(error) => format!("RbxTransport connection closed while waiting for inbound unidirectional stream: {error}"),
-        },
-        result = connection.accept_bi() => match result {
-            Ok((_send, recv)) => format!("✅ RbxTransport inbound receive opened a bidirectional stream (stream id {:?}); connected receive path is live, schema/JoinData decode remains read-only next.", recv.id()),
-            Err(error) => format!("RbxTransport connection closed while waiting for inbound bidirectional stream: {error}"),
-        },
-        result = connection.read_datagram() => match result {
-            Ok(bytes) => format!("✅ RbxTransport inbound receive got an application datagram ({} bytes redacted); connected receive path is live, schema/JoinData decode remains read-only next.", bytes.len()),
-            Err(error) => format!("RbxTransport datagram receive ended while waiting for inbound traffic: {error}"),
-        },
-        _ = tokio::time::sleep(timeout) => format!(
-            "RbxTransport QUIC handshake and early-auth writes completed, but no inbound stream/datagram arrived during the {} ms receive window; channel framing may need the recovered NetStream header/custom TLS capability extension before JoinData can be decoded.",
-            timeout.as_millis()
-        ),
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    let stats = Arc::new(std::sync::Mutex::new(RbxTransportReceiveStats::default()));
+    let mut stream_tasks = tokio::task::JoinSet::new();
+    let mut bidi_send_halves = Vec::new();
+    let mut datagrams_enabled = true;
+    let mut connection_closed = None;
+
+    loop {
+        tokio::select! {
+            accepted = connection.accept_uni() => match accepted {
+                Ok(recv) => {
+                    update_rbx_transport_receive_stats(&stats, |stats| {
+                        stats.accepted_uni_streams += 1;
+                    });
+                    stream_tasks.spawn(read_rbx_transport_stream(
+                        recv,
+                        timeout,
+                        Arc::clone(&stats),
+                    ));
+                }
+                Err(error) => {
+                    connection_closed = Some(error.to_string());
+                    break;
+                }
+            },
+            accepted = connection.accept_bi() => match accepted {
+                Ok((send, recv)) => {
+                    update_rbx_transport_receive_stats(&stats, |stats| {
+                        stats.accepted_bi_streams += 1;
+                    });
+                    bidi_send_halves.push(send);
+                    stream_tasks.spawn(read_rbx_transport_stream(
+                        recv,
+                        timeout,
+                        Arc::clone(&stats),
+                    ));
+                }
+                Err(error) => {
+                    connection_closed = Some(error.to_string());
+                    break;
+                }
+            },
+            datagram = connection.read_datagram(), if datagrams_enabled => match datagram {
+                Ok(bytes) => {
+                    update_rbx_transport_receive_stats(&stats, |stats| {
+                        stats.datagrams += 1;
+                        stats.datagram_bytes = stats.datagram_bytes.saturating_add(bytes.len());
+                    });
+                }
+                Err(error) => {
+                    // A peer may not negotiate QUIC datagrams or may have
+                    // closed the connection. Disable this branch to avoid a
+                    // repeatedly-ready error; the stream accept branches will
+                    // report connection closure if that is what happened.
+                    datagrams_enabled = false;
+                    add_rbx_transport_receive_event(
+                        &stats,
+                        format!("QUIC datagram receive stopped: {error}"),
+                    );
+                }
+            },
+            Some(result) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if let Err(error) = result {
+                    add_rbx_transport_receive_event(
+                        &stats,
+                        format!("stream receive task ended unexpectedly: {error}"),
+                    );
+                }
+            },
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
     }
+
+    stream_tasks.abort_all();
+    while stream_tasks.join_next().await.is_some() {}
+    // Preserve accepted bidi send halves for the whole receive window. They
+    // are deliberately not finished with an invented ACK/control payload.
+    drop(bidi_send_halves);
+
+    let snapshot = stats
+        .lock()
+        .map(|stats| stats.clone())
+        .unwrap_or_default();
+    let mut summary = format!(
+        "RbxTransport persistent receive/dispatch window: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); reliable-stream OpenReliable prefixes {}; body-read errors {}.",
+        started.elapsed().as_millis(),
+        snapshot.accepted_uni_streams,
+        snapshot.accepted_bi_streams,
+        snapshot.valid_stream_headers,
+        snapshot.malformed_stream_headers,
+        snapshot.control_streams,
+        snapshot.application_streams,
+        snapshot.stream_payload_bytes,
+        snapshot.datagrams,
+        snapshot.datagram_bytes,
+        snapshot.control_messages,
+        snapshot.reliable_open_on_control,
+        snapshot.unreliable_opens,
+        snapshot.unreliable_closes,
+        snapshot.unknown_control_tags,
+        snapshot.reliable_stream_open_prefixes,
+        snapshot.stream_read_errors,
+    );
+    if let Some(reason) = connection_closed {
+        summary.push_str(&format!(" Connection closed: {reason}."));
+    }
+    for event in snapshot.events {
+        summary.push_str("\n  ");
+        summary.push_str(&event);
+    }
+    summary.push_str(
+        "\nACK contract: Quinn handles QUIC transport ACK frames; this loop emits no additional RbxTransport application/channel ACK. ReceiveChannelOpened acknowledgment is local event-level bookkeeping; the separate native 'channel ack' log refers to data received on a locally opened stream, and its application-level wire contract remains unresolved.",
+    );
+    summary.push_str(
+        "\nApplication datagrams and post-prefix stream bytes are counted but not decoded; JoinData/change-item parsing is still outstanding.",
+    );
+    summary
 }
 
 #[cfg(not(test))]
@@ -3779,6 +4380,106 @@ mod tests {
             ),
             vec![0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04]
         );
+    }
+
+    #[test]
+    fn rbx_transport_stream_header_uses_the_seven_byte_big_endian_envelope() {
+        let control = RbxTransportStreamHeader {
+            application: RBX_TRANSPORT_CONTROL_APPLICATION,
+            channel_id: RBX_TRANSPORT_CONTROL_CHANNEL_ID,
+        };
+        let encoded = control.encode();
+        assert_eq!(encoded, [0x06, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(RbxTransportStreamHeader::parse(&encoded), Ok(control));
+        assert!(control.is_control_channel());
+        assert_eq!(control.channel_id_label(), "-1");
+
+        let application = RbxTransportStreamHeader {
+            application: 1,
+            channel_id: 0x0102_0304,
+        };
+        let encoded = application.encode();
+        assert_eq!(encoded, [0x06, 0x01, 0x01, 0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(RbxTransportStreamHeader::parse(&encoded), Ok(application));
+        assert!(!application.is_control_channel());
+        assert!(RbxTransportStreamHeader::parse(&encoded[..6]).is_err());
+
+        let mut bad_magic = encoded;
+        bad_magic[0] = 0x05;
+        assert!(RbxTransportStreamHeader::parse(&bad_magic).is_err());
+        let mut bad_version = encoded;
+        bad_version[1] = 0x02;
+        assert!(RbxTransportStreamHeader::parse(&bad_version).is_err());
+    }
+
+    #[test]
+    fn rbx_transport_control_decoder_handles_fragmented_and_coalesced_frames() {
+        let reliable = build_rbx_transport_open_reliable_channel_control(1, 0x0102_0304);
+        let unreliable = build_rbx_transport_open_unreliable_channel_control(
+            2,
+            0x0506_0708,
+            0x090a_0b0c,
+        );
+        // Three QUIC-style varints: 37 (1 byte), 15293 (2 bytes), and
+        // 494878333 (4 bytes). Type-3 field semantics remain unconfirmed.
+        let close_unreliable = [
+            RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE,
+            0x25,
+            0x7b,
+            0xbd,
+            0x9d,
+            0x7f,
+            0x3e,
+            0x7d,
+        ];
+
+        let mut decoder = RbxTransportControlDecoder::default();
+        assert!(decoder.push(&unreliable[..5]).unwrap().is_empty());
+        assert_eq!(
+            decoder.push(&unreliable[5..]).unwrap(),
+            vec![RbxTransportControlMessage::OpenUnreliable {
+                application: 2,
+                channel_id: 0x0506_0708,
+                wire_channel_id: 0x090a_0b0c,
+            }]
+        );
+        assert!(decoder.push(&close_unreliable[..7]).unwrap().is_empty());
+        assert_eq!(
+            decoder.push(&close_unreliable[7..]).unwrap(),
+            vec![RbxTransportControlMessage::CloseUnreliable {
+                fields: [37, 15_293, 494_878_333],
+            }]
+        );
+
+        let mut coalesced = reliable;
+        coalesced.extend_from_slice(&unreliable);
+        coalesced.extend_from_slice(&close_unreliable);
+        assert_eq!(
+            decoder.push(&coalesced).unwrap(),
+            vec![
+                RbxTransportControlMessage::OpenReliable {
+                    application: 1,
+                    channel_id: 0x0102_0304,
+                },
+                RbxTransportControlMessage::OpenUnreliable {
+                    application: 2,
+                    channel_id: 0x0506_0708,
+                    wire_channel_id: 0x090a_0b0c,
+                },
+                RbxTransportControlMessage::CloseUnreliable {
+                    fields: [37, 15_293, 494_878_333],
+                },
+            ]
+        );
+        assert!(decoder.pending.is_empty());
+
+        let mut unknown = RbxTransportControlDecoder::default();
+        assert_eq!(
+            unknown.push(&[0xfe, 0x01, 0x02]).unwrap(),
+            vec![RbxTransportControlMessage::Unknown { tag: 0xfe }]
+        );
+        assert!(unknown.desynchronized);
+        assert!(unknown.push(&reliable).unwrap().is_empty());
     }
 
     #[test]
