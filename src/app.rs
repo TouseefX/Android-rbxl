@@ -369,6 +369,13 @@ pub struct EditorApp {
     /// Last successful join config from gamejoin (has the server endpoints);
     /// enables the transport-resolution button.
     team_create_join_config: Option<serde_json::Value>,
+    /// App-owned transport worker channel; the QUIC runtime and persistent
+    /// receive loop live on the worker, never on the egui frame thread.
+    team_create_session_rx: Option<Receiver<crate::team_create::RbxTransportSessionEvent>>,
+    team_create_session_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    team_create_session_running: bool,
+    team_create_session_connected: bool,
+    team_create_session_status: String,
 
     // Per-property text buffers so number properties (float/int, and vector
     // components) can be TYPED exactly like Studio instead of only dragged.
@@ -521,6 +528,11 @@ impl Default for EditorApp {
             game_cfg_response: String::new(),
             team_create_response: String::new(),
             team_create_join_config: None,
+            team_create_session_rx: None,
+            team_create_session_cancel: None,
+            team_create_session_running: false,
+            team_create_session_connected: false,
+            team_create_session_status: String::new(),
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
@@ -540,6 +552,14 @@ impl Default for EditorApp {
         RobloxApiClient::fetch_live_catalog_async("sword".into());
         app.is_searching_live = true;
         app
+    }
+}
+
+impl Drop for EditorApp {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.team_create_session_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -1778,7 +1798,7 @@ ui.label("Place ID:");
                 // replication client (UDP/RakNet) is a future stage.
                 ui.group(|ui| {
                     ui.label(RichText::new("👥 Team Create Sessions").heading().color(Color32::from_rgb(120, 200, 255)));
-                    ui.label("Cookie-auth control plane: check/enable Team Create, see who's in the cloud-edit session, and negotiate a join (returns the session server's address). Uses the Universe/Place IDs above.");
+                    ui.label("Cookie-auth control plane: check/enable Team Create, view cloud-edit members, and negotiate a join. Start Transport Session runs on a background worker; a connected RbxTransport receive loop stays active until stopped or the peer closes. Early auth/channel-control data remains gated on verified routing.");
 
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("🔄 Check Status").clicked() {
@@ -1860,23 +1880,30 @@ ui.label("Place ID:");
                     });
 
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("🎫 Negotiate Join").clicked() {
+                        let can_start = !self.team_create_session_running;
+                        if ui
+                            .add_enabled(can_start, egui::Button::new("🎫 Negotiate Join"))
+                            .clicked()
+                        {
                             self.team_create_negotiate(false, false, false);
                         }
-                        if ui.button("⚡ Warm Up Server").clicked() {
+                        if ui
+                            .add_enabled(can_start, egui::Button::new("⚡ Warm Up Server"))
+                            .clicked()
+                        {
                             self.team_create_negotiate(true, false, false);
                         }
                         if ui
-                            .button("🎯 Fresh Join + Resolve")
+                            .add_enabled(can_start, egui::Button::new("🎯 Fresh Join + Session"))
                             .on_hover_text(
-                                "Negotiates a brand-new one-use ticket and immediately resolves the selected transport with the normal KeyRing send version",
+                                "Negotiates a brand-new one-use ticket and immediately starts the selected transport session with the normal KeyRing send version",
                             )
                             .clicked()
                         {
                             self.team_create_negotiate(false, true, false);
                         }
                         if ui
-                            .button("🛟 Fresh Revert-Key Probe")
+                            .add_enabled(can_start, egui::Button::new("🛟 Fresh Revert-Key Session"))
                             .on_hover_text(
                                 "Negotiates another fresh ticket and models native DFFlag::KeyRingRevert selection; use when send and revert versions differ",
                             )
@@ -1884,29 +1911,40 @@ ui.label("Place ID:");
                         {
                             self.team_create_negotiate(false, true, true);
                         }
-                        let can_probe = self
-                            .team_create_join_config
-                            .as_ref()
-                            .is_some_and(|cfg| !crate::team_create::parse_join_config(cfg).is_empty());
+                        let can_probe = can_start
+                            && self
+                                .team_create_join_config
+                                .as_ref()
+                                .is_some_and(|cfg| !crate::team_create::parse_join_config(cfg).is_empty());
                         let probe = ui
-                            .add_enabled(can_probe, egui::Button::new("📡 Resolve Rbx Transport"))
+                            .add_enabled(can_probe, egui::Button::new("📡 Start Transport Session"))
                             .on_hover_text(if can_probe {
-                                "Maps the current Team Create config through the 0.741 transport selector. Legacy RakNet configs are probed; RbxTransport configs are preserved for the QUIC path. The join ticket is one-use."
+                                "Consumes this one-use gamejoin config, starts the selected transport on a background worker, and keeps the RbxTransport receive/dispatch loop alive until stopped or disconnected."
                             } else {
-                                "Run Negotiate Join immediately before each transport resolution; encrypted early-auth material is one-use"
+                                "Negotiate Join immediately before each transport session; the join ticket is one-use"
                             });
                         if probe.clicked() {
                             // Request2 pre-auth MACs are replay-protected. Consume the
                             // config so a second click cannot silently reuse a ticket.
                             if let Some(cfg) = self.team_create_join_config.take() {
-                                self.status = "Resolving Team Create transport…".into();
-                                let report = crate::team_create::probe_join_config(&cfg, 3, 2500);
-                                self.log_info(format!("Team Create transport resolution:\n{report}"));
-                                self.team_create_response = report;
-                                self.status = "Team Create transport resolution finished — see panel output".into();
+                                self.start_team_create_transport_session(cfg, false, None);
                             }
                         }
+                        let stop_label = if self.team_create_session_connected {
+                            "⏹ Stop Connected Session"
+                        } else {
+                            "⏹ Cancel Transport Connect"
+                        };
+                        if self.team_create_session_running && ui.button(stop_label).clicked() {
+                            if let Some(cancel) = &self.team_create_session_cancel {
+                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            self.team_create_session_status = "Stopping Team Create transport session…".into();
+                        }
                     });
+                    if !self.team_create_session_status.is_empty() {
+                        ui.label(RichText::new(&self.team_create_session_status).weak());
+                    }
 
                     if !self.team_create_response.is_empty() {
                         ui.horizontal(|ui| {
@@ -4593,6 +4631,7 @@ ui.label("Place ID:");
     fn drain_events(&mut self) {
         // Poll the live-session bridge (connected Studio companion plugin).
         self.drain_live_session_events();
+        self.pump_team_create_session_events();
         // Drain any background plugin-run log lines / completion.
         self.pump_plugin_logs();
         self.pump_plugin_thumbnails();
@@ -5775,17 +5814,199 @@ ui.label("Place ID:");
         });
     }
 
-    /// Build a read-only cookie Option for background threads.
-    /// Team Create join negotiation (or preemptive server warm-up): POST the
-    /// gamejoin request and summarize the returned server config — the
-    /// address/port the UDP replication client would connect to. Proves the
-    /// whole cookie → session → server pipeline works from this device.
+    fn pump_team_create_session_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = self.team_create_session_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                crate::team_create::RbxTransportSessionEvent::Status(status) => {
+                    self.team_create_session_status = status;
+                }
+                crate::team_create::RbxTransportSessionEvent::Connected(status) => {
+                    self.team_create_session_connected = true;
+                    self.team_create_session_status = status.clone();
+                    self.status = "RbxTransport connected; receive/dispatch loop running".into();
+                    self.log_info(status);
+                }
+                crate::team_create::RbxTransportSessionEvent::Finished(report) => {
+                    self.team_create_response = report.clone();
+                    self.team_create_session_status =
+                        "Team Create transport session finished — see output".into();
+                    self.status = self.team_create_session_status.clone();
+                    self.log_info(format!("Team Create transport session:\n{report}"));
+                    self.team_create_session_running = false;
+                    self.team_create_session_connected = false;
+                    self.team_create_session_cancel = None;
+                    self.team_create_session_rx = None;
+                }
+            }
+        }
+
+        if disconnected && self.team_create_session_running {
+            self.team_create_session_running = false;
+            self.team_create_session_connected = false;
+            self.team_create_session_cancel = None;
+            self.team_create_session_rx = None;
+            self.team_create_session_status =
+                "Team Create transport worker exited without a final report".into();
+            self.team_create_response = self.team_create_session_status.clone();
+            self.status = self.team_create_session_status.clone();
+            let error = self.team_create_session_status.clone();
+            self.log_error(error);
+        }
+    }
+
+    fn start_team_create_session_worker<F>(&mut self, initial_status: String, worker: F)
+    where
+        F: FnOnce(
+                Sender<crate::team_create::RbxTransportSessionEvent>,
+                std::sync::Arc<std::sync::atomic::AtomicBool>,
+            ) + Send
+            + 'static,
+    {
+        if self.team_create_session_running {
+            self.team_create_session_status =
+                "A Team Create transport session is already running".into();
+            return;
+        }
+        let (event_tx, event_rx): (
+            Sender<crate::team_create::RbxTransportSessionEvent>,
+            Receiver<crate::team_create::RbxTransportSessionEvent>,
+        ) = channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.team_create_session_rx = Some(event_rx);
+        self.team_create_session_cancel = Some(std::sync::Arc::clone(&cancel));
+        self.team_create_session_running = true;
+        self.team_create_session_connected = false;
+        self.team_create_session_status = initial_status.clone();
+        self.team_create_response = initial_status.clone();
+        self.status = initial_status;
+        std::thread::spawn(move || worker(event_tx, cancel));
+    }
+
+    fn start_team_create_transport_session(
+        &mut self,
+        config: serde_json::Value,
+        key_ring_revert: bool,
+        report_prefix: Option<String>,
+    ) {
+        self.start_team_create_session_worker(
+            "Starting Team Create transport session…".into(),
+            move |event_tx, cancel| {
+                crate::team_create::run_join_config_session(
+                    config,
+                    3,
+                    2500,
+                    key_ring_revert,
+                    report_prefix,
+                    cancel,
+                    event_tx,
+                );
+            },
+        );
+    }
+
+    fn start_team_create_fresh_join_session(&mut self, key_ring_revert: bool) {
+        if self.team_create_session_running {
+            self.team_create_session_status =
+                "Stop the current Team Create transport session before starting a fresh join".into();
+            return;
+        }
+        let Some(cookie) = self.roblosecurity_cookie() else {
+            self.team_create_response =
+                "Set your .ROBLOSECURITY cookie in the Settings tab first".into();
+            return;
+        };
+        let place_id = self.open_cloud_place_id.trim().to_owned();
+        let key_mode = if key_ring_revert {
+            "KeyRingRevert"
+        } else {
+            "normal send"
+        };
+        let report_prefix = format!(
+            "Fresh gamejoin config handed directly to the selected transport path ({key_mode} key selection; one-use config consumed once).\n"
+        );
+        self.team_create_join_config = None;
+        self.log_info(format!(
+            "Starting fresh Team Create join plus transport session ({key_mode}) for place {place_id}"
+        ));
+        self.start_team_create_session_worker(
+            "Requesting a fresh Team Create join config…".into(),
+            move |event_tx, cancel| {
+                match RobloxApiClient::team_create_join(&cookie, &place_id, false) {
+                    Ok(config) => {
+                        let endpoints = crate::team_create::parse_join_config(&config);
+                        if endpoints.is_empty() {
+                            let reason = if crate::team_create::join_response_is_all_null(&config) {
+                                "gamejoin returned only null/empty values; no transport session was started"
+                            } else {
+                                "gamejoin returned no usable server endpoint; no transport session was started"
+                            };
+                            let _ = event_tx.send(
+                                crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                                    "{report_prefix}{reason}"
+                                )),
+                            );
+                            return;
+                        }
+                        let _ = event_tx.send(
+                            crate::team_create::RbxTransportSessionEvent::Status(
+                                "Fresh gamejoin config received; entering the selected transport without a second UI step…".into(),
+                            ),
+                        );
+                        crate::team_create::run_join_config_session(
+                            config,
+                            3,
+                            2500,
+                            key_ring_revert,
+                            Some(report_prefix),
+                            cancel,
+                            event_tx,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(
+                            crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                                "Fresh Team Create join failed: {error}"
+                            )),
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    /// Fetch a cookie-auth gamejoin config (or preemptive server warm-up).
+    /// The combined fresh-join action routes the one-use response to the
+    /// cancellable transport worker without a second UI step.
     fn team_create_negotiate(
         &mut self,
         preemptive: bool,
         probe_immediately: bool,
         key_ring_revert: bool,
     ) {
+        if probe_immediately && !preemptive {
+            self.start_team_create_fresh_join_session(key_ring_revert);
+            return;
+        }
+        if self.team_create_session_running {
+            self.team_create_session_status =
+                "Stop the active Team Create transport session before negotiating another join".into();
+            return;
+        }
         let Some(cookie) = self.roblosecurity_cookie() else {
             self.team_create_response =
                 "Set your .ROBLOSECURITY cookie in the Settings tab first".into();
@@ -5801,37 +6022,8 @@ ui.label("Place ID:");
                 let endpoints = crate::team_create::parse_join_config(&v);
                 let all_null = crate::team_create::join_response_is_all_null(&v);
                 let summary = if let Some(first) = endpoints.first() {
-                    // Native Studio consumes early-auth material immediately
-                    // after gamejoin returns. The combined action does the
-                    // same, avoiding expiry or accidental reuse between two
-                    // separate UI clicks.
-                    if probe_immediately && !preemptive {
-                        self.status =
-                            "Fresh join received — resolving one-use transport immediately…".into();
-                        let report = crate::team_create::probe_join_config_with_key_ring_revert(
-                            &v,
-                            3,
-                            2500,
-                            key_ring_revert,
-                        );
-                        let key_mode = if key_ring_revert {
-                            "KeyRingRevert"
-                        } else {
-                            "normal send"
-                        };
-                        self.log_info(format!(
-                            "Team Create immediate transport resolution ({key_mode}):\n{report}"
-                        ));
-                        self.team_create_response = format!(
-                            "Fresh gamejoin config handed directly to the selected transport path (no UI delay; {key_mode} key selection)\n{report}"
-                        );
-                        self.status =
-                            "Immediate Team Create transport resolution finished — see panel output".into();
-                        return;
-                    }
-
                     // Only a config with an actual socket target may enable
-                    // the separate handshake button. The parser handles
+                    // the separate transport-session button. The parser handles
                     // settings, joinTicket, joinScript, and nested wrappers.
                     self.team_create_join_config = Some(v.clone());
                     let mut text = if preemptive {
@@ -5862,12 +6054,9 @@ ui.label("Place ID:");
                     )
                 };
 
-                let full_raw = v.to_string();
-                let mut raw: String = full_raw.chars().take(700).collect();
-                if raw.chars().count() < full_raw.chars().count() {
-                    raw.push('…');
-                }
-                self.team_create_response = format!("{summary}\n{raw}");
+                self.team_create_response = format!(
+                    "{summary}\nRaw gamejoin ticket and transport tokens stay in memory for one-use resolution and are not displayed."
+                );
                 if endpoints.is_empty() {
                     self.log_error(format!("Team Create {label}: {summary}"));
                 } else {

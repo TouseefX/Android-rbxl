@@ -37,7 +37,8 @@ use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::Sender,
     Arc,
 };
 use std::task::{Context, Poll};
@@ -64,6 +65,16 @@ impl Endpoint {
             _ => "0.0.0.0:0",
         }
     }
+}
+
+/// Safe lifecycle updates emitted by the app-owned Team Create worker. The
+/// worker retains the QUIC endpoint and receive loop until the app requests a
+/// stop or the peer closes the connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RbxTransportSessionEvent {
+    Status(String),
+    Connected(String),
+    Finished(String),
 }
 
 /// Case-insensitive JSON object field lookup (gamejoin responses have used
@@ -804,6 +815,12 @@ impl RbxTransportConnectPlan {
             self.early_key.public_key.len(),
         );
         text.push_str(&format!(
+            "\nPort routing distinction: NetStackPort {} is separate selector/config metadata; the legacy connected NetStackTokenValue reverse-endpoint route is not used on this selected RbxTransport session. QUIC targets public UDMUX port {}, while ClientRuppGenerator/qdmux fields use RCC/server port {}.",
+            self.rbx_transport_port,
+            quic_endpoint.port,
+            self.rcc_endpoint.port
+        ));
+        text.push_str(&format!(
             "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, QUIC first-flight packet protection now follows the native +0x2d enabler evidence instead of forcing the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer on every route, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
@@ -813,7 +830,7 @@ impl RbxTransportConnectPlan {
         ));
         let open = RBX_TRANSPORT_BASECLIENT_OPEN_SEND_CHANNEL;
         text.push_str(&format!(
-            "\nRbxTransport BaseClient openSendChannel (0.741): application {}, channelId {}, reliability enum {}, priority {}; observed control layouts are OpenReliable {} bytes (type {}, app, channelId) and OpenUnreliable {} bytes (type {}, app, channelId, wireId). The BaseClient reliability-2 wire-channel assignment is unresolved, so the probe does not emit a guessed open-control frame.",
+            "\nRbxTransport BaseClient openSendChannel (0.741): application {}, channelId {}, reliability enum {}, priority {}; observed control layouts are OpenReliable {} bytes (type {}, app, channelId) and OpenUnreliable {} bytes (type {}, app, channelId, wireId). The BaseClient reliability-2 wire-channel assignment is unresolved, so no guessed open-control frame is emitted.",
             open.application,
             open.channel_id,
             open.reliability,
@@ -1509,14 +1526,14 @@ fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec
 
 #[cfg(test)]
 fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms: u64) -> String {
-    "\nRbxTransport connected-session attempt: skipped under unit tests (the app build performs a bounded QUIC/RPK/RUPP receive/dispatch window; early auth remains unsent until channel routing is verified).".into()
+    "\nRbxTransport connected-session attempt: skipped under unit tests (the app build runs a cancellable QUIC/RPK/RUPP receive/dispatch session; early auth remains unsent until channel routing is verified).".into()
 }
 
 #[cfg(not(test))]
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified\n{}",
+            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified\n{}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1528,6 +1545,7 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.handshake_timeout_ms,
             report.requested_timeout_ms,
             report.connected_ms,
+            report.udp_summary,
             report.auth_version,
             report.preauth_len,
             report.auth_len,
@@ -1554,6 +1572,7 @@ struct RbxTransportConnectionReport {
     requested_timeout_ms: u64,
     handshake_timeout_ms: u64,
     connected_ms: u128,
+    udp_summary: String,
     auth_version: u8,
     preauth_len: usize,
     auth_len: usize,
@@ -1703,6 +1722,24 @@ async fn run_rbx_transport_connection_async(
     plan: &RbxTransportConnectPlan,
     timeout_ms: u64,
 ) -> Result<RbxTransportConnectionReport, String> {
+    run_rbx_transport_connection_async_with_session(
+        plan,
+        timeout_ms,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        None,
+    )
+    .await
+}
+
+#[cfg(not(test))]
+async fn run_rbx_transport_connection_async_with_session(
+    plan: &RbxTransportConnectPlan,
+    timeout_ms: u64,
+    cancel: Arc<AtomicBool>,
+    persistent_session: bool,
+    event_tx: Option<Sender<RbxTransportSessionEvent>>,
+) -> Result<RbxTransportConnectionReport, String> {
     let requested_timeout_ms = timeout_ms.max(1_500);
     let handshake_timeout_ms = requested_timeout_ms.max(RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS);
     let operation_timeout = Duration::from_millis(requested_timeout_ms);
@@ -1719,7 +1756,16 @@ async fn run_rbx_transport_connection_async(
     let mut failures = Vec::new();
 
     for route in routes {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("RbxTransport session cancelled before the next route attempt".into());
+        }
         let route_label = route.route_label.clone();
+        if let Some(event_tx) = &event_tx {
+            let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
+                "Trying RbxTransport route: {route_label}; target {}",
+                route.target_endpoint.label()
+            )));
+        }
         match attempt_rbx_transport_connection_async(
             plan,
             auth,
@@ -1729,10 +1775,16 @@ async fn run_rbx_transport_connection_async(
             handshake_timeout_ms,
             operation_timeout,
             handshake_timeout,
+            Arc::clone(&cancel),
+            persistent_session,
+            event_tx.clone(),
         )
         .await
         {
             Ok(report) => return Ok(report),
+            Err(reason) if cancel.load(Ordering::Relaxed) => {
+                return Err(format!("RbxTransport session cancelled: {reason}"));
+            }
             Err(reason) => failures.push(format!("{route_label} => {reason}")),
         }
     }
@@ -1753,6 +1805,9 @@ async fn attempt_rbx_transport_connection_async(
     handshake_timeout_ms: u64,
     operation_timeout: Duration,
     handshake_timeout: Duration,
+    cancel: Arc<AtomicBool>,
+    persistent_session: bool,
+    event_tx: Option<Sender<RbxTransportSessionEvent>>,
 ) -> Result<RbxTransportConnectionReport, String> {
     let target_addr = resolve_endpoint(&route.target_endpoint)?;
 
@@ -1766,11 +1821,13 @@ async fn attempt_rbx_transport_connection_async(
     let inner_socket = quinn_runtime
         .wrap_udp_socket(std_socket)
         .map_err(|error| format!("failed to wrap QUIC UDP socket: {error}"))?;
+    let udp_stats = Arc::new(RbxTransportUdpStats::default());
     let native_quic_packet_protection = route.native_quic_packet_protection;
     let socket = Arc::new(RuppUdpSocket::new(
         inner_socket,
         route.outgoing_prefix.clone(),
         native_quic_packet_protection,
+        Arc::clone(&udp_stats),
     ));
     let mut endpoint_config = quinn::EndpointConfig::default();
     if route.initial_dst_cid.is_some() {
@@ -1803,25 +1860,91 @@ async fn attempt_rbx_transport_connection_async(
     let started = Instant::now();
     let connecting = endpoint
         .connect_with(client_config, target_addr, &route.server_name)
-        .map_err(|error| format!("failed to start QUIC connection: {error}"))?;
-    let connection = tokio::time::timeout(handshake_timeout, connecting)
-        .await
-        .map_err(|_| {
+        .map_err(|error| {
             format!(
-                "QUIC handshake timed out after {} ms (native RbxTransport handshake budget; requested probe timeout {} ms)",
-                handshake_timeout.as_millis(),
-                requested_timeout_ms
+                "failed to start QUIC connection for target {} from local {}: {error}; {}",
+                route.target_endpoint.label(),
+                local_addr,
+                udp_stats.summary()
             )
-        })?
-        .map_err(|error| format!("QUIC handshake failed: {error}"))?;
+        })?;
+    let connect_result = if persistent_session {
+        tokio::select! {
+            result = tokio::time::timeout(handshake_timeout, connecting) => result,
+            _ = wait_for_team_create_cancel(&cancel) => {
+                endpoint.close(quinn::VarInt::from_u32(0), b"Team Create session cancelled");
+                return Err(format!(
+                    "cancelled during QUIC handshake for target {} from local {}; {}",
+                    route.target_endpoint.label(),
+                    local_addr,
+                    udp_stats.summary()
+                ));
+            }
+        }
+    } else {
+        tokio::time::timeout(handshake_timeout, connecting).await
+    };
+    let connection = match connect_result {
+        Ok(Ok(connection)) => connection,
+        Err(_) => {
+            return Err(format!(
+                "QUIC handshake timed out after {} ms (native RbxTransport handshake budget; requested probe timeout {} ms); target {}, local {}; {}",
+                handshake_timeout.as_millis(),
+                requested_timeout_ms,
+                route.target_endpoint.label(),
+                local_addr,
+                udp_stats.summary()
+            ));
+        }
+        Ok(Err(error)) => {
+            return Err(format!(
+                "QUIC handshake failed: {error}; target {}, local {}; {}",
+                route.target_endpoint.label(),
+                local_addr,
+                udp_stats.summary()
+            ));
+        }
+    };
     let connected_ms = started.elapsed().as_millis();
+
+    if persistent_session {
+        if let Some(event_tx) = &event_tx {
+            let _ = event_tx.send(RbxTransportSessionEvent::Connected(format!(
+                "RbxTransport QUIC connected via {}; target {}, local {}, ALPN {}. Persistent receive/dispatch loop is active; early-auth and channel-control bytes remain unsent.",
+                route.route_label,
+                route.target_endpoint.label(),
+                local_addr,
+                String::from_utf8_lossy(RBX_TRANSPORT_ALPN)
+            )));
+        }
+    }
 
     // No auth/open-control bytes are sent yet: the native BaseClient request
     // is reliability enum 2, while the reliable and unreliable control paths
     // differ and the native WireChannelId allocator/final writer are still
     // unresolved. Sending the prior raw uni-stream probe here was unframed.
-    let inbound_summary = receive_rbx_transport_session(&connection, operation_timeout).await;
-    endpoint.close(quinn::VarInt::from_u32(0), b"rbxl-editor Team Create receive window complete");
+    let inbound_summary = receive_rbx_transport_session(
+        &connection,
+        if persistent_session {
+            None
+        } else {
+            Some(operation_timeout)
+        },
+        if persistent_session {
+            Some(Arc::clone(&cancel))
+        } else {
+            None
+        },
+    )
+    .await;
+    if persistent_session {
+        endpoint.close(quinn::VarInt::from_u32(0), b"Team Create session ended");
+    } else {
+        endpoint.close(
+            quinn::VarInt::from_u32(0),
+            b"rbxl-editor Team Create receive window complete",
+        );
+    }
     Ok(RbxTransportConnectionReport {
         route_label: route.route_label,
         target: route.target_endpoint.label(),
@@ -1838,12 +1961,23 @@ async fn attempt_rbx_transport_connection_async(
         requested_timeout_ms,
         handshake_timeout_ms,
         connected_ms,
+        udp_summary: udp_stats.summary(),
         auth_version: auth.auth_version,
         preauth_len: auth.preauth_blob.len(),
         auth_len: auth.auth_blob.len(),
         early_auth_payload_len,
         inbound_summary,
     })
+}
+
+#[cfg(not(test))]
+async fn wait_for_team_create_cancel(cancel: &AtomicBool) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[cfg(not(test))]
@@ -2151,15 +2285,20 @@ async fn read_rbx_transport_stream(
 #[cfg(not(test))]
 async fn receive_rbx_transport_session(
     connection: &quinn::Connection,
-    timeout: Duration,
+    timeout: Option<Duration>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> String {
     let started = tokio::time::Instant::now();
-    let deadline = started + timeout;
+    let deadline = timeout.map(|timeout| started + timeout);
+    let stream_header_timeout = timeout
+        .unwrap_or(Duration::from_millis(RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS));
     let stats = Arc::new(std::sync::Mutex::new(RbxTransportReceiveStats::default()));
     let mut stream_tasks = tokio::task::JoinSet::new();
     let mut bidi_send_halves = Vec::new();
     let mut datagrams_enabled = true;
     let mut connection_closed = None;
+    let mut receive_window_ended = false;
+    let mut stopped_by_user = false;
 
     loop {
         tokio::select! {
@@ -2170,7 +2309,7 @@ async fn receive_rbx_transport_session(
                     });
                     stream_tasks.spawn(read_rbx_transport_stream(
                         recv,
-                        timeout,
+                        stream_header_timeout,
                         Arc::clone(&stats),
                     ));
                 }
@@ -2187,7 +2326,7 @@ async fn receive_rbx_transport_session(
                     bidi_send_halves.push(send);
                     stream_tasks.spawn(read_rbx_transport_stream(
                         recv,
-                        timeout,
+                        stream_header_timeout,
                         Arc::clone(&stats),
                     ));
                 }
@@ -2223,7 +2362,26 @@ async fn receive_rbx_transport_session(
                     );
                 }
             },
-            _ = tokio::time::sleep_until(deadline) => break,
+            _ = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                receive_window_ended = true;
+                break;
+            },
+            _ = async {
+                if let Some(cancel) = cancel.as_ref() {
+                    wait_for_team_create_cancel(cancel).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                stopped_by_user = true;
+                break;
+            },
         }
     }
 
@@ -2237,8 +2395,13 @@ async fn receive_rbx_transport_session(
         .lock()
         .map(|stats| stats.clone())
         .unwrap_or_default();
+    let receive_mode = if timeout.is_some() {
+        "bounded receive/dispatch window"
+    } else {
+        "persistent receive/dispatch loop"
+    };
     let mut summary = format!(
-        "RbxTransport persistent receive/dispatch window: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); reliable-stream OpenReliable prefixes {}; body-read errors {}.",
+        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); reliable-stream OpenReliable prefixes {}; body-read errors {}.",
         started.elapsed().as_millis(),
         snapshot.accepted_uni_streams,
         snapshot.accepted_bi_streams,
@@ -2257,6 +2420,12 @@ async fn receive_rbx_transport_session(
         snapshot.reliable_stream_open_prefixes,
         snapshot.stream_read_errors,
     );
+    if receive_window_ended {
+        summary.push_str(" Receive window elapsed.");
+    }
+    if stopped_by_user {
+        summary.push_str(" Session stopped by user.");
+    }
     if let Some(reason) = connection_closed {
         summary.push_str(&format!(" Connection closed: {reason}."));
     }
@@ -2425,26 +2594,80 @@ impl quinn::rustls::client::danger::ServerCertVerifier for ExpectedRpkVerifier {
 }
 
 #[cfg(not(test))]
+#[derive(Debug, Default)]
+struct RbxTransportUdpStats {
+    outgoing_datagrams: AtomicU64,
+    outgoing_bytes: AtomicU64,
+    incoming_datagrams: AtomicU64,
+    incoming_bytes: AtomicU64,
+    incoming_rupp_envelopes: AtomicU64,
+    incoming_rupp_bytes_stripped: AtomicU64,
+    incoming_quic_long_headers: AtomicU64,
+    incoming_quic_short_headers: AtomicU64,
+    incoming_other_packet_prefixes: AtomicU64,
+    native_trailer_decrypt_successes: AtomicU64,
+    native_trailer_decrypt_failures: AtomicU64,
+    send_errors: AtomicU64,
+    receive_errors: AtomicU64,
+}
+
+#[cfg(not(test))]
+impl RbxTransportUdpStats {
+    fn summary(&self) -> String {
+        format!(
+            "UDP tx {} datagrams/{} bytes, rx {} datagrams/{} bytes, RUPP envelopes stripped {}/{} bytes, inbound packet prefixes QUIC-long {}/QUIC-short {}/other {}, native trailer decrypts {}/{}, socket errors tx {}/rx {}",
+            self.outgoing_datagrams.load(Ordering::Relaxed),
+            self.outgoing_bytes.load(Ordering::Relaxed),
+            self.incoming_datagrams.load(Ordering::Relaxed),
+            self.incoming_bytes.load(Ordering::Relaxed),
+            self.incoming_rupp_envelopes.load(Ordering::Relaxed),
+            self.incoming_rupp_bytes_stripped.load(Ordering::Relaxed),
+            self.incoming_quic_long_headers.load(Ordering::Relaxed),
+            self.incoming_quic_short_headers.load(Ordering::Relaxed),
+            self.incoming_other_packet_prefixes.load(Ordering::Relaxed),
+            self.native_trailer_decrypt_successes.load(Ordering::Relaxed),
+            self.native_trailer_decrypt_failures.load(Ordering::Relaxed),
+            self.send_errors.load(Ordering::Relaxed),
+            self.receive_errors.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[cfg(not(test))]
 #[derive(Debug)]
 struct RuppUdpSocket {
     inner: Arc<dyn quinn::AsyncUdpSocket>,
     outgoing_prefix: Vec<u8>,
     native_quic_packet_protection: bool,
     outbound_native_quic_counter: AtomicU64,
+    stats: Arc<RbxTransportUdpStats>,
 }
 
 #[cfg(not(test))]
 impl RuppUdpSocket {
+    fn record_send_result(&self, result: &io::Result<()>, bytes: usize) {
+        if result.is_ok() {
+            self.stats.outgoing_datagrams.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .outgoing_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        } else {
+            self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn new(
         inner: Arc<dyn quinn::AsyncUdpSocket>,
         outgoing_prefix: Vec<u8>,
         native_quic_packet_protection: bool,
+        stats: Arc<RbxTransportUdpStats>,
     ) -> Self {
         Self {
             inner,
             outgoing_prefix,
             native_quic_packet_protection,
             outbound_native_quic_counter: AtomicU64::new(RBX_TRANSPORT_NATIVE_QUIC_COUNTER_INITIAL),
+            stats,
         }
     }
 
@@ -2537,34 +2760,42 @@ impl quinn::AsyncUdpSocket for RuppUdpSocket {
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
-        if self.outgoing_prefix.is_empty() && !self.native_quic_packet_protection {
-            return self.inner.try_send(transmit);
-        }
+        let (result, sent_bytes) = if self.outgoing_prefix.is_empty()
+            && !self.native_quic_packet_protection
+        {
+            (
+                self.inner.try_send(transmit),
+                transmit.contents.len(),
+            )
+        } else {
+            let mut protected = Vec::with_capacity(
+                transmit.contents.len()
+                    + if self.native_quic_packet_protection {
+                        RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES
+                    } else {
+                        0
+                    },
+            );
+            protected.extend_from_slice(transmit.contents);
+            if self.native_quic_packet_protection {
+                self.protect_native_quic_payload(&mut protected)?;
+            }
 
-        let mut protected = Vec::with_capacity(
-            transmit.contents.len()
-                + if self.native_quic_packet_protection {
-                    RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES
-                } else {
-                    0
-                },
-        );
-        protected.extend_from_slice(transmit.contents);
-        if self.native_quic_packet_protection {
-            self.protect_native_quic_payload(&mut protected)?;
-        }
-
-        let mut prefixed = Vec::with_capacity(self.outgoing_prefix.len() + protected.len());
-        prefixed.extend_from_slice(&self.outgoing_prefix);
-        prefixed.extend_from_slice(&protected);
-        let prefixed_transmit = quinn::udp::Transmit {
-            destination: transmit.destination,
-            ecn: transmit.ecn,
-            contents: &prefixed,
-            segment_size: None,
-            src_ip: transmit.src_ip,
+            let mut prefixed = Vec::with_capacity(self.outgoing_prefix.len() + protected.len());
+            prefixed.extend_from_slice(&self.outgoing_prefix);
+            prefixed.extend_from_slice(&protected);
+            let prefixed_transmit = quinn::udp::Transmit {
+                destination: transmit.destination,
+                ecn: transmit.ecn,
+                contents: &prefixed,
+                segment_size: None,
+                src_ip: transmit.src_ip,
+            };
+            let sent_bytes = prefixed.len();
+            (self.inner.try_send(&prefixed_transmit), sent_bytes)
         };
-        self.inner.try_send(&prefixed_transmit)
+        self.record_send_result(&result, sent_bytes);
+        result
     }
 
     fn poll_recv(
@@ -2576,9 +2807,19 @@ impl quinn::AsyncUdpSocket for RuppUdpSocket {
         match self.inner.poll_recv(cx, bufs, meta) {
             Poll::Ready(Ok(count)) => {
                 for index in 0..count.min(bufs.len()).min(meta.len()) {
-                    let mut len = meta[index].len;
+                    let mut len = meta[index].len.min(bufs[index].len());
+                    self.stats.incoming_datagrams.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .incoming_bytes
+                        .fetch_add(len as u64, Ordering::Relaxed);
                     let buf: &mut [u8] = &mut *bufs[index];
                     if let Some(header_len) = Self::maybe_rupp_header_len(buf, len) {
+                        self.stats
+                            .incoming_rupp_envelopes
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .incoming_rupp_bytes_stripped
+                            .fetch_add(header_len as u64, Ordering::Relaxed);
                         buf.copy_within(header_len..len, 0);
                         len -= header_len;
                         meta[index].len = len;
@@ -2586,16 +2827,38 @@ impl quinn::AsyncUdpSocket for RuppUdpSocket {
                     }
                     if self.native_quic_packet_protection {
                         if let Some(body_len) = Self::decrypt_native_quic_payload(buf, len) {
+                            self.stats
+                                .native_trailer_decrypt_successes
+                                .fetch_add(1, Ordering::Relaxed);
                             meta[index].len = body_len;
                             meta[index].stride = meta[index]
                                 .stride
                                 .saturating_sub(len.saturating_sub(body_len));
+                            len = body_len;
+                        } else {
+                            self.stats
+                                .native_trailer_decrypt_failures
+                                .fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+                    if let Some(first) = buf.get(..len).and_then(|payload| payload.first()).copied() {
+                        let counter = if first & 0x80 != 0 {
+                            &self.stats.incoming_quic_long_headers
+                        } else if first & 0x40 != 0 {
+                            &self.stats.incoming_quic_short_headers
+                        } else {
+                            &self.stats.incoming_other_packet_prefixes
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Poll::Ready(Ok(count))
             }
-            other => other,
+            Poll::Ready(Err(error)) => {
+                self.stats.receive_errors.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -3899,15 +4162,29 @@ pub fn probe_join_config_with_key_ring_revert(
     }
     match &rupp {
         Ok(material) => {
-            heading.push_str(&format!(
-                "\n2022 RUPP routing ready: open TokenValue + RCC {}",
-                material.rcc_endpoint.label()
-            ));
-            if let Some(route) = &material.connected_route {
+            if rbx_transport_plan.is_some() {
                 heading.push_str(&format!(
-                    "; connected NetStackTokenValue + RCC {}",
-                    route.rcc_endpoint.label()
+                    "\nLegacy RakNet RUPP metadata (not used by the selected RbxTransport/QUIC route): open TokenValue + RCC {}",
+                    material.rcc_endpoint.label()
                 ));
+            } else {
+                heading.push_str(&format!(
+                    "\n2022 RUPP routing ready: open TokenValue + RCC {}",
+                    material.rcc_endpoint.label()
+                ));
+            }
+            if let Some(route) = &material.connected_route {
+                if rbx_transport_plan.is_some() {
+                    heading.push_str(&format!(
+                        "; legacy connected NetStackTokenValue + RCC {} (reverse-endpoint TLV 6/7; NetStackPort is not the RbxTransport UDP target or endpoint-TLV port)",
+                        route.rcc_endpoint.label()
+                    ));
+                } else {
+                    heading.push_str(&format!(
+                        "; connected NetStackTokenValue + RCC {}",
+                        route.rcc_endpoint.label()
+                    ));
+                }
             }
         }
         Err(reason) => heading.push_str(&format!("\nRUPP routing unavailable: {reason}")),
@@ -4042,6 +4319,91 @@ pub fn probe_join_config_with_key_ring_revert(
         ));
     }
     lines.join("\n")
+}
+
+/// Run the selected transport on an app-owned worker. RbxTransport sessions
+/// keep their runtime, QUIC endpoint, and receive/dispatch loop alive until
+/// cancellation or peer closure; legacy configs retain the bounded probe.
+pub fn run_join_config_session(
+    config: serde_json::Value,
+    max: usize,
+    timeout_ms: u64,
+    key_ring_revert: bool,
+    report_prefix: Option<String>,
+    cancel: Arc<AtomicBool>,
+    event_tx: Sender<RbxTransportSessionEvent>,
+) {
+    let mut report = report_prefix.unwrap_or_default();
+    if cancel.load(Ordering::Relaxed) {
+        report.push_str("Team Create transport session cancelled before start.");
+        let _ = event_tx.send(RbxTransportSessionEvent::Finished(report));
+        return;
+    }
+
+    let Ok(plan) = extract_rbx_transport_connect_plan(&config) else {
+        report.push_str(&probe_join_config_with_key_ring_revert(
+            &config,
+            max,
+            timeout_ms,
+            key_ring_revert,
+        ));
+        let _ = event_tx.send(RbxTransportSessionEvent::Finished(report));
+        return;
+    };
+
+    report.push_str(&plan.summary());
+    let _ = event_tx.send(RbxTransportSessionEvent::Status(
+        "RbxTransport selected; starting native QUIC route attempts. Early auth and channel-control data remain unsent.".into(),
+    ));
+
+    #[cfg(not(test))]
+    {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to create Tokio runtime for QUIC: {error}"))
+            .and_then(|runtime| {
+                runtime.block_on(run_rbx_transport_connection_async_with_session(
+                    &plan,
+                    timeout_ms,
+                    cancel,
+                    true,
+                    Some(event_tx.clone()),
+                ))
+            });
+        match result {
+            Ok(connection_report) => report.push_str(&format!(
+                "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified\n{}",
+                connection_report.route_label,
+                connection_report.target,
+                connection_report.local_addr,
+                connection_report.alpn,
+                connection_report.rupp_prefix_len,
+                connection_report.initial_dst_cid_len,
+                connection_report.native_quic_cid_trailer_len,
+                connection_report.rpk_version,
+                connection_report.handshake_timeout_ms,
+                connection_report.requested_timeout_ms,
+                connection_report.connected_ms,
+                connection_report.udp_summary,
+                connection_report.auth_version,
+                connection_report.preauth_len,
+                connection_report.auth_len,
+                connection_report.early_auth_payload_len,
+                connection_report.inbound_summary
+            )),
+            Err(reason) => report.push_str(&format!(
+                "\nRbxTransport session ended before inbound Team Create traffic was accepted: {reason}"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    report.push_str(
+        "\nRbxTransport persistent session skipped under unit tests; app builds run the cancellable QUIC receive/dispatch loop.",
+    );
+
+    let _ = event_tx.send(RbxTransportSessionEvent::Finished(report));
 }
 
 #[cfg(test)]
@@ -4358,6 +4720,62 @@ mod tests {
         assert!(report.contains("auth version 17, pre-auth 33 bytes, auth 66 bytes, wire payload 103 bytes"));
         assert!(!report.contains("QEFCQ0"));
         assert!(!report.contains("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"));
+    }
+
+    #[test]
+    fn rbx_transport_uses_server_port_while_legacy_connected_rupp_uses_netstack_port() {
+        let key_ring = serde_json::json!({
+            "applications": {
+                "RbxTransportEphemeralEarlyPublicKey": {
+                    "versions": [{
+                        "id": 1,
+                        "value": "EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI=",
+                        "allowed": true
+                    }],
+                    "send": 1,
+                    "revert": 1
+                }
+            }
+        });
+        let config = serde_json::json!({
+            "TokenValue": "AAECAwQFBgcICQoLDA0ODw==",
+            "NetStackTokenValue": "ICEiIyQlJicoKSorLC0uLw==",
+            "NetStackPort": 51433,
+            "ClientPublicKeyData": key_ring.to_string(),
+            "ClientTicket": "ticket-prefix;ignored;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4CB;17",
+            "ServerConnections": [{ "Address": "10.32.2.228", "Port": 58526 }],
+            "UdmuxEndpoints": [{ "Address": "128.116.54.33", "Port": 58526 }]
+        });
+        let plan = extract_rbx_transport_connect_plan(&config).unwrap();
+
+        assert_eq!(plan.rbx_transport_port, 51433);
+        assert_eq!(
+            rbx_transport_quic_endpoint(&plan),
+            Endpoint {
+                address: "128.116.54.33".into(),
+                port: 58526,
+            }
+        );
+        let rbx_header = build_rbx_transport_rupp_header(&plan).unwrap();
+        assert_eq!(&rbx_header[rbx_header.len() - 2..], &58526u16.to_be_bytes());
+        let native_sni = derive_qdmux_game_fqdn(&plan).unwrap();
+        let qdmux_sni_port = native_sni
+            .split('.')
+            .next()
+            .unwrap()
+            .rsplit('-')
+            .next()
+            .unwrap();
+        assert_eq!(qdmux_sni_port, "e49e");
+
+        let legacy = extract_rupp_probe_material(&config).unwrap();
+        assert_eq!(
+            legacy.connected_route.unwrap().rcc_endpoint.port,
+            51433
+        );
+        let report = probe_join_config(&config, 3, 1);
+        assert!(report.contains("RbxTransport QUIC UDP target: 128.116.54.33:58526"));
+        assert!(report.contains("NetStackPort is not the RbxTransport UDP target or endpoint-TLV port"));
     }
 
     #[test]
