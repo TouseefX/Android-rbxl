@@ -2018,6 +2018,9 @@ async fn attempt_rbx_transport_connection_async(
                     .map_err(|error| format!("ngtcp2 timer handling failed: {error}"))?;
             }
             RbxTransportWake::HandshakeTimeout => continue,
+            RbxTransportWake::ReceiveWindowEnded => {
+                unreachable!("handshake loop has no receive-window timer")
+            }
             RbxTransportWake::Cancelled => {
                 return Err(format!(
                     "cancelled during ngtcp2/Rustls handshake for target {} from local {}; {}",
