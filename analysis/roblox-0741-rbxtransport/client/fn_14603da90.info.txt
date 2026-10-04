@@ -1,0 +1,28 @@
+offset: 0x14603da90
+name: fcn.14603da90
+size: 86
+is-pure: false
+realsz: 86
+stackframe: 56
+call-convention: ms
+cyclomatic-cost: 34
+cyclomatic-complexity: 1
+loops: 0
+bits: 64
+type: fcn
+num-bbs: 1
+edges: 0
+end-bbs: 1
+call-refs: 0x1427c8210 C 0x1427c8240 C
+data-refs:
+code-xrefs:
+noreturn: false
+in-degree: 0
+out-degree: 2
+data-xrefs:
+locals: 3
+args: 1
+arg int64_t arg1 @ rcx
+var int64_t var_18h @ stack - 0x18
+var int64_t var_8h @ stack + 0x8
+var int64_t var_10h @ stack + 0x10

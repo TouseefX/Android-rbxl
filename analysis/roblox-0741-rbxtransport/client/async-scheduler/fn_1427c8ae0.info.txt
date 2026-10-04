@@ -1,0 +1,26 @@
+offset: 0x1427c8ae0
+name: fcn.1427c8ae0
+size: 48
+is-pure: true
+realsz: 48
+stackframe: 40
+call-convention: ms
+cyclomatic-cost: 19
+cyclomatic-complexity: 2
+loops: 0
+bits: 64
+type: fcn
+num-bbs: 3
+edges: 3
+end-bbs: 1
+call-refs:
+data-refs:
+code-xrefs:
+noreturn: false
+in-degree: 0
+out-degree: 0
+data-xrefs:
+locals: 0
+args: 2
+arg int64_t arg3 @ r8
+arg int64_t arg1 @ rcx

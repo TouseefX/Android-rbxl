@@ -1,0 +1,18 @@
+            0x1435db340      mov   r8d, 0x02
+            0x1435db346      lea   rdx, qword [0x14d735648]
+            0x1435db34d      lea   rcx, qword [0x148aa7280]            ; "RbxTransportRtcIoUseMultipleEventLoopThreads"
+        ,=< 0x1435db354      jmp   0x143862120
+        |   0x1435db359      int3
+        |   0x1435db35a      int3
+        |   0x1435db35b      int3
+        |   0x1435db35c      int3
+        |   0x1435db35d      int3
+        |   0x1435db35e      int3
+        |   0x1435db35f      int3
+        |   0x1435db360      mov   r8d, 0x02
+        |   0x1435db366      lea   rdx, qword [0x14d735680]
+        |   0x1435db36d      lea   rcx, qword [0x148aa72d8]            ; "RtcIoSharedSocketResources"
+- offset -    0 1  2 3  4 5  6 7  8 9  A B  C D  E F  0123456789ABCDEF
+0x14d735648  00                                       .
+- offset -    0 1  2 3  4 5  6 7  8 9  A B  C D  E F  0123456789ABCDEF
+0x14d4a6cc8  00                                       .

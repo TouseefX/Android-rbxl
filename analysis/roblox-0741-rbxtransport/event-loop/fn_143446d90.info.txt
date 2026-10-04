@@ -1,0 +1,34 @@
+offset: 0x143446d90
+name: fcn.143446d90
+size: 260
+is-pure: false
+realsz: 260
+stackframe: 136
+call-convention: ms
+cyclomatic-cost: 79
+cyclomatic-complexity: 5
+loops: 0
+bits: 64
+type: fcn
+num-bbs: 6
+edges: 7
+end-bbs: 2
+call-refs: 0x142a338a0 C 0x1438688a0 C 0x148442550 C 0x14385bd60 C 0x1434464d0 C 0x1473107be C 0x14385bd60 C 0x14730fca0 C
+data-refs: 0x14c4644b8 0x1489f9ba8
+code-xrefs:
+noreturn: false
+in-degree: 0
+out-degree: 8
+data-xrefs: 0x143447ad6
+locals: 8
+args: 1
+arg int64_t arg1 @ rcx
+var int64_t var_68h @ stack - 0x68
+var int64_t var_60h @ stack - 0x60
+var int64_t var_58h @ stack - 0x58
+var int64_t var_50h @ stack - 0x50
+var int64_t var_48h @ stack - 0x48
+var int64_t var_30h @ stack - 0x30
+var int64_t var_28h @ stack - 0x28
+var int64_t var_18h @ stack - 0x18
+            ; CALL XREF from fcn.143446d90 @ 0x143446e6a

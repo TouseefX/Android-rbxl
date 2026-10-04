@@ -1,0 +1,26 @@
+offset: 0x140009480
+name: fcn.140009480
+size: 36
+is-pure: false
+realsz: 36
+stackframe: 56
+call-convention: ms
+cyclomatic-cost: 16
+cyclomatic-complexity: 1
+loops: 0
+bits: 64
+type: fcn
+num-bbs: 1
+edges: 0
+end-bbs: 1
+call-refs: 0x140002310 C
+data-refs:
+code-xrefs:
+noreturn: false
+in-degree: 0
+out-degree: 1
+data-xrefs:
+locals: 1
+args: 1
+arg int64_t arg1 @ rcx
+var int64_t var_18h @ stack - 0x18

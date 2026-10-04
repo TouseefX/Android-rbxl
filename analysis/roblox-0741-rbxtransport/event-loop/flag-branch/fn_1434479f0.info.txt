@@ -1,0 +1,25 @@
+offset: 0x1434479f0
+name: fcn.1434479f0
+size: 9
+is-pure: true
+realsz: 9
+stackframe: 0
+call-convention: ms
+cyclomatic-cost: 5
+cyclomatic-complexity: 1
+loops: 0
+bits: 64
+type: fcn
+num-bbs: 1
+edges: 0
+end-bbs: 1
+call-refs:
+data-refs:
+code-xrefs:
+noreturn: false
+in-degree: 0
+out-degree: 0
+data-xrefs:
+locals: 0
+args: 1
+arg int64_t arg1 @ rcx

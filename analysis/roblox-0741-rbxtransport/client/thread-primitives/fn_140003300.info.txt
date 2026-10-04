@@ -1,0 +1,37 @@
+offset: 0x140003300
+name: fcn.140003300
+size: 272
+is-pure: false
+realsz: 272
+stackframe: 120
+call-convention: ms
+cyclomatic-cost: 95
+cyclomatic-complexity: 4
+loops: 0
+bits: 64
+type: fcn
+num-bbs: 9
+edges: 11
+end-bbs: 1
+call-refs: 0x140001b80 C 0x140001b80 C 0x140003360 J 0x140003410 C 0x140001b80 C 0x1400033fa J 0x140011270 C
+data-refs: 0x14c39fe98 0x1484aed78 0x1484aed8c
+code-xrefs: 0x140003351 J 0x1400033e7 J
+noreturn: false
+in-degree: 2
+out-degree: 5
+data-xrefs:
+locals: 8
+args: 5
+arg int64_t arg3 @ r8
+arg int64_t arg1 @ rcx
+arg int64_t arg2 @ rdx
+var int64_t var_58h @ stack - 0x58
+var int64_t var_50h @ stack - 0x50
+var int64_t var_48h @ stack - 0x48
+var int64_t var_40h @ stack - 0x40
+var int64_t var_38h @ stack - 0x38
+var int64_t var_30h @ stack - 0x30
+var int64_t var_28h @ stack - 0x28
+var int64_t var_21h @ stack - 0x21
+arg int64_t arg_28h @ stack + 0x28
+arg int64_t arg_30h @ stack + 0x30

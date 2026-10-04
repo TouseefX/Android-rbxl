@@ -44,11 +44,16 @@ pub const SUBDOMAINS: &[&str] = &[
     "users.roblox.com",
 ];
 
-// Note on publishing: as of 2025 the legacy assetgame.roblox.com/Asset/
-// .ashx gateway is retired for third-party uploads. The supported path is
-// Open Cloud:
+// Place Versions API request used by this app. Roblox announced that
+// data.roblox.com/Data/Upload.ashx would reject place-file uploads starting
+// June 24, 2024, so this app does not use Upload.ashx for place publishing.
+// The Creator Hub API reference lists API Key and Cookie authentication for:
 //   POST https://apis.roblox.com/universes/v1/{universeId}/places/{placeId}/versions?versionType=Published|Saved
-// with header `x-api-key: <open-cloud-key>` and an octet-stream body.
+// The Cookie-auth implementation below sends .ROBLOSECURITY and handles the
+// X-CSRF-TOKEN challenge. This public API reference does not establish that
+// Studio 0.741's internal place-publish flow calls this exact route.
+// References: https://devforum.roblox.com/t/official-list-of-deprecated-web-endpoints/62889/62
+// https://create.roblox.com/docs/cloud/reference/domains/apis
 
 pub const OPEN_CLOUD_BASE: &str = "https://apis.roblox.com";
 pub const ASSET_DELIVERY: &str = "https://assetdelivery.roblox.com";
@@ -63,8 +68,8 @@ pub const GROUPS: &str = "https://groups.roblox.com";
 pub const ECONOMY: &str = "https://economy.roblox.com";
 pub const CATALOG: &str = "https://catalog.roblox.com";
 
-/// Build an Open Cloud place-publish URL.
-pub fn open_cloud_publish_url(universe_id: u64, place_id: u64, published: bool) -> String {
+/// Build the Place Versions API URL (API-key or session-cookie auth).
+pub fn place_versions_url(universe_id: u64, place_id: u64, published: bool) -> String {
     let version_type = if published { "Published" } else { "Saved" };
     format!(
         "{OPEN_CLOUD_BASE}/universes/v1/{universe_id}/places/{place_id}/versions?versionType={version_type}"

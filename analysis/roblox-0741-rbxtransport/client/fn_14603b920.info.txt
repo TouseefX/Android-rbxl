@@ -1,0 +1,50 @@
+offset: 0x14603b920
+name: fcn.14603b920
+size: 584
+is-pure: false
+realsz: 584
+stackframe: 344
+call-convention: ms
+cyclomatic-cost: 190
+cyclomatic-complexity: 15
+loops: 0
+bits: 64
+type: fcn
+num-bbs: 22
+edges: 35
+end-bbs: 1
+call-refs: 0x1438602b0 C 0x14073b9f0 C 0x14603bb44 J 0x1438602b0 C 0x14603bb14 J 0x14603e7f0 C 0x14730fca0 C
+data-refs: 0x14c4644b8 0x14d920598 0x14c421540 0x148f72a30 0x14c421540 0x14c421540 0x148f72a80 0x1436a2f60 0x14c421540 0x148f731e0
+code-xrefs: 0x14603ba3b J 0x14603bae5 J
+noreturn: false
+in-degree: 2
+out-degree: 5
+data-xrefs:
+locals: 24
+args: 2
+arg int64_t arg1 @ rcx
+arg int64_t arg2 @ rdx
+var int64_t var_138h @ stack - 0x138
+var int64_t var_128h @ stack - 0x128
+var int64_t var_120h @ stack - 0x120
+var int64_t var_118h @ stack - 0x118
+var int64_t var_110h @ stack - 0x110
+var int64_t var_108h @ stack - 0x108
+var int64_t var_f8h @ stack - 0xf8
+var int64_t var_f0h @ stack - 0xf0
+var int64_t var_e8h @ stack - 0xe8
+var int64_t var_e0h @ stack - 0xe0
+var int64_t var_d8h @ stack - 0xd8
+var int64_t var_d0h @ stack - 0xd0
+var int64_t var_c8h @ stack - 0xc8
+var int64_t var_b8h @ stack - 0xb8
+var int64_t var_a8h @ stack - 0xa8
+var int64_t var_98h @ stack - 0x98
+var int64_t var_88h @ stack - 0x88
+var int64_t var_80h @ stack - 0x80
+var int64_t var_50h @ stack - 0x50
+var int64_t var_48h @ stack - 0x48
+var int64_t var_38h @ stack - 0x38
+var int64_t var_28h @ stack - 0x28
+var int64_t var_18h @ stack + 0x18
+var int64_t var_20h @ stack + 0x20

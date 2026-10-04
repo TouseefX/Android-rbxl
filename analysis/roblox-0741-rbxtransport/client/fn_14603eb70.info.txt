@@ -1,0 +1,91 @@
+offset: 0x14603eb70
+name: fcn.14603eb70
+size: 2404
+is-pure: false
+realsz: 2404
+stackframe: 968
+call-convention: ms
+cyclomatic-cost: 657
+cyclomatic-complexity: 46
+loops: 5
+bits: 64
+type: fcn
+num-bbs: 77
+edges: 119
+end-bbs: 2
+call-refs: 0x1427c28c0 C 0x148442550 C 0x14385bd60 C 0x14385bce0 C 0x1427c8210 C 0x1435d0810 C 0x14073a8e0 C 0x14385bd60 C 0x14385bd60 C 0x14385bd60 C 0x1435dc900 C 0x14385bd60 C 0x1427c8240 C 0x1435e2050 C 0x1435d0810 C 0x14073a8e0 C 0x14385bd60 C 0x14603eef7 J 0x1435e2050 C 0x1435d0810 C 0x14073a8e0 C 0x14385bd60 C 0x14603f2ea J 0x1438602b0 C 0x140739200 C 0x14385bd60 C 0x14073a8e0 C 0x1438602b0 C 0x1427c8210 C 0x1427c8240 C 0x1438602b0 C 0x140739200 C 0x14385bd60 C 0x14073a8e0 C 0x1435d0810 C 0x14073a8e0 C 0x14385bd60 C 0x1435dc900 C 0x14385bd60 C 0x1438602b0 C 0x14073a8e0 C 0x14730fca0 C 0x148442550 C 0x148442550 C 0x1435dc900 C 0x14385bd60 C 0x14603f416 J
+data-refs: 0x14c4644b8 0x14c421550 0x14c421540 0x148f72d70 0x14c421540 0x14c421540 0x148f72dc0 0x1435e0c40 0x14c421540 0x14c421540 0x148f72e30 0x14c421540 0x14c421568 0x14c421550 0x14c421540 0x148f72e78 0x14c421540
+code-xrefs: 0x14603bd6b C 0x14603eeee J 0x14603ef49 J 0x14603f4cf J
+noreturn: false
+in-degree: 4
+out-degree: 44
+data-xrefs:
+locals: 65
+args: 2
+arg int64_t arg1 @ rcx
+arg int64_t arg2 @ rdx
+var int64_t var_3a8h @ stack - 0x3a8
+var int64_t var_398h @ stack - 0x398
+var int64_t var_390h @ stack - 0x390
+var int64_t var_388h @ stack - 0x388
+var int64_t var_380h @ stack - 0x380
+var int64_t var_378h @ stack - 0x378
+var int64_t var_370h @ stack - 0x370
+var int64_t var_368h @ stack - 0x368
+var int64_t var_358h @ stack - 0x358
+var int64_t var_348h @ stack - 0x348
+var int64_t var_338h @ stack - 0x338
+var int64_t var_328h @ stack - 0x328
+var int64_t var_320h @ stack - 0x320
+var int64_t var_318h @ stack - 0x318
+var int64_t var_310h @ stack - 0x310
+var int64_t var_308h @ stack - 0x308
+var int64_t var_300h @ stack - 0x300
+var int64_t var_2f8h @ stack - 0x2f8
+var int64_t var_2f0h @ stack - 0x2f0
+var int64_t var_2e8h @ stack - 0x2e8
+var int64_t var_2e0h @ stack - 0x2e0
+var int64_t var_2d8h @ stack - 0x2d8
+var int64_t var_2d0h @ stack - 0x2d0
+var int64_t var_2c8h @ stack - 0x2c8
+var int64_t var_2c0h @ stack - 0x2c0
+var int64_t var_2b8h @ stack - 0x2b8
+var int64_t var_2b0h @ stack - 0x2b0
+var int64_t var_2a8h @ stack - 0x2a8
+var int64_t var_2a0h @ stack - 0x2a0
+var int64_t var_298h @ stack - 0x298
+var int64_t var_288h @ stack - 0x288
+var int64_t var_280h @ stack - 0x280
+var int64_t var_278h @ stack - 0x278
+var int64_t var_260h @ stack - 0x260
+var int64_t var_25ch @ stack - 0x25c
+var int64_t var_258h @ stack - 0x258
+var int64_t var_238h @ stack - 0x238
+var int64_t var_1e0h @ stack - 0x1e0
+var int64_t var_1d8h @ stack - 0x1d8
+var int64_t var_1d0h @ stack - 0x1d0
+var int64_t var_1c8h @ stack - 0x1c8
+var int64_t var_1c0h @ stack - 0x1c0
+var int64_t var_1bch @ stack - 0x1bc
+var int64_t var_1b8h @ stack - 0x1b8
+var int64_t var_1a8h @ stack - 0x1a8
+var int64_t var_1a0h @ stack - 0x1a0
+var int64_t var_198h @ stack - 0x198
+var int64_t var_190h @ stack - 0x190
+var int64_t var_18ch @ stack - 0x18c
+var int64_t var_188h @ stack - 0x188
+var int64_t var_178h @ stack - 0x178
+var int64_t var_170h @ stack - 0x170
+var int64_t var_168h @ stack - 0x168
+var int64_t var_158h @ stack - 0x158
+var int64_t var_150h @ stack - 0x150
+var int64_t var_138h @ stack - 0x138
+var int64_t var_130h @ stack - 0x130
+var int64_t var_120h @ stack - 0x120
+var int64_t var_110h @ stack - 0x110
+var int64_t var_f8h @ stack - 0xf8
+var int64_t var_e0h @ stack - 0xe0
+var int64_t var_b8h @ stack - 0xb8
+var int64_t var_60h @ stack - 0x60
+var int64_t var_48h @ stack - 0x48
+var int64_t var_18h @ stack + 0x18

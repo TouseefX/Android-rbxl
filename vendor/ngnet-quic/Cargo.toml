@@ -1,0 +1,53 @@
+[package]
+name = "ngnet-quic"
+version = "0.0.1"
+description = "Safe, sans-I/O Rust bindings to libngtcp2 for QUIC transport"
+readme = "README.md"
+# Released at 0.0.x alongside `ngnet-quic-sys`, deliberately below 0.1: the API is still
+# expected to change -- see `docs/quic/pending-work.md` -- and a leading zero minor is the
+# only version range cargo treats as breaking on every bump.
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/youyuanwu/ngnet"
+
+[features]
+# The OpenSSL TLS backend is on by default, because a QUIC connection without a TLS
+# backend cannot complete a handshake and so cannot do anything a caller wants. Turning it
+# off leaves the `TlsBackend` seam in place with no implementation behind it, for a caller
+# supplying their own.
+#
+# This maps onto the sys crate's own feature rather than merely gating Rust code: with
+# `crypto-ossl` off, `ngnet-quic-sys` builds no crypto helper archive and its `wrapper.h`
+# does not include the crypto headers, so no `ngtcp2_crypto_*` symbol exists to call.
+#
+# The `endpoint` layer is the headline API for a caller who wants to speak QUIC rather than
+# to drive a state machine, so it is on by default, as the `http` layers are in `ngnet-h2`
+# and `ngnet-h3`. Disabling it returns the crate to a sans-I/O state machine with exactly
+# one dependency and no asynchrony of its own -- which is what `--no-default-features`
+# builds, and what a structural test reads the source to confirm.
+default = ["tls-ossl", "endpoint"]
+tls-ossl = ["ngnet-quic-sys/crypto-ossl"]
+endpoint = []
+# A ready-made socket and clock for tokio. Off by default: a caller on another runtime
+# should not pay for this one, and describing a socket to this crate is a small job for
+# anyone who has to. Implies `endpoint`, since there is nothing for it to plug into
+# otherwise.
+tokio = ["endpoint", "dep:tokio"]
+
+# Exactly one *non-optional* dependency, as in `ngnet-h2` and `ngnet-h3`. A test fails the
+# build if that grows, and requires every optional one to be reachable only through a
+# declared feature.
+#
+# `default-features = false` on the workspace entry above is load-bearing rather than
+# tidiness. The sys crate defaults `crypto-ossl` on, and inheriting that would link libssl
+# into a build this crate was asked to make without TLS -- the one thing
+# `--no-default-features` is for. The `tls-ossl` feature above is what turns it back on, so
+# the decision is made here rather than inherited silently. (Cargo forbids a member from
+# overriding an inherited `default-features`, which is why the flag lives in the workspace
+# table and not on this line.)
+[dependencies]
+ngnet-quic-sys = { path = "../ngnet-quic-sys", default-features = false }
+
+# Optional, and reachable only through the `tokio` feature above -- which is what keeps the
+# non-optional count at one, the claim a structural test enforces.
+tokio = { version = "1", optional = true }

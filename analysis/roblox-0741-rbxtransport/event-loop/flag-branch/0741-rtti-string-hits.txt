@@ -1,0 +1,8 @@
+0x0c913d78 0x14c916b78   43   44 .data    ascii   .?AVSysEventLoop@Impl@Io@RbxTransport@RBX@@
+0x0c914e78 0x14c917c78   45   46 .data    ascii   .?AVLibuvEventLoop@Impl@Io@RbxTransport@RBX@@
+0x0c921f48 0x14c924d48   36   37 .data    ascii   .?AVRtcIoRna@Impl@RbxTransport@RBX@@
+0x0c913d30 0x14c916b30   49   50 .data    ascii   .?AVEventLoopInterface@Impl@Io@RbxTransport@RBX@@
+0x0c913d78 0x14c916b78   43   44 .data    ascii   .?AVSysEventLoop@Impl@Io@RbxTransport@RBX@@
+0x0c914e78 0x14c917c78   45   46 .data    ascii   .?AVLibuvEventLoop@Impl@Io@RbxTransport@RBX@@
+0x0cb241a0 0x14cb26fa0  333  334 .data    ascii   .?AV?$thread_data@V?$bind_t@XV?$mf4@XVUpdateUIManager@@V?$function@$$A6AXXZ@std@@PEAVQEventLoop@@PEAVQtMutex@RBX@@PEA_N@_mfi@boost@@V?$list5@V?$value@PEAVUpdateUIManager@@@_bi@boost@@V?$value@V?$function@$$A6AXXZ@std@@@23@V?$value@PEAVQEventLoop@@@23@V?$value@PEAVQtMutex@RBX@@@23@V?$value@PEA_N@23@@_bi@3@@_bi@boost@@@detail@boost@@
+0x148aa7338  0x0000000000000002                       ........

@@ -1,0 +1,54 @@
+offset: 0x1427c8b10
+name: fcn.1427c8b10
+size: 27
+is-pure: true
+realsz: 27
+stackframe: 40
+call-convention: ms
+cyclomatic-cost: 15
+cyclomatic-complexity: 2
+loops: 0
+bits: 64
+type: fcn
+num-bbs: 3
+edges: 3
+end-bbs: 1
+call-refs:
+data-refs:
+code-xrefs:
+noreturn: false
+in-degree: 0
+out-degree: 0
+data-xrefs:
+locals: 0
+args: 1
+arg int64_t arg1 @ rcx
+offset: 0x1427c81d0
+name: fcn.1427c81d0
+size: 41683269
+is-pure: false
+realsz: 139
+stackframe: 88
+call-convention: ms
+cyclomatic-cost: 54
+cyclomatic-complexity: 3
+loops: 1
+bits: 64
+type: fcn
+num-bbs: 5
+edges: 6
+end-bbs: 1
+call-refs: 0x140001b80 C 0x140001b80 C 0x1400109a0 C 0x140007890 J
+data-refs: 0x14c39fe98 0x1484aeee7
+code-xrefs: 0x1427c81d0 J
+noreturn: false
+in-degree: 1
+out-degree: 3
+data-xrefs:
+locals: 4
+args: 1
+arg int64_t arg1 @ rcx
+var int64_t var_38h @ stack - 0x38
+var int64_t var_30h @ stack - 0x30
+var int64_t var_20h @ stack - 0x20
+var int64_t var_18h @ stack - 0x18
