@@ -289,23 +289,30 @@ impl RustlsQuicAlgorithm for CapturedQuicAlgorithm {
     }
 }
 
-pub(super) struct RbxTransportRustlsPacketKey {
-    inner: Box<dyn RustlsPacketKeyTrait>,
-    iv: Vec<u8>,
+// ngnet's Session uses one concrete packet-key type for every level. QUIC Retry has a
+// separate fixed AES-GCM key, so both implementations share this adapter type.
+enum PacketKeyInner {
+    Rustls {
+        inner: Box<dyn RustlsPacketKeyTrait>,
+        iv: Vec<u8>,
+    },
+    Retry(RetryPacketKey),
 }
 
+pub(super) struct RbxTransportRustlsPacketKey(PacketKeyInner);
+
 impl RbxTransportRustlsPacketKey {
-    fn packet_number(&self, nonce: &[u8]) -> Result<u64, ng::CryptoError> {
-        if self.iv.len() != QUIC_IV_LEN || nonce.len() != QUIC_IV_LEN {
+    fn packet_number(iv: &[u8], nonce: &[u8]) -> Result<u64, ng::CryptoError> {
+        if iv.len() != QUIC_IV_LEN || nonce.len() != QUIC_IV_LEN {
             return Err(ng::CryptoError::Fatal);
         }
-        let pn_offset = self.iv.len() - 8;
-        if nonce[..pn_offset] != self.iv[..pn_offset] {
+        let pn_offset = iv.len() - 8;
+        if nonce[..pn_offset] != iv[..pn_offset] {
             return Err(ng::CryptoError::Fatal);
         }
         let mut packet_number = [0u8; 8];
         for (index, byte) in packet_number.iter_mut().enumerate() {
-            *byte = nonce[pn_offset + index] ^ self.iv[pn_offset + index];
+            *byte = nonce[pn_offset + index] ^ iv[pn_offset + index];
         }
         Ok(u64::from_be_bytes(packet_number))
     }
@@ -319,21 +326,27 @@ impl ng::PacketKey for RbxTransportRustlsPacketKey {
         nonce: &[u8],
         aad: &[u8],
     ) -> Result<(), ng::CryptoError> {
-        let packet_number = self.packet_number(nonce)?;
-        let tag_len = self.inner.tag_len();
-        let end = plaintext_len
-            .checked_add(tag_len)
-            .filter(|end| *end <= buf.len())
-            .ok_or(ng::CryptoError::Fatal)?;
-        let tag = self
-            .inner
-            .encrypt_in_place(packet_number, aad, &mut buf[..plaintext_len])
-            .map_err(|_| ng::CryptoError::Fatal)?;
-        if tag.as_ref().len() != tag_len {
-            return Err(ng::CryptoError::Fatal);
+        match &self.0 {
+            PacketKeyInner::Rustls { inner, iv } => {
+                let packet_number = Self::packet_number(iv, nonce)?;
+                let tag_len = inner.tag_len();
+                let end = plaintext_len
+                    .checked_add(tag_len)
+                    .filter(|end| *end <= buf.len())
+                    .ok_or(ng::CryptoError::Fatal)?;
+                let tag = inner
+                    .encrypt_in_place(packet_number, aad, &mut buf[..plaintext_len])
+                    .map_err(|_| ng::CryptoError::Fatal)?;
+                if tag.as_ref().len() != tag_len {
+                    return Err(ng::CryptoError::Fatal);
+                }
+                buf[plaintext_len..end].copy_from_slice(tag.as_ref());
+                Ok(())
+            }
+            PacketKeyInner::Retry(inner) => {
+                ng::PacketKey::seal(inner, buf, plaintext_len, nonce, aad)
+            }
         }
-        buf[plaintext_len..end].copy_from_slice(tag.as_ref());
-        Ok(())
     }
 
     fn open(
@@ -343,31 +356,46 @@ impl ng::PacketKey for RbxTransportRustlsPacketKey {
         nonce: &[u8],
         aad: &[u8],
     ) -> Result<usize, ng::CryptoError> {
-        let packet_number = self.packet_number(nonce)?;
-        let tag_len = self.inner.tag_len();
-        if ciphertext.len() < tag_len || dest.len() < ciphertext.len() - tag_len {
-            return Err(ng::CryptoError::Fatal);
+        match &self.0 {
+            PacketKeyInner::Rustls { inner, iv } => {
+                let packet_number = Self::packet_number(iv, nonce)?;
+                let tag_len = inner.tag_len();
+                if ciphertext.len() < tag_len || dest.len() < ciphertext.len() - tag_len {
+                    return Err(ng::CryptoError::Fatal);
+                }
+                let mut plaintext = ciphertext.to_vec();
+                let plaintext_len = inner
+                    .decrypt_in_place(packet_number, aad, &mut plaintext)
+                    .map(|plaintext| plaintext.len())
+                    .map_err(|_| ng::CryptoError::Decrypt)?;
+                dest[..plaintext_len].copy_from_slice(&plaintext[..plaintext_len]);
+                Ok(plaintext_len)
+            }
+            PacketKeyInner::Retry(inner) => {
+                ng::PacketKey::open(inner, dest, ciphertext, nonce, aad)
+            }
         }
-        let mut plaintext = ciphertext.to_vec();
-        let plaintext_len = self
-            .inner
-            .decrypt_in_place(packet_number, aad, &mut plaintext)
-            .map(|plaintext| plaintext.len())
-            .map_err(|_| ng::CryptoError::Decrypt)?;
-        dest[..plaintext_len].copy_from_slice(&plaintext[..plaintext_len]);
-        Ok(plaintext_len)
     }
 
     fn tag_len(&self) -> usize {
-        self.inner.tag_len()
+        match &self.0 {
+            PacketKeyInner::Rustls { inner, .. } => inner.tag_len(),
+            PacketKeyInner::Retry(inner) => ng::PacketKey::tag_len(inner),
+        }
     }
 
     fn confidentiality_limit(&self) -> u64 {
-        self.inner.confidentiality_limit()
+        match &self.0 {
+            PacketKeyInner::Rustls { inner, .. } => inner.confidentiality_limit(),
+            PacketKeyInner::Retry(inner) => ng::PacketKey::confidentiality_limit(inner),
+        }
     }
 
     fn integrity_limit(&self) -> u64 {
-        self.inner.integrity_limit()
+        match &self.0 {
+            PacketKeyInner::Rustls { inner, .. } => inner.integrity_limit(),
+            PacketKeyInner::Retry(inner) => ng::PacketKey::integrity_limit(inner),
+        }
     }
 }
 
@@ -421,10 +449,10 @@ fn rustls_directional_keys(
     let ng_iv = ng::Iv::new(&iv)
         .map_err(|_| ng::Error::backend("Rustls produced an invalid QUIC initialization vector"))?;
     Ok(ng::DirectionalKeys {
-        packet: RbxTransportRustlsPacketKey {
+        packet: RbxTransportRustlsPacketKey(PacketKeyInner::Rustls {
             inner: keys.packet,
             iv,
-        },
+        }),
         header: RbxTransportRustlsHeaderKey(keys.header),
         iv: ng_iv,
     })
@@ -676,7 +704,9 @@ impl ng::Session for RbxTransportRustlsSession {
         };
         let key = UnboundKey::new(&aead::AES_128_GCM, key)
             .map_err(|_| ng::Error::backend("failed to initialize the QUIC Retry key"))?;
-        Ok(RetryPacketKey(LessSafeKey::new(key)))
+        Ok(RbxTransportRustlsPacketKey(PacketKeyInner::Retry(
+            RetryPacketKey(LessSafeKey::new(key)),
+        )))
     }
 
     fn set_local_transport_params(&mut self, params: &[u8]) -> ng::Result<()> {
@@ -740,17 +770,17 @@ impl ng::Session for RbxTransportRustlsSession {
         self.next_one_rtt_secrets = Some(secrets);
         let placeholder = vec![0u8; self.one_rtt_secret_len];
         Ok(ng::RotatedKeys {
-            rx_packet: RbxTransportRustlsPacketKey {
+            rx_packet: RbxTransportRustlsPacketKey(PacketKeyInner::Rustls {
                 inner: keys.remote,
                 iv: remote_iv.clone(),
-            },
+            }),
             rx_iv: ng::Iv::new(&remote_iv)
                 .map_err(|_| ng::Error::backend("Rustls produced an invalid receive IV"))?,
             rx_secret: placeholder.clone(),
-            tx_packet: RbxTransportRustlsPacketKey {
+            tx_packet: RbxTransportRustlsPacketKey(PacketKeyInner::Rustls {
                 inner: keys.local,
                 iv: local_iv.clone(),
-            },
+            }),
             tx_iv: ng::Iv::new(&local_iv)
                 .map_err(|_| ng::Error::backend("Rustls produced an invalid transmit IV"))?,
             tx_secret: placeholder,

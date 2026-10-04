@@ -43,6 +43,8 @@ use std::sync::{
 };
 #[cfg(not(test))]
 use crate::ngtcp2_rustls::RbxTransportRustlsBackend;
+#[cfg(not(test))]
+use ngnet_quic::Session as _;
 use std::time::{Duration, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
 
