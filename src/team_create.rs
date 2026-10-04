@@ -1802,6 +1802,24 @@ async fn run_rbx_transport_connection_async_with_session(
 }
 
 #[cfg(not(test))]
+fn rbx_transport_handshake_timeout_message(
+    handshake_timeout: Duration,
+    requested_timeout_ms: u64,
+    route: &RbxTransportQuicRoute,
+    local_addr: SocketAddr,
+    udp_stats: &RbxTransportUdpStats,
+) -> String {
+    format!(
+        "ngtcp2/Rustls handshake timed out after {} ms (native RbxTransport budget; requested probe timeout {} ms); target {}, local {}; {}",
+        handshake_timeout.as_millis(),
+        requested_timeout_ms,
+        route.target_endpoint.label(),
+        local_addr,
+        udp_stats.summary()
+    )
+}
+
+#[cfg(not(test))]
 async fn attempt_rbx_transport_connection_async(
     plan: &RbxTransportConnectPlan,
     auth: &EarlyAuthData,
@@ -1956,13 +1974,12 @@ async fn attempt_rbx_transport_connection_async(
             break;
         }
         if tokio::time::Instant::now() >= handshake_deadline {
-            return Err(format!(
-                "ngtcp2/Rustls handshake timed out after {} ms (native RbxTransport budget; requested probe timeout {} ms); target {}, local {}; {}",
-                handshake_timeout.as_millis(),
+            return Err(rbx_transport_handshake_timeout_message(
+                handshake_timeout,
                 requested_timeout_ms,
-                route.target_endpoint.label(),
+                &route,
                 local_addr,
-                udp_stats.summary()
+                &udp_stats,
             ));
         }
         let expiry = rbx_transport_expiry(&connection, started);
@@ -2013,9 +2030,30 @@ async fn attempt_rbx_transport_connection_async(
             }
             RbxTransportWake::Expiry => {
                 let timestamp = rbx_transport_timestamp(started)?;
-                connection
-                    .handle_expiry(timestamp)
-                    .map_err(|error| format!("ngtcp2 timer handling failed: {error}"))?;
+                match connection.handle_expiry(timestamp) {
+                    Ok(_) => {}
+                    Err(error)
+                        if error.native_code().is_some_and(|code| {
+                            code.get() == ngnet_quic::raw::NGTCP2_ERR_HANDSHAKE_TIMEOUT
+                        }) =>
+                    {
+                        return Err(rbx_transport_handshake_timeout_message(
+                            handshake_timeout,
+                            requested_timeout_ms,
+                            &route,
+                            local_addr,
+                            &udp_stats,
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "ngtcp2 timer handling failed: {error}; target {}, local {}; {}",
+                            route.target_endpoint.label(),
+                            local_addr,
+                            udp_stats.summary()
+                        ));
+                    }
+                }
             }
             RbxTransportWake::HandshakeTimeout => continue,
             RbxTransportWake::ReceiveWindowEnded => {
