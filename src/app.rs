@@ -1658,7 +1658,7 @@ ui.label("Place ID:");
                 // Section 2: Direct Place Publishing
                 ui.group(|ui| {
                     ui.label(RichText::new("🚀 Publish Active Place to Live Universe").heading().color(Color32::from_rgb(120, 255, 120)));
-                    ui.label("Serializes the active .rbxl and publishes through the documented Place Versions API. Authenticate with an Open Cloud API key or your saved .ROBLOSECURITY cookie; cookie auth does not require an Open Cloud key. Studio 0.741's exact internal publishing route remains unverified. Requires the correct Universe ID and Place ID. This app does not use Upload.ashx for place files.");
+                    ui.label("Serializes the active .rbxl and sends this app's documented Place Versions API request. Authenticate with an Open Cloud API key or your saved .ROBLOSECURITY cookie (the public API reference lists Cookie auth; Studio 0.741's exact internal route is not confirmed). Requires the correct Universe ID and Place ID. This app does not use Upload.ashx for place files.");
 
                     ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published; unchecked saves a version only)");
 
