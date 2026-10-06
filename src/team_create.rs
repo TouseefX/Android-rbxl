@@ -2199,6 +2199,8 @@ struct RbxTransportStreamState {
     header: Option<RbxTransportStreamHeader>,
     invalid_header: bool,
     control_decoder: RbxTransportControlDecoder,
+    pending_candidate_open: Vec<u8>,
+    body_prefix_checked: bool,
 }
 
 #[cfg(not(test))]
@@ -2301,7 +2303,14 @@ impl RbxTransportStreamReceiver {
                     }
                 }
             } else {
-                account_rbx_transport_application_stream_bytes(&stats, body);
+                account_rbx_transport_application_stream_bytes(
+                    &stats,
+                    &format!("{stream_id:?}"),
+                    header,
+                    &mut state.pending_candidate_open,
+                    &mut state.body_prefix_checked,
+                    body,
+                );
             }
         }
 
@@ -2322,6 +2331,15 @@ impl RbxTransportStreamReceiver {
                     format!(
                         "stream {stream_id:?}: stream ended with {} incomplete control-frame byte(s)",
                         state.control_decoder.pending.len()
+                    ),
+                );
+            }
+            if !state.pending_candidate_open.is_empty() && !state.body_prefix_checked {
+                add_rbx_transport_receive_event(
+                    &stats,
+                    format!(
+                        "stream {stream_id:?}: stream ended with an incomplete candidate type-1 body record ({} byte(s))",
+                        state.pending_candidate_open.len()
                     ),
                 );
             }
@@ -2498,7 +2516,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         "persistent receive/dispatch loop"
     };
     let mut summary = format!(
-        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, opaque application-stream payload {} bytes; datagrams {} ({} bytes, 1 MiB receive-buffer drops {}); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); body-read errors {}.",
+        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes, 1 MiB receive-buffer drops {}); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); app-body type-1/OpenReliable-shaped candidates {} (second-header semantics unresolved); body-read errors {}.",
         started.elapsed().as_millis(),
         snapshot.accepted_uni_streams,
         snapshot.accepted_bi_streams,
@@ -2506,7 +2524,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         snapshot.malformed_stream_headers,
         snapshot.control_streams,
         snapshot.application_streams,
-        snapshot.application_stream_payload_bytes,
+        snapshot.stream_payload_bytes,
         snapshot.datagrams,
         snapshot.datagram_bytes,
         snapshot.datagram_receive_buffer_drops,
@@ -2515,6 +2533,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         snapshot.unreliable_opens,
         snapshot.unreliable_closes,
         snapshot.unknown_control_tags,
+        snapshot.application_body_open_reliable_candidates,
         snapshot.stream_read_errors,
     );
     if receive_window_ended {
@@ -2561,12 +2580,13 @@ struct RbxTransportReceiveStats {
     malformed_stream_headers: usize,
     control_streams: usize,
     application_streams: usize,
-    application_stream_payload_bytes: usize,
+    stream_payload_bytes: usize,
     control_messages: usize,
     reliable_open_on_control: usize,
     unreliable_opens: usize,
     unreliable_closes: usize,
     unknown_control_tags: usize,
+    application_body_open_reliable_candidates: usize,
     stream_read_errors: usize,
     events: Vec<String>,
 }
@@ -2643,17 +2663,70 @@ fn dispatch_rbx_transport_control_message(
 }
 
 #[cfg(not(test))]
-// The Player IDA path writes its channel-open header before channel payload.
-// Studio 0.741's post-header application framing is not mapped here, so count
-// remaining bytes opaquely instead of guessing that another type-1 header is
-// present.
+// This is observational only: a type-1 body prefix matches the known
+// OpenReliable shape, but 0.741 has not been shown to require a second channel
+// header after its seven-byte stream prefix. Never use this heuristic to route
+// payloads or generate control bytes.
 fn account_rbx_transport_application_stream_bytes(
     stats: &Arc<std::sync::Mutex<RbxTransportReceiveStats>>,
+    stream_id: &str,
+    header: RbxTransportStreamHeader,
+    pending_candidate_open: &mut Vec<u8>,
+    body_prefix_checked: &mut bool,
     bytes: &[u8],
 ) {
+    if *body_prefix_checked {
+        update_rbx_transport_receive_stats(stats, |stats| {
+            stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(bytes.len());
+        });
+        return;
+    }
+
+    pending_candidate_open.extend_from_slice(bytes);
+    let Some(&tag) = pending_candidate_open.first() else {
+        return;
+    };
+    if tag != RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE {
+        *body_prefix_checked = true;
+        let payload_bytes = pending_candidate_open.len();
+        update_rbx_transport_receive_stats(stats, |stats| {
+            stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(payload_bytes);
+            if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+                stats.events.push(format!(
+                    "stream {stream_id}: body did not start with type-1/OpenReliable-shaped bytes; counting it as opaque application data (app {}, channel {})",
+                    header.application,
+                    header.channel_id_label()
+                ));
+            }
+        });
+        pending_candidate_open.clear();
+        return;
+    }
+    if pending_candidate_open.len() < RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES {
+        return;
+    }
+
+    let application = pending_candidate_open[1];
+    let channel_id = u32::from_be_bytes([
+        pending_candidate_open[2],
+        pending_candidate_open[3],
+        pending_candidate_open[4],
+        pending_candidate_open[5],
+    ]);
+    let payload_bytes = pending_candidate_open.len() - RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES;
+    *body_prefix_checked = true;
     update_rbx_transport_receive_stats(stats, |stats| {
-        stats.application_stream_payload_bytes = stats.application_stream_payload_bytes.saturating_add(bytes.len());
+        stats.application_body_open_reliable_candidates += 1;
+        stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(payload_bytes);
+        if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
+            stats.events.push(format!(
+                "stream {stream_id}: candidate type-1/OpenReliable-shaped body record app={application}, channel={channel_id}; outer prefix app={}, channel={} (whether this is a second channel-open header is unresolved)",
+                header.application,
+                header.channel_id_label()
+            ));
+        }
     });
+    pending_candidate_open.clear();
 }
 
 
