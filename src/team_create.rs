@@ -76,7 +76,9 @@ impl Endpoint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RbxTransportSessionEvent {
     Status(String),
-    Connected(String),
+    /// The QUIC/TLS handshake completed. This is deliberately distinct from
+    /// BaseClient's post-WaitForConnection state and Team Create acceptance.
+    QuicHandshakeComplete(String),
     Finished(String),
 }
 
@@ -469,10 +471,13 @@ const RBX_TRANSPORT_BASECLIENT_SEND_CHANNEL_ID: u32 = 0;
 const RBX_TRANSPORT_BASECLIENT_SEND_RELIABILITY: u32 = 2;
 const RBX_TRANSPORT_BASECLIENT_SEND_PRIORITY: u32 = 0;
 
-// Per-stream RbxTransport envelope recovered from Studio's receive path:
-// magic 0x06, version 0x01, application byte, then a big-endian channel ID.
-const RBX_TRANSPORT_STREAM_HEADER_MAGIC: u8 = 0x06;
-const RBX_TRANSPORT_STREAM_HEADER_VERSION: u8 = 0x01;
+// The 0.741 receive path consumes seven bytes beginning 0x06, 0x01, followed
+// by an application byte and big-endian channel id. The adjacent 0.735 source
+// and Player IDA session interpret 0x06/0x01 as [length=6][OpenReliable type=1];
+// keep the target parser semantically neutral until that receive-side contract
+// is directly matched in 0.741.
+const RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_0: u8 = 0x06;
+const RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_1: u8 = 0x01;
 const RBX_TRANSPORT_STREAM_HEADER_BYTES: usize = 7;
 const RBX_TRANSPORT_CONTROL_APPLICATION: u8 = 0;
 const RBX_TRANSPORT_CONTROL_CHANNEL_ID: u32 = u32::MAX; // native signed -1
@@ -1291,16 +1296,16 @@ impl RbxTransportStreamHeader {
                 RBX_TRANSPORT_STREAM_HEADER_BYTES
             ));
         }
-        if bytes[0] != RBX_TRANSPORT_STREAM_HEADER_MAGIC {
+        if bytes[0] != RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_0 {
             return Err(format!(
-                "stream header magic 0x{:02x}; expected 0x{:02x}",
-                bytes[0], RBX_TRANSPORT_STREAM_HEADER_MAGIC
+                "stream header prefix byte 0 is 0x{:02x}; expected 0x{:02x}",
+                bytes[0], RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_0
             ));
         }
-        if bytes[1] != RBX_TRANSPORT_STREAM_HEADER_VERSION {
+        if bytes[1] != RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_1 {
             return Err(format!(
-                "stream header version 0x{:02x}; expected 0x{:02x}",
-                bytes[1], RBX_TRANSPORT_STREAM_HEADER_VERSION
+                "stream header prefix byte 1 is 0x{:02x}; expected 0x{:02x}",
+                bytes[1], RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_1
             ));
         }
         Ok(Self {
@@ -1313,8 +1318,8 @@ impl RbxTransportStreamHeader {
     fn encode(self) -> [u8; RBX_TRANSPORT_STREAM_HEADER_BYTES] {
         let channel_id = self.channel_id.to_be_bytes();
         [
-            RBX_TRANSPORT_STREAM_HEADER_MAGIC,
-            RBX_TRANSPORT_STREAM_HEADER_VERSION,
+            RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_0,
+            RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_1,
             self.application,
             channel_id[0],
             channel_id[1],
@@ -1532,14 +1537,14 @@ fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec
 
 #[cfg(test)]
 fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms: u64) -> String {
-    "\nRbxTransport connected-session attempt: skipped under unit tests (the app build runs a cancellable QUIC/RPK/RUPP receive/dispatch session; early auth remains unsent until channel routing is verified).".into()
+    "\nRbxTransport QUIC session attempt: skipped under unit tests (the app build runs a cancellable QUIC/RPK/RUPP receive/dispatch session; early auth remains unsent until channel routing is verified).".into()
 }
 
 #[cfg(not(test))]
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified\n{}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1550,7 +1555,7 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.rpk_version,
             report.handshake_timeout_ms,
             report.requested_timeout_ms,
-            report.connected_ms,
+            report.handshake_completed_ms,
             report.udp_summary,
             report.auth_version,
             report.preauth_len,
@@ -1559,7 +1564,7 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.inbound_summary
         ),
         Err(reason) => format!(
-            "\nRbxTransport connected-session attempt failed before inbound Team Create traffic was accepted: {reason}"
+            "\nRbxTransport QUIC session attempt failed before inbound Team Create traffic was accepted: {reason}"
         ),
     }
 }
@@ -1577,7 +1582,7 @@ struct RbxTransportConnectionReport {
     rpk_version: u16,
     requested_timeout_ms: u64,
     handshake_timeout_ms: u64,
-    connected_ms: u128,
+    handshake_completed_ms: u128,
     udp_summary: String,
     auth_version: u8,
     preauth_len: usize,
@@ -2070,11 +2075,11 @@ async fn attempt_rbx_transport_connection_async(
         }
     }
 
-    let connected_ms = started.elapsed().as_millis();
+    let handshake_completed_ms = started.elapsed().as_millis();
     if persistent_session {
         if let Some(event_tx) = &event_tx {
-            let _ = event_tx.send(RbxTransportSessionEvent::Connected(format!(
-                "RbxTransport QUIC connected via {}; target {}, local {}, ALPN {}. Persistent ngtcp2 receive/dispatch loop is active; early-auth and channel-control bytes remain unsent.",
+            let _ = event_tx.send(RbxTransportSessionEvent::QuicHandshakeComplete(format!(
+                "RbxTransport QUIC/TLS handshake completed via {}; target {}, local {}, ALPN {}. The receive/dispatch loop is active; this is not BaseClient connected state or Team Create acceptance. Early-auth and channel-control bytes remain unsent.",
                 route.route_label,
                 route.target_endpoint.label(),
                 local_addr,
@@ -2119,7 +2124,7 @@ async fn attempt_rbx_transport_connection_async(
         rpk_version: plan.early_key.version,
         requested_timeout_ms,
         handshake_timeout_ms,
-        connected_ms,
+        handshake_completed_ms,
         udp_summary: udp_stats.summary(),
         auth_version: auth.auth_version,
         preauth_len: auth.preauth_blob.len(),
@@ -2194,8 +2199,6 @@ struct RbxTransportStreamState {
     header: Option<RbxTransportStreamHeader>,
     invalid_header: bool,
     control_decoder: RbxTransportControlDecoder,
-    pending_open: Vec<u8>,
-    open_prefix_checked: bool,
 }
 
 #[cfg(not(test))]
@@ -2298,14 +2301,7 @@ impl RbxTransportStreamReceiver {
                     }
                 }
             } else {
-                account_rbx_transport_application_stream_bytes(
-                    &stats,
-                    &format!("{stream_id:?}"),
-                    header,
-                    &mut state.pending_open,
-                    &mut state.open_prefix_checked,
-                    body,
-                );
+                account_rbx_transport_application_stream_bytes(&stats, body);
             }
         }
 
@@ -2326,15 +2322,6 @@ impl RbxTransportStreamReceiver {
                     format!(
                         "stream {stream_id:?}: stream ended with {} incomplete control-frame byte(s)",
                         state.control_decoder.pending.len()
-                    ),
-                );
-            }
-            if !state.pending_open.is_empty() && !state.open_prefix_checked {
-                add_rbx_transport_receive_event(
-                    &stats,
-                    format!(
-                        "stream {stream_id:?}: stream ended with an incomplete OpenReliable prefix ({} byte(s))",
-                        state.pending_open.len()
                     ),
                 );
             }
@@ -2511,7 +2498,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         "persistent receive/dispatch loop"
     };
     let mut summary = format!(
-        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes, 1 MiB receive-buffer drops {}); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); reliable-stream OpenReliable prefixes {}; body-read errors {}.",
+        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, opaque application-stream payload {} bytes; datagrams {} ({} bytes, 1 MiB receive-buffer drops {}); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); body-read errors {}.",
         started.elapsed().as_millis(),
         snapshot.accepted_uni_streams,
         snapshot.accepted_bi_streams,
@@ -2519,7 +2506,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         snapshot.malformed_stream_headers,
         snapshot.control_streams,
         snapshot.application_streams,
-        snapshot.stream_payload_bytes,
+        snapshot.application_stream_payload_bytes,
         snapshot.datagrams,
         snapshot.datagram_bytes,
         snapshot.datagram_receive_buffer_drops,
@@ -2528,7 +2515,6 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         snapshot.unreliable_opens,
         snapshot.unreliable_closes,
         snapshot.unknown_control_tags,
-        snapshot.reliable_stream_open_prefixes,
         snapshot.stream_read_errors,
     );
     if receive_window_ended {
@@ -2575,13 +2561,12 @@ struct RbxTransportReceiveStats {
     malformed_stream_headers: usize,
     control_streams: usize,
     application_streams: usize,
-    stream_payload_bytes: usize,
+    application_stream_payload_bytes: usize,
     control_messages: usize,
     reliable_open_on_control: usize,
     unreliable_opens: usize,
     unreliable_closes: usize,
     unknown_control_tags: usize,
-    reliable_stream_open_prefixes: usize,
     stream_read_errors: usize,
     events: Vec<String>,
 }
@@ -2658,66 +2643,17 @@ fn dispatch_rbx_transport_control_message(
 }
 
 #[cfg(not(test))]
+// The Player IDA path writes its channel-open header before channel payload.
+// Studio 0.741's post-header application framing is not mapped here, so count
+// remaining bytes opaquely instead of guessing that another type-1 header is
+// present.
 fn account_rbx_transport_application_stream_bytes(
     stats: &Arc<std::sync::Mutex<RbxTransportReceiveStats>>,
-    stream_id: &str,
-    header: RbxTransportStreamHeader,
-    pending_open: &mut Vec<u8>,
-    open_prefix_checked: &mut bool,
     bytes: &[u8],
 ) {
-    if *open_prefix_checked {
-        update_rbx_transport_receive_stats(stats, |stats| {
-            stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(bytes.len());
-        });
-        return;
-    }
-
-    pending_open.extend_from_slice(bytes);
-    let Some(&tag) = pending_open.first() else {
-        return;
-    };
-    if tag != RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE {
-        *open_prefix_checked = true;
-        let payload_bytes = pending_open.len();
-        update_rbx_transport_receive_stats(stats, |stats| {
-            stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(payload_bytes);
-            if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
-                stats.events.push(format!(
-                    "stream {stream_id}: body did not start with an OpenReliable prefix; counting it as opaque application data (app {}, channel {})",
-                    header.application,
-                    header.channel_id_label()
-                ));
-            }
-        });
-        pending_open.clear();
-        return;
-    }
-    if pending_open.len() < RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES {
-        return;
-    }
-
-    let application = pending_open[1];
-    let channel_id = u32::from_be_bytes([
-        pending_open[2],
-        pending_open[3],
-        pending_open[4],
-        pending_open[5],
-    ]);
-    let payload_bytes = pending_open.len() - RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES;
-    *open_prefix_checked = true;
     update_rbx_transport_receive_stats(stats, |stats| {
-        stats.reliable_stream_open_prefixes += 1;
-        stats.stream_payload_bytes = stats.stream_payload_bytes.saturating_add(payload_bytes);
-        if stats.events.len() < RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS {
-            stats.events.push(format!(
-                "stream {stream_id}: reliable-stream OpenReliable prefix app={application}, channel={channel_id}; outer header app={}, channel={} (channel identities are reported separately)",
-                header.application,
-                header.channel_id_label()
-            ));
-        }
+        stats.application_stream_payload_bytes = stats.application_stream_payload_bytes.saturating_add(bytes.len());
     });
-    pending_open.clear();
 }
 
 
@@ -4468,7 +4404,7 @@ pub fn run_join_config_session(
             });
         match result {
             Ok(connection_report) => report.push_str(&format!(
-                "\n✅ RbxTransport QUIC connected — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), connected in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified\n{}",
+                "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
                 connection_report.route_label,
                 connection_report.target,
                 connection_report.local_addr,
@@ -4479,7 +4415,7 @@ pub fn run_join_config_session(
                 connection_report.rpk_version,
                 connection_report.handshake_timeout_ms,
                 connection_report.requested_timeout_ms,
-                connection_report.connected_ms,
+                connection_report.handshake_completed_ms,
                 connection_report.udp_summary,
                 connection_report.auth_version,
                 connection_report.preauth_len,
@@ -4748,7 +4684,7 @@ mod tests {
         assert!(report.contains("active connection send slot argument 1, frame tag 0xA8"));
         assert!(report.contains("wire payload 52 bytes"));
         assert!(report.contains("Legacy RakNet connected packets are intentionally skipped"));
-        assert!(report.contains("RbxTransport connected-session attempt: skipped under unit tests"));
+        assert!(report.contains("RbxTransport QUIC session attempt: skipped under unit tests"));
         assert!(!report.contains("ICEiIyQl"));
         assert!(!report.contains("AAECAw"));
     }
@@ -4896,7 +4832,7 @@ mod tests {
     }
 
     #[test]
-    fn rbx_transport_stream_header_uses_the_seven_byte_big_endian_envelope() {
+    fn rbx_transport_stream_header_validates_fixed_prefix_and_big_endian_channel_id() {
         let control = RbxTransportStreamHeader {
             application: RBX_TRANSPORT_CONTROL_APPLICATION,
             channel_id: RBX_TRANSPORT_CONTROL_CHANNEL_ID,
@@ -4917,12 +4853,31 @@ mod tests {
         assert!(!application.is_control_channel());
         assert!(RbxTransportStreamHeader::parse(&encoded[..6]).is_err());
 
-        let mut bad_magic = encoded;
-        bad_magic[0] = 0x05;
-        assert!(RbxTransportStreamHeader::parse(&bad_magic).is_err());
-        let mut bad_version = encoded;
-        bad_version[1] = 0x02;
-        assert!(RbxTransportStreamHeader::parse(&bad_version).is_err());
+        let mut bad_prefix_byte_0 = encoded;
+        bad_prefix_byte_0[0] = 0x05;
+        assert!(RbxTransportStreamHeader::parse(&bad_prefix_byte_0).is_err());
+        let mut bad_prefix_byte_1 = encoded;
+        bad_prefix_byte_1[1] = 0x02;
+        assert!(RbxTransportStreamHeader::parse(&bad_prefix_byte_1).is_err());
+    }
+
+    #[test]
+    fn rbx_transport_stream_bytes_match_the_length_prefixed_open_reliable_candidate() {
+        let open_reliable = build_rbx_transport_open_reliable_channel_control(1, 0x0102_0304);
+        assert_eq!(open_reliable.len(), RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES);
+
+        let mut candidate = vec![RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES as u8];
+        candidate.extend_from_slice(&open_reliable);
+        assert_eq!(candidate, vec![0x06, 0x01, 0x01, 0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(
+            RbxTransportStreamHeader::parse(&candidate),
+            Ok(RbxTransportStreamHeader {
+                application: 1,
+                channel_id: 0x0102_0304,
+            })
+        );
+        // This establishes byte equivalence only. The 0.741 receive-side
+        // interpretation of these bytes is still not directly recovered.
     }
 
     #[test]

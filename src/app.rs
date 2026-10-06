@@ -374,7 +374,8 @@ pub struct EditorApp {
     team_create_session_rx: Option<Receiver<crate::team_create::RbxTransportSessionEvent>>,
     team_create_session_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     team_create_session_running: bool,
-    team_create_session_connected: bool,
+    /// QUIC/TLS handshake milestone only; not BaseClient-connected or Team Create-accepted.
+    team_create_session_quic_handshake_complete: bool,
     team_create_session_status: String,
 
     // Per-property text buffers so number properties (float/int, and vector
@@ -531,7 +532,7 @@ impl Default for EditorApp {
             team_create_session_rx: None,
             team_create_session_cancel: None,
             team_create_session_running: false,
-            team_create_session_connected: false,
+            team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
@@ -1798,7 +1799,7 @@ ui.label("Place ID:");
                 // replication client (UDP/RakNet) is a future stage.
                 ui.group(|ui| {
                     ui.label(RichText::new("👥 Team Create Sessions").heading().color(Color32::from_rgb(120, 200, 255)));
-                    ui.label("Cookie-auth control plane: check/enable Team Create, view cloud-edit members, and negotiate a join. Start Transport Session runs on a background worker; a connected RbxTransport receive loop stays active until stopped or the peer closes. Early auth/channel-control data remains gated on verified routing.");
+                    ui.label("Cookie-auth control plane: check/enable Team Create, view cloud-edit members, and negotiate a join. Start Transport Session runs on a background worker; after QUIC/TLS completes, a receive loop stays active until stopped or the peer closes. This is not the native BaseClient connected state or Team Create acceptance; early auth/channel-control data remains unsent.");
 
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("🔄 Check Status").clicked() {
@@ -1919,7 +1920,7 @@ ui.label("Place ID:");
                         let probe = ui
                             .add_enabled(can_probe, egui::Button::new("📡 Start Transport Session"))
                             .on_hover_text(if can_probe {
-                                "Consumes this one-use gamejoin config, starts the selected transport on a background worker, and keeps the RbxTransport receive/dispatch loop alive until stopped or disconnected."
+                                "Consumes this one-use gamejoin config and keeps the selected transport's receive loop alive on a worker. A QUIC/TLS handshake alone does not mean BaseClient connected or Team Create accepted."
                             } else {
                                 "Negotiate Join immediately before each transport session; the join ticket is one-use"
                             });
@@ -1930,10 +1931,10 @@ ui.label("Place ID:");
                                 self.start_team_create_transport_session(cfg, false, None);
                             }
                         }
-                        let stop_label = if self.team_create_session_connected {
-                            "⏹ Stop Connected Session"
+                        let stop_label = if self.team_create_session_quic_handshake_complete {
+                            "⏹ Stop QUIC Receive Session"
                         } else {
-                            "⏹ Cancel Transport Connect"
+                            "⏹ Cancel QUIC Connect"
                         };
                         if self.team_create_session_running && ui.button(stop_label).clicked() {
                             if let Some(cancel) = &self.team_create_session_cancel {
@@ -5835,10 +5836,10 @@ ui.label("Place ID:");
                 crate::team_create::RbxTransportSessionEvent::Status(status) => {
                     self.team_create_session_status = status;
                 }
-                crate::team_create::RbxTransportSessionEvent::Connected(status) => {
-                    self.team_create_session_connected = true;
+                crate::team_create::RbxTransportSessionEvent::QuicHandshakeComplete(status) => {
+                    self.team_create_session_quic_handshake_complete = true;
                     self.team_create_session_status = status.clone();
-                    self.status = "RbxTransport connected; receive/dispatch loop running".into();
+                    self.status = "RbxTransport QUIC/TLS handshake complete; receive loop running (Team Create acceptance not confirmed)".into();
                     self.log_info(status);
                 }
                 crate::team_create::RbxTransportSessionEvent::Finished(report) => {
@@ -5848,7 +5849,7 @@ ui.label("Place ID:");
                     self.status = self.team_create_session_status.clone();
                     self.log_info(format!("Team Create transport session:\n{report}"));
                     self.team_create_session_running = false;
-                    self.team_create_session_connected = false;
+                    self.team_create_session_quic_handshake_complete = false;
                     self.team_create_session_cancel = None;
                     self.team_create_session_rx = None;
                 }
@@ -5857,7 +5858,7 @@ ui.label("Place ID:");
 
         if disconnected && self.team_create_session_running {
             self.team_create_session_running = false;
-            self.team_create_session_connected = false;
+            self.team_create_session_quic_handshake_complete = false;
             self.team_create_session_cancel = None;
             self.team_create_session_rx = None;
             self.team_create_session_status =
@@ -5890,7 +5891,7 @@ ui.label("Place ID:");
         self.team_create_session_rx = Some(event_rx);
         self.team_create_session_cancel = Some(std::sync::Arc::clone(&cancel));
         self.team_create_session_running = true;
-        self.team_create_session_connected = false;
+        self.team_create_session_quic_handshake_complete = false;
         self.team_create_session_status = initial_status.clone();
         self.team_create_response = initial_status.clone();
         self.status = initial_status;
