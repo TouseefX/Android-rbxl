@@ -61,6 +61,23 @@ pub fn class_is_creatable(class_name: &str) -> bool {
     })
 }
 
+/// Return the runtime default for a reflected property. Prefer the class dump's
+/// explicit default, then synthesize a safe default from its reflected type.
+pub fn default_property_value(class_name: &str, property_name: &str) -> Option<Variant> {
+    let db = database();
+    let mut current = Some(class_name);
+    for _ in 0..128 {
+        let Some(name) = current else { break };
+        let Some(class) = db.classes.get(name) else { break };
+        if let Some(value) = class.default_properties.get(property_name) {
+            return Some(value.clone());
+        }
+        current = class.superclass.as_deref();
+    }
+    let data_type = resolve_property_type(class_name, property_name)?;
+    default_variant_for(&data_type)
+}
+
 pub fn enum_item_exists(enum_name: &str, item_name: &str) -> Option<bool> {
     database().enums.get(enum_name)
         .map(|desc| desc.items.contains_key(item_name))
@@ -135,6 +152,19 @@ pub fn get_enum_items(enum_name: &str) -> Vec<String> {
     }
 }
 
+/// Return reflected enum item names and their engine-defined numeric values.
+pub fn get_enum_items_with_values(enum_name: &str) -> Vec<(String, u32)> {
+    let db = database();
+    let mut items: Vec<(String, u32)> = db.enums.get(enum_name).map_or_else(Vec::new, |desc| {
+        desc.items
+            .iter()
+            .map(|(name, value)| (name.to_string(), *value))
+            .collect()
+    });
+    items.sort_by_key(|(name, value)| (*value, name.clone()));
+    items
+}
+
 /// Resolve the official type of a property on a class, walking the superclass
 /// chain. Returns the reflection `DataType` (either a concrete `VariantType` or
 /// a named Roblox `Enum`), so the properties editor can render the right
@@ -153,6 +183,35 @@ pub fn resolve_property_type(class_name: &str, prop_name: &str) -> Option<DataTy
         }
     }
     None
+}
+
+/// Check common Luau-to-DOM value types against reflected property metadata.
+/// `None` means the property has no reflected descriptor; unsupported Roblox
+/// types remain permissive so their specialized host conversions can evolve.
+pub fn property_value_matches_type(
+    class_name: &str,
+    property_name: &str,
+    value: &Variant,
+) -> Option<bool> {
+    use rbx_dom_weak::types::VariantType;
+    let data_type = resolve_property_type(class_name, property_name)?;
+    Some(match data_type {
+        DataType::Enum(_) => matches!(value, Variant::Enum(_)),
+        DataType::Value(VariantType::Bool) => matches!(value, Variant::Bool(_)),
+        DataType::Value(VariantType::String) => matches!(value, Variant::String(_)),
+        DataType::Value(VariantType::Float32) => matches!(value, Variant::Float32(_)),
+        DataType::Value(VariantType::Float64) => matches!(value, Variant::Float64(_)),
+        DataType::Value(VariantType::Int32) => matches!(value, Variant::Int32(_)),
+        DataType::Value(VariantType::Int64) => matches!(value, Variant::Int64(_)),
+        DataType::Value(VariantType::CFrame) => matches!(value, Variant::CFrame(_)),
+        DataType::Value(VariantType::Vector2) => matches!(value, Variant::Vector2(_)),
+        DataType::Value(VariantType::Vector3) => matches!(value, Variant::Vector3(_)),
+        DataType::Value(VariantType::Color3) => matches!(value, Variant::Color3(_)),
+        DataType::Value(VariantType::UDim) => matches!(value, Variant::UDim(_)),
+        DataType::Value(VariantType::UDim2) => matches!(value, Variant::UDim2(_)),
+        DataType::Value(VariantType::NumberRange) => matches!(value, Variant::NumberRange(_)),
+        _ => true,
+    })
 }
 
 /// If a property resolves to a Roblox enum, return (enum_name, items sorted).

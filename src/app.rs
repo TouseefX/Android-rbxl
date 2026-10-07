@@ -5163,10 +5163,11 @@ ui.label("Place ID:");
     fn show_command_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("▶ Command Bar");
         ui.label(RichText::new(
-            "Run Luau against this editor's local DataModel. Use game:GetService, \
-             reflection-backed Instance classes, and script.Source for the active \
-             open script. This is a host subset, not the Roblox Studio runtime; a \
-             connected Live Session executes the command inside Studio.",
+            "Run Luau against this editor's DataModel: reflected Instance properties and defaults, \
+             Enum items, Vector2/Vector3 math, Color3 HSV/hex conversions, edit-mode RunService, \
+             and InsertService:LoadAsset (cached assets first; network fetch may block and uses the \
+             saved Roblox cookie when required). This host subset has no full physics/render loop; \
+             a connected Live Session executes the command inside Studio.",
         ).weak());
 
         ui.separator();
@@ -5278,8 +5279,10 @@ ui.label("Place ID:");
                 let rc = Rc::new(RefCell::new(taken));
                 let script_ref = script_context.as_ref().map(|(referent, _)| *referent);
                 let script_source = script_context.as_ref().map(|(_, source)| source.as_str());
-                match lua_runtime::run_command_with_script_context(
-                    rc.clone(), &src, "=command", script_ref, script_source,
+                let asset_cookie = (!self.roblosecurity_cookie.trim().is_empty())
+                    .then_some(self.roblosecurity_cookie.as_str());
+                match lua_runtime::run_command_with_script_context_and_cookie(
+                    rc.clone(), &src, "=command", script_ref, script_source, asset_cookie,
                 ) {
                     Ok(outcome) => {
                         for line in lua_runtime::take_command_log() {
