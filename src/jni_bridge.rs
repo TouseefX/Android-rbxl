@@ -17,6 +17,8 @@ pub enum FileEvent {
     PublishResult { uri: String, result: Result<(), String> },
     /// Group universes finished loading (group_id, list, thumbnails id->url).
     GroupUniverses { group_id: u64, universes: Vec<crate::roblox_api::GroupUniverse>, thumbs: std::collections::HashMap<u64, String> },
+    /// Experiences owned by the authenticated account finished loading.
+    UserUniverses { user_id: u64, universes: Vec<crate::roblox_api::GroupUniverse>, thumbs: std::collections::HashMap<u64, String> },
     /// Places under a universe finished (universe_id, list of (place_id, name)).
     UniversePlaces { universe_id: u64, places: Vec<(u64, String)> },
     /// A browse/network error happened.
@@ -28,6 +30,7 @@ pub enum FileEvent {
     /// script identified by `script_id` (see EditorApp::next_external_id).
     ExternalEditReturned { script_id: u64, text: String },
     NativeEditorChanged { script_id: u64, text: String, selection_start: usize, selection_end: usize },
+    NativeEditorSignatureChanged { script_id: u64, text: String, cursor: usize },
     NativeEditorCommand { script_id: u64, command: String, text: String, cursor: usize },
     /// Snapshot of exported src/**/*.luau files after returning to the app.
     ProjectSync { bundle_json: String },
@@ -121,6 +124,15 @@ pub fn queue_group_universes(
 ) {
     let (tx, _) = channel();
     let _ = tx.send(FileEvent::GroupUniverses { group_id, universes, thumbs });
+}
+
+pub fn queue_user_universes(
+    user_id: u64,
+    universes: Vec<crate::roblox_api::GroupUniverse>,
+    thumbs: std::collections::HashMap<u64, String>,
+) {
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::UserUniverses { user_id, universes, thumbs });
 }
 
 pub fn queue_universe_places(universe_id: u64, places: Vec<(u64, String)>) {
@@ -354,6 +366,19 @@ pub fn update_native_completions(script_id: u64, json: &str) {
     });
 }
 
+pub fn update_native_signature_help(script_id: u64, json: &str) {
+    with_env(|env, class| {
+        let value = env.new_string(json)?;
+        let _ = env.call_static_method(
+            class,
+            "updateNativeSignatureHelpStatic",
+            "(JLjava/lang/String;)V",
+            &[JValue::Long(script_id as i64), JValue::Object(&value)],
+        )?;
+        Ok(())
+    });
+}
+
 pub fn trigger_edit_externally(script_id: u64, name: &str, source: &str) {
     with_env(|env, class| {
         let jname = env.new_string(name)?;
@@ -509,6 +534,24 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeE
         text: value,
         selection_start: selection_start.max(0) as usize,
         selection_end: selection_end.max(0) as usize,
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeEditorSignatureChanged(
+    mut env: JNIEnv,
+    _class: JClass,
+    script_id: jni::sys::jlong,
+    text: JString,
+    cursor: jni::sys::jint,
+) {
+    if text.is_null() { return; }
+    let value: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+    let (tx, _) = channel();
+    let _ = tx.send(FileEvent::NativeEditorSignatureChanged {
+        script_id: script_id as u64,
+        text: value,
+        cursor: cursor.max(0) as usize,
     });
 }
 

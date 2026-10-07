@@ -248,12 +248,11 @@ impl StudioPresenceReport {
             .map(|s| format!("; location: {s}"))
             .unwrap_or_default();
         format!(
-            "Roblox Studio presence bootstrap sent AppStarted for {} ({}) with browserTrackerId {} from {}; accepted by {}; current presence: {}{}",
+            "AppStarted diagnostic for {} ({}): HTTP success from candidate {}; browserTrackerId from {}; Roblox currently reports {}{} (HTTP success alone does not confirm Studio session state)",
             self.username,
             self.user_id,
-            self.browser_tracker_id,
-            self.browser_tracker_source,
             self.client_status_route,
+            self.browser_tracker_source,
             presence,
             location
         )
@@ -285,16 +284,13 @@ fn studio_presence_panic_summary(payload: &(dyn std::any::Any + Send)) -> &'stat
     }
 }
 
-/// Send the same client-status heartbeat Studio emits on startup.
+/// Best-effort diagnostic for Studio-style client-status reporting.
 ///
-/// Native Studio still carries the legacy `www.roblox.com/client-status/set`
-/// route while newer builds also expose the Matchmaking API Beta
-/// `/matchmaking-api/v1/client-status` shape
-/// `{"browserTrackerId":…, "status":"…"}`. At app start it sends
-/// `status = "AppStarted"`; Roblox then decides whether that session appears
-/// as Online/InStudio. We do this as a best-effort authenticated request and
-/// follow it with a read-only presence query so the UI can tell the user what
-/// Roblox currently reports.
+/// This tries known legacy/Beta candidate routes, then performs a read-only
+/// presence query. A successful HTTP response does not prove the candidate
+/// request changed Roblox session state; the presence API is the only result
+/// shown as the account's current status. Studio 0.741's exact endpoint still
+/// needs confirmation against that executable.
 pub fn start_studio_presence_async(cookie: String) {
     let tx = studio_presence_channel().0.clone();
     std::thread::spawn(move || {
@@ -3650,6 +3646,18 @@ fn summarize_http_body(text: &str) -> String {
     }
 }
 
+fn looks_like_html_document(content_type: &str, body: &str) -> bool {
+    let content_type = content_type.to_ascii_lowercase();
+    if content_type.contains("text/html") {
+        return true;
+    }
+    let prefix = body.trim_start().chars().take(256).collect::<String>().to_ascii_lowercase();
+    prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
+        || prefix.starts_with("<head")
+        || prefix.starts_with("<body")
+}
+
 fn find_u64_key_recursive(value: &serde_json::Value, wanted: &[&str]) -> Option<u64> {
     match value {
         serde_json::Value::Object(map) => {
@@ -3706,11 +3714,28 @@ impl WebClient {
     }
 
     /// Build the short-deadline client used by the Settings-panel Studio
-    /// presence bootstrap. That path is only a small status heartbeat plus a
-    /// read-back query; using the longer asset/config timeout made the UI look
-    /// permanently stuck on Android when one Roblox edge endpoint black-holed.
+    /// presence bootstrap. Redirects are disabled on this diagnostic path:
+    /// otherwise a retired status URL can redirect to a login/home page and
+    /// the final 200 response is incorrectly reported as an accepted heartbeat.
     fn new_studio_presence_client(cookie: &str) -> Result<Self, String> {
-        Self::new_with_raw_cookie_timeout(cookie, std::time::Duration::from_secs(8))
+        let cookie = if cookie.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_roblosecurity_cookie(cookie)?
+        };
+        let timeout = std::time::Duration::from_secs(8);
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("RobloxStudio/WinInet rbxl-editor")
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("HTTP client build: {e}"))?;
+        Ok(Self {
+            cookie,
+            csrf: std::cell::RefCell::new(None),
+            http,
+        })
     }
 
     fn new_with_raw_cookie_timeout(
@@ -3868,11 +3893,22 @@ impl WebClient {
             .send()
             .map_err(|e| format!("GET {url}: {e}"))?;
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
         let text = resp.text().map_err(|e| format!("read body: {e}"))?;
         if !status.is_success() {
             return Err(format!(
                 "GET {url} → {status}: {}",
                 summarize_http_body(&text)
+            ));
+        }
+        if looks_like_html_document(&content_type, &text) {
+            return Err(format!(
+                "GET {url} → {status}: returned HTML rather than a client-status response"
             ));
         }
         Ok(text)
@@ -3968,7 +4004,10 @@ impl WebClient {
             "POST",
             &body,
         ) {
-            Ok(_) => return Ok("www/client-status/set POST".into()),
+            Ok(response) if !looks_like_html_document("", &response) => {
+                return Ok("www/client-status/set POST".into());
+            }
+            Ok(_) => errors.push("legacy POST: returned an HTML page".into()),
             Err(error) => errors.push(format!("legacy POST: {error}")),
         }
 
@@ -3977,7 +4016,10 @@ impl WebClient {
             "POST",
             &body,
         ) {
-            Ok(_) => return Ok("matchmaking-api client-status POST".into()),
+            Ok(response) if !looks_like_html_document("", &response) => {
+                return Ok("matchmaking-api client-status POST".into());
+            }
+            Ok(_) => errors.push("matchmaking POST: returned an HTML page".into()),
             Err(error) => errors.push(format!("matchmaking POST: {error}")),
         }
 
@@ -4332,6 +4374,37 @@ impl WebClient {
 
     // ---- Groups / universes browser -------------------------------------
 
+    /// List experiences owned by the authenticated user. Roblox's website
+    /// experience list uses `accessFilter=2`, which includes the user's
+    /// non-public experiences when their account has permission to edit them.
+    pub fn user_universes(&self, user_id: u64) -> Result<Vec<GroupUniverse>, String> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _page in 0..20 {
+            let mut url = format!(
+                "https://games.roblox.com/v2/users/{user_id}/games?accessFilter=2&limit=50&sortOrder=Asc"
+            );
+            if let Some(cursor) = &cursor {
+                url.push_str("&cursor=");
+                url.push_str(&percent_encode_query_component(cursor));
+            }
+            let value = self.get_json(&url)?;
+            if let Some(items) = value.get("data").and_then(|data| data.as_array()) {
+                all.extend(items.iter().filter_map(|item| {
+                    serde_json::from_value::<GroupUniverse>(item.clone()).ok()
+                }));
+            }
+            cursor = value
+                .get("nextPageCursor")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            if cursor.is_none() {
+                return Ok(all);
+            }
+        }
+        Err("user experiences exceeded the 20-page safety limit".into())
+    }
+
     /// List experiences (universes) under a group, paging through all
     /// results. `access_filter`: 1=public, 2=all (needs edit permission).
     pub fn group_universes(
@@ -4444,10 +4517,25 @@ pub struct GroupUniverse {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
+    #[serde(default, rename = "playing", alias = "playerCount", alias = "player_count")]
     pub player_count: Option<u64>,
-    #[serde(default)]
+    #[serde(default, rename = "rootPlaceId", alias = "root_place_id")]
     pub root_place_id: Option<u64>,
+    #[serde(default, rename = "rootPlace")]
+    root_place: Option<serde_json::Value>,
+}
+
+impl GroupUniverse {
+    /// Resolve either response shape returned by Roblox: a direct
+    /// `rootPlaceId`, or a nested `rootPlace: { id: ... }` record.
+    pub fn primary_place_id(&self) -> Option<u64> {
+        self.root_place_id.or_else(|| {
+            self.root_place.as_ref().and_then(|root| {
+                root.as_u64()
+                    .or_else(|| root.get("id").and_then(serde_json::Value::as_u64))
+            })
+        })
+    }
 }
 
 enum SendError {
@@ -4459,6 +4547,27 @@ enum SendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn studio_presence_does_not_accept_html_login_pages_as_heartbeats() {
+        assert!(looks_like_html_document("text/html; charset=utf-8", "ok"));
+        assert!(looks_like_html_document("", " <!DOCTYPE html><html><body>login</body></html>"));
+        assert!(!looks_like_html_document("application/json", "{}"));
+    }
+
+    #[test]
+    fn universe_listing_accepts_both_root_place_response_shapes() {
+        let direct: GroupUniverse = serde_json::from_str(
+            r#"{"id":10,"name":"Direct","playing":7,"rootPlaceId":20}"#,
+        ).unwrap();
+        assert_eq!(direct.player_count, Some(7));
+        assert_eq!(direct.primary_place_id(), Some(20));
+
+        let nested: GroupUniverse = serde_json::from_str(
+            r#"{"id":11,"name":"Nested","rootPlace":{"id":21,"name":"Start"}}"#,
+        ).unwrap();
+        assert_eq!(nested.primary_place_id(), Some(21));
+    }
 
     #[test]
     fn extracts_browser_tracker_id_from_plain_cookie_header() {

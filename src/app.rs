@@ -229,8 +229,6 @@ pub struct EditorApp {
     catalog_thumbs_fetched_for: String,
     is_searching_live: bool,
     direct_asset_id_input: String,
-    /// Place ID typed in the toolbar "🌐 Open from Roblox" field.
-    open_place_id_input: String,
     roblosecurity_cookie: String,
     /// Studio-style Roblox presence/client-status bootstrap shown in Settings.
     studio_presence_status: String,
@@ -459,7 +457,6 @@ impl Default for EditorApp {
             catalog_thumbs_fetched_for: String::new(),
             is_searching_live: false,
             direct_asset_id_input: "47433".into(),
-            open_place_id_input: String::new(),
             roblosecurity_cookie: saved_settings.roblosecurity_cookie,
             studio_presence_status: String::new(),
             studio_presence_in_flight: false,
@@ -673,7 +670,7 @@ impl EditorApp {
             return;
         };
         self.studio_presence_status =
-            "Sending native Studio client-status presence to Roblox…".into();
+            "Checking candidate Studio status routes and reading Roblox presence…".into();
         self.studio_presence_in_flight = true;
         self.studio_presence_started_at = Some(Instant::now());
         roblox_api::start_studio_presence_async(cookie);
@@ -763,16 +760,8 @@ impl EditorApp {
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();
                     }
-                    // Open a place directly from Roblox by place ID using the
-                    // cookie-authenticated web client. Downloads the .rbxl then
-                    // loads it exactly like a local file open.
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.open_place_id_input)
-                            .hint_text("place ID")
-                            .desired_width(if compact { 72.0 } else { 90.0 }),
-                    );
-                    if ui.button(if compact { "🌐 Roblox" } else { "🌐 Open from Roblox" }).clicked() {
-                        self.open_place_from_roblox();
+                    if ui.button(if compact { "🗺 Places" } else { "🗺 Place Explorer" }).clicked() {
+                        self.active_tab = ActiveTab::Browse;
                     }
                     if compact {
                         ui.menu_button("⋮ More", |ui| {
@@ -900,7 +889,7 @@ impl EditorApp {
                             tab_btn(ui, "📜 Snippets", ActiveTab::Snippets);
                             tab_btn(ui, "☁️ Creator Store", ActiveTab::Assets);
                             tab_btn(ui, "🧩 Plugins", ActiveTab::Plugins);
-                            tab_btn(ui, "🌐 Browse Roblox", ActiveTab::Browse);
+                            tab_btn(ui, "🗺 Place Explorer", ActiveTab::Browse);
                             tab_btn(ui, "🚀 Open Cloud", ActiveTab::OpenCloud);
                             tab_btn(ui, "▶ Command Bar", ActiveTab::Command);
                             tab_btn(ui, "🖥️ Output", ActiveTab::Output);
@@ -1642,6 +1631,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 // Section 1: Authentication & Universe Config
                 ui.group(|ui| {
                     ui.label(RichText::new("🔑 Open Cloud Authentication & Target").heading().color(Color32::from_rgb(100, 200, 255)));
+                    ui.label(RichText::new("Choose a place in Place Explorer to auto-fill these target IDs; they remain editable here.").weak());
                     ui.horizontal(|ui| {
                         ui.label("API Key:");
                         ui.add(egui::TextEdit::singleline(&mut self.open_cloud_api_key).password(true).desired_width(180.0));
@@ -2068,6 +2058,9 @@ ui.label("Place ID:");
     fn show_explorer_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Explorer");
+            if ui.button("🗺 Place Explorer").clicked() {
+                self.active_tab = ActiveTab::Browse;
+            }
             ui.add(
                 egui::TextEdit::singleline(&mut self.explorer_search)
                     .hint_text("🔍 Filter tree...")
@@ -4933,6 +4926,16 @@ ui.label("Place ID:");
                         self.browse_universes.len()
                     );
                 }
+                FileEvent::UserUniverses { user_id, universes, thumbs } => {
+                    self.browse_universes = universes;
+                    self.browse_thumbnails.extend(thumbs);
+                    self.browse_selected_universe = None;
+                    self.browse_places.clear();
+                    self.browse_status = format!(
+                        "Loaded {} experience(s) owned by account {user_id}",
+                        self.browse_universes.len()
+                    );
+                }
                 FileEvent::UniversePlaces { universe_id, places } => {
                     self.browse_selected_universe = Some(universe_id);
                     self.browse_places = places;
@@ -5090,7 +5093,8 @@ ui.label("Place ID:");
                                 )
                             ))
                         });
-                        let items = index.map(|index| index.complete_at(referent, &text, cursor))
+                        let items = index.as_ref()
+                            .map(|index| index.complete_at(referent, &text, cursor))
                             .unwrap_or_default();
                         let payload: Vec<_> = items.into_iter().take(24).map(|item| serde_json::json!({
                             "label": item.label,
@@ -5100,6 +5104,38 @@ ui.label("Place ID:");
                         })).collect();
                         if let Ok(json) = serde_json::to_string(&payload) {
                             jni_bridge::update_native_completions(script_id, &json);
+                        }
+                    }
+                }
+                FileEvent::NativeEditorSignatureChanged { script_id, text, cursor } => {
+                    if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
+                        let cursor_utf16 = cursor;
+                        let cursor = utf16_to_char_index(&text, cursor_utf16);
+                        if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                            tab.buffer = text.clone();
+                        }
+                        let index = self.project_index_cache.clone().or_else(|| {
+                            self.dom.as_ref().map(|dom| std::sync::Arc::new(
+                                luau_intelligence::ProjectIndex::build_with_overrides(
+                                    dom,
+                                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                                )
+                            ))
+                        });
+                        let signature = index.as_ref()
+                            .and_then(|index| index.signature_help_at(referent, &text, cursor));
+                        let payload = if let Some(help) = signature {
+                            serde_json::json!({
+                                "name": help.name,
+                                "parameters": help.parameters,
+                                "activeParameter": help.active_parameter,
+                                "cursorUtf16": cursor_utf16,
+                            })
+                        } else {
+                            serde_json::json!({ "cursorUtf16": cursor_utf16 })
+                        };
+                        if let Ok(json) = serde_json::to_string(&payload) {
+                            jni_bridge::update_native_signature_help(script_id, &json);
                         }
                     }
                 }
@@ -5756,8 +5792,43 @@ ui.label("Place ID:");
     }
 
     // ------------------------------------------------------------------
-    // Browse Roblox tab: group -> universes -> places, with thumbnails.
+    // Browse Roblox tab: account/group -> experiences -> places.
     // ------------------------------------------------------------------
+    fn browse_load_my_experiences(&self) {
+        let Some(cookie) = self.roblosecurity_cookie() else {
+            jni_bridge::queue_browse_error("Set your .ROBLOSECURITY cookie in Settings first".into());
+            return;
+        };
+        std::thread::spawn(move || {
+            let client = match roblox_api::RobloxApiClient::web_client(&cookie) {
+                Ok(client) => client,
+                Err(error) => {
+                    jni_bridge::queue_browse_error(error);
+                    return;
+                }
+            };
+            let (user_id, _) = match client.whoami() {
+                Ok(user) => user,
+                Err(error) => {
+                    jni_bridge::queue_browse_error(format!("Could not identify the signed-in account: {error}"));
+                    return;
+                }
+            };
+            let universes = match client.user_universes(user_id) {
+                Ok(universes) => universes,
+                Err(error) => {
+                    jni_bridge::queue_browse_error(error);
+                    return;
+                }
+            };
+            let ids: Vec<u64> = universes.iter().map(|universe| universe.id).collect();
+            let thumbs = client
+                .thumbnails_batch(&ids, "GameIcon", "150x150")
+                .unwrap_or_default();
+            jni_bridge::queue_user_universes(user_id, universes, thumbs);
+        });
+    }
+
     fn browse_load_group(&self, group_id: u64) {
         let cookie = self.roblosecurity_cookie();
         std::thread::spawn(move || {
@@ -6088,14 +6159,27 @@ ui.label("Place ID:");
     }
 
     fn show_browse_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("🌐 Browse Roblox");
+        ui.horizontal(|ui| {
+            ui.heading("🗺 Place Explorer");
+            if self.dom.is_some() && ui.button("↩ Current place").clicked() {
+                self.active_tab = ActiveTab::Explorer;
+            }
+        });
         ui.label(RichText::new(
-            "Browse a group's experiences, see their icons, and open any place by downloading its .rbxl.",
+            "Choose an experience by icon and name, then open one of its places. The selection also fills the Open Cloud Universe and Place IDs.",
         ).weak());
         ui.separator();
 
-        // Group input.
+        // Find experiences owned by the signed-in account or by a group.
         ui.horizontal(|ui| {
+            if ui.button("👤 My experiences").clicked() {
+                if self.roblosecurity_cookie().is_some() {
+                    self.browse_status = "Loading your experiences...".into();
+                    self.browse_load_my_experiences();
+                } else {
+                    self.browse_status = "Set your .ROBLOSECURITY cookie in Settings to load your experiences".into();
+                }
+            }
             ui.label("Group ID:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.browse_group_id)
@@ -6125,34 +6209,32 @@ ui.label("Place ID:");
             let thumbs = self.browse_thumbnails.clone();
             let selected_universe = self.browse_selected_universe;
             let places: Vec<(u64, String)> = self.browse_places.clone();
-            let mut open_place: Option<u64> = None;
-            let mut load_places: Option<u64> = None;
+            let mut open_place: Option<(u64, u64)> = None;
+            let mut load_places: Option<(u64, Option<u64>)> = None;
             egui::ScrollArea::vertical()
                 .id_salt("browse_universes_scroll")
                 .show(ui, |ui| {
                     for univ in &universes {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
-                                // Thumbnail: load/render the image if we
-                                // have a URL; the cache downloads and
-                                // uploads it to the GPU asynchronously.
                                 if let Some(url) = thumbs.get(&univ.id) {
                                     match crate::thumbnails::get_or_load(ui.ctx(), url) {
                                         Some(tex) => {
                                             ui.add(
                                                 egui::Image::from_texture(&tex)
-                                                    .fit_to_exact_size(egui::vec2(96.0, 96.0))
+                                                    .fit_to_exact_size(egui::vec2(88.0, 88.0))
                                                     .corner_radius(egui::CornerRadius::same(4)),
                                             );
                                         }
                                         None => {
-                                            ui.add_space(96.0);
+                                            ui.add_space(88.0);
                                             ui.spinner();
                                         }
                                     }
                                 }
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new(&univ.name).strong());
+                                    ui.label(RichText::new(format!("Universe {}", univ.id)).small().weak());
                                     if !univ.description.is_empty() {
                                         ui.label(RichText::new(&univ.description).weak());
                                     }
@@ -6160,30 +6242,29 @@ ui.label("Place ID:");
                                         ui.label(format!("👥 {players} playing"));
                                     }
                                     ui.horizontal(|ui| {
-                                        if ui.button("📂 Places").clicked() {
-                                            load_places = Some(univ.id);
+                                        if ui.button("📂 Show places").clicked() {
+                                            load_places = Some((univ.id, univ.primary_place_id()));
                                         }
-                                        if univ.root_place_id.is_some() {
-                                            if ui.button("🌐 Open root place").clicked() {
-                                                if let Some(pid) = univ.root_place_id { open_place = Some(pid); }
+                                        if let Some(place_id) = univ.primary_place_id() {
+                                            if ui.button("▶ Open start place").clicked() {
+                                                open_place = Some((univ.id, place_id));
                                             }
                                         }
                                     });
                                 });
                             });
 
-                            // If this universe is selected, show its places.
                             if selected_universe == Some(univ.id) {
                                 ui.separator();
                                 if places.is_empty() {
-                                    ui.label(RichText::new("Loading places...").weak());
+                                    ui.label(RichText::new("Loading places…").weak());
                                 } else {
-                                    for (pid, pname) in &places {
+                                    for (place_id, place_name) in &places {
                                         ui.horizontal(|ui| {
-                                            ui.label(format!("• {pname}"));
-                                            if ui.button("📂 Open").clicked() {
-                                                self.open_place_id_input = pid.to_string();
-                                                self.open_place_from_roblox();
+                                            ui.label(format!("• {place_name}"));
+                                            ui.label(RichText::new(format!("{place_id}")).small().weak());
+                                            if ui.button("▶ Open").clicked() {
+                                                open_place = Some((univ.id, *place_id));
                                             }
                                         });
                                     }
@@ -6193,15 +6274,19 @@ ui.label("Place ID:");
                         ui.add_space(4.0);
                     }
                 });
-            // Apply any deferred click actions (now that the immutable
-            // borrow of self.browse_* has been dropped).
-            if let Some(uid) = load_places {
-                self.browse_status = format!("Loading places...");
-                self.browse_load_universe_places(uid);
+            // Apply deferred actions after releasing the list snapshot.
+            if let Some((universe_id, root_place_id)) = load_places {
+                self.open_cloud_universe_id = universe_id.to_string();
+                self.open_cloud_place_id = root_place_id.map(|id| id.to_string()).unwrap_or_default();
+                self.browse_selected_universe = Some(universe_id);
+                self.browse_places.clear();
+                self.browse_status = "Loading places…".into();
+                self.browse_load_universe_places(universe_id);
             }
-            if let Some(pid) = open_place {
-                self.open_place_id_input = pid.to_string();
-                self.open_place_from_roblox();
+            if let Some((universe_id, place_id)) = open_place {
+                self.open_cloud_universe_id = universe_id.to_string();
+                self.open_cloud_place_id = place_id.to_string();
+                self.open_place_from_roblox(place_id);
             }
         }
     }
@@ -6249,7 +6334,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
 
                 ui.group(|ui| {
                     ui.label(RichText::new("🟦 Roblox Studio profile presence").heading().color(Color32::from_rgb(100, 200, 255)));
-                    ui.label("On startup this app sends Studio's AppStarted client-status heartbeat to Roblox. It tries the native legacy client-status/set route first, falls back to the newer Matchmaking API route if needed, then reads back your presence. Roblox may still keep showing Online until Team Create is fully connected.");
+                    ui.label("Diagnostic only: tries known AppStarted client-status routes, then reads your presence from Roblox. An HTTP success is not proof that Studio session state changed; the exact Studio 0.741 endpoint still needs binary confirmation. Team Create connection state is separate.");
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(
@@ -6459,15 +6544,11 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
     /// configured `.ROBLOSECURITY` cookie, then open it exactly like a local
     /// file. This works for places you can edit (Team Create or solo); it
     /// does NOT join a live session — it fetches the latest saved version.
-    fn open_place_from_roblox(&mut self) {
-        let id_str = self.open_place_id_input.trim();
-        let place_id: u64 = match id_str.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                self.status = "Enter a numeric place ID".into();
-                return;
-            }
-        };
+    fn open_place_from_roblox(&mut self, place_id: u64) {
+        if place_id == 0 {
+            self.status = "The selected place has an invalid ID".into();
+            return;
+        }
         if self.roblosecurity_cookie.trim().is_empty() {
             self.status = "Set your .ROBLOSECURITY cookie in Settings first".into();
             self.log_error("Open from Roblox requires a .ROBLOSECURITY cookie");

@@ -18256,11 +18256,46 @@ pub fn library(name: &str) -> Option<&'static [ApiMember]> {
         .map(|(_, members)| *members)
 }
 
+/// Type of a value that Luau actually exposes as an implicit global.
+/// `GLOBAL_TYPES` is generated from the API dump and intentionally contains
+/// every engine class for metadata; most class names are types, not runtime
+/// globals. Keep the value namespace curated here so a class such as `Players`
+/// is not mistaken for a declared service variable.
 pub fn global_type(name: &str) -> Option<&'static str> {
-    GLOBAL_TYPES
+    let ty = GLOBAL_TYPES
         .iter()
         .find(|(label, _)| *label == name)
-        .map(|(_, ty)| *ty)
+        .map(|(_, ty)| *ty)?;
+    let is_global_value = matches!(
+        name,
+        "Enum" | "game" | "Instance" | "plugin" | "script" | "workspace"
+            | "bit32" | "buffer" | "coroutine" | "debug" | "math" | "os"
+            | "string" | "table" | "task" | "utf8" | "vector"
+            | "Axes" | "BrickColor" | "CFrame" | "CatalogSearchParams" | "Color3"
+            | "ColorSequence" | "ColorSequenceKeypoint" | "Content" | "DateTime"
+            | "DockWidgetPluginGuiInfo" | "Faces" | "FloatCurveKey" | "Font"
+            | "NumberRange" | "NumberSequence" | "NumberSequenceKeypoint"
+            | "OverlapParams" | "PathWaypoint" | "PhysicalProperties" | "Random"
+            | "Ray" | "RaycastParams" | "Rect" | "Region3" | "Region3int16"
+            | "SharedTable" | "TweenInfo" | "UDim" | "UDim2" | "Vector2"
+            | "Vector2int16" | "Vector3" | "Vector3int16"
+    );
+    is_global_value.then_some(ty)
+}
+
+#[cfg(test)]
+mod global_value_tests {
+    use super::global_type;
+
+    #[test]
+    fn api_class_metadata_does_not_make_classes_implicit_globals() {
+        assert_eq!(global_type("Players"), None);
+        assert_eq!(global_type("Model"), None);
+        assert_eq!(global_type("Vector3"), Some("Vector3"));
+        assert_eq!(global_type("workspace"), Some("Workspace"));
+        assert_eq!(global_type("game"), Some("DataModel"));
+        assert_eq!(global_type("math"), Some("@lib:math"));
+    }
 }
 
 pub fn enum_items(name: &str) -> Option<&'static [&'static str]> {
