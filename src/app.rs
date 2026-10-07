@@ -5163,10 +5163,10 @@ ui.label("Place ID:");
     fn show_command_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("▶ Command Bar");
         ui.label(RichText::new(
-            "Run Luau against this editor's local DataModel. Use game, workspace, \
-             Instance.new, properties, children, Clone/Destroy, Selection, and \
-             ChangeHistoryService. A connected Live Session can instead execute \
-             the command inside Roblox Studio.",
+            "Run Luau against this editor's local DataModel. Use game:GetService, \
+             reflection-backed Instance classes, and script.Source for the active \
+             open script. This is a host subset, not the Roblox Studio runtime; a \
+             connected Live Session executes the command inside Studio.",
         ).weak());
 
         ui.separator();
@@ -5251,12 +5251,36 @@ ui.label("Place ID:");
                     text: "(sent to Studio; result will appear in its Output window)".into(),
                 });
             } else if self.dom.is_some() {
+                // Use the active editor buffer as the command's script context;
+                // fall back to the selected script if no source tab is active.
+                let is_source_container = |class: &str| {
+                    schema::class_is_subclass_of(class, "LuaSourceContainer")
+                        || matches!(class, "Script" | "LocalScript" | "ModuleScript")
+                };
+                let script_context = self.open_tabs.get(self.active_script_idx).and_then(|tab| {
+                    let dom = self.dom.as_ref()?;
+                    let instance = dom.get_by_ref(tab.referent)?;
+                    is_source_container(instance.class.as_str())
+                        .then(|| (tab.referent, tab.buffer.clone()))
+                }).or_else(|| {
+                    let referent = self.selected?;
+                    let dom = self.dom.as_ref()?;
+                    let instance = dom.get_by_ref(referent)?;
+                    is_source_container(instance.class.as_str()).then(|| {
+                        (referent, rbxl::get_source(dom, referent).unwrap_or_default())
+                    })
+                });
+
                 // Run against the REAL loaded DataModel.
                 use std::cell::RefCell;
                 use std::rc::Rc;
                 let taken = self.dom.take().unwrap();
                 let rc = Rc::new(RefCell::new(taken));
-                match lua_runtime::run_command(rc.clone(), &src, "=command") {
+                let script_ref = script_context.as_ref().map(|(referent, _)| *referent);
+                let script_source = script_context.as_ref().map(|(_, source)| source.as_str());
+                match lua_runtime::run_command_with_script_context(
+                    rc.clone(), &src, "=command", script_ref, script_source,
+                ) {
                     Ok(outcome) => {
                         for line in lua_runtime::take_command_log() {
                             self.command_output.push(line);
@@ -5320,6 +5344,14 @@ ui.label("Place ID:");
                             level: lua_runtime::Level::Error, text: e,
                         });
                         self.dom = Some(lua_runtime::take_command_dom(rc));
+                    }
+                }
+                for (referent, source) in lua_runtime::take_command_source_updates() {
+                    if let Some(tab) = self.open_tabs.iter_mut()
+                        .find(|tab| tab.referent == referent)
+                    {
+                        tab.buffer = source.clone();
+                        tab.previous_buffer = source;
                     }
                 }
             } else {

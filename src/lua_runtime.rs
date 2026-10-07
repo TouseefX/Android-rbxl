@@ -591,6 +591,7 @@ fn instance_children(this:&Table)->LuaResult<Vec<Table>> {
 
 fn class_is_a(class:&str,target:&str)->bool {
     if class==target||target=="Instance" {return true;}
+    if crate::schema::class_is_subclass_of(class, target) { return true; }
     match target {
         "GuiBase"=>matches!(class,"ScreenGui"|"BillboardGui"|"SurfaceGui"|"GuiObject"|"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
         "GuiBase2d"=>matches!(class,"GuiObject"|"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
@@ -603,6 +604,15 @@ fn class_is_a(class:&str,target:&str)->bool {
         "BaseScript"=>matches!(class,"LocalScript"|"Script"),
         _=>false,
     }
+}
+
+fn is_service_class(class: &str) -> bool {
+    crate::schema::class_is_service(class)
+        || matches!(class, "Workspace" | "Selection" | "ChangeHistoryService")
+}
+
+fn is_lua_source_container(class: &str) -> bool {
+    class_is_a(class, "LuaSourceContainer")
 }
 
 fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
@@ -1369,32 +1379,62 @@ thread_local! {
         undo: false,
         redo: false,
     }) };
+    static COMMAND_SOURCE_UPDATES: RefCell<Vec<(DomRef, String)>> = const { RefCell::new(Vec::new()) };
     /// Persisted undo/redo snapshots for ChangeHistoryService.
     static UNDO_STACK: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     static REDO_STACK: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Run a snippet against a real, mutable DataModel. The snippet can use the
-/// standard globals plus `game`, `workspace`, `Instance.new`, `GetService`,
-/// property get/set, `:Clone()`, `:Destroy()`, `:FindFirstChild()`, and
-/// `:GetChildren()`.
+/// Run a snippet against the loaded DataModel. A selected/open source
+/// container can be supplied so command-bar code also has a meaningful
+/// `script` global and editor-buffer view of `script.Source` without saving
+/// that buffer into the place unless the command explicitly assigns Source.
 pub fn run_command(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Result<CommandOutcome, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(||run_command_inner(dom_rc,source,name)))
-        .unwrap_or_else(|panic| {
-            let detail=panic.downcast_ref::<&str>().map(|value|(*value).to_string())
-                .or_else(||panic.downcast_ref::<String>().cloned()).unwrap_or_else(||"unknown VM panic".into());
-            Err(format!("Luau command recovered from an internal error: {detail}"))
-        })
+    run_command_with_script_context(dom_rc, source, name, None, None)
 }
 
-fn run_command_inner(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Result<CommandOutcome, String> {
+/// Drain script Source writes made by the most recent command, including
+/// writes from a command that later returned an error.
+pub fn take_command_source_updates() -> Vec<(DomRef, String)> {
+    COMMAND_SOURCE_UPDATES.with(|updates| std::mem::take(&mut *updates.borrow_mut()))
+}
+
+/// Run a command with a `script` Instance context. `script_source`, when
+/// supplied for a valid LuaSourceContainer, shadows saved Source for reads in
+/// this VM only; explicit `script.Source = ...` writes are persisted to the DOM.
+pub fn run_command_with_script_context(
+    dom_rc: Rc<RefCell<WeakDom>>,
+    source: &str,
+    name: &str,
+    script_context: Option<rbx_dom_weak::types::Ref>,
+    script_source: Option<&str>,
+) -> Result<CommandOutcome, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_command_inner(dom_rc, source, name, script_context, script_source)
+    }))
+    .unwrap_or_else(|panic| {
+        let detail=panic.downcast_ref::<&str>().map(|value|(*value).to_string())
+            .or_else(||panic.downcast_ref::<String>().cloned()).unwrap_or_else(||"unknown VM panic".into());
+        Err(format!("Luau command recovered from an internal error: {detail}"))
+    })
+}
+
+fn run_command_inner(
+    dom_rc: Rc<RefCell<WeakDom>>,
+    source: &str,
+    name: &str,
+    script_context: Option<DomRef>,
+    script_source: Option<&str>,
+) -> Result<CommandOutcome, String> {
     LOG.with(|c| c.borrow_mut().clear());
     COMMAND_OUTCOME.with(|c| *c.borrow_mut() = CommandOutcome::default());
+    COMMAND_SOURCE_UPDATES.with(|updates| updates.borrow_mut().clear());
 
     let lua = build_vm().map_err(|e| e.to_string())?;
 
     // Replace the stub `Instance.new` with the real one and install game.
-    let selection = install_command_globals(&lua, dom_rc).map_err(|e| e.to_string())?;
+    let selection = install_command_globals(&lua, dom_rc, script_context, script_source)
+        .map_err(|e| e.to_string())?;
 
     match lua.load(source).set_name(name).exec() {
         Ok(()) => {
@@ -1434,19 +1474,53 @@ pub fn reset_command_history() {
     REDO_STACK.with(|r| r.borrow_mut().clear());
 }
 
-fn install_command_globals(lua: &Lua, dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult<Rc<RefCell<Vec<DomRef>>>> {
+fn install_command_globals(
+    lua: &Lua,
+    dom_rc: Rc<RefCell<WeakDom>>,
+    script_context: Option<DomRef>,
+    script_source: Option<&str>,
+) -> LuaResult<Rc<RefCell<Vec<DomRef>>>> {
     // A handle to a DOM instance is a plain table with a single numeric
     // field "_ref" holding the i64 low-64-bits of the Ref. We keep a
     // per-VM cache so the same Ref always maps to one table (important for
     // `==` and Parent cycles).
     let cache: Rc<RefCell<std::collections::HashMap<DomRef, Table>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
-    let instance_mt = make_instance_metatable(lua, dom_rc.clone(), cache.clone())?;
+    let source_overrides: Rc<RefCell<std::collections::HashMap<DomRef, String>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let instance_mt = make_instance_metatable(
+        lua,
+        dom_rc.clone(),
+        cache.clone(),
+        source_overrides.clone(),
+    )?;
 
     let root_ref = dom_rc.borrow().root_ref();
     let game_table = ref_to_table(lua, dom_rc.clone(), cache.clone(), instance_mt.clone(), root_ref)?;
     lua.globals().set("game", game_table.clone())?;
     lua.globals().set("Game", game_table.clone())?;
+
+    let script_table = if let Some(referent) = script_context {
+        let valid = dom_rc.borrow().get_by_ref(referent)
+            .is_some_and(|instance| is_lua_source_container(instance.class.as_str()));
+        if valid {
+            if let Some(source) = script_source {
+                source_overrides.borrow_mut().insert(referent, source.to_owned());
+            }
+            Some(ref_to_table(
+                lua,
+                dom_rc.clone(),
+                cache.clone(),
+                instance_mt.clone(),
+                referent,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    lua.globals().set("script", script_table.map(Value::Table).unwrap_or(Value::Nil))?;
 
     // Resolve Workspace eagerly; create it if missing.
     let ws = ensure_service(lua, dom_rc.clone(), cache.clone(), instance_mt.clone(), "Workspace")?;
@@ -1639,16 +1713,22 @@ fn install_command_globals(lua: &Lua, dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult
         let cache = cache.clone();
         let mt = instance_mt.clone();
         lua.create_function(move |lua, (class, parent): (String, Option<Table>)| {
+            if !crate::schema::class_exists(&class) || !crate::schema::class_is_creatable(&class) {
+                return Err(LuaError::runtime(format!("{} is not a creatable Roblox class", class)));
+            }
             let parent_ref = parent
                 .as_ref()
                 .map(|p| table_to_ref(p))
                 .transpose()?
                 .flatten()
                 .unwrap_or_else(|| dom.borrow().root_ref());
-            let r = {
-                let mut d = dom.borrow_mut();
-                d.insert(parent_ref, InstanceBuilder::new(class.clone()))
-            };
+            let r = crate::schema::create_instance_from_schema(
+                &mut *dom.borrow_mut(),
+                parent_ref,
+                &class,
+                &class,
+            )
+            .map_err(|error| LuaError::runtime(error.to_string()))?;
             COMMAND_OUTCOME.with(|o| o.borrow_mut().created.push(r));
             ref_to_table(lua, dom.clone(), cache.clone(), mt.clone(), r)
         })?
@@ -1663,6 +1743,7 @@ fn make_instance_metatable(
     lua: &Lua,
     dom: Rc<RefCell<WeakDom>>,
     cache: Rc<RefCell<std::collections::HashMap<DomRef, Table>>>,
+    source_overrides: Rc<RefCell<std::collections::HashMap<DomRef, String>>>,
 ) -> LuaResult<Rc<Table>> {
     let mt = lua.create_table();
 
@@ -1672,6 +1753,7 @@ fn make_instance_metatable(
     let index = {
         let dom = dom.clone();
         let cache = cache.clone();
+        let source_overrides = source_overrides.clone();
         let mt_handle = mt_handle.clone();
         lua.create_function(move |lua, (this, key): (Table, String)| {
             if let Some(f) = method_for(lua, dom.clone(), cache.clone(), mt_handle.borrow().as_ref().unwrap().clone(), &key)? {
@@ -1683,6 +1765,19 @@ fn make_instance_metatable(
                 return Ok(Value::Table(signal));
             }
             let Some(r) = table_to_ref(&this)? else { return Ok(Value::Nil) };
+            if dom.borrow().root_ref() == r && is_service_class(&key) {
+                if let Ok(global) = lua.globals().get::<Value>(&key) {
+                    if !global.is_nil() { return Ok(global); }
+                }
+                let service = ensure_service(
+                    lua,
+                    dom.clone(),
+                    cache.clone(),
+                    mt_handle.borrow().as_ref().unwrap().clone(),
+                    &key,
+                )?;
+                return Ok(Value::Table(service));
+            }
             enum Resolved { Text(String), Property(DomVariant), Instance(DomRef), Nil }
             let resolved={
                 let d=dom.borrow();
@@ -1691,6 +1786,11 @@ fn make_instance_metatable(
                     "Name"=>Resolved::Text(inst.name.clone()),
                     "ClassName"=>Resolved::Text(inst.class.to_string()),
                     "Parent"=>if inst.parent().is_none(){Resolved::Nil}else{Resolved::Instance(inst.parent())},
+                    "Source" if is_lua_source_container(inst.class.as_str())=>Resolved::Text(
+                        source_overrides.borrow().get(&r).cloned()
+                            .or_else(|| crate::rbxl::get_source(&d, r))
+                            .unwrap_or_default(),
+                    ),
                     _=>if let Some(property)=inst.properties.get(&rbx_dom_weak::Ustr::from(key.as_str())){Resolved::Property(property.clone())}
                         else{inst.children().iter().copied().find(|child|d.get_by_ref(*child).is_some_and(|instance|instance.name==key)).map(Resolved::Instance).unwrap_or(Resolved::Nil)},
                 }
@@ -1708,6 +1808,7 @@ fn make_instance_metatable(
     // __newindex: Name, Parent, and arbitrary properties.
     let newindex = {
         let dom = dom.clone();
+        let source_overrides = source_overrides.clone();
         lua.create_function(move |lua, (this, key, value): (Table, String, Value)| {
             let Some(r) = table_to_ref(&this)? else { return Ok(()) };
             let mut changed=false;
@@ -1723,6 +1824,30 @@ fn make_instance_metatable(
                         _ => return Err(LuaError::runtime("Parent must be an Instance or nil")),
                     };
                     dom.borrow_mut().transfer_within(r, new_parent); changed=true;
+                }
+                "Source" => {
+                    let is_script = dom.borrow().get_by_ref(r)
+                        .is_some_and(|instance| is_lua_source_container(instance.class.as_str()));
+                    if is_script {
+                        let Value::String(source) = &value else {
+                            return Err(LuaError::runtime("Source must be a string"));
+                        };
+                        let source = source.to_str()?.to_owned();
+                        crate::rbxl::set_source(&mut *dom.borrow_mut(), r, source.clone())
+                            .map_err(|error| LuaError::runtime(error.to_string()))?;
+                        source_overrides.borrow_mut().insert(r, source.clone());
+                        COMMAND_SOURCE_UPDATES.with(|updates| updates.borrow_mut().push((r, source)));
+                        changed = true;
+                        COMMAND_OUTCOME.with(|outcome| outcome.borrow_mut().mutated += 1);
+                    } else if let Some(variant) = value_to_variant(lua, &value)? {
+                        if let Ok(mut d) = dom.try_borrow_mut() {
+                            if let Some(i) = d.get_by_ref_mut(r) {
+                                i.properties.insert(rbx_dom_weak::Ustr::from(&key), variant);
+                                changed=true;
+                                COMMAND_OUTCOME.with(|o| o.borrow_mut().mutated += 1);
+                            }
+                        }
+                    }
                 }
                 _ => if let Some(variant) = value_to_variant(lua, &value)? {
                     if let Ok(mut d) = dom.try_borrow_mut() {
@@ -1833,23 +1958,27 @@ fn method_for(
             tween.set("Cancel",lua.create_function(|_,_tween:Table|Ok(()))?)?;
             Ok(tween)
         })?),
-        "GetService" => Some(lua.create_function(move |lua, (_this, name): (Table, String)| {
-            // Virtual (non-DOM) services are exposed as globals.
-            match name.as_str() {
-                "Selection" | "ChangeHistoryService" | "CoreGui" | "PluginGuiService"
-                | "UserInputService" | "RunService" | "HttpService" | "MarketplaceService"
-                | "Players" | "Lighting" | "ReplicatedStorage" | "ServerStorage"
-                | "ServerScriptService" | "StarterGui" | "StarterPack" | "StarterPlayer"
-                | "SoundService" | "TweenService" => {
-                    if let Ok(svc) = lua.globals().get::<Value>(&name) {
-                        if !svc.is_nil() { return Ok(svc); }
-                    }
-                }
-                _ => {}
+        "GetService" => Some(lua.create_function(move |lua, (this, name): (Table, String)| {
+            let Some(referent) = table_to_ref(&this)? else {
+                return Err(LuaError::runtime("GetService must be called on a DataModel"));
+            };
+            let is_data_model = d.borrow().get_by_ref(referent)
+                .is_some_and(|instance| instance.class == "DataModel");
+            if !is_data_model {
+                return Err(LuaError::runtime("GetService must be called on a DataModel"));
             }
-            let t = ensure_service(lua, d.clone(), c.clone(), mt.clone(), &name)?;
-            Ok(Value::Table(t))
+            if !is_service_class(&name) {
+                return Err(LuaError::runtime(format!("{} is not a valid service", name)));
+            }
+            // Studio-only services are represented by virtual globals; engine
+            // services are resolved from the loaded place or created lazily.
+            if let Ok(service) = lua.globals().get::<Value>(&name) {
+                if !service.is_nil() { return Ok(service); }
+            }
+            let service = ensure_service(lua, d.clone(), c.clone(), mt.clone(), &name)?;
+            Ok(Value::Table(service))
         })?),
+
         "FindFirstChild" => Some(lua.create_function(move |lua, (this, name): (Table, String)| {
             let Some(r) = table_to_ref(&this)? else { return Ok(Value::Nil) };
             let found = {
@@ -1873,7 +2002,7 @@ fn method_for(
         })?),
         "IsA" => Some(lua.create_function(move |_lua, (this, class): (Table, String)| {
             let Some(r) = table_to_ref(&this)? else { return Ok(false) };
-            Ok(d.borrow().get_by_ref(r).is_some_and(|i| i.class == class))
+            Ok(d.borrow().get_by_ref(r).is_some_and(|i| class_is_a(i.class.as_str(), &class)))
         })?),
         "Clone" => Some(lua.create_function(move |lua, this: Table| {
             let Some(r) = table_to_ref(&this)? else { return Err(LuaError::runtime("cannot clone <destroyed>")) };
@@ -1920,6 +2049,9 @@ fn ensure_service(
     mt: Rc<Table>,
     name: &str,
 ) -> LuaResult<Table> {
+    if !is_service_class(name) {
+        return Err(LuaError::runtime(format!("{} is not a valid service", name)));
+    }
     // Keep this lookup inside one immutable borrow. Borrowing `dom` again from
     // the iterator closure used to panic (`RefCell already borrowed`) as soon
     // as command mode tried to resolve Workspace, aborting the Android app.
@@ -1929,17 +2061,20 @@ fn ensure_service(
         let existing = d.get_by_ref(root).and_then(|root_inst| {
             root_inst.children().iter().copied().find(|c| {
                 d.get_by_ref(*c)
-                    .is_some_and(|i| i.class == name || i.name == name)
+                    .is_some_and(|instance| instance.class == name)
             })
         });
         (root, existing)
     };
     let r = match existing {
         Some(r) => r,
-        None => {
-            let b = InstanceBuilder::new(name).with_name(name);
-            dom.borrow_mut().insert(root, b)
-        }
+        None => crate::schema::create_instance_from_schema(
+            &mut *dom.borrow_mut(),
+            root,
+            name,
+            name,
+        )
+        .map_err(|error| LuaError::runtime(error.to_string()))?,
     };
     ref_to_table(lua, dom, cache, mt, r)
 }
@@ -2084,4 +2219,68 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
         }
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod command_api_tests {
+    use super::*;
+
+    #[test]
+    fn command_bar_binds_script_source_and_reflection_backed_services() {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root_ref = dom.root_ref();
+        let script_ref = dom.insert(
+            root_ref,
+            InstanceBuilder::new("ModuleScript")
+                .with_name("Probe")
+                .with_property("Source", DomVariant::String("saved source".into())),
+        );
+        let dom = Rc::new(RefCell::new(dom));
+        let command = r#"
+            assert(script:IsA("LuaSourceContainer"))
+            assert(script.Source == "unsaved buffer")
+            assert(game:GetService("Workspace") == workspace)
+            assert(game.Workspace == workspace)
+            local runService = game:GetService("RunService")
+            assert(runService:IsA("RunService"))
+            assert(game.RunService == runService)
+            local part = Instance.new("Part")
+            assert(part:IsA("BasePart"))
+        "#;
+
+        run_command_with_script_context(
+            dom.clone(),
+            command,
+            "=command-api-test",
+            Some(script_ref),
+            Some("unsaved buffer"),
+        )
+        .expect("command context and services should resolve");
+
+        let dom = take_command_dom(dom);
+        assert_eq!(
+            crate::rbxl::get_source(&dom, script_ref).as_deref(),
+            Some("saved source"),
+            "reading the editor buffer must not implicitly save it into the place",
+        );
+
+        let dom = Rc::new(RefCell::new(dom));
+        run_command_with_script_context(
+            dom.clone(),
+            r#"script.Source = "command update"; assert(script.Source == "command update")"#,
+            "=command-source-write-test",
+            Some(script_ref),
+            Some("unsaved buffer"),
+        )
+        .expect("Source assignment should update the script");
+        let updates = take_command_source_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].1, "command update");
+
+        let dom = take_command_dom(dom);
+        assert_eq!(
+            crate::rbxl::get_source(&dom, script_ref).as_deref(),
+            Some("command update"),
+        );
+    }
 }

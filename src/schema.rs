@@ -39,6 +39,21 @@ pub fn class_is_service(class_name: &str) -> bool {
         .is_some_and(|desc| desc.tags.contains(&rbx_reflection::ClassTag::Service))
 }
 
+/// Test Roblox API-dump inheritance, including classes not covered by the
+/// command VM's small set of hand-written fallback aliases.
+pub fn class_is_subclass_of(class_name: &str, ancestor_name: &str) -> bool {
+    let db = database();
+    let mut current = Some(class_name);
+    for _ in 0..128 {
+        let Some(name) = current else { return false };
+        if name == ancestor_name {
+            return true;
+        }
+        current = db.classes.get(name).and_then(|desc| desc.superclass.as_deref());
+    }
+    false
+}
+
 pub fn class_is_creatable(class_name: &str) -> bool {
     database().classes.get(class_name).is_some_and(|desc| {
         !desc.tags.contains(&rbx_reflection::ClassTag::NotCreatable)
