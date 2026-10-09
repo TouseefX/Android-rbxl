@@ -1,2 +1,0 @@
-(nofunc) 0x1435db34d [DATA] lea rcx, qword [rip+0x54cbf2c]
-(nofunc) 0x1435d41a1 [DATA] lea rdx, qword [rip+0x54d31c0]

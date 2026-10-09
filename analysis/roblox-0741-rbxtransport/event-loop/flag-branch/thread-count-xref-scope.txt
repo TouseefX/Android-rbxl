@@ -1,3 +1,0 @@
-Search target: RbxTransportRtcIoEventLoopThreadCount literal at 0x148aa72b0
-Rizin scoped /r over executable range 0x143000000-0x144000000: no matching reference lines (stdout empty).
-Scope limitation: this is not a binary-wide proof of absence.
