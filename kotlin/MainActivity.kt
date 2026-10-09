@@ -12,6 +12,11 @@ import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
+import android.text.Spannable
+import android.text.SpannableStringBuilder
+import android.text.style.BackgroundColorSpan
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import android.os.Looper
 import android.os.StrictMode
 import android.util.Log
@@ -30,6 +35,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.ViewCompat
 import com.google.androidgamesdk.GameActivity
 import io.github.rosemoe.sora.event.ContentChangeEvent
+import io.github.rosemoe.sora.event.SelectionChangeEvent
 import io.github.rosemoe.sora.widget.CodeEditor
 import io.github.rosemoe.sora.widget.component.EditorAutoCompletion
 import java.io.ByteArrayOutputStream
@@ -77,6 +83,7 @@ class MainActivity : GameActivity() {
     /** The script editor and its language, non-null only while one is open. */
     private var soraEditorView: CodeEditor? = null
     private var soraLanguage: LuauLanguage? = null
+    private var nativeSignatureHelpView: TextView? = null
 
     /** Last sora construction failure, shown on screen when adb is unavailable. */
     private var lastSoraError: String? = null
@@ -489,6 +496,20 @@ class MainActivity : GameActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
+        val signatureHelp = TextView(this).apply {
+            setTextColor(Color.rgb(220, 225, 235))
+            setBackgroundColor(Color.rgb(38, 42, 50))
+            setPadding(12, 7, 12, 7)
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            visibility = View.GONE
+            maxLines = 2
+        }
+        root.addView(signatureHelp, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        nativeSignatureHelpView = signatureHelp
 
         val language = LuauLanguage(scriptId) { id, text, cursor ->
             // Called on sora's completion worker; the JNI bridge is
@@ -526,15 +547,20 @@ class MainActivity : GameActivity() {
             getProps().deleteMultiSpaces = -1
             setText(normalizedSource)
         }
-        // Re-ask for completions after an auto-paired quote or bracket.
-        //
-        // commitText() inserts the pair and then calls setSelection() with
-        // CAUSE_UNKNOWN, and EditorAutoCompletion.onSelectionChange() hides the
-        // window unconditionally for that cause. So typing the opening quote of
-        // require('') showed nothing, while typing a '.' afterwards -- a plain
-        // insert with no pairing -- worked. Re-requesting on the next frame
-        // runs after the hide() and puts the path list back.
+        val requestNativeSignatureHelp = {
+            if (nativeEditorScriptId == scriptId) {
+                val cursor = editor.cursor.right.coerceIn(0, editor.text.length)
+                nativeOnNativeEditorSignatureChanged(scriptId, editor.text.toString(), cursor)
+            }
+        }
+        // Signature help follows both edits and caret movement. Use post so
+        // auto-paired delimiters and the resulting cursor placement have
+        // settled before taking the UTF-16 cursor snapshot.
         editor.subscribeEvent(ContentChangeEvent::class.java) { event, _ ->
+            editor.post { requestNativeSignatureHelp() }
+            // Re-ask for completions after an auto-paired quote or bracket.
+            // commitText() inserts the pair and then calls setSelection() with
+            // CAUSE_UNKNOWN, which hides the window; re-request after that hide.
             if (event.action == ContentChangeEvent.ACTION_INSERT &&
                 event.changedText.length == 1 &&
                 event.changedText[0] in PAIRED_OPENERS
@@ -544,6 +570,9 @@ class MainActivity : GameActivity() {
                 }
             }
         }
+        editor.subscribeEvent(SelectionChangeEvent::class.java) { _, _ ->
+            editor.post { requestNativeSignatureHelp() }
+        }
 
         // Position the caret by translating the Rust character index into
         // the (line, column) pair sora addresses text with.
@@ -551,6 +580,11 @@ class MainActivity : GameActivity() {
             initialCursor.coerceIn(0, normalizedSource.length)
         )
         editor.setSelection(caret.line, caret.column)
+        nativeOnNativeEditorSignatureChanged(
+            scriptId,
+            normalizedSource,
+            initialCursor.coerceIn(0, normalizedSource.length)
+        )
 
         val actions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -668,6 +702,7 @@ class MainActivity : GameActivity() {
             imm?.hideSoftInputFromWindow(editor.windowToken, 0)
             soraEditorView = null
             soraLanguage = null
+            nativeSignatureHelpView = null
             nativeEditorScriptId = -1
             // Frees the editor's threads and the language's analyzer.
             editor.release()
@@ -714,6 +749,60 @@ class MainActivity : GameActivity() {
             val language = soraLanguage ?: return@runOnUiThread
             if (nativeEditorScriptId != scriptId) return@runOnUiThread
             language.deliverCompletions(json)
+        }
+    }
+
+    fun updateNativeSignatureHelp(scriptId: Long, json: String) {
+        runOnUiThread {
+            if (nativeEditorScriptId != scriptId) return@runOnUiThread
+            val view = nativeSignatureHelpView ?: return@runOnUiThread
+            try {
+                val payload = JSONObject(json)
+                val editor = soraEditorView ?: return@runOnUiThread
+                val expectedCursor = payload.optInt("cursorUtf16", -1)
+                if (expectedCursor >= 0 && editor.cursor.right != expectedCursor) return@runOnUiThread
+                val name = payload.optString("name")
+                val parameters = payload.optJSONArray("parameters")
+                if (name.isBlank() || parameters == null) {
+                    view.visibility = View.GONE
+                    view.text = ""
+                    return@runOnUiThread
+                }
+                val activeParameter = payload.optInt("activeParameter", -1)
+                val display = SpannableStringBuilder().append(name).append("(")
+                for (index in 0 until parameters.length()) {
+                    if (index > 0) display.append(", ")
+                    val start = display.length
+                    display.append(parameters.optString(index))
+                    val end = display.length
+                    if (index == activeParameter && end > start) {
+                        display.setSpan(
+                            BackgroundColorSpan(Color.rgb(67, 91, 132)),
+                            start,
+                            end,
+                            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+                        )
+                        display.setSpan(
+                            ForegroundColorSpan(Color.WHITE),
+                            start,
+                            end,
+                            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+                        )
+                        display.setSpan(
+                            StyleSpan(Typeface.BOLD),
+                            start,
+                            end,
+                            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+                        )
+                    }
+                }
+                display.append(")")
+                view.text = display
+                view.visibility = View.VISIBLE
+            } catch (error: Exception) {
+                Log.w(TAG, "Could not render native signature help", error)
+                view.visibility = View.GONE
+            }
         }
     }
 
@@ -934,6 +1023,7 @@ class MainActivity : GameActivity() {
     private external fun nativeOnSaveComplete(success: Boolean)
     private external fun nativeOnExternalEditReturned(scriptId: Long, text: String?)
     private external fun nativeOnNativeEditorChanged(scriptId: Long, text: String?, selectionStart: Int, selectionEnd: Int)
+    private external fun nativeOnNativeEditorSignatureChanged(scriptId: Long, text: String?, cursor: Int)
     private external fun nativeOnNativeEditorCommand(scriptId: Long, command: String?, text: String?, cursor: Int)
     private external fun nativeOnProjectSync(bundleJson: String)
 
@@ -1049,6 +1139,11 @@ class MainActivity : GameActivity() {
         @JvmStatic
         fun updateNativeCompletionsStatic(scriptId: Long, json: String) {
             sInstance?.updateNativeCompletions(scriptId, json)
+        }
+
+        @JvmStatic
+        fun updateNativeSignatureHelpStatic(scriptId: Long, json: String) {
+            sInstance?.updateNativeSignatureHelp(scriptId, json)
         }
 
         @JvmStatic

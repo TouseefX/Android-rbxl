@@ -19,6 +19,13 @@ pub struct Completion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureHelp {
+    pub name: String,
+    pub parameters: Vec<String>,
+    pub active_parameter: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectDiagnostic {
     pub line: usize,
     pub message: String,
@@ -321,7 +328,10 @@ impl ProjectIndex {
                 .unwrap_or_default();
             if root_inferred.is_unknown() {
                 if let Some(api_type) = api::global_type(root) {
-                    if !api_type.starts_with("@lib:") && api_type != "@enum" {
+                    if !api_type.starts_with("@lib:")
+                        && api_type != "@enum"
+                        && !is_implicit_service_class(root, api_type)
+                    {
                         root_inferred.class = Some(api_type.to_string());
                         root_inferred.path = self.global_path(root, api_type, current_script);
                     }
@@ -387,9 +397,18 @@ impl ProjectIndex {
             if let Some(request) = local.and_then(|_| aliases.get(alias)) {
                 let resolved = self.resolve_request(current_script, request);
                 let key = normalize_path(&resolved);
-                let members = self.modules.get(&key).or_else(|| {
-                    key.rsplit('/').next().and_then(|name| self.modules.get(name))
-                });
+                let members = self.resolve_module_ref(current_script, request)
+                    .and_then(|module| self.module_sources.get(&module))
+                    .map(|module_source| {
+                        if returned_binding_name(module_source).is_some() {
+                            returned_binding_members(module_source)
+                        } else {
+                            exported_members(module_source)
+                        }
+                    })
+                    .or_else(|| self.modules.get(&key).or_else(|| {
+                        key.rsplit('/').next().and_then(|name| self.modules.get(name))
+                    }).cloned());
                 if let Some(members) = members {
                     return members
                         .iter()
@@ -412,7 +431,7 @@ impl ProjectIndex {
                 if let Some(request) = aliases.get(module_alias) {
                     let target = self.resolve_module_ref(current_script, request);
                     if let Some(members) = target.and_then(|target| self.module_sources.get(&target))
-                        .map(|source| constructed_object_members(source))
+                        .map(|source| constructed_object_members_for_returned_class(source))
                     {
                         return members.into_iter()
                             .filter(|(member, detail)| member.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
@@ -555,6 +574,18 @@ impl ProjectIndex {
             // Generated Roblox globals/datatypes/libraries (Vector3, task,
             // game, script, ...) — never ModuleScript names.
             for &(label, detail, insert) in api::BARE_GLOBALS {
+                // GLOBAL_TYPES is generated from API classes as well as real
+                // Luau globals. A service class (e.g. `Players`) is not an
+                // implicitly declared value; it must come from GetService or
+                // another local binding. `workspace` is the real global.
+                if detail == "Roblox datatype" && api::global_type(label).is_none() {
+                    continue;
+                }
+                if let Some(api_type) = api::global_type(label) {
+                    if is_implicit_service_class(label, api_type) {
+                        continue;
+                    }
+                }
                 let candidate = label.to_ascii_lowercase();
                 if (candidate.starts_with(&lower)
                     || (lower.len() >= 3 && common_prefix_len(&candidate, &lower) >= 2))
@@ -579,6 +610,41 @@ impl ProjectIndex {
         }
         completions.truncate(12);
         completions
+    }
+
+    /// Return the signature for the innermost callable around the caret. The
+    /// active parameter counts only commas at that call's top level, so nested
+    /// calls and table/function literals do not shift the highlighted argument.
+    pub fn signature_help_at(
+        &self,
+        current_script: Ref,
+        source: &str,
+        cursor_char: usize,
+    ) -> Option<SignatureHelp> {
+        let cursor_byte = char_to_byte(source, cursor_char);
+        let before_cursor = &source[..cursor_byte];
+        let locals = local_bindings_at(self, source, cursor_char, current_script);
+        for call in unclosed_call_frames(before_cursor).into_iter().rev() {
+            let Some(callee) = call_callee_before(before_cursor, call.open_byte) else {
+                continue;
+            };
+            let Some((name, parameters)) =
+                resolve_call_signature(self, current_script, before_cursor, &locals, &callee)
+            else {
+                continue;
+            };
+            let active_parameter = if parameters.is_empty() {
+                None
+            } else {
+                Some(call.commas.min(parameters.len() - 1))
+            };
+            return Some(SignatureHelp {
+                name,
+                parameters,
+                active_parameter,
+            });
+        }
+        None
     }
 
     fn complete_require_path(&self, current_script: Ref, typed: &str) -> Vec<Completion> {
@@ -1476,6 +1542,414 @@ fn require_path(expression: &str) -> String {
         .replace("\")", "").replace('.', "/")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OpenCallFrame {
+    open_byte: usize,
+    commas: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OpenDelimiter {
+    Call(OpenCallFrame),
+    Other(u8),
+}
+
+fn unclosed_call_frames(source: &str) -> Vec<OpenCallFrame> {
+    let mut stack: Vec<OpenDelimiter> = Vec::new();
+    let mut cursor = 0;
+    let mut line = 1;
+    while let Some(token) = next_token(source, &mut cursor, &mut line) {
+        match token {
+            Token::Op("(") => stack.push(OpenDelimiter::Call(OpenCallFrame {
+                open_byte: cursor.saturating_sub(1),
+                commas: 0,
+            })),
+            Token::Op("[") => stack.push(OpenDelimiter::Other(b'[')),
+            Token::Op("{") => stack.push(OpenDelimiter::Other(b'{')),
+            Token::Op(",") => {
+                if let Some(OpenDelimiter::Call(frame)) = stack.last_mut() {
+                    frame.commas = frame.commas.saturating_add(1);
+                }
+            }
+            Token::Op(")") => close_open_delimiter(&mut stack, b'('),
+            Token::Op("]") => close_open_delimiter(&mut stack, b'['),
+            Token::Op("}") => close_open_delimiter(&mut stack, b'{'),
+            _ => {}
+        }
+    }
+    stack.into_iter().filter_map(|item| match item {
+        OpenDelimiter::Call(frame) => Some(frame),
+        OpenDelimiter::Other(_) => None,
+    }).collect()
+}
+
+fn close_open_delimiter(stack: &mut Vec<OpenDelimiter>, opening: u8) {
+    while let Some(item) = stack.pop() {
+        let found = match item {
+            OpenDelimiter::Call(_) => opening == b'(',
+            OpenDelimiter::Other(kind) => kind == opening,
+        };
+        if found {
+            break;
+        }
+    }
+}
+
+fn skip_whitespace_backward(source: &str, mut end: usize) -> usize {
+    while end > 0 {
+        let character = source[..end].chars().next_back().unwrap();
+        if !character.is_whitespace() {
+            break;
+        }
+        end -= character.len_utf8();
+    }
+    end
+}
+
+fn previous_expression_component_start(source: &str, end: usize) -> Option<usize> {
+    let end = skip_whitespace_backward(source, end);
+    if end == 0 {
+        return None;
+    }
+    let last = *source.as_bytes().get(end - 1)?;
+    if last.is_ascii_alphanumeric() || last == b'_' {
+        let mut start = end - 1;
+        while start > 0 {
+            let byte = source.as_bytes()[start - 1];
+            if byte.is_ascii_alphanumeric() || byte == b'_' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        return Some(start);
+    }
+    let opening = match last {
+        b')' => b'(',
+        b']' => b'[',
+        b'}' => b'{',
+        _ => return None,
+    };
+    let group_start = match_backward(&source[..end], last, opening)?;
+    let before_group = skip_whitespace_backward(source, group_start);
+    if before_group > 0 {
+        let byte = source.as_bytes()[before_group - 1];
+        if byte.is_ascii_alphanumeric() || byte == b'_' {
+            let mut start = before_group - 1;
+            while start > 0 {
+                let previous = source.as_bytes()[start - 1];
+                if previous.is_ascii_alphanumeric() || previous == b'_' {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            return Some(start);
+        }
+    }
+    Some(group_start)
+}
+
+fn call_callee_before(source: &str, open_byte: usize) -> Option<String> {
+    let mut start = previous_expression_component_start(source, open_byte)?;
+    loop {
+        let before = skip_whitespace_backward(source, start);
+        if before == 0 || !matches!(source.as_bytes()[before - 1], b'.' | b':') {
+            break;
+        }
+        let owner_end = before - 1;
+        let Some(owner_start) = previous_expression_component_start(source, owner_end) else {
+            break;
+        };
+        start = owner_start;
+    }
+    let callee = source.get(start..open_byte)?.trim();
+    (!callee.is_empty()).then(|| callee.to_string())
+}
+
+fn last_top_level_member_separator(expression: &str) -> Option<(usize, char)> {
+    let mut cursor = 0;
+    let mut line = 1;
+    let mut delimiters = Vec::new();
+    let mut last = None;
+    while let Some(token) = next_token(expression, &mut cursor, &mut line) {
+        match token {
+            Token::Op("(") => delimiters.push(b'('),
+            Token::Op("[") => delimiters.push(b'['),
+            Token::Op("{") => delimiters.push(b'{'),
+            Token::Op(")") => { if delimiters.last() == Some(&b'(') { delimiters.pop(); } },
+            Token::Op("]") => { if delimiters.last() == Some(&b'[') { delimiters.pop(); } },
+            Token::Op("}") => { if delimiters.last() == Some(&b'{') { delimiters.pop(); } },
+            Token::Op(".") if delimiters.is_empty() => {
+                last = Some((cursor.saturating_sub(1), '.'));
+            }
+            Token::Op(":") if delimiters.is_empty() => {
+                last = Some((cursor.saturating_sub(1), ':'));
+            }
+            _ => {}
+        }
+    }
+    last
+}
+
+fn split_member_callee(callee: &str) -> Option<(&str, &str, char)> {
+    let (position, separator) = last_top_level_member_separator(callee)?;
+    let receiver = callee[..position].trim();
+    let member = callee[position + 1..].trim();
+    (is_identifier(member) && !receiver.is_empty()).then_some((receiver, member, separator))
+}
+
+fn matching_delimiter_forward(source: &str, open_at: usize, opening: u8, closing: u8) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut cursor = open_at;
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(&byte) = bytes.get(cursor) {
+        if escaped {
+            escaped = false;
+            cursor += 1;
+            continue;
+        }
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                escaped = true;
+            } else if byte == active {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            cursor += 1;
+            continue;
+        }
+        if byte == opening {
+            depth += 1;
+        } else if byte == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(cursor);
+            }
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn parse_signature_detail(
+    detail: &str,
+    fallback_name: &str,
+    separator: char,
+) -> Option<(String, Vec<String>)> {
+    let open = detail.find('(')?;
+    let close = matching_delimiter_forward(detail, open, b'(', b')')?;
+    let declared_name = detail[..open]
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .trim_matches(['.', ':']);
+    let name = if is_identifier(declared_name) {
+        declared_name.to_string()
+    } else {
+        fallback_name.to_string()
+    };
+    let mut parameters: Vec<String> = split_top_level_fields(&detail[open + 1..close])
+        .into_iter()
+        .map(|parameter| parameter.trim().to_string())
+        .filter(|parameter| !parameter.is_empty())
+        .collect();
+    if separator == ':'
+        && parameters.first().is_some_and(|parameter| {
+            let first = identifier_start(parameter);
+            first == "self"
+        })
+    {
+        parameters.remove(0);
+    }
+    Some((name, parameters))
+}
+
+fn source_function_signature_before(source: &str, name: &str) -> Option<String> {
+    for raw in source.lines().rev() {
+        let code = raw.split("--").next().unwrap_or("").trim();
+        let function = code
+            .strip_prefix("local function ")
+            .or_else(|| code.strip_prefix("const function "))
+            .or_else(|| code.strip_prefix("export function "))
+            .or_else(|| code.strip_prefix("function "));
+        if let Some(rest) = function {
+            let declared: String = rest
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || matches!(*character, '_' | '.' | ':'))
+                .collect();
+            if declared == name {
+                return function_signature(name, &rest[declared.len()..]);
+            }
+        }
+        let Some(declaration) = code.strip_prefix("local ").or_else(|| code.strip_prefix("const ")) else {
+            continue;
+        };
+        let Some((left, right)) = declaration.split_once('=') else { continue };
+        if identifier_start(left.trim()) == name {
+            let value = right.trim_start();
+            if let Some(tail) = value.strip_prefix("function") {
+                return function_signature(name, tail);
+            }
+        }
+    }
+    None
+}
+
+fn module_member_signature_detail(index: &ProjectIndex, module: Ref, member: &str) -> Option<String> {
+    let source = index.module_sources.get(&module)?;
+    if returned_binding_name(source).is_some() {
+        // A named return value is the module's public surface. Do not fall
+        // through to file-wide function collection, which can expose methods
+        // belonging to sibling/private classes in the same ModuleScript.
+        return returned_binding_members(source)
+            .get(member)
+            .filter(|detail| detail.contains('('))
+            .cloned();
+    }
+    exported_members(source)
+        .get(member)
+        .filter(|detail| detail.contains('('))
+        .cloned()
+}
+
+fn constructed_object_member_signature_detail(
+    index: &ProjectIndex,
+    module: Ref,
+    member: &str,
+) -> Option<String> {
+    let source = index.module_sources.get(&module)?;
+    constructed_object_members_for_returned_class(source)
+        .get(member)
+        .filter(|detail| detail.contains('('))
+        .cloned()
+}
+
+fn api_member_signature_detail(class: &str, member: &str, separator: char) -> Option<String> {
+    if let Some(library) = class.strip_prefix("@lib:") {
+        return api::library(library)?
+            .iter()
+            .find(|(name, detail, kind, _)| {
+                *name == member && api::kind_matches_separator(*kind, separator) && detail.contains('(')
+            })
+            .map(|(_, detail, _, _)| (*detail).to_string());
+    }
+    api::members_of(class)
+        .into_iter()
+        .find(|(name, detail, kind, _)| {
+            *name == member && api::kind_matches_separator(*kind, separator) && detail.contains('(')
+        })
+        .map(|(_, detail, _, _)| detail.to_string())
+}
+
+fn resolve_call_signature(
+    index: &ProjectIndex,
+    current_script: Ref,
+    source: &str,
+    locals: &[LocalBinding],
+    callee: &str,
+) -> Option<(String, Vec<String>)> {
+    let aliases = require_aliases(source);
+    if let Some((receiver, member, separator)) = split_member_callee(callee) {
+        let local = is_identifier(receiver).then(|| innermost_local(locals, receiver)).flatten();
+        if let Some(binding) = local {
+            if let Some((module, type_name)) = &binding.module_type {
+                if let Some(detail) = index.module_types.get(module)
+                    .and_then(|types| types.get(type_name))
+                    .and_then(|info| info.members.get(member))
+                {
+                    return parse_signature_detail(detail, member, separator);
+                }
+            }
+            if let Some(class) = &binding.instance_class {
+                if let Some(detail) = api_member_signature_detail(class, member, separator) {
+                    return parse_signature_detail(&detail, member, separator);
+                }
+            }
+            if let Some(module_alias) = constructor_module_alias(source, receiver) {
+                let request = aliases.get(module_alias)?;
+                let module = index.resolve_module_ref(current_script, request)?;
+                let detail = constructed_object_member_signature_detail(index, module, member)?;
+                return parse_signature_detail(&detail, member, separator);
+            }
+            if let Some(module) = binding.module {
+                if let Some(detail) = module_member_signature_detail(index, module, member) {
+                    return parse_signature_detail(&detail, member, separator);
+                }
+            }
+            if let Some(request) = aliases.get(receiver) {
+                if let Some(module) = index.resolve_module_ref(current_script, request) {
+                    if let Some(detail) = module_member_signature_detail(index, module, member) {
+                        return parse_signature_detail(&detail, member, separator);
+                    }
+                }
+            }
+        }
+
+        let inferred = infer_expression_type(
+            index,
+            receiver,
+            locals,
+            &aliases,
+            &BTreeMap::new(),
+            current_script,
+        );
+        if let Some((module, type_name)) = inferred.module_type {
+            if let Some(detail) = index.module_types.get(&module)
+                .and_then(|types| types.get(&type_name))
+                .and_then(|info| info.members.get(member))
+            {
+                return parse_signature_detail(detail, member, separator);
+            }
+        }
+        if let Some(module) = inferred.module {
+            if let Some(detail) = module_member_signature_detail(index, module, member) {
+                return parse_signature_detail(&detail, member, separator);
+            }
+        }
+        if let Some(class) = inferred.class {
+            if let Some(detail) = api_member_signature_detail(&class, member, separator) {
+                return parse_signature_detail(&detail, member, separator);
+            }
+        }
+        if let Some(api_type) = api::global_type(receiver) {
+            if !is_implicit_service_class(receiver, api_type) {
+                if let Some(detail) = api_member_signature_detail(api_type, member, separator) {
+                    return parse_signature_detail(&detail, member, separator);
+                }
+            }
+        }
+        return None;
+    }
+
+    if is_identifier(callee) {
+        if let Some(signature) = source_function_signature_before(source, callee) {
+            return parse_signature_detail(&signature, callee, '.');
+        }
+        let builtin = match callee {
+            "assert" => "function assert(value: any, message?: string)",
+            "error" => "function error(message: any, level?: number)",
+            "ipairs" => "function ipairs(value: {any})",
+            "pairs" => "function pairs(value: { [any]: any })",
+            "pcall" => "function pcall(callback: (...any) -> ...any, ...any)",
+            "print" | "warn" => "function log(...any)",
+            "require" => "function require(moduleScript: ModuleScript | string)",
+            "tonumber" => "function tonumber(value: any, base?: number)",
+            "tostring" | "type" | "typeof" => "function convert(value: any)",
+            "xpcall" => "function xpcall(callback: (...any) -> ...any, handler: (...any) -> ...any, ...any)",
+            _ => return None,
+        };
+        return parse_signature_detail(builtin, callee, '.');
+    }
+    None
+}
+
 /// Kind-aware completions for a known API type: properties/events/statics
 /// complete through `.`; methods complete ONLY through `:` (Roblox methods
 /// are colon functions — `part.Destroy` is never offered).
@@ -1498,6 +1972,14 @@ fn api_member_completions(owner_type: &str, prefix: &str, separator: char) -> Ve
         .collect()
 }
 
+/// The generated type table includes every API class as if it were a global.
+/// Services such as `Players` are only values after a script binds them (most
+/// commonly with `game:GetService`). `workspace` is the sole service-class
+/// name exposed as an implicit global here.
+fn is_implicit_service_class(global_name: &str, api_type: &str) -> bool {
+    !global_name.eq_ignore_ascii_case("workspace") && schema::class_is_service(api_type)
+}
+
 /// Members of the built-in globals/services/datatypes/libraries (`game`,
 /// `workspace`, `script`, `Vector3`, `task`, `Enum`, ...) from the generated
 /// API tables. Kind-aware: methods only via `:`.
@@ -1514,6 +1996,9 @@ fn global_member_completions(
     let Some(api_type) = api::global_type(owner) else {
         return Vec::new();
     };
+    if is_implicit_service_class(owner, api_type) {
+        return Vec::new();
+    }
     if let Some(library) = api_type.strip_prefix("@lib:") {
         let lower = prefix.to_ascii_lowercase();
         let Some(members) = api::library(library) else {
@@ -2465,7 +2950,10 @@ fn infer_expression_type(
             }
         }
     } else if let Some(api_type) = api::global_type(base) {
-        if api_type.starts_with("@lib:") || api_type == "@enum" {
+        if api_type.starts_with("@lib:")
+            || api_type == "@enum"
+            || is_implicit_service_class(base, api_type)
+        {
             return InferredType::default();
         }
         let path = index.global_path(base, api_type, current_script);
@@ -3354,6 +3842,232 @@ fn source_symbols(source: &str) -> Vec<(String, String, usize)> {
         }
     }
     result
+}
+
+#[derive(Debug, Clone)]
+struct SourceFunctionRange {
+    owner: String,
+    member: String,
+    separator: char,
+    signature_start: usize,
+    body_start: usize,
+    body_end: usize,
+}
+
+fn declared_function_owner(source: &str, after_keyword: usize) -> Option<(String, String, char, usize)> {
+    let mut line = 1 + source[..after_keyword].bytes().filter(|byte| *byte == b'\n').count();
+    let mut cursor = skip_whitespace(source, after_keyword, &mut line);
+    let start = cursor;
+    if !is_identifier_start(source.as_bytes().get(cursor).copied()) {
+        return None;
+    }
+    cursor = read_identifier_end(source, cursor);
+    let mut last_member = None;
+    loop {
+        let separator_at = skip_whitespace(source, cursor, &mut line);
+        let separator = match source.as_bytes().get(separator_at) {
+            Some(&b'.') => '.',
+            Some(&b':') => ':',
+            _ => break,
+        };
+        let member_start = skip_whitespace(source, separator_at + 1, &mut line);
+        if !is_identifier_start(source.as_bytes().get(member_start).copied()) {
+            break;
+        }
+        let member_end = read_identifier_end(source, member_start);
+        last_member = Some((separator, separator_at, source[member_start..member_end].to_string(), member_end));
+        cursor = member_end;
+    }
+    let (separator, separator_at, member, member_end) = last_member?;
+    let owner = source[start..separator_at].trim().to_string();
+    is_identifier(&member).then_some((owner, member, separator, member_end))
+}
+
+fn inline_function_owner(source: &str, function_start: usize) -> Option<(String, String, char)> {
+    let prefix = &source[..function_start];
+    let assignment = prefix.rfind('=')?;
+    let line_start = prefix[..assignment].rfind('\n').map_or(0, |position| position + 1);
+    let left = prefix[line_start..assignment].trim();
+    let left = left.strip_prefix("local ")
+        .or_else(|| left.strip_prefix("const "))
+        .unwrap_or(left);
+    let (separator_at, separator) = left.char_indices().rev()
+        .find(|(_, character)| matches!(*character, '.' | ':'))?;
+    let owner = left[..separator_at].trim();
+    let member = identifier_start(&left[separator_at + 1..]);
+    (is_identifier(owner) && is_identifier(member))
+        .then(|| (owner.to_string(), member.to_string(), separator))
+}
+
+fn matching_function_end(source: &str, body_start: usize) -> usize {
+    let mut cursor = body_start;
+    let mut line = 1 + source[..body_start].bytes().filter(|byte| *byte == b'\n').count();
+    let mut depth = 1i32;
+    let mut pending_loop_do = 0usize;
+    while let Some(token) = next_token(source, &mut cursor, &mut line) {
+        let Token::Word(word) = token else { continue };
+        match word {
+            "function" => {
+                depth += 1;
+                let (_, _, after_params) = parse_function_header(source, cursor, &mut line);
+                cursor = after_params;
+            }
+            "if" | "repeat" => depth += 1,
+            "for" | "while" => {
+                depth += 1;
+                pending_loop_do = pending_loop_do.saturating_add(1);
+            }
+            "do" if pending_loop_do > 0 => pending_loop_do -= 1,
+            "do" => depth += 1,
+            "end" => {
+                depth -= 1;
+                if depth == 0 {
+                    return cursor;
+                }
+            }
+            "until" => depth -= 1,
+            _ => {}
+        }
+    }
+    source.len()
+}
+
+fn source_function_ranges(source: &str) -> Vec<SourceFunctionRange> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    let mut line = 1;
+    while let Some(token) = next_token(source, &mut cursor, &mut line) {
+        if token != Token::Word("function") {
+            continue;
+        }
+        let function_start = cursor.saturating_sub("function".len());
+        let declared = declared_function_owner(source, cursor);
+        let inline = declared.is_none().then(|| inline_function_owner(source, function_start)).flatten();
+        let (_, _, body_start) = parse_function_header(source, cursor, &mut line);
+        if let Some((owner, member, separator, member_end)) = declared {
+            ranges.push(SourceFunctionRange {
+                owner,
+                member,
+                separator,
+                signature_start: member_end,
+                body_start,
+                body_end: matching_function_end(source, body_start),
+            });
+        } else if let Some((owner, member, separator)) = inline {
+            ranges.push(SourceFunctionRange {
+                owner,
+                member,
+                separator,
+                signature_start: function_start + "function".len(),
+                body_start,
+                body_end: matching_function_end(source, body_start),
+            });
+        }
+        // Keep scanning inside the body so nested function tokens are still
+        // visited, but skip the already parsed parameter list.
+        cursor = body_start;
+    }
+    ranges
+}
+
+fn assignment_lhs(code: &str) -> Option<&str> {
+    ["+=", "-=", "*=", "/=", "..=", "//=", "%=", "^=", "="]
+        .into_iter()
+        .find_map(|operator| code.split_once(operator).map(|(lhs, _)| lhs.trim()))
+}
+
+/// Infer the public shape of an object produced by a specific returned class
+/// (`Class.new`, `setmetatable`, `self.x`). Members are scoped to that class's
+/// methods so a sibling class in the same ModuleScript cannot leak methods or
+/// fields into the constructed value's completion list.
+fn constructed_object_members_for_class(source: &str, class_name: &str) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    let methods: Vec<SourceFunctionRange> = source_function_ranges(source)
+        .into_iter()
+        .filter(|range| range.owner == class_name)
+        .collect();
+    let mut preset_names = std::collections::BTreeSet::new();
+
+    for method in &methods {
+        let signature = function_signature(
+            &method.member,
+            &source[method.signature_start..method.body_start],
+        )
+        .unwrap_or_else(|| format!("function {}", method.member));
+        let explicit_self = parse_signature_detail(&signature, &method.member, '.')
+            .and_then(|(_, parameters)| parameters.first().cloned())
+            .is_some_and(|parameter| identifier_start(&parameter) == "self");
+        let is_constructor = matches!(method.member.as_str(), "new" | "create" | "Create");
+        let is_instance_method = method.separator == ':' || explicit_self;
+        if !is_constructor && !is_metamethod(&method.member) && is_instance_method {
+            result.insert(method.member.clone(), format!("method {signature}"));
+        }
+        if !is_constructor && !is_instance_method {
+            continue;
+        }
+
+        let body = &source[method.body_start..method.body_end.min(source.len())];
+        let mut receivers: std::collections::BTreeSet<String> = ["self".to_string()].into_iter().collect();
+        for raw in body.lines() {
+            let code = raw.split("--").next().unwrap_or("").trim();
+            if let Some(lhs) = assignment_lhs(code) {
+                if code.contains("setmetatable(") {
+                    let name = lhs
+                        .strip_prefix("local ")
+                        .or_else(|| lhs.strip_prefix("const "))
+                        .unwrap_or(lhs)
+                        .split(':')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if is_identifier(name) {
+                        receivers.insert(name.to_string());
+                    }
+                    if let Some((_, rhs)) = code.split_once('=') {
+                        for token in rhs.split(|character: char| {
+                            !(character.is_ascii_alphanumeric() || character == '_')
+                        }) {
+                            if is_identifier(token)
+                                && token != class_name
+                                && !matches!(token, "setmetatable" | "table" | "clone")
+                            {
+                                preset_names.insert(token.to_string());
+                            }
+                        }
+                    }
+                }
+                if let Some((receiver, field)) = lhs.split_once('.') {
+                    let receiver = receiver.trim();
+                    let field = field.trim();
+                    if receivers.contains(receiver) && is_identifier(field) && !is_metamethod(field) {
+                        result.entry(field.to_string())
+                            .or_insert_with(|| format!("instance field {field}"));
+                    }
+                }
+            }
+        }
+    }
+
+    for preset in preset_names {
+        if let Some((_, line)) = binding_declaration(source, &preset) {
+            for (field, _) in table_literal_members(source, line) {
+                result.entry(field.clone())
+                    .or_insert_with(|| format!("preset field {field}"));
+            }
+        }
+    }
+    result
+}
+
+fn constructed_object_members_for_returned_class(source: &str) -> BTreeMap<String, String> {
+    let class_name = returned_binding_name(source).map(str::to_owned).or_else(|| {
+        let owners: std::collections::BTreeSet<String> = source_function_ranges(source)
+            .into_iter()
+            .map(|range| range.owner)
+            .collect();
+        (owners.len() == 1).then(|| owners.into_iter().next()).flatten()
+    });
+    class_name.map_or_else(BTreeMap::new, |class| constructed_object_members_for_class(source, &class))
 }
 
 /// Infer the public shape of objects produced by the common Roblox/Luau OOP
@@ -4376,7 +5090,7 @@ fn structural_brace_delta(code: &str) -> i32 {
 
 fn function_signature(name: &str, suffix: &str) -> Option<String> {
     let open = suffix.find('(')?;
-    let close = suffix[open..].find(')')? + open;
+    let close = matching_delimiter_forward(suffix, open, b'(', b')')?;
     let parameters = &suffix[open..=close];
     let return_type = suffix[close + 1..].trim();
     Some(if return_type.starts_with(':') {
@@ -4835,6 +5549,37 @@ mod tests {
     }
 
     #[test]
+    fn locals_do_not_leak_between_sibling_functions() {
+        let index = ProjectIndex::default();
+        let source = r#"local function first()
+    local onlyFirst = 1
+end
+local function second()
+    only"#;
+        let suggestions = index.complete_at(Ref::none(), source, source.chars().count());
+        assert!(
+            !suggestions.iter().any(|item| item.label == "onlyFirst"),
+            "local from a sibling function leaked into completion: {suggestions:?}",
+        );
+    }
+
+    #[test]
+    fn api_service_classes_are_not_implicit_globals() {
+        let index = ProjectIndex::default();
+        let bare = index.complete_at(Ref::none(), "Play", 4);
+        assert!(!bare.iter().any(|item| item.label == "Players"), "{bare:?}");
+
+        let unbound = "Players:GetPl";
+        let no_binding = index.complete_at(Ref::none(), unbound, unbound.chars().count());
+        assert!(no_binding.is_empty(), "unbound service got member completions: {no_binding:?}");
+
+        let bound = r#"local Players = game:GetService("Players")
+Players:GetPl"#;
+        let with_binding = index.complete_at(Ref::none(), bound, bound.chars().count());
+        assert!(with_binding.iter().any(|item| item.label == "GetPlayers"), "{with_binding:?}");
+    }
+
+    #[test]
     fn instance_properties_come_from_scope_aware_locals() {
         let index = ProjectIndex::default();
         let source = "local part = Instance.new(\"Part\")\npart.Trans";
@@ -4876,6 +5621,74 @@ mod tests {
         let dot_source = "local Module = require(\"WeldModule\")\nlocal weld = Module.new(part)\nweld.D";
         assert!(!index.complete_at(consumer, dot_source, dot_source.chars().count())
             .iter().any(|item| item.label == "Destroy"));
+    }
+
+    #[test]
+    fn constructor_inference_stays_with_the_module_returned_class() {
+        let module = Ref::new();
+        let consumer = Ref::new();
+        let module_source = r#"
+local Alpha = {}
+function Alpha.new()
+    local value = setmetatable({}, Alpha)
+    value.AlphaField = true
+    return value
+end
+function Alpha:AlphaMethod(value: string) end
+
+local Beta = {}
+function Beta.new()
+    local value = setmetatable({}, Beta)
+    value.BetaField = true
+    return value
+end
+function Beta:BetaMethod(value: number) end
+return Alpha
+"#;
+        let mut index = ProjectIndex::default();
+        index.module_refs.insert("oopmodule".into(), module);
+        index.module_sources.insert(module, module_source.into());
+        index.paths.insert(consumer, "Controller".into());
+
+        let method_source = r#"local Module = require("OopModule")
+local value = Module.new()
+value:"#;
+        let methods = index.complete_at(consumer, method_source, method_source.chars().count());
+        assert!(methods.iter().any(|item| item.label == "AlphaMethod"), "{methods:?}");
+        assert!(!methods.iter().any(|item| item.label == "BetaMethod"), "{methods:?}");
+
+        let field_source = r#"local Module = require("OopModule")
+local value = Module.new()
+value."#;
+        let fields = index.complete_at(consumer, field_source, field_source.chars().count());
+        assert!(fields.iter().any(|item| item.label == "AlphaField"), "{fields:?}");
+        assert!(!fields.iter().any(|item| item.label == "BetaField"), "{fields:?}");
+
+        let module_source_at_cursor = r#"local Module = require("OopModule")
+Module."#;
+        let module_members = index.complete_at(
+            consumer,
+            module_source_at_cursor,
+            module_source_at_cursor.chars().count(),
+        );
+        assert!(module_members.iter().any(|item| item.label == "new"), "{module_members:?}");
+        assert!(!module_members.iter().any(|item| item.label == "BetaMethod"), "{module_members:?}");
+
+        let signature_source = r#"local Module = require("OopModule")
+local value = Module.new()
+value:AlphaMethod("#;
+        let help = index
+            .signature_help_at(consumer, signature_source, signature_source.chars().count())
+            .expect("returned class method signature should resolve");
+        assert_eq!(help.name, "AlphaMethod");
+        assert_eq!(help.parameters, vec!["value: string".to_string()]);
+
+        let sibling_method = r#"local Module = require("OopModule")
+local value = Module.new()
+value:BetaMethod("#;
+        assert!(index
+            .signature_help_at(consumer, sibling_method, sibling_method.chars().count())
+            .is_none(), "a sibling class method must not leak into Alpha's instance");
     }
 
     #[test]
@@ -5161,6 +5974,38 @@ return Registry
         let bare_name = "StatsRegistry[player].Kil";
         let nothing = index.complete_at(script, bare_name, bare_name.chars().count());
         assert!(!nothing.iter().any(|item| item.label == "KillCount"), "{nothing:?}");
+    }
+
+    #[test]
+    fn signature_help_parses_typed_parameters_and_active_argument() {
+        let index = ProjectIndex::default();
+        let source = r#"
+local function spawn(Character: Model | BasePart, Data: {}) end
+spawn(game:GetService("Players"):GetPlayerFromCharacter(character), { Nested = { a = 1, b = 2 } },
+"#;
+        let help = index
+            .signature_help_at(Ref::none(), source, source.chars().count())
+            .expect("local function signature should be available");
+        assert_eq!(help.name, "spawn");
+        assert_eq!(help.parameters, vec!["Character: Model | BasePart".to_string(), "Data: {}".to_string()]);
+        assert_eq!(help.active_parameter, Some(1));
+    }
+
+    #[test]
+    fn signature_help_resolves_api_methods_on_bound_services() {
+        let index = ProjectIndex::default();
+        let source = r#"local Players = game:GetService("Players")
+Players:GetPlayerFromCharacter(
+"#;
+        let help = index
+            .signature_help_at(Ref::none(), source, source.chars().count())
+            .expect("bound Players method should resolve");
+        assert_eq!(help.name, "GetPlayerFromCharacter");
+        assert_eq!(help.parameters, vec!["character: Model".to_string()]);
+        assert_eq!(help.active_parameter, Some(0));
+
+        let unbound = "Players:GetPlayerFromCharacter(";
+        assert!(index.signature_help_at(Ref::none(), unbound, unbound.chars().count()).is_none());
     }
 
     #[test]

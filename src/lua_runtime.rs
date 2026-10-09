@@ -280,9 +280,123 @@ fn typed_metatable(lua: &Lua, type_name: &str) -> LuaResult<Table> {
     let name = type_name.to_string();
     mt.set(
         "__type",
-        lua.create_function(move |_, _: ()| Ok(name.clone()))?,
+        lua.create_function(move |_, _value: Value| Ok(name.clone()))?,
     )?;
     Ok(mt)
+}
+
+fn datatype_metatable(lua: &Lua, type_name: &str) -> LuaResult<Table> {
+    if let Ok(namespace) = lua.globals().get::<Table>(type_name) {
+        if let Ok(mt) = namespace.raw_get::<Table>("__runtime_metatable") {
+            return Ok(mt);
+        }
+    }
+    typed_metatable(lua, type_name)
+}
+
+fn numeric_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => Some(*number),
+        Value::Integer(integer) => Some(*integer as f64),
+        _ => None,
+    }
+}
+
+fn vector3_components(value: &Table) -> LuaResult<(f64, f64, f64)> {
+    Ok((value.get("X")?, value.get("Y")?, value.get("Z")?))
+}
+
+fn vector3_base(lua: &Lua, mt: &Table, x: f64, y: f64, z: f64) -> LuaResult<Table> {
+    let value = lua.create_table();
+    value.set("X", x)?;
+    value.set("Y", y)?;
+    value.set("Z", z)?;
+    value.set("Magnitude", (x * x + y * y + z * z).sqrt())?;
+    value.set_metatable(Some(mt.clone()));
+    Ok(value)
+}
+
+fn vector3_value(lua: &Lua, mt: &Table, x: f64, y: f64, z: f64) -> LuaResult<Table> {
+    let value = vector3_base(lua, mt, x, y, z)?;
+    let magnitude = (x * x + y * y + z * z).sqrt();
+    let unit = if magnitude > 0.0 {
+        vector3_base(lua, mt, x / magnitude, y / magnitude, z / magnitude)?
+    } else {
+        vector3_base(lua, mt, 0.0, 0.0, 0.0)?
+    };
+    unit.raw_set("Unit", unit.clone())?;
+    value.set("Unit", unit)?;
+    Ok(value)
+}
+
+fn vector2_components(value: &Table) -> LuaResult<(f64, f64)> {
+    Ok((value.get("X")?, value.get("Y")?))
+}
+
+fn vector2_base(lua: &Lua, mt: &Table, x: f64, y: f64) -> LuaResult<Table> {
+    let value = lua.create_table();
+    value.set("X", x)?;
+    value.set("Y", y)?;
+    value.set("Magnitude", (x * x + y * y).sqrt())?;
+    value.set_metatable(Some(mt.clone()));
+    Ok(value)
+}
+
+fn vector2_value(lua: &Lua, mt: &Table, x: f64, y: f64) -> LuaResult<Table> {
+    let value = vector2_base(lua, mt, x, y)?;
+    let magnitude = (x * x + y * y).sqrt();
+    let unit = if magnitude > 0.0 {
+        vector2_base(lua, mt, x / magnitude, y / magnitude)?
+    } else {
+        vector2_base(lua, mt, 0.0, 0.0)?
+    };
+    unit.raw_set("Unit", unit.clone())?;
+    value.set("Unit", unit)?;
+    Ok(value)
+}
+
+fn color3_value(lua: &Lua, mt: &Table, r: f64, g: f64, b: f64) -> LuaResult<Table> {
+    let value = lua.create_table();
+    value.set("R", r)?;
+    value.set("G", g)?;
+    value.set("B", b)?;
+    value.set_metatable(Some(mt.clone()));
+    Ok(value)
+}
+
+fn color3_to_hsv(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let hue = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        ((g - b) / delta).rem_euclid(6.0) / 6.0
+    } else if max == g {
+        ((b - r) / delta + 2.0) / 6.0
+    } else {
+        ((r - g) / delta + 4.0) / 6.0
+    };
+    let saturation = if max == 0.0 { 0.0 } else { delta / max };
+    (hue, saturation, max)
+}
+
+fn color3_from_hsv(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
+    let hue = h.rem_euclid(1.0) * 6.0;
+    let saturation = s.clamp(0.0, 1.0);
+    let value = v.clamp(0.0, 1.0);
+    let chroma = value * saturation;
+    let x = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match hue as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let m = value - chroma;
+    (r + m, g + m, b + m)
 }
 
 fn simple_tostring(lua: &Lua, fields: &[&str]) -> LuaResult<Function> {
@@ -299,153 +413,403 @@ fn simple_tostring(lua: &Lua, fields: &[&str]) -> LuaResult<Function> {
 }
 
 fn install_vector3(lua: &Lua) -> LuaResult<()> {
-    // One shared metatable, cloned into every instance/result.
-    let make_mt = || {
-        let mt = lua.create_table();
-        mt.set("__type", lua.create_function(|_, _: ()| Ok("Vector3"))?)?;
-        mt.set(
-            "__tostring",
-            lua.create_function(|_lua, t: Table| {
-                Ok(format!(
-                    "{}, {}, {}",
-                    t.get::<f64>("X")?,
-                    t.get::<f64>("Y")?,
-                    t.get::<f64>("Z")?
-                ))
-            })?,
-        )?;
-        let wrap = |f: fn(f64, f64, f64, f64, f64, f64) -> (f64, f64, f64)| {
-            let mt = mt.clone();
-            lua.create_function(move |lua, (a, b): (Table, Table)| {
-                let (x, y, z) = f(
-                    a.get::<f64>("X")?,
-                    a.get::<f64>("Y")?,
-                    a.get::<f64>("Z")?,
-                    b.get::<f64>("X")?,
-                    b.get::<f64>("Y")?,
-                    b.get::<f64>("Z")?,
-                );
-                let t = lua.create_table();
-                t.set("X", x)?;
-                t.set("Y", y)?;
-                t.set("Z", z)?;
-                t.set("Magnitude", (x * x + y * y + z * z).sqrt())?;
-                t.set_metatable(Some(mt.clone()));
-                Ok(t)
-            })
-        };
-        mt.set("__add", wrap(|ax, ay, az, bx, by, bz| (ax + bx, ay + by, az + bz))?)?;
-        mt.set("__sub", wrap(|ax, ay, az, bx, by, bz| (ax - bx, ay - by, az - bz))?)?;
-        mt.set(
-            "__mul",
-            {
-                let mt2 = mt.clone();
-                lua.create_function(move |lua, (a, b): (Value, Value)| {
-                    let (x, y, z) = match (&a, &b) {
-                        (Value::Table(t), Value::Number(s)) => (
-                            t.get::<f64>("X")? * s,
-                            t.get::<f64>("Y")? * s,
-                            t.get::<f64>("Z")? * s,
-                        ),
-                        (Value::Number(s), Value::Table(t)) => (
-                            t.get::<f64>("X")? * s,
-                            t.get::<f64>("Y")? * s,
-                            t.get::<f64>("Z")? * s,
-                        ),
-                        _ => return Err(LuaError::runtime("Vector3 can only be multiplied by a number")),
-                    };
-                    let out = lua.create_table();
-                    out.set("X", x)?;
-                    out.set("Y", y)?;
-                    out.set("Z", z)?;
-                    out.set("Magnitude", (x * x + y * y + z * z).sqrt())?;
-                    out.set_metatable(Some(mt2.clone()));
-                    Ok(out)
-                })?
-            },
-        )?;
-        Ok::<Table, LuaError>(mt)
-    };
-    let mt = make_mt()?;
+    let mt = lua.create_table();
+    mt.set("__type", lua.create_function(|_, _value: Value| Ok("Vector3"))?)?;
+    mt.set(
+        "__tostring",
+        lua.create_function(|_, value: Table| {
+            let (x, y, z) = vector3_components(&value)?;
+            Ok(format!("{x}, {y}, {z}"))
+        })?,
+    )?;
 
-    let new_fn = {
+    let methods = lua.create_table();
+    methods.set(
+        "Dot",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            let (ax, ay, az) = vector3_components(&a)?;
+            let (bx, by, bz) = vector3_components(&b)?;
+            Ok(ax * bx + ay * by + az * bz)
+        })?,
+    )?;
+    let cross_mt = mt.clone();
+    methods.set(
+        "Cross",
+        lua.create_function(move |lua, (a, b): (Table, Table)| {
+            let (ax, ay, az) = vector3_components(&a)?;
+            let (bx, by, bz) = vector3_components(&b)?;
+            vector3_value(lua, &cross_mt, ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
+        })?,
+    )?;
+    let lerp_mt = mt.clone();
+    methods.set(
+        "Lerp",
+        lua.create_function(move |lua, (a, b, alpha): (Table, Table, f64)| {
+            let (ax, ay, az) = vector3_components(&a)?;
+            let (bx, by, bz) = vector3_components(&b)?;
+            vector3_value(
+                lua,
+                &lerp_mt,
+                ax + (bx - ax) * alpha,
+                ay + (by - ay) * alpha,
+                az + (bz - az) * alpha,
+            )
+        })?,
+    )?;
+    methods.set(
+        "FuzzyEq",
+        lua.create_function(|_, (a, b, epsilon): (Table, Table, Option<f64>)| {
+            let (ax, ay, az) = vector3_components(&a)?;
+            let (bx, by, bz) = vector3_components(&b)?;
+            let epsilon = epsilon.unwrap_or(1.0e-4).abs();
+            Ok((ax - bx).abs() <= epsilon
+                && (ay - by).abs() <= epsilon
+                && (az - bz).abs() <= epsilon)
+        })?,
+    )?;
+    methods.set(
+        "Angle",
+        lua.create_function(|_, (a, b, axis): (Table, Table, Option<Table>)| {
+            let (ax, ay, az) = vector3_components(&a)?;
+            let (bx, by, bz) = vector3_components(&b)?;
+            let dot = ax * bx + ay * by + az * bz;
+            let cross = (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx);
+            let angle = if let Some(axis) = axis {
+                let (nx, ny, nz) = vector3_components(&axis)?;
+                (nx * cross.0 + ny * cross.1 + nz * cross.2).atan2(dot).rem_euclid(std::f64::consts::TAU)
+            } else {
+                let denominator = (ax * ax + ay * ay + az * az).sqrt()
+                    * (bx * bx + by * by + bz * bz).sqrt();
+                if denominator == 0.0 {
+                    0.0
+                } else {
+                    (dot / denominator).clamp(-1.0, 1.0).acos()
+                }
+            };
+            Ok(angle)
+        })?,
+    )?;
+    mt.set("__index", methods)?;
+
+    let wrap = |operation: fn(f64, f64, f64, f64, f64, f64) -> (f64, f64, f64)| {
         let mt = mt.clone();
-        lua.create_function(move |lua, args: Variadic<f64>| {
-            let x = args.first().copied().unwrap_or(0.0);
-            let y = args.get(1).copied().unwrap_or(0.0);
-            let z = args.get(2).copied().unwrap_or(0.0);
-            let t = lua.create_table();
-            t.set("X", x)?;
-            t.set("Y", y)?;
-            t.set("Z", z)?;
-            t.set("Magnitude", (x * x + y * y + z * z).sqrt())?;
-            t.set_metatable(Some(mt.clone()));
-            Ok(t)
-        })?
+        lua.create_function(move |lua, (a, b): (Table, Table)| {
+            let (ax, ay, az) = vector3_components(&a)?;
+            let (bx, by, bz) = vector3_components(&b)?;
+            let (x, y, z) = operation(ax, ay, az, bx, by, bz);
+            vector3_value(lua, &mt, x, y, z)
+        })
     };
+    mt.set("__add", wrap(|ax, ay, az, bx, by, bz| (ax + bx, ay + by, az + bz))?)?;
+    mt.set("__sub", wrap(|ax, ay, az, bx, by, bz| (ax - bx, ay - by, az - bz))?)?;
+
+    let multiply_mt = mt.clone();
+    mt.set(
+        "__mul",
+        lua.create_function(move |lua, (left, right): (Value, Value)| {
+            let (vector, scalar) = match (&left, &right) {
+                (Value::Table(vector), scalar) if numeric_value(scalar).is_some() => {
+                    (vector, numeric_value(scalar).unwrap())
+                }
+                (scalar, Value::Table(vector)) if numeric_value(scalar).is_some() => {
+                    (vector, numeric_value(scalar).unwrap())
+                }
+                _ => return Err(LuaError::runtime("Vector3 can only be multiplied by a number")),
+            };
+            let (x, y, z) = vector3_components(vector)?;
+            vector3_value(lua, &multiply_mt, x * scalar, y * scalar, z * scalar)
+        })?,
+    )?;
+    let divide_mt = mt.clone();
+    mt.set(
+        "__div",
+        lua.create_function(move |lua, (vector, scalar): (Table, Value)| {
+            let Some(scalar) = numeric_value(&scalar) else {
+                return Err(LuaError::runtime("Vector3 can only be divided by a number"));
+            };
+            if scalar == 0.0 {
+                return Err(LuaError::runtime("attempt to divide Vector3 by zero"));
+            }
+            let (x, y, z) = vector3_components(&vector)?;
+            vector3_value(lua, &divide_mt, x / scalar, y / scalar, z / scalar)
+        })?,
+    )?;
+    let negate_mt = mt.clone();
+    mt.set(
+        "__unm",
+        lua.create_function(move |lua, vector: Table| {
+            let (x, y, z) = vector3_components(&vector)?;
+            vector3_value(lua, &negate_mt, -x, -y, -z)
+        })?,
+    )?;
+    mt.set(
+        "__eq",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            let (ax, ay, az) = vector3_components(&a)?;
+            let (bx, by, bz) = vector3_components(&b)?;
+            Ok(ax == bx && ay == by && az == bz)
+        })?,
+    )?;
+
+    let new_mt = mt.clone();
+    let new_fn = lua.create_function(move |lua, args: Variadic<f64>| {
+        vector3_value(
+            lua,
+            &new_mt,
+            args.first().copied().unwrap_or(0.0),
+            args.get(1).copied().unwrap_or(0.0),
+            args.get(2).copied().unwrap_or(0.0),
+        )
+    })?;
     let v3 = lua.create_table();
     v3.set("new", new_fn.clone())?;
-    let zero = new_fn.call::<Table>((0.0, 0.0, 0.0))?;
-    let one = new_fn.call::<Table>((1.0, 1.0, 1.0))?;
-    v3.set("zero", zero)?;
-    v3.set("one", one)?;
+    v3.set("zero", new_fn.call::<Table>((0.0, 0.0, 0.0))?)?;
+    v3.set("one", new_fn.call::<Table>((1.0, 1.0, 1.0))?)?;
+    v3.set("xAxis", new_fn.call::<Table>((1.0, 0.0, 0.0))?)?;
+    v3.set("yAxis", new_fn.call::<Table>((0.0, 1.0, 0.0))?)?;
+    v3.set("zAxis", new_fn.call::<Table>((0.0, 0.0, 1.0))?)?;
+    v3.raw_set("__runtime_metatable", mt)?;
     lua.globals().set("Vector3", v3)?;
     Ok(())
 }
 
 fn install_vector2(lua: &Lua) -> LuaResult<()> {
-    let v2 = lua.create_table();
-    v2.set(
-        "new",
-        lua.create_function(|lua, (x, y): (f64, f64)| {
-            let t = lua.create_table();
-            t.set("X", x)?;
-            t.set("Y", y)?;
-            t.set("Magnitude", (x * x + y * y).sqrt())?;
-            t.set_metatable(Some(typed_metatable(lua, "Vector2")?));
-            Ok(t)
+    let mt = lua.create_table();
+    mt.set("__type", lua.create_function(|_, _value: Value| Ok("Vector2"))?)?;
+    mt.set(
+        "__tostring",
+        lua.create_function(|_, value: Table| {
+            let (x, y) = vector2_components(&value)?;
+            Ok(format!("{x}, {y}"))
         })?,
     )?;
+    let methods = lua.create_table();
+    methods.set(
+        "Dot",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            let (ax, ay) = vector2_components(&a)?;
+            let (bx, by) = vector2_components(&b)?;
+            Ok(ax * bx + ay * by)
+        })?,
+    )?;
+    let lerp_mt = mt.clone();
+    methods.set(
+        "Lerp",
+        lua.create_function(move |lua, (a, b, alpha): (Table, Table, f64)| {
+            let (ax, ay) = vector2_components(&a)?;
+            let (bx, by) = vector2_components(&b)?;
+            vector2_value(lua, &lerp_mt, ax + (bx - ax) * alpha, ay + (by - ay) * alpha)
+        })?,
+    )?;
+    methods.set(
+        "FuzzyEq",
+        lua.create_function(|_, (a, b, epsilon): (Table, Table, Option<f64>)| {
+            let (ax, ay) = vector2_components(&a)?;
+            let (bx, by) = vector2_components(&b)?;
+            let epsilon = epsilon.unwrap_or(1.0e-4).abs();
+            Ok((ax - bx).abs() <= epsilon && (ay - by).abs() <= epsilon)
+        })?,
+    )?;
+    mt.set("__index", methods)?;
+
+    let wrap = |operation: fn(f64, f64, f64, f64) -> (f64, f64)| {
+        let mt = mt.clone();
+        lua.create_function(move |lua, (a, b): (Table, Table)| {
+            let (ax, ay) = vector2_components(&a)?;
+            let (bx, by) = vector2_components(&b)?;
+            let (x, y) = operation(ax, ay, bx, by);
+            vector2_value(lua, &mt, x, y)
+        })
+    };
+    mt.set("__add", wrap(|ax, ay, bx, by| (ax + bx, ay + by))?)?;
+    mt.set("__sub", wrap(|ax, ay, bx, by| (ax - bx, ay - by))?)?;
+    let multiply_mt = mt.clone();
+    mt.set(
+        "__mul",
+        lua.create_function(move |lua, (left, right): (Value, Value)| {
+            let (vector, scalar) = match (&left, &right) {
+                (Value::Table(vector), scalar) if numeric_value(scalar).is_some() => {
+                    (vector, numeric_value(scalar).unwrap())
+                }
+                (scalar, Value::Table(vector)) if numeric_value(scalar).is_some() => {
+                    (vector, numeric_value(scalar).unwrap())
+                }
+                _ => return Err(LuaError::runtime("Vector2 can only be multiplied by a number")),
+            };
+            let (x, y) = vector2_components(vector)?;
+            vector2_value(lua, &multiply_mt, x * scalar, y * scalar)
+        })?,
+    )?;
+    let divide_mt = mt.clone();
+    mt.set(
+        "__div",
+        lua.create_function(move |lua, (vector, scalar): (Table, Value)| {
+            let Some(scalar) = numeric_value(&scalar) else {
+                return Err(LuaError::runtime("Vector2 can only be divided by a number"));
+            };
+            if scalar == 0.0 {
+                return Err(LuaError::runtime("attempt to divide Vector2 by zero"));
+            }
+            let (x, y) = vector2_components(&vector)?;
+            vector2_value(lua, &divide_mt, x / scalar, y / scalar)
+        })?,
+    )?;
+    let negate_mt = mt.clone();
+    mt.set(
+        "__unm",
+        lua.create_function(move |lua, vector: Table| {
+            let (x, y) = vector2_components(&vector)?;
+            vector2_value(lua, &negate_mt, -x, -y)
+        })?,
+    )?;
+    mt.set(
+        "__eq",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            let (ax, ay) = vector2_components(&a)?;
+            let (bx, by) = vector2_components(&b)?;
+            Ok(ax == bx && ay == by)
+        })?,
+    )?;
+
+    let new_mt = mt.clone();
+    let new_fn = lua.create_function(move |lua, args: Variadic<f64>| {
+        vector2_value(
+            lua,
+            &new_mt,
+            args.first().copied().unwrap_or(0.0),
+            args.get(1).copied().unwrap_or(0.0),
+        )
+    })?;
+    let v2 = lua.create_table();
+    v2.set("new", new_fn.clone())?;
+    v2.set("zero", new_fn.call::<Table>((0.0, 0.0))?)?;
+    v2.set("one", new_fn.call::<Table>((1.0, 1.0))?)?;
+    v2.set("xAxis", new_fn.call::<Table>((1.0, 0.0))?)?;
+    v2.set("yAxis", new_fn.call::<Table>((0.0, 1.0))?)?;
+    v2.raw_set("__runtime_metatable", mt)?;
     lua.globals().set("Vector2", v2)?;
     Ok(())
 }
 
 fn install_color3(lua: &Lua) -> LuaResult<()> {
+    let mt = lua.create_table();
+    mt.set("__type", lua.create_function(|_, _value: Value| Ok("Color3"))?)?;
+    mt.set(
+        "__tostring",
+        lua.create_function(|_, value: Table| {
+            Ok(format!(
+                "{} {} {}",
+                value.get::<f64>("R")?,
+                value.get::<f64>("G")?,
+                value.get::<f64>("B")?
+            ))
+        })?,
+    )?;
+    let methods = lua.create_table();
+    methods.set(
+        "ToHSV",
+        lua.create_function(|_, value: Table| {
+            color3_to_hsv(
+                value.get("R")?,
+                value.get("G")?,
+                value.get("B")?,
+            )
+        })?,
+    )?;
+    methods.set(
+        "ToRGB",
+        lua.create_function(|_, value: Table| {
+            let channel = |name: &str| -> LuaResult<i64> {
+                Ok((value.get::<f64>(name)? * 255.0).round().clamp(0.0, 255.0) as i64)
+            };
+            Ok((channel("R")?, channel("G")?, channel("B")?))
+        })?,
+    )?;
+    methods.set(
+        "ToHex",
+        lua.create_function(|_, value: Table| {
+            let channel = |name: &str| -> LuaResult<u8> {
+                Ok((value.get::<f64>(name)? * 255.0).round().clamp(0.0, 255.0) as u8)
+            };
+            Ok(format!("{:02x}{:02x}{:02x}", channel("R")?, channel("G")?, channel("B")?))
+        })?,
+    )?;
+    let lerp_mt = mt.clone();
+    methods.set(
+        "Lerp",
+        lua.create_function(move |lua, (a, b, alpha): (Table, Table, f64)| {
+            color3_value(
+                lua,
+                &lerp_mt,
+                a.get::<f64>("R")? + (b.get::<f64>("R")? - a.get::<f64>("R")?) * alpha,
+                a.get::<f64>("G")? + (b.get::<f64>("G")? - a.get::<f64>("G")?) * alpha,
+                a.get::<f64>("B")? + (b.get::<f64>("B")? - a.get::<f64>("B")?) * alpha,
+            )
+        })?,
+    )?;
+    mt.set("__index", methods)?;
+    mt.set(
+        "__eq",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            Ok(a.get::<f64>("R")? == b.get::<f64>("R")?
+                && a.get::<f64>("G")? == b.get::<f64>("G")?
+                && a.get::<f64>("B")? == b.get::<f64>("B")?)
+        })?,
+    )?;
+
     let c3 = lua.create_table();
+    let new_mt = mt.clone();
     c3.set(
         "new",
-        lua.create_function(|lua, (r, g, b): (f64, f64, f64)| {
-            let t = lua.create_table();
-            t.set("R", r)?;
-            t.set("G", g)?;
-            t.set("B", b)?;
-            t.set_metatable(Some(typed_metatable(lua, "Color3")?));
-            Ok(t)
+        lua.create_function(move |lua, (r, g, b): (f64, f64, f64)| {
+            color3_value(lua, &new_mt, r, g, b)
         })?,
     )?;
+    let rgb_mt = mt.clone();
     c3.set(
         "fromRGB",
-        lua.create_function(|lua, (r, g, b): (i64, i64, i64)| {
-            let t = lua.create_table();
-            t.set("R", r as f64 / 255.0)?;
-            t.set("G", g as f64 / 255.0)?;
-            t.set("B", b as f64 / 255.0)?;
-            t.set_metatable(Some(typed_metatable(lua, "Color3")?));
-            Ok(t)
+        lua.create_function(move |lua, (r, g, b): (f64, f64, f64)| {
+            color3_value(lua, &rgb_mt, r / 255.0, g / 255.0, b / 255.0)
         })?,
     )?;
+    let hsv_mt = mt.clone();
     c3.set(
         "fromHSV",
-        lua.create_function(|lua, (_h, _s, _v): (f64, f64, f64)| {
-            // No HSV conversion in this minimal sandbox; return white.
-            let t = lua.create_table();
-            t.set("R", 1.0f64)?;
-            t.set("G", 1.0f64)?;
-            t.set("B", 1.0f64)?;
-            t.set_metatable(Some(typed_metatable(lua, "Color3")?));
-            Ok(t)
+        lua.create_function(move |lua, (h, s, v): (f64, f64, f64)| {
+            let (r, g, b) = color3_from_hsv(h, s, v);
+            color3_value(lua, &hsv_mt, r, g, b)
         })?,
     )?;
+    let hex_mt = mt.clone();
+    c3.set(
+        "fromHex",
+        lua.create_function(move |lua, hex: String| {
+            let trimmed = hex.trim_start_matches('#');
+            let expanded = if trimmed.len() == 3 {
+                let mut value = String::with_capacity(6);
+                for digit in trimmed.chars() {
+                    value.push(digit);
+                    value.push(digit);
+                }
+                value
+            } else {
+                trimmed.to_owned()
+            };
+            if expanded.len() != 6 {
+                return Err(LuaError::runtime("Color3.fromHex expects a 3- or 6-digit hex string"));
+            }
+            let value = u32::from_str_radix(&expanded, 16)
+                .map_err(|_| LuaError::runtime("Color3.fromHex received an invalid hex string"))?;
+            color3_value(
+                lua,
+                &hex_mt,
+                ((value >> 16) & 0xff) as f64 / 255.0,
+                ((value >> 8) & 0xff) as f64 / 255.0,
+                (value & 0xff) as f64 / 255.0,
+            )
+        })?,
+    )?;
+    c3.raw_set("__runtime_metatable", mt)?;
     lua.globals().set("Color3", c3)?;
     Ok(())
 }
@@ -519,31 +883,67 @@ fn install_tween_info(lua: &Lua) -> LuaResult<()> {
 }
 
 fn install_enum(lua: &Lua) -> LuaResult<()> {
-    let root_mt=lua.create_table();
-    root_mt.set("__index",lua.create_function(|lua,(_root,enum_type):(Table,String)|{
-        let group=lua.create_table();let item_mt=lua.create_table();let captured=enum_type.clone();
-        item_mt.set("__index",lua.create_function(move |lua,(_group,name):(Table,String)|{
-            let value=match (captured.as_str(),name.as_str()) {
-                ("AutomaticSize","X")=>1,("AutomaticSize","Y")=>2,("AutomaticSize","XY")=>3,
-                ("ZIndexBehavior","Sibling")=>1,
-                ("ScaleType","Slice")=>1,("ScaleType","Tile")=>2,("ScaleType","Fit")=>3,("ScaleType","Crop")=>4,
-                ("TextXAlignment","Center")=>1,("TextXAlignment","Right")=>2,
-                ("TextYAlignment","Center")=>1,("TextYAlignment","Bottom")=>2,
-                ("EasingDirection","Out")=>1,("EasingDirection","InOut")=>2,
-                ("FillDirection","Vertical")=>1,("ScrollingDirection","X")=>1,("ScrollingDirection","Y")=>2,
-                ("VerticalScrollBarPosition","Left")=>1,("ResamplerMode","Pixelated")=>1,
-                ("ScreenInsets","DeviceSafeInsets")=>1,("ScreenInsets","CoreUISafeInsets")=>2,("ScreenInsets","TopbarSafeInsets")=>3,
-                _=>0,
-            };
-            let item=lua.create_table();item.set("Name",name)?;item.set("Value",value)?;item.set("EnumType",captured.clone())?;Ok(item)
-        })?)?;
-        group.set_metatable(Some(item_mt));group.raw_set("Name",enum_type)?;Ok(group)
-    })?)?;
-    let enum_root=lua.create_table();enum_root.set_metatable(Some(root_mt));lua.globals().set("Enum",enum_root)
+    let item_mt = lua.create_table();
+    item_mt.set("__type", lua.create_function(|_, _item: Value| Ok("EnumItem"))?)?;
+    item_mt.set(
+        "__tostring",
+        lua.create_function(|_, item: Table| {
+            let enum_type: Table = item.get("EnumType")?;
+            Ok(format!("Enum.{}.{}", enum_type.get::<String>("Name")?, item.get::<String>("Name")?))
+        })?,
+    )?;
+
+    let group_mt = lua.create_table();
+    group_mt.set("__type", lua.create_function(|_, _group: Value| Ok("Enum"))?)?;
+    group_mt.set(
+        "__tostring",
+        lua.create_function(|_, group: Table| Ok(format!("Enum.{}", group.get::<String>("Name")?)))?,
+    )?;
+
+    let root_mt = lua.create_table();
+    root_mt.set("__type", lua.create_function(|_, _root: Value| Ok("Enums"))?)?;
+    root_mt.set(
+        "__index",
+        lua.create_function(move |lua, (root, enum_type): (Table, String)| {
+            let reflected_items = crate::schema::get_enum_items_with_values(&enum_type);
+            if reflected_items.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let group = lua.create_table();
+            group.raw_set("Name", enum_type.clone())?;
+            group.set_metatable(Some(group_mt.clone()));
+            let mut items = Vec::with_capacity(reflected_items.len());
+            for (name, value) in reflected_items {
+                let item = lua.create_table();
+                item.raw_set("Name", name.as_str())?;
+                item.raw_set("Value", value as i64)?;
+                item.raw_set("EnumType", group.clone())?;
+                item.set_metatable(Some(item_mt.clone()));
+                group.raw_set(name.as_str(), item.clone())?;
+                items.push(item);
+            }
+            group.raw_set(
+                "GetEnumItems",
+                lua.create_function(move |lua, _group: Table| {
+                    let result = lua.create_table();
+                    for (index, item) in items.iter().enumerate() {
+                        result.raw_set(index + 1, item.clone())?;
+                    }
+                    Ok(result)
+                })?,
+            )?;
+            root.raw_set(enum_type, group.clone())?;
+            Ok(Value::Table(group))
+        })?,
+    )?;
+    let enum_root = lua.create_table();
+    enum_root.set_metatable(Some(root_mt))?;
+    lua.globals().set("Enum", enum_root)
 }
 
 fn make_signal(lua: &Lua) -> LuaResult<Table> {
     let signal=lua.create_table();
+    signal.set_metatable(Some(typed_metatable(lua,"RBXScriptSignal")?));
     let callbacks: Rc<RefCell<Vec<(Function,bool,Rc<Cell<bool>>)>>>=Rc::new(RefCell::new(Vec::new()));
     let connected=callbacks.clone();
     signal.set("Connect",lua.create_function(move |lua,(_signal,callback):(Table,Function)|{
@@ -582,7 +982,8 @@ fn is_instance_signal(key: &str) -> bool {
     matches!(key,"Activated"|"MouseButton1Click"|"MouseButton1Down"|"MouseButton1Up"|
         "MouseEnter"|"MouseLeave"|"InputBegan"|"InputChanged"|"InputEnded"|
         "Focused"|"FocusLost"|"SelectionGained"|"SelectionLost"|"Changed"|"AncestryChanged"|
-        "ChildAdded"|"ChildRemoved"|"DescendantAdded"|"DescendantRemoving"|"Destroying")
+        "ChildAdded"|"ChildRemoved"|"DescendantAdded"|"DescendantRemoving"|"Destroying"|
+        "Touched"|"TouchEnded"|"Died"|"HealthChanged"|"StateChanged"|"MoveToFinished"|"Jumping")
 }
 
 fn instance_children(this:&Table)->LuaResult<Vec<Table>> {
@@ -591,6 +992,7 @@ fn instance_children(this:&Table)->LuaResult<Vec<Table>> {
 
 fn class_is_a(class:&str,target:&str)->bool {
     if class==target||target=="Instance" {return true;}
+    if crate::schema::class_is_subclass_of(class, target) { return true; }
     match target {
         "GuiBase"=>matches!(class,"ScreenGui"|"BillboardGui"|"SurfaceGui"|"GuiObject"|"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
         "GuiBase2d"=>matches!(class,"GuiObject"|"Frame"|"CanvasGroup"|"ScrollingFrame"|"TextLabel"|"TextButton"|"TextBox"|"ImageLabel"|"ImageButton"|"ViewportFrame"),
@@ -603,6 +1005,15 @@ fn class_is_a(class:&str,target:&str)->bool {
         "BaseScript"=>matches!(class,"LocalScript"|"Script"),
         _=>false,
     }
+}
+
+fn is_service_class(class: &str) -> bool {
+    crate::schema::class_is_service(class)
+        || matches!(class, "Workspace" | "Selection" | "ChangeHistoryService")
+}
+
+fn is_lua_source_container(class: &str) -> bool {
+    class_is_a(class, "LuaSourceContainer")
 }
 
 fn make_instance(lua: &Lua, class: &str, name: &str) -> LuaResult<Table> {
@@ -1369,32 +1780,97 @@ thread_local! {
         undo: false,
         redo: false,
     }) };
+    static COMMAND_SOURCE_UPDATES: RefCell<Vec<(DomRef, String)>> = const { RefCell::new(Vec::new()) };
     /// Persisted undo/redo snapshots for ChangeHistoryService.
     static UNDO_STACK: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     static REDO_STACK: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Run a snippet against a real, mutable DataModel. The snippet can use the
-/// standard globals plus `game`, `workspace`, `Instance.new`, `GetService`,
-/// property get/set, `:Clone()`, `:Destroy()`, `:FindFirstChild()`, and
-/// `:GetChildren()`.
+/// Run a snippet against the loaded DataModel. A selected/open source
+/// container can be supplied so command-bar code also has a meaningful
+/// `script` global and editor-buffer view of `script.Source` without saving
+/// that buffer into the place unless the command explicitly assigns Source.
 pub fn run_command(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Result<CommandOutcome, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(||run_command_inner(dom_rc,source,name)))
-        .unwrap_or_else(|panic| {
-            let detail=panic.downcast_ref::<&str>().map(|value|(*value).to_string())
-                .or_else(||panic.downcast_ref::<String>().cloned()).unwrap_or_else(||"unknown VM panic".into());
-            Err(format!("Luau command recovered from an internal error: {detail}"))
-        })
+    run_command_with_script_context(dom_rc, source, name, None, None)
 }
 
-fn run_command_inner(dom_rc: Rc<RefCell<WeakDom>>, source: &str, name: &str) -> Result<CommandOutcome, String> {
+/// Drain script Source writes made by the most recent command, including
+/// writes from a command that later returned an error.
+pub fn take_command_source_updates() -> Vec<(DomRef, String)> {
+    COMMAND_SOURCE_UPDATES.with(|updates| std::mem::take(&mut *updates.borrow_mut()))
+}
+
+/// Run a command with a `script` Instance context. `script_source`, when
+/// supplied for a valid LuaSourceContainer, shadows saved Source for reads in
+/// this VM only; explicit `script.Source = ...` writes are persisted to the DOM.
+pub fn run_command_with_script_context(
+    dom_rc: Rc<RefCell<WeakDom>>,
+    source: &str,
+    name: &str,
+    script_context: Option<rbx_dom_weak::types::Ref>,
+    script_source: Option<&str>,
+) -> Result<CommandOutcome, String> {
+    run_command_with_script_context_and_cookie(
+        dom_rc,
+        source,
+        name,
+        script_context,
+        script_source,
+        None,
+    )
+}
+
+/// Run a command with optional source-editor and Roblox asset-delivery context.
+/// The cookie is only handed to InsertService's host callback and never exposed
+/// as a Luau global or written to command output.
+pub fn run_command_with_script_context_and_cookie(
+    dom_rc: Rc<RefCell<WeakDom>>,
+    source: &str,
+    name: &str,
+    script_context: Option<rbx_dom_weak::types::Ref>,
+    script_source: Option<&str>,
+    asset_cookie: Option<&str>,
+) -> Result<CommandOutcome, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_command_inner(
+            dom_rc,
+            source,
+            name,
+            script_context,
+            script_source,
+            asset_cookie.map(str::to_owned),
+        )
+    }))
+    .unwrap_or_else(|panic| {
+        let detail=panic.downcast_ref::<&str>().map(|value|(*value).to_string())
+            .or_else(||panic.downcast_ref::<String>().cloned()).unwrap_or_else(||"unknown VM panic".into());
+        Err(format!("Luau command recovered from an internal error: {detail}"))
+    })
+}
+
+fn run_command_inner(
+    dom_rc: Rc<RefCell<WeakDom>>,
+    source: &str,
+    name: &str,
+    script_context: Option<DomRef>,
+    script_source: Option<&str>,
+    asset_cookie: Option<String>,
+) -> Result<CommandOutcome, String> {
     LOG.with(|c| c.borrow_mut().clear());
     COMMAND_OUTCOME.with(|c| *c.borrow_mut() = CommandOutcome::default());
+    COMMAND_SOURCE_UPDATES.with(|updates| updates.borrow_mut().clear());
 
     let lua = build_vm().map_err(|e| e.to_string())?;
 
     // Replace the stub `Instance.new` with the real one and install game.
-    let selection = install_command_globals(&lua, dom_rc).map_err(|e| e.to_string())?;
+    let selection = install_command_globals(
+        &lua,
+        dom_rc,
+        script_context,
+        script_source,
+        asset_cookie,
+    )
+    .map_err(|e| e.to_string())?;
 
     match lua.load(source).set_name(name).exec() {
         Ok(()) => {
@@ -1434,19 +1910,54 @@ pub fn reset_command_history() {
     REDO_STACK.with(|r| r.borrow_mut().clear());
 }
 
-fn install_command_globals(lua: &Lua, dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult<Rc<RefCell<Vec<DomRef>>>> {
+fn install_command_globals(
+    lua: &Lua,
+    dom_rc: Rc<RefCell<WeakDom>>,
+    script_context: Option<DomRef>,
+    script_source: Option<&str>,
+    asset_cookie: Option<String>,
+) -> LuaResult<Rc<RefCell<Vec<DomRef>>>> {
     // A handle to a DOM instance is a plain table with a single numeric
     // field "_ref" holding the i64 low-64-bits of the Ref. We keep a
     // per-VM cache so the same Ref always maps to one table (important for
     // `==` and Parent cycles).
     let cache: Rc<RefCell<std::collections::HashMap<DomRef, Table>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
-    let instance_mt = make_instance_metatable(lua, dom_rc.clone(), cache.clone())?;
+    let source_overrides: Rc<RefCell<std::collections::HashMap<DomRef, String>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let instance_mt = make_instance_metatable(
+        lua,
+        dom_rc.clone(),
+        cache.clone(),
+        source_overrides.clone(),
+    )?;
 
     let root_ref = dom_rc.borrow().root_ref();
     let game_table = ref_to_table(lua, dom_rc.clone(), cache.clone(), instance_mt.clone(), root_ref)?;
     lua.globals().set("game", game_table.clone())?;
     lua.globals().set("Game", game_table.clone())?;
+
+    let script_table = if let Some(referent) = script_context {
+        let valid = dom_rc.borrow().get_by_ref(referent)
+            .is_some_and(|instance| is_lua_source_container(instance.class.as_str()));
+        if valid {
+            if let Some(source) = script_source {
+                source_overrides.borrow_mut().insert(referent, source.to_owned());
+            }
+            Some(ref_to_table(
+                lua,
+                dom_rc.clone(),
+                cache.clone(),
+                instance_mt.clone(),
+                referent,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    lua.globals().set("script", script_table.map(Value::Table).unwrap_or(Value::Nil))?;
 
     // Resolve Workspace eagerly; create it if missing.
     let ws = ensure_service(lua, dom_rc.clone(), cache.clone(), instance_mt.clone(), "Workspace")?;
@@ -1633,22 +2144,36 @@ fn install_command_globals(lua: &Lua, dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult
     })?)?;
     lua.globals().set("ChangeHistoryService", chs)?;
 
+    install_command_services(
+        lua,
+        dom_rc.clone(),
+        cache.clone(),
+        instance_mt.clone(),
+        asset_cookie,
+    )?;
+
     // Instance.new(class, [parent])
     let inst_new = {
         let dom = dom_rc.clone();
         let cache = cache.clone();
         let mt = instance_mt.clone();
         lua.create_function(move |lua, (class, parent): (String, Option<Table>)| {
+            if !crate::schema::class_exists(&class) || !crate::schema::class_is_creatable(&class) {
+                return Err(LuaError::runtime(format!("{} is not a creatable Roblox class", class)));
+            }
             let parent_ref = parent
                 .as_ref()
                 .map(|p| table_to_ref(p))
                 .transpose()?
                 .flatten()
                 .unwrap_or_else(|| dom.borrow().root_ref());
-            let r = {
-                let mut d = dom.borrow_mut();
-                d.insert(parent_ref, InstanceBuilder::new(class.clone()))
-            };
+            let r = crate::schema::create_instance_from_schema(
+                &mut *dom.borrow_mut(),
+                parent_ref,
+                &class,
+                &class,
+            )
+            .map_err(|error| LuaError::runtime(error.to_string()))?;
             COMMAND_OUTCOME.with(|o| o.borrow_mut().created.push(r));
             ref_to_table(lua, dom.clone(), cache.clone(), mt.clone(), r)
         })?
@@ -1659,10 +2184,121 @@ fn install_command_globals(lua: &Lua, dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult
     Ok(selection)
 }
 
+fn install_command_services(
+    lua: &Lua,
+    dom: Rc<RefCell<WeakDom>>,
+    cache: Rc<RefCell<std::collections::HashMap<DomRef, Table>>>,
+    mt: Rc<Table>,
+    asset_cookie: Option<String>,
+) -> LuaResult<()> {
+    let run_service = ensure_service(lua, dom.clone(), cache.clone(), mt.clone(), "RunService")?;
+    for event in [
+        "Heartbeat", "Stepped", "RenderStepped", "PreRender", "PreSimulation",
+        "PostSimulation", "PreAnimation", "PostAnimation",
+    ] {
+        if run_service.raw_get::<Value>(event).map_or(true, |value| value.is_nil()) {
+            run_service.raw_set(event, make_signal(lua)?)?;
+        }
+    }
+    run_service.raw_set("IsStudio", lua.create_function(|_, _service: Table| Ok(true))?)?;
+    run_service.raw_set("IsRunning", lua.create_function(|_, _service: Table| Ok(false))?)?;
+    run_service.raw_set("IsClient", lua.create_function(|_, _service: Table| Ok(false))?)?;
+    run_service.raw_set("IsServer", lua.create_function(|_, _service: Table| Ok(false))?)?;
+    let bound_callbacks: Rc<RefCell<std::collections::HashMap<String, (i64, Function)>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let bind_callbacks = bound_callbacks.clone();
+    run_service.raw_set(
+        "BindToRenderStep",
+        lua.create_function(move |_, (_service, name, priority, callback): (Table, String, i64, Function)| {
+            bind_callbacks.borrow_mut().insert(name, (priority, callback));
+            Ok(())
+        })?,
+    )?;
+    let unbind_callbacks = bound_callbacks.clone();
+    run_service.raw_set(
+        "UnbindFromRenderStep",
+        lua.create_function(move |_, (_service, name): (Table, String)| {
+            unbind_callbacks.borrow_mut().remove(&name);
+            Ok(())
+        })?,
+    )?;
+    let render_signal: Table = run_service.raw_get("RenderStepped")?;
+    let fire_connected_callbacks: Function = render_signal.raw_get("Fire")?;
+    let bound_for_render = bound_callbacks.clone();
+    render_signal.raw_set(
+        "Fire",
+        lua.create_function(move |_, (signal, args): (Table, Variadic<Value>)| {
+            let mut callbacks: Vec<(i64, Function)> =
+                bound_for_render.borrow().values().cloned().collect();
+            callbacks.sort_by_key(|(priority, _)| *priority);
+            for (_, callback) in callbacks {
+                callback.call::<()>(args.clone())?;
+            }
+            fire_connected_callbacks.call::<()>((signal, args))
+        })?,
+    )?;
+
+    let insert_service = ensure_service(lua, dom.clone(), cache.clone(), mt.clone(), "InsertService")?;
+    let load_dom = dom;
+    let load_cache = cache;
+    let load_mt = mt;
+    insert_service.raw_set(
+        "LoadAsset",
+        lua.create_function(move |lua, (_service, requested_id): (Table, i64)| {
+            let asset_id = u64::try_from(requested_id)
+                .ok()
+                .filter(|asset_id| *asset_id > 0)
+                .ok_or_else(|| LuaError::runtime("LoadAsset expects a positive asset ID"))?;
+            let cache_key = format!("rbxassetid://{asset_id}");
+            let bytes = if let Some(bytes) = crate::asset_downloader::get_cached_raw(&cache_key)
+                .or_else(|| crate::asset_downloader::get_cached_raw(&asset_id.to_string()))
+            {
+                bytes
+            } else {
+                let bytes = crate::roblox_api::RobloxApiClient::fetch_asset_payload_sync(
+                    asset_id,
+                    asset_cookie.as_deref(),
+                )
+                .map_err(|error| LuaError::runtime(error))?;
+                crate::asset_downloader::store_cached_raw(cache_key, bytes.clone());
+                bytes
+            };
+            let source_dom = crate::rbxl::decode_model_bytes(&bytes)
+                .map_err(|error| LuaError::runtime(error.to_string()))?;
+            let (model_ref, child_count) = {
+                let mut target = load_dom.borrow_mut();
+                let root = target.root_ref();
+                let model_name = format!("Asset_{asset_id}");
+                let model_ref = crate::schema::create_instance_from_schema(
+                    &mut *target,
+                    root,
+                    "Model",
+                    &model_name,
+                )
+                .map_err(|error| LuaError::runtime(error.to_string()))?;
+                let (_, child_count) = crate::rbxl::insert_all_root_children(
+                    &mut *target,
+                    model_ref,
+                    &source_dom,
+                );
+                (model_ref, child_count)
+            };
+            COMMAND_OUTCOME.with(|state| {
+                let mut state = state.borrow_mut();
+                state.created.push(model_ref);
+                state.mutated += child_count;
+            });
+            ref_to_table(lua, load_dom.clone(), load_cache.clone(), load_mt.clone(), model_ref)
+        })?,
+    )?;
+    Ok(())
+}
+
 fn make_instance_metatable(
     lua: &Lua,
     dom: Rc<RefCell<WeakDom>>,
     cache: Rc<RefCell<std::collections::HashMap<DomRef, Table>>>,
+    source_overrides: Rc<RefCell<std::collections::HashMap<DomRef, String>>>,
 ) -> LuaResult<Rc<Table>> {
     let mt = lua.create_table();
 
@@ -1672,6 +2308,7 @@ fn make_instance_metatable(
     let index = {
         let dom = dom.clone();
         let cache = cache.clone();
+        let source_overrides = source_overrides.clone();
         let mt_handle = mt_handle.clone();
         lua.create_function(move |lua, (this, key): (Table, String)| {
             if let Some(f) = method_for(lua, dom.clone(), cache.clone(), mt_handle.borrow().as_ref().unwrap().clone(), &key)? {
@@ -1683,7 +2320,20 @@ fn make_instance_metatable(
                 return Ok(Value::Table(signal));
             }
             let Some(r) = table_to_ref(&this)? else { return Ok(Value::Nil) };
-            enum Resolved { Text(String), Property(DomVariant), Instance(DomRef), Nil }
+            if dom.borrow().root_ref() == r && is_service_class(&key) {
+                if let Ok(global) = lua.globals().get::<Value>(&key) {
+                    if !global.is_nil() { return Ok(global); }
+                }
+                let service = ensure_service(
+                    lua,
+                    dom.clone(),
+                    cache.clone(),
+                    mt_handle.borrow().as_ref().unwrap().clone(),
+                    &key,
+                )?;
+                return Ok(Value::Table(service));
+            }
+            enum Resolved { Text(String), Property(DomVariant, String), Instance(DomRef), Unknown(String), Nil }
             let resolved={
                 let d=dom.borrow();
                 let Some(inst)=d.get_by_ref(r) else{return Ok(Value::Nil);};
@@ -1691,14 +2341,27 @@ fn make_instance_metatable(
                     "Name"=>Resolved::Text(inst.name.clone()),
                     "ClassName"=>Resolved::Text(inst.class.to_string()),
                     "Parent"=>if inst.parent().is_none(){Resolved::Nil}else{Resolved::Instance(inst.parent())},
-                    _=>if let Some(property)=inst.properties.get(&rbx_dom_weak::Ustr::from(key.as_str())){Resolved::Property(property.clone())}
-                        else{inst.children().iter().copied().find(|child|d.get_by_ref(*child).is_some_and(|instance|instance.name==key)).map(Resolved::Instance).unwrap_or(Resolved::Nil)},
+                    "Source" if is_lua_source_container(inst.class.as_str())=>Resolved::Text(
+                        source_overrides.borrow().get(&r).cloned()
+                            .or_else(|| crate::rbxl::get_source(&d, r))
+                            .unwrap_or_default(),
+                    ),
+                    _=>{
+                        let property_key=rbx_dom_weak::Ustr::from(key.as_str());
+                        if let Some(property)=inst.properties.get(&property_key){Resolved::Property(property.clone(),inst.class.to_string())}
+                        else if let Some(default)=crate::schema::default_property_value(inst.class.as_str(),&key){Resolved::Property(default,inst.class.to_string())}
+                        else if let Some(child)=inst.children().iter().copied().find(|child|d.get_by_ref(*child).is_some_and(|instance|instance.name==key)){Resolved::Instance(child)}
+                        else if crate::schema::class_exists(inst.class.as_str())
+                            && crate::schema::resolve_property_type(inst.class.as_str(),&key).is_none(){Resolved::Unknown(inst.class.to_string())}
+                        else{Resolved::Nil}
+                    },
                 }
             };
             Ok(match resolved {
                 Resolved::Text(value)=>Value::String(lua.create_string(&value)),
-                Resolved::Property(value)=>variant_to_value(lua,&value)?,
+                Resolved::Property(value,class)=>variant_to_property_value(lua,&value,&class,&key)?,
                 Resolved::Instance(value)=>Value::Table(ref_to_table(lua,dom.clone(),cache.clone(),mt_handle.borrow().as_ref().unwrap().clone(),value)?),
+                Resolved::Unknown(class)=>return Err(LuaError::runtime(format!("{} is not a valid member of {}",key,class))),
                 Resolved::Nil=>Value::Nil,
             })
         })?
@@ -1708,28 +2371,98 @@ fn make_instance_metatable(
     // __newindex: Name, Parent, and arbitrary properties.
     let newindex = {
         let dom = dom.clone();
+        let source_overrides = source_overrides.clone();
         lua.create_function(move |lua, (this, key, value): (Table, String, Value)| {
             let Some(r) = table_to_ref(&this)? else { return Ok(()) };
             let mut changed=false;
             match key.as_str() {
-                "Name" => if let Value::String(s) = value {
-                    if let Ok(mut d) = dom.try_borrow_mut() { if let Some(i) = d.get_by_ref_mut(r) { i.name = s.to_str()?; changed=true; } }
-                },
-                "ClassName" => {} // read-only
+                "Name" => {
+                    let Value::String(name) = value else {
+                        return Err(LuaError::runtime("Name must be a string"));
+                    };
+                    if let Ok(mut d) = dom.try_borrow_mut() {
+                        if let Some(instance) = d.get_by_ref_mut(r) {
+                            instance.name = name.to_str()?;
+                            changed = true;
+                        }
+                    }
+                }
+                "ClassName" => return Err(LuaError::runtime("ClassName is read-only")),
                 "Parent" => {
                     let new_parent = match value {
-                        Value::Table(t) => table_to_ref(&t)?.unwrap_or(dom.borrow().root_ref()),
+                        Value::Table(t) => table_to_ref(&t)?
+                            .ok_or_else(|| LuaError::runtime("Parent must be an Instance or nil"))?,
                         Value::Nil => dom.borrow().root_ref(),
                         _ => return Err(LuaError::runtime("Parent must be an Instance or nil")),
                     };
                     dom.borrow_mut().transfer_within(r, new_parent); changed=true;
                 }
-                _ => if let Some(variant) = value_to_variant(lua, &value)? {
-                    if let Ok(mut d) = dom.try_borrow_mut() {
-                        if let Some(i) = d.get_by_ref_mut(r) {
-                            i.properties.insert(rbx_dom_weak::Ustr::from(&key), variant);
-                            changed=true;
-                            COMMAND_OUTCOME.with(|o| o.borrow_mut().mutated += 1);
+                "Source" => {
+                    let is_script = dom.borrow().get_by_ref(r)
+                        .is_some_and(|instance| is_lua_source_container(instance.class.as_str()));
+                    if is_script {
+                        let Value::String(source) = &value else {
+                            return Err(LuaError::runtime("Source must be a string"));
+                        };
+                        let source = source.to_str()?.to_owned();
+                        crate::rbxl::set_source(&mut *dom.borrow_mut(), r, source.clone())
+                            .map_err(|error| LuaError::runtime(error.to_string()))?;
+                        source_overrides.borrow_mut().insert(r, source.clone());
+                        COMMAND_SOURCE_UPDATES.with(|updates| updates.borrow_mut().push((r, source)));
+                        changed = true;
+                        COMMAND_OUTCOME.with(|outcome| outcome.borrow_mut().mutated += 1);
+                    } else {
+                        return Err(LuaError::runtime(
+                            "Source is only available on LuaSourceContainer instances",
+                        ));
+                    }
+                }
+                _ => {
+                    let property_key = rbx_dom_weak::Ustr::from(key.as_str());
+                    let (class, existing) = {
+                        let d = dom.borrow();
+                        let Some(instance) = d.get_by_ref(r) else {
+                            return Err(LuaError::runtime("Instance no longer exists"));
+                        };
+                        (
+                            instance.class.to_string(),
+                            instance.properties.get(&property_key).cloned(),
+                        )
+                    };
+                    if existing.is_none()
+                        && crate::schema::class_exists(&class)
+                        && crate::schema::resolve_property_type(&class, &key).is_none()
+                    {
+                        return Err(LuaError::runtime(format!(
+                            "{} is not a valid property of {}",
+                            key, class
+                        )));
+                    }
+                    let default = crate::schema::default_property_value(&class, &key);
+                    if let Some(variant) = value_to_variant(lua, &value)? {
+                        let variant = preserve_variant_type(
+                            existing.as_ref().or(default.as_ref()),
+                            variant,
+                        );
+                        if crate::schema::property_value_matches_type(&class, &key, &variant)
+                            == Some(false)
+                        {
+                            let expected = crate::schema::resolve_property_type(&class, &key)
+                                .map(|data_type| format!("{data_type:?}"))
+                                .unwrap_or_else(|| "the reflected property type".into());
+                            return Err(LuaError::runtime(format!(
+                                "cannot assign a value of the wrong type to {}.{} (expected {})",
+                                class, key, expected
+                            )));
+                        }
+                        if let Ok(mut d) = dom.try_borrow_mut() {
+                            if let Some(instance) = d.get_by_ref_mut(r) {
+                                instance.properties.insert(property_key, variant);
+                                changed = true;
+                                COMMAND_OUTCOME.with(|outcome| {
+                                    outcome.borrow_mut().mutated += 1;
+                                });
+                            }
                         }
                     }
                 }
@@ -1833,23 +2566,27 @@ fn method_for(
             tween.set("Cancel",lua.create_function(|_,_tween:Table|Ok(()))?)?;
             Ok(tween)
         })?),
-        "GetService" => Some(lua.create_function(move |lua, (_this, name): (Table, String)| {
-            // Virtual (non-DOM) services are exposed as globals.
-            match name.as_str() {
-                "Selection" | "ChangeHistoryService" | "CoreGui" | "PluginGuiService"
-                | "UserInputService" | "RunService" | "HttpService" | "MarketplaceService"
-                | "Players" | "Lighting" | "ReplicatedStorage" | "ServerStorage"
-                | "ServerScriptService" | "StarterGui" | "StarterPack" | "StarterPlayer"
-                | "SoundService" | "TweenService" => {
-                    if let Ok(svc) = lua.globals().get::<Value>(&name) {
-                        if !svc.is_nil() { return Ok(svc); }
-                    }
-                }
-                _ => {}
+        "GetService" => Some(lua.create_function(move |lua, (this, name): (Table, String)| {
+            let Some(referent) = table_to_ref(&this)? else {
+                return Err(LuaError::runtime("GetService must be called on a DataModel"));
+            };
+            let is_data_model = d.borrow().get_by_ref(referent)
+                .is_some_and(|instance| instance.class == "DataModel");
+            if !is_data_model {
+                return Err(LuaError::runtime("GetService must be called on a DataModel"));
             }
-            let t = ensure_service(lua, d.clone(), c.clone(), mt.clone(), &name)?;
-            Ok(Value::Table(t))
+            if !is_service_class(&name) {
+                return Err(LuaError::runtime(format!("{} is not a valid service", name)));
+            }
+            // Studio-only services are represented by virtual globals; engine
+            // services are resolved from the loaded place or created lazily.
+            if let Ok(service) = lua.globals().get::<Value>(&name) {
+                if !service.is_nil() { return Ok(service); }
+            }
+            let service = ensure_service(lua, d.clone(), c.clone(), mt.clone(), &name)?;
+            Ok(Value::Table(service))
         })?),
+
         "FindFirstChild" => Some(lua.create_function(move |lua, (this, name): (Table, String)| {
             let Some(r) = table_to_ref(&this)? else { return Ok(Value::Nil) };
             let found = {
@@ -1873,7 +2610,7 @@ fn method_for(
         })?),
         "IsA" => Some(lua.create_function(move |_lua, (this, class): (Table, String)| {
             let Some(r) = table_to_ref(&this)? else { return Ok(false) };
-            Ok(d.borrow().get_by_ref(r).is_some_and(|i| i.class == class))
+            Ok(d.borrow().get_by_ref(r).is_some_and(|i| class_is_a(i.class.as_str(), &class)))
         })?),
         "Clone" => Some(lua.create_function(move |lua, this: Table| {
             let Some(r) = table_to_ref(&this)? else { return Err(LuaError::runtime("cannot clone <destroyed>")) };
@@ -1920,6 +2657,9 @@ fn ensure_service(
     mt: Rc<Table>,
     name: &str,
 ) -> LuaResult<Table> {
+    if !is_service_class(name) {
+        return Err(LuaError::runtime(format!("{} is not a valid service", name)));
+    }
     // Keep this lookup inside one immutable borrow. Borrowing `dom` again from
     // the iterator closure used to panic (`RefCell already borrowed`) as soon
     // as command mode tried to resolve Workspace, aborting the Android app.
@@ -1929,17 +2669,20 @@ fn ensure_service(
         let existing = d.get_by_ref(root).and_then(|root_inst| {
             root_inst.children().iter().copied().find(|c| {
                 d.get_by_ref(*c)
-                    .is_some_and(|i| i.class == name || i.name == name)
+                    .is_some_and(|instance| instance.class == name)
             })
         });
         (root, existing)
     };
     let r = match existing {
         Some(r) => r,
-        None => {
-            let b = InstanceBuilder::new(name).with_name(name);
-            dom.borrow_mut().insert(root, b)
-        }
+        None => crate::schema::create_instance_from_schema(
+            &mut *dom.borrow_mut(),
+            root,
+            name,
+            name,
+        )
+        .map_err(|error| LuaError::runtime(error.to_string()))?,
     };
     ref_to_table(lua, dom, cache, mt, r)
 }
@@ -2013,12 +2756,12 @@ fn variant_to_value(lua: &Lua, v: &DomVariant) -> LuaResult<Value> {
         Variant::Int64(n) => Value::Number(*n as f64),
         Variant::CFrame(cf)=>{let t=lua.create_table();t.set("X",cf.position.x)?;t.set("Y",cf.position.y)?;t.set("Z",cf.position.z)?;for(name,value)in [("R00",cf.orientation.x.x),("R01",cf.orientation.y.x),("R02",cf.orientation.z.x),("R10",cf.orientation.x.y),("R11",cf.orientation.y.y),("R12",cf.orientation.z.y),("R20",cf.orientation.x.z),("R21",cf.orientation.y.z),("R22",cf.orientation.z.z)]{t.set(name,value)?;}let position=lua.create_table();position.set("X",cf.position.x)?;position.set("Y",cf.position.y)?;position.set("Z",cf.position.z)?;t.set("Position",position)?;t.set_metatable(Some(typed_metatable(lua,"CFrame")?));Value::Table(t)}
         Variant::Vector3(v) => {
-            let t = lua.create_table();
-            t.set("X", v.x as f64)?; t.set("Y", v.y as f64)?; t.set("Z", v.z as f64)?;
-            Value::Table(t)
+            let mt = datatype_metatable(lua, "Vector3")?;
+            Value::Table(vector3_value(lua, &mt, v.x as f64, v.y as f64, v.z as f64)?)
         }
         Variant::Vector2(v) => {
-            let t=lua.create_table();t.set("X",v.x as f64)?;t.set("Y",v.y as f64)?;Value::Table(t)
+            let mt = datatype_metatable(lua, "Vector2")?;
+            Value::Table(vector2_value(lua, &mt, v.x as f64, v.y as f64)?)
         }
         Variant::UDim(v) => {
             let t=lua.create_table();t.set("Scale",v.scale as f64)?;t.set("Offset",v.offset as i64)?;Value::Table(t)
@@ -2027,9 +2770,8 @@ fn variant_to_value(lua: &Lua, v: &DomVariant) -> LuaResult<Value> {
             let t=lua.create_table();t.set("XScale",v.x.scale as f64)?;t.set("XOffset",v.x.offset as i64)?;t.set("YScale",v.y.scale as f64)?;t.set("YOffset",v.y.offset as i64)?;Value::Table(t)
         }
         Variant::Color3(c) => {
-            let t = lua.create_table();
-            t.set("R", c.r as f64)?; t.set("G", c.g as f64)?; t.set("B", c.b as f64)?;
-            Value::Table(t)
+            let mt = datatype_metatable(lua, "Color3")?;
+            Value::Table(color3_value(lua, &mt, c.r as f64, c.g as f64, c.b as f64)?)
         }
         Variant::Enum(e) => Value::Number(e.to_u32() as f64),
         Variant::ColorSequence(sequence)=>{let result=lua.create_table();let points=lua.create_table();for(index,point)in sequence.keypoints.iter().enumerate(){let item=lua.create_table();item.set("Time",point.time)?;let value=lua.create_table();value.set("R",point.color.r)?;value.set("G",point.color.g)?;value.set("B",point.color.b)?;item.set("Value",value)?;points.raw_set(index+1,item)?;}result.set("Keypoints",points)?;Value::Table(result)}
@@ -2038,6 +2780,28 @@ fn variant_to_value(lua: &Lua, v: &DomVariant) -> LuaResult<Value> {
         Variant::Rect(rect)=>{let result=lua.create_table();let min=lua.create_table();min.set("X",rect.min.x)?;min.set("Y",rect.min.y)?;let max=lua.create_table();max.set("X",rect.max.x)?;max.set("Y",rect.max.y)?;result.set("Min",min)?;result.set("Max",max)?;Value::Table(result)}
         _ => Value::Nil,
     })
+}
+
+fn variant_to_property_value(
+    lua: &Lua,
+    value: &DomVariant,
+    class_name: &str,
+    property_name: &str,
+) -> LuaResult<Value> {
+    if let DomVariant::Enum(enum_value) = value {
+        if let Some((enum_name, items)) = crate::schema::resolve_enum(class_name, property_name) {
+            let numeric_value = enum_value.to_u32();
+            if let Some((item_name, _)) = items
+                .into_iter()
+                .find(|(_, item_value)| *item_value == numeric_value)
+            {
+                let enum_root: Table = lua.globals().get("Enum")?;
+                let enum_type: Table = enum_root.get(enum_name.as_str())?;
+                return enum_type.get::<Value>(item_name.as_str());
+            }
+        }
+    }
+    variant_to_value(lua, value)
 }
 
 fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
@@ -2084,4 +2848,171 @@ fn value_to_variant(_lua: &Lua, v: &Value) -> LuaResult<Option<DomVariant>> {
         }
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod command_api_tests {
+    use super::*;
+
+    #[test]
+    fn command_bar_binds_script_source_and_reflection_backed_services() {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root_ref = dom.root_ref();
+        let script_ref = dom.insert(
+            root_ref,
+            InstanceBuilder::new("ModuleScript")
+                .with_name("Probe")
+                .with_property("Source", DomVariant::String("saved source".into())),
+        );
+        let dom = Rc::new(RefCell::new(dom));
+        let command = r#"
+            assert(script:IsA("LuaSourceContainer"))
+            assert(script.Source == "unsaved buffer")
+            assert(game:GetService("Workspace") == workspace)
+            assert(game.Workspace == workspace)
+            local runService = game:GetService("RunService")
+            assert(runService:IsA("RunService"))
+            assert(game.RunService == runService)
+            local part = Instance.new("Part")
+            assert(part:IsA("BasePart"))
+        "#;
+
+        run_command_with_script_context(
+            dom.clone(),
+            command,
+            "=command-api-test",
+            Some(script_ref),
+            Some("unsaved buffer"),
+        )
+        .expect("command context and services should resolve");
+
+        let dom = take_command_dom(dom);
+        assert_eq!(
+            crate::rbxl::get_source(&dom, script_ref).as_deref(),
+            Some("saved source"),
+            "reading the editor buffer must not implicitly save it into the place",
+        );
+
+        let dom = Rc::new(RefCell::new(dom));
+        run_command_with_script_context(
+            dom.clone(),
+            r#"script.Source = "command update"; assert(script.Source == "command update")"#,
+            "=command-source-write-test",
+            Some(script_ref),
+            Some("unsaved buffer"),
+        )
+        .expect("Source assignment should update the script");
+        let updates = take_command_source_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].1, "command update");
+
+        let dom = take_command_dom(dom);
+        assert_eq!(
+            crate::rbxl::get_source(&dom, script_ref).as_deref(),
+            Some("command update"),
+        );
+    }
+
+    #[test]
+    fn command_bar_supports_properties_math_enums_and_edit_run_service() {
+        let dom = Rc::new(RefCell::new(WeakDom::new(InstanceBuilder::new("DataModel"))));
+        let command = r#"
+            local part = Instance.new("Part")
+            assert(part:IsA("BasePart"))
+            assert(part.Anchored == false)
+            part.Anchored = true
+            assert(part.Anchored == true)
+            local assignedWrongType = pcall(function() part.Anchored = "yes" end)
+            assert(not assignedWrongType and part.Anchored == true)
+            local unknownMember = pcall(function() return part.NotARealProperty end)
+            assert(not unknownMember)
+            part.Position = Vector3.new(1, 2, 3)
+            assert(typeof(part.Position) == "Vector3")
+            assert((part.Position + Vector3.xAxis).X == 2)
+
+            local v = Vector3.new(3, 4, 0)
+            assert(v.Magnitude == 5)
+            assert(math.abs(v.Unit.Y - 0.8) < 1e-6)
+            assert(v:Dot(Vector3.xAxis) == 3)
+            assert(v:Cross(Vector3.yAxis).Z == 3)
+            assert((v * 2).Y == 8)
+            assert((2 * v).X == 6)
+            assert((v / 2).X == 1.5)
+
+            local v2 = Vector2.new(3, 4)
+            assert(v2.Magnitude == 5)
+            assert(v2:Lerp(Vector2.zero, 0.5).Y == 2)
+
+            local green = Color3.fromHSV(1 / 3, 1, 1)
+            assert(green.R == 0 and green.G == 1 and green.B == 0)
+            local h, s, value = green:ToHSV()
+            assert(math.abs(h - 1 / 3) < 1e-6 and s == 1 and value == 1)
+            assert(green:ToHex() == "00ff00")
+            assert(Color3.fromHex("#ff0000").R == 1)
+
+            local material = Enum.Material.Wood
+            part.Material = material
+            assert(typeof(part.Material) == "EnumItem")
+            assert(part.Material == material)
+            assert(part.Material.EnumType.Name == "Material")
+            assert(#Enum.Material:GetEnumItems() > 0)
+
+            local runService = game:GetService("RunService")
+            assert(runService == game.RunService and runService:IsStudio())
+            assert(not runService:IsRunning())
+            assert(typeof(runService.Heartbeat) == "RBXScriptSignal")
+            local connection = runService.Heartbeat:Connect(function() end)
+            assert(connection.Connected)
+            connection:Disconnect()
+            assert(not connection.Connected)
+            local rendered = false
+            runService:BindToRenderStep("command-test", 1, function(deltaTime)
+                rendered = deltaTime > 0
+            end)
+            runService.RenderStepped:Fire(0.016)
+            assert(rendered)
+            runService:UnbindFromRenderStep("command-test")
+        "#;
+        run_command(dom.clone(), command, "=command-api-behavior-test")
+            .expect("the reflected property, value, and edit-mode service APIs should work");
+    }
+
+    #[test]
+    fn insert_service_loads_a_cached_model_payload_into_the_place() {
+        const ASSET_ID: u64 = 9_876_543_210_123;
+        let mut asset_dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let asset_root = asset_dom.root_ref();
+        asset_dom.insert(
+            asset_root,
+            InstanceBuilder::new("Part").with_name("CacheOnlyAssetPart"),
+        );
+        let mut payload = Vec::new();
+        rbx_binary::to_writer(&mut payload, &asset_dom, &[asset_root])
+            .expect("test model should serialize");
+        crate::asset_downloader::store_cached_raw(
+            format!("rbxassetid://{ASSET_ID}"),
+            payload,
+        );
+
+        let dom = Rc::new(RefCell::new(WeakDom::new(InstanceBuilder::new("DataModel"))));
+        let command = format!(
+            r#"
+                local model = game:GetService("InsertService"):LoadAsset({ASSET_ID})
+                assert(model:IsA("Model"))
+                assert(model.Name == "Asset_{ASSET_ID}")
+                local inserted = model:FindFirstChild("CacheOnlyAssetPart")
+                assert(inserted ~= nil and inserted:IsA("Part"))
+            "#
+        );
+        let outcome = run_command(dom.clone(), &command, "=insert-service-cache-test")
+            .expect("InsertService should load the cached Roblox model bytes");
+        assert_eq!(outcome.created.len(), 1, "the returned asset Model is a command-created instance");
+
+        let dom = take_command_dom(dom);
+        let root = dom.root();
+        let loaded_model = root.children().iter().copied().find(|child| {
+            dom.get_by_ref(*child).is_some_and(|instance| instance.name == format!("Asset_{ASSET_ID}"))
+        });
+        assert!(loaded_model.is_some(), "loaded asset should be inserted into the DataModel");
+    }
 }

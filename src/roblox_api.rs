@@ -248,12 +248,11 @@ impl StudioPresenceReport {
             .map(|s| format!("; location: {s}"))
             .unwrap_or_default();
         format!(
-            "Roblox Studio presence bootstrap sent AppStarted for {} ({}) with browserTrackerId {} from {}; accepted by {}; current presence: {}{}",
+            "AppStarted diagnostic for {} ({}): HTTP success from candidate {}; browserTrackerId from {}; Roblox currently reports {}{} (HTTP success alone does not confirm Studio session state)",
             self.username,
             self.user_id,
-            self.browser_tracker_id,
-            self.browser_tracker_source,
             self.client_status_route,
+            self.browser_tracker_source,
             presence,
             location
         )
@@ -270,24 +269,41 @@ fn studio_presence_channel() -> &'static (Sender<StudioPresenceResult>, Mutex<Re
     })
 }
 
-/// Send the same client-status heartbeat Studio emits on startup.
+fn studio_presence_panic_summary(payload: &(dyn std::any::Any + Send)) -> &'static str {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    match message {
+        Some(message)
+            if message.contains("BorrowMutError") || message.contains("already borrowed") =>
+        {
+            "internal CSRF-state borrow conflict"
+        }
+        _ => "unexpected worker panic; details suppressed",
+    }
+}
+
+/// Best-effort diagnostic for Studio-style client-status reporting.
 ///
-/// Native Studio still carries the legacy `www.roblox.com/client-status/set`
-/// route while newer builds also expose the Matchmaking API Beta
-/// `/matchmaking-api/v1/client-status` shape
-/// `{"browserTrackerId":…, "status":"…"}`. At app start it sends
-/// `status = "AppStarted"`; Roblox then decides whether that session appears
-/// as Online/InStudio. We do this as a best-effort authenticated request and
-/// follow it with a read-only presence query so the UI can tell the user what
-/// Roblox currently reports.
+/// This tries known legacy/Beta candidate routes, then performs a read-only
+/// presence query. A successful HTTP response does not prove the candidate
+/// request changed Roblox session state; the presence API is the only result
+/// shown as the account's current status. Studio 0.741's exact endpoint still
+/// needs confirmation against that executable.
 pub fn start_studio_presence_async(cookie: String) {
     let tx = studio_presence_channel().0.clone();
     std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(|| {
+        let result = match std::panic::catch_unwind(|| {
             WebClient::new_studio_presence_client(&cookie)
                 .and_then(|client| client.bootstrap_studio_presence(&cookie))
-        })
-        .unwrap_or_else(|_| Err("Studio presence worker panicked before returning a result".into()));
+        }) {
+            Ok(result) => result,
+            Err(payload) => Err(format!(
+                "Studio presence worker panicked ({})",
+                studio_presence_panic_summary(payload.as_ref())
+            )),
+        };
         let _ = tx.send(StudioPresenceResult { result });
     });
 }
@@ -766,40 +782,19 @@ impl RobloxApiClient {
         Ok(id)
     }
 
-    /// Publish (overwrite) an EXISTING place through the same hidden
-    /// endpoint: `Data/Upload.ashx?assetid={placeId}&type=Place` with the
-    /// raw `.rbxl` as the body — the way `rojo upload` and older bots pushed
-    /// places for years (roblox-cookie-upload-endpoints.md §4). Cookie-only:
-    /// no Open Cloud API key needed, but the account must have edit access
-    /// to the place. Returns a human-readable success message.
+    /// Compatibility stub for the retired cookie-based place upload path.
+    /// Roblox announced that `data.roblox.com/Data/Upload.ashx` would reject
+    /// place-file uploads starting June 24, 2024; a fresh CSRF token cannot
+    /// override that endpoint policy. Use `publish_place_open_cloud` instead.
+    #[deprecated(note = "Roblox retired place-file uploads through Upload.ashx; use publish_place_open_cloud or publish_place_with_cookie")]
     pub fn publish_place_legacy(
-        cookie: &str,
-        place_id: &str,
-        rbxl_bytes: &[u8],
+        _cookie: &str,
+        _place_id: &str,
+        _rbxl_bytes: &[u8],
     ) -> Result<String, String> {
-        let pid = place_id.trim();
-        if pid.is_empty() || pid.parse::<u64>().is_err() {
-            return Err("Enter a valid numeric Place ID first.".into());
-        }
-        let url = format!(
-            "https://data.roblox.com/Data/Upload.ashx?json=1&assetid={pid}&type=Place&genreTypeId=1"
-        );
-        let text = Self::post_upload_ashx(cookie, &url, rbxl_bytes)?;
-        // Success body is a version/asset id (bare or {"id":...}); any 2xx
-        // means the new version was accepted.
-        let version = serde_json::from_str::<serde_json::Value>(text.trim())
-            .ok()
-            .and_then(|v| v.get("id").and_then(|x| x.as_u64()))
-            .map(|id| format!(" (version id {id})"))
-            .unwrap_or_else(|| {
-                let t = text.trim();
-                if t.is_empty() || t.parse::<u64>().is_err() {
-                    String::new()
-                } else {
-                    format!(" (version id {t})")
-                }
-            });
-        Ok(format!("Place {pid} updated via Upload.ashx{version}"))
+        Err(
+            "Roblox no longer accepts place-file uploads through Upload.ashx (disabled June 24, 2024), regardless of the X-CSRF token. Use the Place Versions API with either an Open Cloud key or your Roblox session cookie.".into(),
+        )
     }
 
     /// Shared POST to the hidden `Data/Upload.ashx` endpoint with full CSRF
@@ -1619,7 +1614,7 @@ impl RobloxApiClient {
         }
 
         let version_type = if is_published { "Published" } else { "Saved" };
-        let url = crate::roblox_domains::open_cloud_publish_url(
+        let url = crate::roblox_domains::place_versions_url(
             u_id.parse().map_err(|_| "Universe ID must be numeric")?,
             p_id.parse().map_err(|_| "Place ID must be numeric")?,
             is_published,
@@ -1660,6 +1655,135 @@ impl RobloxApiClient {
             }
             Err(format!("Roblox Open Cloud error (HTTP {status}): {resp_body}"))
         }
+    }
+
+    /// This app's Cookie-authenticated POST to the public Place Versions API.
+    /// Roblox's API reference lists Cookie as an authentication method; this
+    /// request uses `.ROBLOSECURITY` plus X-CSRF-TOKEN and needs no Open Cloud
+    /// key. Static inspection has not established that Studio 0.741 uses this
+    /// same internal route. This is not the retired Data/Upload.ashx route.
+    pub fn publish_place_with_cookie(
+        cookie: &str,
+        universe_id_str: &str,
+        place_id_str: &str,
+        rbxl_bytes: &[u8],
+        is_published: bool,
+    ) -> Result<String, String> {
+        let cookie = normalize_roblosecurity_cookie(cookie)?;
+        if rbxl_bytes.is_empty() {
+            return Err("Nothing to publish (empty .rbxl data).".into());
+        }
+        let universe_id = universe_id_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "Enter a valid numeric Universe ID first.".to_string())?;
+        let place_id = place_id_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "Enter a valid numeric Place ID first.".to_string())?;
+        let version_type = if is_published { "Published" } else { "Saved" };
+        let url = crate::roblox_domains::place_versions_url(
+            universe_id,
+            place_id,
+            is_published,
+        );
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("Roblox/WinInet")
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|error| format!("HTTP client initialization error: {error}"))?;
+
+        let send = |csrf: Option<&str>| -> Result<reqwest::blocking::Response, String> {
+            let mut request = http
+                .post(&url)
+                .header("Cookie", format!(".ROBLOSECURITY={cookie}"))
+                .header("Content-Type", "application/octet-stream")
+                .header("Accept", "application/json")
+                .body(rbxl_bytes.to_vec());
+            if let Some(token) = csrf {
+                request = request.header("X-CSRF-TOKEN", token);
+            }
+            request
+                .send()
+                .map_err(|error| format!("Cookie-auth place publish network error: {error}"))
+        };
+
+        let mut csrf: Option<String> = None;
+        let mut tried_logout_handshake = false;
+        let mut last_failure: Option<(reqwest::StatusCode, String)> = None;
+        for attempt in 1..=4 {
+            let response = send(csrf.as_deref())?;
+            let status = response.status();
+            let challenged_token = response
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|token| token.to_str().ok())
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned);
+            let body = response.text().unwrap_or_default();
+
+            if status.is_success() {
+                let version_number = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("versionNumber").cloned())
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+                    });
+                return Ok(match version_number {
+                    Some(version) => format!(
+                        "Successfully published place {place_id} through cookie-auth Place Publishing API: version {version} ({version_type})"
+                    ),
+                    None => format!(
+                        "Place {place_id} accepted through cookie-auth Place Publishing API ({version_type}): {}",
+                        snippet(&body)
+                    ),
+                });
+            }
+
+            last_failure = Some((status, body));
+            if attempt == 4 {
+                break;
+            }
+
+            if let Some(token) = challenged_token {
+                if csrf.as_deref() != Some(token.as_str()) {
+                    csrf = Some(token);
+                    continue;
+                }
+            }
+
+            // Some edge responses omit the challenge header. Fall back once
+            // to Roblox's standard logout CSRF handshake, then retry this
+            // same place endpoint with the same cookie.
+            if !tried_logout_handshake {
+                tried_logout_handshake = true;
+                if let Ok(token) = Self::fetch_csrf_token(&cookie) {
+                    if csrf.as_deref() != Some(token.as_str()) {
+                        csrf = Some(token);
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+
+        let (status, body) = last_failure
+            .unwrap_or((reqwest::StatusCode::INTERNAL_SERVER_ERROR, String::new()));
+        let server_message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("message").and_then(|message| message.as_str()).map(str::to_owned));
+        Err(match server_message {
+            Some(message) => format!(
+                "Cookie-auth place publish failed (HTTP {status}): {message}"
+            ),
+            None => format!(
+                "Cookie-auth place publish failed (HTTP {status}): {}",
+                snippet(&body)
+            ),
+        })
     }
 
     /// Read entry from Roblox Open Cloud DataStore API using native in-process HTTP client
@@ -3522,6 +3646,18 @@ fn summarize_http_body(text: &str) -> String {
     }
 }
 
+fn looks_like_html_document(content_type: &str, body: &str) -> bool {
+    let content_type = content_type.to_ascii_lowercase();
+    if content_type.contains("text/html") {
+        return true;
+    }
+    let prefix = body.trim_start().chars().take(256).collect::<String>().to_ascii_lowercase();
+    prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
+        || prefix.starts_with("<head")
+        || prefix.starts_with("<body")
+}
+
 fn find_u64_key_recursive(value: &serde_json::Value, wanted: &[&str]) -> Option<u64> {
     match value {
         serde_json::Value::Object(map) => {
@@ -3578,11 +3714,28 @@ impl WebClient {
     }
 
     /// Build the short-deadline client used by the Settings-panel Studio
-    /// presence bootstrap. That path is only a small status heartbeat plus a
-    /// read-back query; using the longer asset/config timeout made the UI look
-    /// permanently stuck on Android when one Roblox edge endpoint black-holed.
+    /// presence bootstrap. Redirects are disabled on this diagnostic path:
+    /// otherwise a retired status URL can redirect to a login/home page and
+    /// the final 200 response is incorrectly reported as an accepted heartbeat.
     fn new_studio_presence_client(cookie: &str) -> Result<Self, String> {
-        Self::new_with_raw_cookie_timeout(cookie, std::time::Duration::from_secs(8))
+        let cookie = if cookie.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_roblosecurity_cookie(cookie)?
+        };
+        let timeout = std::time::Duration::from_secs(8);
+        let http = reqwest::blocking::Client::builder()
+            .user_agent("RobloxStudio/WinInet rbxl-editor")
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("HTTP client build: {e}"))?;
+        Ok(Self {
+            cookie,
+            csrf: std::cell::RefCell::new(None),
+            http,
+        })
     }
 
     fn new_with_raw_cookie_timeout(
@@ -3663,21 +3816,30 @@ impl WebClient {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<String, String> {
-        // First attempt (possibly without a token).
-        match self.try_send_json_text(url, method, body, self.csrf.borrow().clone()) {
-            Ok(v) => return Ok(v),
+        self.send_json_text_with_retry(|csrf| {
+            self.try_send_json_text(url, method, body, csrf)
+        })
+    }
+
+    /// Keep the cached-token RefCell borrow out of the `match` scrutinee.
+    /// Match scrutinee temporaries live through their arms; borrowing the cell
+    /// there and then calling `borrow_mut` after a CSRF challenge panics with
+    /// `BorrowMutError` instead of retrying the request.
+    fn send_json_text_with_retry(
+        &self,
+        mut send: impl FnMut(Option<String>) -> Result<String, SendError>,
+    ) -> Result<String, String> {
+        let cached_csrf = { self.csrf.borrow().clone() };
+        match send(cached_csrf) {
+            Ok(value) => Ok(value),
             Err(SendError::NeedsToken(new_token)) => {
-                // Server told us the correct token; cache and retry once.
                 *self.csrf.borrow_mut() = Some(new_token.clone());
-                self.try_send_json_text(url, method, body, Some(new_token))
-                    .map_err(|e| match e {
-                        SendError::Http(s) => s,
-                        SendError::NeedsToken(_) => {
-                            "CSRF token rejected on retry".to_string()
-                        }
-                    })
+                send(Some(new_token)).map_err(|error| match error {
+                    SendError::Http(message) => message,
+                    SendError::NeedsToken(_) => "CSRF token rejected on retry".to_string(),
+                })
             }
-            Err(SendError::Http(s)) => Err(s),
+            Err(SendError::Http(message)) => Err(message),
         }
     }
 
@@ -3731,11 +3893,22 @@ impl WebClient {
             .send()
             .map_err(|e| format!("GET {url}: {e}"))?;
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
         let text = resp.text().map_err(|e| format!("read body: {e}"))?;
         if !status.is_success() {
             return Err(format!(
                 "GET {url} → {status}: {}",
                 summarize_http_body(&text)
+            ));
+        }
+        if looks_like_html_document(&content_type, &text) {
+            return Err(format!(
+                "GET {url} → {status}: returned HTML rather than a client-status response"
             ));
         }
         Ok(text)
@@ -3831,7 +4004,10 @@ impl WebClient {
             "POST",
             &body,
         ) {
-            Ok(_) => return Ok("www/client-status/set POST".into()),
+            Ok(response) if !looks_like_html_document("", &response) => {
+                return Ok("www/client-status/set POST".into());
+            }
+            Ok(_) => errors.push("legacy POST: returned an HTML page".into()),
             Err(error) => errors.push(format!("legacy POST: {error}")),
         }
 
@@ -3840,7 +4016,10 @@ impl WebClient {
             "POST",
             &body,
         ) {
-            Ok(_) => return Ok("matchmaking-api client-status POST".into()),
+            Ok(response) if !looks_like_html_document("", &response) => {
+                return Ok("matchmaking-api client-status POST".into());
+            }
+            Ok(_) => errors.push("matchmaking POST: returned an HTML page".into()),
             Err(error) => errors.push(format!("matchmaking POST: {error}")),
         }
 
@@ -4195,6 +4374,37 @@ impl WebClient {
 
     // ---- Groups / universes browser -------------------------------------
 
+    /// List experiences owned by the authenticated user. Roblox's website
+    /// experience list uses `accessFilter=2`, which includes the user's
+    /// non-public experiences when their account has permission to edit them.
+    pub fn user_universes(&self, user_id: u64) -> Result<Vec<GroupUniverse>, String> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _page in 0..20 {
+            let mut url = format!(
+                "https://games.roblox.com/v2/users/{user_id}/games?accessFilter=2&limit=50&sortOrder=Asc"
+            );
+            if let Some(cursor) = &cursor {
+                url.push_str("&cursor=");
+                url.push_str(&percent_encode_query_component(cursor));
+            }
+            let value = self.get_json(&url)?;
+            if let Some(items) = value.get("data").and_then(|data| data.as_array()) {
+                all.extend(items.iter().filter_map(|item| {
+                    serde_json::from_value::<GroupUniverse>(item.clone()).ok()
+                }));
+            }
+            cursor = value
+                .get("nextPageCursor")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            if cursor.is_none() {
+                return Ok(all);
+            }
+        }
+        Err("user experiences exceeded the 20-page safety limit".into())
+    }
+
     /// List experiences (universes) under a group, paging through all
     /// results. `access_filter`: 1=public, 2=all (needs edit permission).
     pub fn group_universes(
@@ -4307,10 +4517,25 @@ pub struct GroupUniverse {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
+    #[serde(default, rename = "playing", alias = "playerCount", alias = "player_count")]
     pub player_count: Option<u64>,
-    #[serde(default)]
+    #[serde(default, rename = "rootPlaceId", alias = "root_place_id")]
     pub root_place_id: Option<u64>,
+    #[serde(default, rename = "rootPlace")]
+    root_place: Option<serde_json::Value>,
+}
+
+impl GroupUniverse {
+    /// Resolve either response shape returned by Roblox: a direct
+    /// `rootPlaceId`, or a nested `rootPlace: { id: ... }` record.
+    pub fn primary_place_id(&self) -> Option<u64> {
+        self.root_place_id.or_else(|| {
+            self.root_place.as_ref().and_then(|root| {
+                root.as_u64()
+                    .or_else(|| root.get("id").and_then(serde_json::Value::as_u64))
+            })
+        })
+    }
 }
 
 enum SendError {
@@ -4322,6 +4547,27 @@ enum SendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn studio_presence_does_not_accept_html_login_pages_as_heartbeats() {
+        assert!(looks_like_html_document("text/html; charset=utf-8", "ok"));
+        assert!(looks_like_html_document("", " <!DOCTYPE html><html><body>login</body></html>"));
+        assert!(!looks_like_html_document("application/json", "{}"));
+    }
+
+    #[test]
+    fn universe_listing_accepts_both_root_place_response_shapes() {
+        let direct: GroupUniverse = serde_json::from_str(
+            r#"{"id":10,"name":"Direct","playing":7,"rootPlaceId":20}"#,
+        ).unwrap();
+        assert_eq!(direct.player_count, Some(7));
+        assert_eq!(direct.primary_place_id(), Some(20));
+
+        let nested: GroupUniverse = serde_json::from_str(
+            r#"{"id":11,"name":"Nested","rootPlace":{"id":21,"name":"Start"}}"#,
+        ).unwrap();
+        assert_eq!(nested.primary_place_id(), Some(21));
+    }
 
     #[test]
     fn extracts_browser_tracker_id_from_plain_cookie_header() {
@@ -4339,5 +4585,51 @@ mod tests {
     fn percent_encodes_client_status_query_component() {
         assert_eq!(percent_encode_query_component("AppStarted"), "AppStarted");
         assert_eq!(percent_encode_query_component("Joining Game"), "Joining%20Game");
+    }
+
+    #[test]
+    fn csrf_challenge_refreshes_cached_token_without_refcell_panic() {
+        let client = WebClient::new_with_raw_cookie_timeout(
+            "",
+            std::time::Duration::from_secs(1),
+        )
+        .expect("test HTTP client should build");
+        *client.csrf.borrow_mut() = Some("stale-token".into());
+
+        let mut seen_tokens = Vec::new();
+        let mut attempts = 0;
+        let result = client.send_json_text_with_retry(|token| {
+            attempts += 1;
+            seen_tokens.push(token.clone());
+            if attempts == 1 {
+                Err(SendError::NeedsToken("fresh-token".into()))
+            } else {
+                Ok("accepted".into())
+            }
+        });
+
+        assert_eq!(result.as_deref(), Ok("accepted"));
+        assert_eq!(
+            seen_tokens,
+            vec![Some("stale-token".into()), Some("fresh-token".into())]
+        );
+        assert_eq!(client.csrf.borrow().as_deref(), Some("fresh-token"));
+    }
+
+    #[test]
+    fn studio_presence_panic_summary_is_safe_and_specific_for_csrf_borrow() {
+        let csrf_panic: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("already borrowed: BorrowMutError"));
+        assert_eq!(
+            studio_presence_panic_summary(csrf_panic.as_ref()),
+            "internal CSRF-state borrow conflict"
+        );
+
+        let sensitive_panic: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("cookie=do-not-print"));
+        assert_eq!(
+            studio_presence_panic_summary(sensitive_panic.as_ref()),
+            "unexpected worker panic; details suppressed"
+        );
     }
 }

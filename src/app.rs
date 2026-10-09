@@ -229,8 +229,6 @@ pub struct EditorApp {
     catalog_thumbs_fetched_for: String,
     is_searching_live: bool,
     direct_asset_id_input: String,
-    /// Place ID typed in the toolbar "🌐 Open from Roblox" field.
-    open_place_id_input: String,
     roblosecurity_cookie: String,
     /// Studio-style Roblox presence/client-status bootstrap shown in Settings.
     studio_presence_status: String,
@@ -369,6 +367,14 @@ pub struct EditorApp {
     /// Last successful join config from gamejoin (has the server endpoints);
     /// enables the transport-resolution button.
     team_create_join_config: Option<serde_json::Value>,
+    /// App-owned transport worker channel; the QUIC runtime and persistent
+    /// receive loop live on the worker, never on the egui frame thread.
+    team_create_session_rx: Option<Receiver<crate::team_create::RbxTransportSessionEvent>>,
+    team_create_session_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    team_create_session_running: bool,
+    /// QUIC/TLS handshake milestone only; not BaseClient-connected or Team Create-accepted.
+    team_create_session_quic_handshake_complete: bool,
+    team_create_session_status: String,
 
     // Per-property text buffers so number properties (float/int, and vector
     // components) can be TYPED exactly like Studio instead of only dragged.
@@ -451,7 +457,6 @@ impl Default for EditorApp {
             catalog_thumbs_fetched_for: String::new(),
             is_searching_live: false,
             direct_asset_id_input: "47433".into(),
-            open_place_id_input: String::new(),
             roblosecurity_cookie: saved_settings.roblosecurity_cookie,
             studio_presence_status: String::new(),
             studio_presence_in_flight: false,
@@ -521,6 +526,11 @@ impl Default for EditorApp {
             game_cfg_response: String::new(),
             team_create_response: String::new(),
             team_create_join_config: None,
+            team_create_session_rx: None,
+            team_create_session_cancel: None,
+            team_create_session_running: false,
+            team_create_session_quic_handshake_complete: false,
+            team_create_session_status: String::new(),
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
@@ -540,6 +550,14 @@ impl Default for EditorApp {
         RobloxApiClient::fetch_live_catalog_async("sword".into());
         app.is_searching_live = true;
         app
+    }
+}
+
+impl Drop for EditorApp {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.team_create_session_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -652,7 +670,7 @@ impl EditorApp {
             return;
         };
         self.studio_presence_status =
-            "Sending native Studio client-status presence to Roblox…".into();
+            "Checking candidate Studio status routes and reading Roblox presence…".into();
         self.studio_presence_in_flight = true;
         self.studio_presence_started_at = Some(Instant::now());
         roblox_api::start_studio_presence_async(cookie);
@@ -742,16 +760,8 @@ impl EditorApp {
                     if ui.button(RichText::new("📂 Open .rbxl").strong()).clicked() {
                         jni_bridge::trigger_open_document();
                     }
-                    // Open a place directly from Roblox by place ID using the
-                    // cookie-authenticated web client. Downloads the .rbxl then
-                    // loads it exactly like a local file open.
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.open_place_id_input)
-                            .hint_text("place ID")
-                            .desired_width(if compact { 72.0 } else { 90.0 }),
-                    );
-                    if ui.button(if compact { "🌐 Roblox" } else { "🌐 Open from Roblox" }).clicked() {
-                        self.open_place_from_roblox();
+                    if ui.button(if compact { "🗺 Places" } else { "🗺 Place Explorer" }).clicked() {
+                        self.active_tab = ActiveTab::Browse;
                     }
                     if compact {
                         ui.menu_button("⋮ More", |ui| {
@@ -879,7 +889,7 @@ impl EditorApp {
                             tab_btn(ui, "📜 Snippets", ActiveTab::Snippets);
                             tab_btn(ui, "☁️ Creator Store", ActiveTab::Assets);
                             tab_btn(ui, "🧩 Plugins", ActiveTab::Plugins);
-                            tab_btn(ui, "🌐 Browse Roblox", ActiveTab::Browse);
+                            tab_btn(ui, "🗺 Place Explorer", ActiveTab::Browse);
                             tab_btn(ui, "🚀 Open Cloud", ActiveTab::OpenCloud);
                             tab_btn(ui, "▶ Command Bar", ActiveTab::Command);
                             tab_btn(ui, "🖥️ Output", ActiveTab::Output);
@@ -1621,6 +1631,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 // Section 1: Authentication & Universe Config
                 ui.group(|ui| {
                     ui.label(RichText::new("🔑 Open Cloud Authentication & Target").heading().color(Color32::from_rgb(100, 200, 255)));
+                    ui.label(RichText::new("Choose a place in Place Explorer to auto-fill these target IDs; they remain editable here.").weak());
                     ui.horizontal(|ui| {
                         ui.label("API Key:");
                         ui.add(egui::TextEdit::singleline(&mut self.open_cloud_api_key).password(true).desired_width(180.0));
@@ -1638,9 +1649,9 @@ ui.label("Place ID:");
                 // Section 2: Direct Place Publishing
                 ui.group(|ui| {
                     ui.label(RichText::new("🚀 Publish Active Place to Live Universe").heading().color(Color32::from_rgb(120, 255, 120)));
-                    ui.label("Serializes the active .rbxl in memory and streams it to Roblox. Uses the Open Cloud API when a key is set; otherwise (or if Open Cloud fails) it falls back to the cookie-authenticated Upload.ashx endpoint — only the Place ID is needed for that path.");
+                    ui.label("Serializes the active .rbxl and sends this app's documented Place Versions API request. Authenticate with an Open Cloud API key or your saved .ROBLOSECURITY cookie (the public API reference lists Cookie auth; Studio 0.741's exact internal route is not confirmed). Requires the correct Universe ID and Place ID. This app does not use Upload.ashx for place files.");
 
-                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published; Upload.ashx fallback always goes live)");
+                    ui.checkbox(&mut self.open_cloud_publish_live, "Publish Live to Players (versionType=Published; unchecked saves a version only)");
 
                     if ui.button(RichText::new("⚡ Publish Place Now").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
                         self.publish_place_to_roblox();
@@ -1778,7 +1789,7 @@ ui.label("Place ID:");
                 // replication client (UDP/RakNet) is a future stage.
                 ui.group(|ui| {
                     ui.label(RichText::new("👥 Team Create Sessions").heading().color(Color32::from_rgb(120, 200, 255)));
-                    ui.label("Cookie-auth control plane: check/enable Team Create, see who's in the cloud-edit session, and negotiate a join (returns the session server's address). Uses the Universe/Place IDs above.");
+                    ui.label("Cookie-auth control plane: check/enable Team Create, view cloud-edit members, and negotiate a join. Start Transport Session runs on a background worker; after QUIC/TLS completes, a receive loop stays active until stopped or the peer closes. This is not the native BaseClient connected state or Team Create acceptance; early auth/channel-control data remains unsent.");
 
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("🔄 Check Status").clicked() {
@@ -1860,23 +1871,30 @@ ui.label("Place ID:");
                     });
 
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("🎫 Negotiate Join").clicked() {
+                        let can_start = !self.team_create_session_running;
+                        if ui
+                            .add_enabled(can_start, egui::Button::new("🎫 Negotiate Join"))
+                            .clicked()
+                        {
                             self.team_create_negotiate(false, false, false);
                         }
-                        if ui.button("⚡ Warm Up Server").clicked() {
+                        if ui
+                            .add_enabled(can_start, egui::Button::new("⚡ Warm Up Server"))
+                            .clicked()
+                        {
                             self.team_create_negotiate(true, false, false);
                         }
                         if ui
-                            .button("🎯 Fresh Join + Resolve")
+                            .add_enabled(can_start, egui::Button::new("🎯 Fresh Join + Session"))
                             .on_hover_text(
-                                "Negotiates a brand-new one-use ticket and immediately resolves the selected transport with the normal KeyRing send version",
+                                "Negotiates a brand-new one-use ticket and immediately starts the selected transport session with the normal KeyRing send version",
                             )
                             .clicked()
                         {
                             self.team_create_negotiate(false, true, false);
                         }
                         if ui
-                            .button("🛟 Fresh Revert-Key Probe")
+                            .add_enabled(can_start, egui::Button::new("🛟 Fresh Revert-Key Session"))
                             .on_hover_text(
                                 "Negotiates another fresh ticket and models native DFFlag::KeyRingRevert selection; use when send and revert versions differ",
                             )
@@ -1884,29 +1902,40 @@ ui.label("Place ID:");
                         {
                             self.team_create_negotiate(false, true, true);
                         }
-                        let can_probe = self
-                            .team_create_join_config
-                            .as_ref()
-                            .is_some_and(|cfg| !crate::team_create::parse_join_config(cfg).is_empty());
+                        let can_probe = can_start
+                            && self
+                                .team_create_join_config
+                                .as_ref()
+                                .is_some_and(|cfg| !crate::team_create::parse_join_config(cfg).is_empty());
                         let probe = ui
-                            .add_enabled(can_probe, egui::Button::new("📡 Resolve Rbx Transport"))
+                            .add_enabled(can_probe, egui::Button::new("📡 Start Transport Session"))
                             .on_hover_text(if can_probe {
-                                "Maps the current Team Create config through the 0.741 transport selector. Legacy RakNet configs are probed; RbxTransport configs are preserved for the QUIC path. The join ticket is one-use."
+                                "Consumes this one-use gamejoin config and keeps the selected transport's receive loop alive on a worker. A QUIC/TLS handshake alone does not mean BaseClient connected or Team Create accepted."
                             } else {
-                                "Run Negotiate Join immediately before each transport resolution; encrypted early-auth material is one-use"
+                                "Negotiate Join immediately before each transport session; the join ticket is one-use"
                             });
                         if probe.clicked() {
                             // Request2 pre-auth MACs are replay-protected. Consume the
                             // config so a second click cannot silently reuse a ticket.
                             if let Some(cfg) = self.team_create_join_config.take() {
-                                self.status = "Resolving Team Create transport…".into();
-                                let report = crate::team_create::probe_join_config(&cfg, 3, 2500);
-                                self.log_info(format!("Team Create transport resolution:\n{report}"));
-                                self.team_create_response = report;
-                                self.status = "Team Create transport resolution finished — see panel output".into();
+                                self.start_team_create_transport_session(cfg, false, None);
                             }
                         }
+                        let stop_label = if self.team_create_session_quic_handshake_complete {
+                            "⏹ Stop QUIC Receive Session"
+                        } else {
+                            "⏹ Cancel QUIC Connect"
+                        };
+                        if self.team_create_session_running && ui.button(stop_label).clicked() {
+                            if let Some(cancel) = &self.team_create_session_cancel {
+                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            self.team_create_session_status = "Stopping Team Create transport session…".into();
+                        }
                     });
+                    if !self.team_create_session_status.is_empty() {
+                        ui.label(RichText::new(&self.team_create_session_status).weak());
+                    }
 
                     if !self.team_create_response.is_empty() {
                         ui.horizontal(|ui| {
@@ -2029,6 +2058,9 @@ ui.label("Place ID:");
     fn show_explorer_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Explorer");
+            if ui.button("🗺 Place Explorer").clicked() {
+                self.active_tab = ActiveTab::Browse;
+            }
             ui.add(
                 egui::TextEdit::singleline(&mut self.explorer_search)
                     .hint_text("🔍 Filter tree...")
@@ -4593,6 +4625,7 @@ ui.label("Place ID:");
     fn drain_events(&mut self) {
         // Poll the live-session bridge (connected Studio companion plugin).
         self.drain_live_session_events();
+        self.pump_team_create_session_events();
         // Drain any background plugin-run log lines / completion.
         self.pump_plugin_logs();
         self.pump_plugin_thumbnails();
@@ -4893,6 +4926,16 @@ ui.label("Place ID:");
                         self.browse_universes.len()
                     );
                 }
+                FileEvent::UserUniverses { user_id, universes, thumbs } => {
+                    self.browse_universes = universes;
+                    self.browse_thumbnails.extend(thumbs);
+                    self.browse_selected_universe = None;
+                    self.browse_places.clear();
+                    self.browse_status = format!(
+                        "Loaded {} experience(s) owned by account {user_id}",
+                        self.browse_universes.len()
+                    );
+                }
                 FileEvent::UniversePlaces { universe_id, places } => {
                     self.browse_selected_universe = Some(universe_id);
                     self.browse_places = places;
@@ -5050,7 +5093,8 @@ ui.label("Place ID:");
                                 )
                             ))
                         });
-                        let items = index.map(|index| index.complete_at(referent, &text, cursor))
+                        let items = index.as_ref()
+                            .map(|index| index.complete_at(referent, &text, cursor))
                             .unwrap_or_default();
                         let payload: Vec<_> = items.into_iter().take(24).map(|item| serde_json::json!({
                             "label": item.label,
@@ -5060,6 +5104,38 @@ ui.label("Place ID:");
                         })).collect();
                         if let Ok(json) = serde_json::to_string(&payload) {
                             jni_bridge::update_native_completions(script_id, &json);
+                        }
+                    }
+                }
+                FileEvent::NativeEditorSignatureChanged { script_id, text, cursor } => {
+                    if let Some(referent) = self.pending_external_edits.get(&script_id).copied() {
+                        let cursor_utf16 = cursor;
+                        let cursor = utf16_to_char_index(&text, cursor_utf16);
+                        if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.referent == referent) {
+                            tab.buffer = text.clone();
+                        }
+                        let index = self.project_index_cache.clone().or_else(|| {
+                            self.dom.as_ref().map(|dom| std::sync::Arc::new(
+                                luau_intelligence::ProjectIndex::build_with_overrides(
+                                    dom,
+                                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                                )
+                            ))
+                        });
+                        let signature = index.as_ref()
+                            .and_then(|index| index.signature_help_at(referent, &text, cursor));
+                        let payload = if let Some(help) = signature {
+                            serde_json::json!({
+                                "name": help.name,
+                                "parameters": help.parameters,
+                                "activeParameter": help.active_parameter,
+                                "cursorUtf16": cursor_utf16,
+                            })
+                        } else {
+                            serde_json::json!({ "cursorUtf16": cursor_utf16 })
+                        };
+                        if let Ok(json) = serde_json::to_string(&payload) {
+                            jni_bridge::update_native_signature_help(script_id, &json);
                         }
                     }
                 }
@@ -5087,10 +5163,11 @@ ui.label("Place ID:");
     fn show_command_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("▶ Command Bar");
         ui.label(RichText::new(
-            "Run Luau against this editor's local DataModel. Use game, workspace, \
-             Instance.new, properties, children, Clone/Destroy, Selection, and \
-             ChangeHistoryService. A connected Live Session can instead execute \
-             the command inside Roblox Studio.",
+            "Run Luau against this editor's DataModel: reflected Instance properties and defaults, \
+             Enum items, Vector2/Vector3 math, Color3 HSV/hex conversions, edit-mode RunService, \
+             and InsertService:LoadAsset (cached assets first; network fetch may block and uses the \
+             saved Roblox cookie when required). This host subset has no full physics/render loop; \
+             a connected Live Session executes the command inside Studio.",
         ).weak());
 
         ui.separator();
@@ -5175,12 +5252,38 @@ ui.label("Place ID:");
                     text: "(sent to Studio; result will appear in its Output window)".into(),
                 });
             } else if self.dom.is_some() {
+                // Use the active editor buffer as the command's script context;
+                // fall back to the selected script if no source tab is active.
+                let is_source_container = |class: &str| {
+                    schema::class_is_subclass_of(class, "LuaSourceContainer")
+                        || matches!(class, "Script" | "LocalScript" | "ModuleScript")
+                };
+                let script_context = self.open_tabs.get(self.active_script_idx).and_then(|tab| {
+                    let dom = self.dom.as_ref()?;
+                    let instance = dom.get_by_ref(tab.referent)?;
+                    is_source_container(instance.class.as_str())
+                        .then(|| (tab.referent, tab.buffer.clone()))
+                }).or_else(|| {
+                    let referent = self.selected?;
+                    let dom = self.dom.as_ref()?;
+                    let instance = dom.get_by_ref(referent)?;
+                    is_source_container(instance.class.as_str()).then(|| {
+                        (referent, rbxl::get_source(dom, referent).unwrap_or_default())
+                    })
+                });
+
                 // Run against the REAL loaded DataModel.
                 use std::cell::RefCell;
                 use std::rc::Rc;
                 let taken = self.dom.take().unwrap();
                 let rc = Rc::new(RefCell::new(taken));
-                match lua_runtime::run_command(rc.clone(), &src, "=command") {
+                let script_ref = script_context.as_ref().map(|(referent, _)| *referent);
+                let script_source = script_context.as_ref().map(|(_, source)| source.as_str());
+                let asset_cookie = (!self.roblosecurity_cookie.trim().is_empty())
+                    .then_some(self.roblosecurity_cookie.as_str());
+                match lua_runtime::run_command_with_script_context_and_cookie(
+                    rc.clone(), &src, "=command", script_ref, script_source, asset_cookie,
+                ) {
                     Ok(outcome) => {
                         for line in lua_runtime::take_command_log() {
                             self.command_output.push(line);
@@ -5244,6 +5347,14 @@ ui.label("Place ID:");
                             level: lua_runtime::Level::Error, text: e,
                         });
                         self.dom = Some(lua_runtime::take_command_dom(rc));
+                    }
+                }
+                for (referent, source) in lua_runtime::take_command_source_updates() {
+                    if let Some(tab) = self.open_tabs.iter_mut()
+                        .find(|tab| tab.referent == referent)
+                    {
+                        tab.buffer = source.clone();
+                        tab.previous_buffer = source;
                     }
                 }
             } else {
@@ -5716,8 +5827,43 @@ ui.label("Place ID:");
     }
 
     // ------------------------------------------------------------------
-    // Browse Roblox tab: group -> universes -> places, with thumbnails.
+    // Browse Roblox tab: account/group -> experiences -> places.
     // ------------------------------------------------------------------
+    fn browse_load_my_experiences(&self) {
+        let Some(cookie) = self.roblosecurity_cookie() else {
+            jni_bridge::queue_browse_error("Set your .ROBLOSECURITY cookie in Settings first".into());
+            return;
+        };
+        std::thread::spawn(move || {
+            let client = match roblox_api::RobloxApiClient::web_client(&cookie) {
+                Ok(client) => client,
+                Err(error) => {
+                    jni_bridge::queue_browse_error(error);
+                    return;
+                }
+            };
+            let (user_id, _) = match client.whoami() {
+                Ok(user) => user,
+                Err(error) => {
+                    jni_bridge::queue_browse_error(format!("Could not identify the signed-in account: {error}"));
+                    return;
+                }
+            };
+            let universes = match client.user_universes(user_id) {
+                Ok(universes) => universes,
+                Err(error) => {
+                    jni_bridge::queue_browse_error(error);
+                    return;
+                }
+            };
+            let ids: Vec<u64> = universes.iter().map(|universe| universe.id).collect();
+            let thumbs = client
+                .thumbnails_batch(&ids, "GameIcon", "150x150")
+                .unwrap_or_default();
+            jni_bridge::queue_user_universes(user_id, universes, thumbs);
+        });
+    }
+
     fn browse_load_group(&self, group_id: u64) {
         let cookie = self.roblosecurity_cookie();
         std::thread::spawn(move || {
@@ -5775,17 +5921,199 @@ ui.label("Place ID:");
         });
     }
 
-    /// Build a read-only cookie Option for background threads.
-    /// Team Create join negotiation (or preemptive server warm-up): POST the
-    /// gamejoin request and summarize the returned server config — the
-    /// address/port the UDP replication client would connect to. Proves the
-    /// whole cookie → session → server pipeline works from this device.
+    fn pump_team_create_session_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = self.team_create_session_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                crate::team_create::RbxTransportSessionEvent::Status(status) => {
+                    self.team_create_session_status = status;
+                }
+                crate::team_create::RbxTransportSessionEvent::QuicHandshakeComplete(status) => {
+                    self.team_create_session_quic_handshake_complete = true;
+                    self.team_create_session_status = status.clone();
+                    self.status = "RbxTransport QUIC/TLS handshake complete; receive loop running (Team Create acceptance not confirmed)".into();
+                    self.log_info(status);
+                }
+                crate::team_create::RbxTransportSessionEvent::Finished(report) => {
+                    self.team_create_response = report.clone();
+                    self.team_create_session_status =
+                        "Team Create transport session finished — see output".into();
+                    self.status = self.team_create_session_status.clone();
+                    self.log_info(format!("Team Create transport session:\n{report}"));
+                    self.team_create_session_running = false;
+                    self.team_create_session_quic_handshake_complete = false;
+                    self.team_create_session_cancel = None;
+                    self.team_create_session_rx = None;
+                }
+            }
+        }
+
+        if disconnected && self.team_create_session_running {
+            self.team_create_session_running = false;
+            self.team_create_session_quic_handshake_complete = false;
+            self.team_create_session_cancel = None;
+            self.team_create_session_rx = None;
+            self.team_create_session_status =
+                "Team Create transport worker exited without a final report".into();
+            self.team_create_response = self.team_create_session_status.clone();
+            self.status = self.team_create_session_status.clone();
+            let error = self.team_create_session_status.clone();
+            self.log_error(error);
+        }
+    }
+
+    fn start_team_create_session_worker<F>(&mut self, initial_status: String, worker: F)
+    where
+        F: FnOnce(
+                Sender<crate::team_create::RbxTransportSessionEvent>,
+                std::sync::Arc<std::sync::atomic::AtomicBool>,
+            ) + Send
+            + 'static,
+    {
+        if self.team_create_session_running {
+            self.team_create_session_status =
+                "A Team Create transport session is already running".into();
+            return;
+        }
+        let (event_tx, event_rx): (
+            Sender<crate::team_create::RbxTransportSessionEvent>,
+            Receiver<crate::team_create::RbxTransportSessionEvent>,
+        ) = channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.team_create_session_rx = Some(event_rx);
+        self.team_create_session_cancel = Some(std::sync::Arc::clone(&cancel));
+        self.team_create_session_running = true;
+        self.team_create_session_quic_handshake_complete = false;
+        self.team_create_session_status = initial_status.clone();
+        self.team_create_response = initial_status.clone();
+        self.status = initial_status;
+        std::thread::spawn(move || worker(event_tx, cancel));
+    }
+
+    fn start_team_create_transport_session(
+        &mut self,
+        config: serde_json::Value,
+        key_ring_revert: bool,
+        report_prefix: Option<String>,
+    ) {
+        self.start_team_create_session_worker(
+            "Starting Team Create transport session…".into(),
+            move |event_tx, cancel| {
+                crate::team_create::run_join_config_session(
+                    config,
+                    3,
+                    2500,
+                    key_ring_revert,
+                    report_prefix,
+                    cancel,
+                    event_tx,
+                );
+            },
+        );
+    }
+
+    fn start_team_create_fresh_join_session(&mut self, key_ring_revert: bool) {
+        if self.team_create_session_running {
+            self.team_create_session_status =
+                "Stop the current Team Create transport session before starting a fresh join".into();
+            return;
+        }
+        let Some(cookie) = self.roblosecurity_cookie() else {
+            self.team_create_response =
+                "Set your .ROBLOSECURITY cookie in the Settings tab first".into();
+            return;
+        };
+        let place_id = self.open_cloud_place_id.trim().to_owned();
+        let key_mode = if key_ring_revert {
+            "KeyRingRevert"
+        } else {
+            "normal send"
+        };
+        let report_prefix = format!(
+            "Fresh gamejoin config handed directly to the selected transport path ({key_mode} key selection; one-use config consumed once).\n"
+        );
+        self.team_create_join_config = None;
+        self.log_info(format!(
+            "Starting fresh Team Create join plus transport session ({key_mode}) for place {place_id}"
+        ));
+        self.start_team_create_session_worker(
+            "Requesting a fresh Team Create join config…".into(),
+            move |event_tx, cancel| {
+                match RobloxApiClient::team_create_join(&cookie, &place_id, false) {
+                    Ok(config) => {
+                        let endpoints = crate::team_create::parse_join_config(&config);
+                        if endpoints.is_empty() {
+                            let reason = if crate::team_create::join_response_is_all_null(&config) {
+                                "gamejoin returned only null/empty values; no transport session was started"
+                            } else {
+                                "gamejoin returned no usable server endpoint; no transport session was started"
+                            };
+                            let _ = event_tx.send(
+                                crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                                    "{report_prefix}{reason}"
+                                )),
+                            );
+                            return;
+                        }
+                        let _ = event_tx.send(
+                            crate::team_create::RbxTransportSessionEvent::Status(
+                                "Fresh gamejoin config received; entering the selected transport without a second UI step…".into(),
+                            ),
+                        );
+                        crate::team_create::run_join_config_session(
+                            config,
+                            3,
+                            2500,
+                            key_ring_revert,
+                            Some(report_prefix),
+                            cancel,
+                            event_tx,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(
+                            crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                                "Fresh Team Create join failed: {error}"
+                            )),
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    /// Fetch a cookie-auth gamejoin config (or preemptive server warm-up).
+    /// The combined fresh-join action routes the one-use response to the
+    /// cancellable transport worker without a second UI step.
     fn team_create_negotiate(
         &mut self,
         preemptive: bool,
         probe_immediately: bool,
         key_ring_revert: bool,
     ) {
+        if probe_immediately && !preemptive {
+            self.start_team_create_fresh_join_session(key_ring_revert);
+            return;
+        }
+        if self.team_create_session_running {
+            self.team_create_session_status =
+                "Stop the active Team Create transport session before negotiating another join".into();
+            return;
+        }
         let Some(cookie) = self.roblosecurity_cookie() else {
             self.team_create_response =
                 "Set your .ROBLOSECURITY cookie in the Settings tab first".into();
@@ -5801,37 +6129,8 @@ ui.label("Place ID:");
                 let endpoints = crate::team_create::parse_join_config(&v);
                 let all_null = crate::team_create::join_response_is_all_null(&v);
                 let summary = if let Some(first) = endpoints.first() {
-                    // Native Studio consumes early-auth material immediately
-                    // after gamejoin returns. The combined action does the
-                    // same, avoiding expiry or accidental reuse between two
-                    // separate UI clicks.
-                    if probe_immediately && !preemptive {
-                        self.status =
-                            "Fresh join received — resolving one-use transport immediately…".into();
-                        let report = crate::team_create::probe_join_config_with_key_ring_revert(
-                            &v,
-                            3,
-                            2500,
-                            key_ring_revert,
-                        );
-                        let key_mode = if key_ring_revert {
-                            "KeyRingRevert"
-                        } else {
-                            "normal send"
-                        };
-                        self.log_info(format!(
-                            "Team Create immediate transport resolution ({key_mode}):\n{report}"
-                        ));
-                        self.team_create_response = format!(
-                            "Fresh gamejoin config handed directly to the selected transport path (no UI delay; {key_mode} key selection)\n{report}"
-                        );
-                        self.status =
-                            "Immediate Team Create transport resolution finished — see panel output".into();
-                        return;
-                    }
-
                     // Only a config with an actual socket target may enable
-                    // the separate handshake button. The parser handles
+                    // the separate transport-session button. The parser handles
                     // settings, joinTicket, joinScript, and nested wrappers.
                     self.team_create_join_config = Some(v.clone());
                     let mut text = if preemptive {
@@ -5862,12 +6161,9 @@ ui.label("Place ID:");
                     )
                 };
 
-                let full_raw = v.to_string();
-                let mut raw: String = full_raw.chars().take(700).collect();
-                if raw.chars().count() < full_raw.chars().count() {
-                    raw.push('…');
-                }
-                self.team_create_response = format!("{summary}\n{raw}");
+                self.team_create_response = format!(
+                    "{summary}\nRaw gamejoin ticket and transport tokens stay in memory for one-use resolution and are not displayed."
+                );
                 if endpoints.is_empty() {
                     self.log_error(format!("Team Create {label}: {summary}"));
                 } else {
@@ -5898,14 +6194,27 @@ ui.label("Place ID:");
     }
 
     fn show_browse_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("🌐 Browse Roblox");
+        ui.horizontal(|ui| {
+            ui.heading("🗺 Place Explorer");
+            if self.dom.is_some() && ui.button("↩ Current place").clicked() {
+                self.active_tab = ActiveTab::Explorer;
+            }
+        });
         ui.label(RichText::new(
-            "Browse a group's experiences, see their icons, and open any place by downloading its .rbxl.",
+            "Choose an experience by icon and name, then open one of its places. The selection also fills the Open Cloud Universe and Place IDs.",
         ).weak());
         ui.separator();
 
-        // Group input.
+        // Find experiences owned by the signed-in account or by a group.
         ui.horizontal(|ui| {
+            if ui.button("👤 My experiences").clicked() {
+                if self.roblosecurity_cookie().is_some() {
+                    self.browse_status = "Loading your experiences...".into();
+                    self.browse_load_my_experiences();
+                } else {
+                    self.browse_status = "Set your .ROBLOSECURITY cookie in Settings to load your experiences".into();
+                }
+            }
             ui.label("Group ID:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.browse_group_id)
@@ -5935,34 +6244,32 @@ ui.label("Place ID:");
             let thumbs = self.browse_thumbnails.clone();
             let selected_universe = self.browse_selected_universe;
             let places: Vec<(u64, String)> = self.browse_places.clone();
-            let mut open_place: Option<u64> = None;
-            let mut load_places: Option<u64> = None;
+            let mut open_place: Option<(u64, u64)> = None;
+            let mut load_places: Option<(u64, Option<u64>)> = None;
             egui::ScrollArea::vertical()
                 .id_salt("browse_universes_scroll")
                 .show(ui, |ui| {
                     for univ in &universes {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
-                                // Thumbnail: load/render the image if we
-                                // have a URL; the cache downloads and
-                                // uploads it to the GPU asynchronously.
                                 if let Some(url) = thumbs.get(&univ.id) {
                                     match crate::thumbnails::get_or_load(ui.ctx(), url) {
                                         Some(tex) => {
                                             ui.add(
                                                 egui::Image::from_texture(&tex)
-                                                    .fit_to_exact_size(egui::vec2(96.0, 96.0))
+                                                    .fit_to_exact_size(egui::vec2(88.0, 88.0))
                                                     .corner_radius(egui::CornerRadius::same(4)),
                                             );
                                         }
                                         None => {
-                                            ui.add_space(96.0);
+                                            ui.add_space(88.0);
                                             ui.spinner();
                                         }
                                     }
                                 }
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new(&univ.name).strong());
+                                    ui.label(RichText::new(format!("Universe {}", univ.id)).small().weak());
                                     if !univ.description.is_empty() {
                                         ui.label(RichText::new(&univ.description).weak());
                                     }
@@ -5970,30 +6277,29 @@ ui.label("Place ID:");
                                         ui.label(format!("👥 {players} playing"));
                                     }
                                     ui.horizontal(|ui| {
-                                        if ui.button("📂 Places").clicked() {
-                                            load_places = Some(univ.id);
+                                        if ui.button("📂 Show places").clicked() {
+                                            load_places = Some((univ.id, univ.primary_place_id()));
                                         }
-                                        if univ.root_place_id.is_some() {
-                                            if ui.button("🌐 Open root place").clicked() {
-                                                if let Some(pid) = univ.root_place_id { open_place = Some(pid); }
+                                        if let Some(place_id) = univ.primary_place_id() {
+                                            if ui.button("▶ Open start place").clicked() {
+                                                open_place = Some((univ.id, place_id));
                                             }
                                         }
                                     });
                                 });
                             });
 
-                            // If this universe is selected, show its places.
                             if selected_universe == Some(univ.id) {
                                 ui.separator();
                                 if places.is_empty() {
-                                    ui.label(RichText::new("Loading places...").weak());
+                                    ui.label(RichText::new("Loading places…").weak());
                                 } else {
-                                    for (pid, pname) in &places {
+                                    for (place_id, place_name) in &places {
                                         ui.horizontal(|ui| {
-                                            ui.label(format!("• {pname}"));
-                                            if ui.button("📂 Open").clicked() {
-                                                self.open_place_id_input = pid.to_string();
-                                                self.open_place_from_roblox();
+                                            ui.label(format!("• {place_name}"));
+                                            ui.label(RichText::new(format!("{place_id}")).small().weak());
+                                            if ui.button("▶ Open").clicked() {
+                                                open_place = Some((univ.id, *place_id));
                                             }
                                         });
                                     }
@@ -6003,15 +6309,19 @@ ui.label("Place ID:");
                         ui.add_space(4.0);
                     }
                 });
-            // Apply any deferred click actions (now that the immutable
-            // borrow of self.browse_* has been dropped).
-            if let Some(uid) = load_places {
-                self.browse_status = format!("Loading places...");
-                self.browse_load_universe_places(uid);
+            // Apply deferred actions after releasing the list snapshot.
+            if let Some((universe_id, root_place_id)) = load_places {
+                self.open_cloud_universe_id = universe_id.to_string();
+                self.open_cloud_place_id = root_place_id.map(|id| id.to_string()).unwrap_or_default();
+                self.browse_selected_universe = Some(universe_id);
+                self.browse_places.clear();
+                self.browse_status = "Loading places…".into();
+                self.browse_load_universe_places(universe_id);
             }
-            if let Some(pid) = open_place {
-                self.open_place_id_input = pid.to_string();
-                self.open_place_from_roblox();
+            if let Some((universe_id, place_id)) = open_place {
+                self.open_cloud_universe_id = universe_id.to_string();
+                self.open_cloud_place_id = place_id.to_string();
+                self.open_place_from_roblox(place_id);
             }
         }
     }
@@ -6059,7 +6369,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
 
                 ui.group(|ui| {
                     ui.label(RichText::new("🟦 Roblox Studio profile presence").heading().color(Color32::from_rgb(100, 200, 255)));
-                    ui.label("On startup this app sends Studio's AppStarted client-status heartbeat to Roblox. It tries the native legacy client-status/set route first, falls back to the newer Matchmaking API route if needed, then reads back your presence. Roblox may still keep showing Online until Team Create is fully connected.");
+                    ui.label("Diagnostic only: tries known AppStarted client-status routes, then reads your presence from Roblox. An HTTP success is not proof that Studio session state changed; the exact Studio 0.741 endpoint still needs binary confirmation. Team Create connection state is separate.");
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(
@@ -6269,15 +6579,11 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
     /// configured `.ROBLOSECURITY` cookie, then open it exactly like a local
     /// file. This works for places you can edit (Team Create or solo); it
     /// does NOT join a live session — it fetches the latest saved version.
-    fn open_place_from_roblox(&mut self) {
-        let id_str = self.open_place_id_input.trim();
-        let place_id: u64 = match id_str.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                self.status = "Enter a numeric place ID".into();
-                return;
-            }
-        };
+    fn open_place_from_roblox(&mut self, place_id: u64) {
+        if place_id == 0 {
+            self.status = "The selected place has an invalid ID".into();
+            return;
+        }
         if self.roblosecurity_cookie.trim().is_empty() {
             self.status = "Set your .ROBLOSECURITY cookie in Settings first".into();
             self.log_error("Open from Roblox requires a .ROBLOSECURITY cookie");
@@ -6307,10 +6613,9 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         });
     }
 
-    /// Publish the currently-open place to Roblox using Open Cloud (the
-    /// only currently-supported upload path). The legacy ashx cookie
-    /// gateway is gone, so this always talks to apis.roblox.com with the
-    /// API key from Settings.
+    /// Publish the currently-open place through Roblox's Place Versions API.
+    /// It accepts either an Open Cloud key or Studio-style cookie auth; the
+    /// retired Upload.ashx place-upload route is never used.
     fn publish_place_to_roblox(&mut self) {
         let Some(dom) = &self.dom else {
             self.status = "Open a place first".into();
@@ -6319,36 +6624,36 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         let api_key = self.open_cloud_api_key.trim().to_string();
         let cookie = self.roblosecurity_cookie();
         if api_key.is_empty() && cookie.is_none() {
-            self.status =
-                "Set an Open Cloud API key (Open Cloud tab) or a .ROBLOSECURITY cookie (Settings) first".into();
-            self.log_error("Publish requires an Open Cloud API key or a cookie");
+            self.status = "Set an Open Cloud API key or a .ROBLOSECURITY cookie first".into();
+            self.log_error("Place publishing requires an Open Cloud API key or saved Roblox session cookie");
+            return;
+        }
+        let universe = self.open_cloud_universe_id.trim().to_string();
+        if universe.is_empty() || universe.parse::<u64>().is_err() {
+            self.status = "Enter a numeric Universe ID in the Open Cloud tab first".into();
             return;
         }
         let place = self.open_cloud_place_id.trim().to_string();
-        if place.is_empty() {
-            self.status = "Enter the Place ID in the Open Cloud tab first".into();
+        if place.is_empty() || place.parse::<u64>().is_err() {
+            self.status = "Enter a numeric Place ID in the Open Cloud tab first".into();
             return;
         }
-        // Both paths only accept binary .rbxl; force binary serialization
-        // regardless of the on-disk format.
+        // The Place Versions API accepts the binary .rbxl body.
         let bytes = match rbxl::save_place(dom) {
-            Ok(b) => b,
-            Err(e) => {
-                self.status = format!("Serialize failed: {e}");
-                self.log_error(format!("Publish serialize: {e}"));
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Serialize failed: {error}");
+                self.log_error(format!("Publish serialize: {error}"));
                 return;
             }
         };
-        let universe = self.open_cloud_universe_id.trim().to_string();
         let publish_live = self.open_cloud_publish_live;
-        self.status = "Publishing place…".into();
+        self.status = "Publishing place through Roblox Place Versions API…".into();
         self.log_info(format!(
-            "Publishing place {place} (universe {universe}) — Open Cloud{}",
-            if cookie.is_some() { ", falling back to cookie Upload.ashx" } else { "" }
+            "Publishing place {place} (universe {universe}) through Roblox Place Versions API"
         ));
         std::thread::spawn(move || {
-            let mut errors: Vec<String> = Vec::new();
-            // 1) Open Cloud place-publishing API when a key is configured.
+            let mut errors = Vec::new();
             if !api_key.is_empty() {
                 match roblox_api::RobloxApiClient::publish_place_open_cloud(
                     &api_key,
@@ -6357,28 +6662,32 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                     &bytes,
                     publish_live,
                 ) {
-                    Ok(_msg) => {
+                    Ok(_) => {
                         jni_bridge::queue_publish_result(
-                            format!("place {place} (Open Cloud)"),
+                            format!("place {place} (API key)"),
                             Ok(()),
                         );
                         return;
                     }
-                    Err(e) => errors.push(format!("Open Cloud: {e}")),
+                    Err(error) => errors.push(format!("API-key auth: {error}")),
                 }
             }
-            // 2) Legacy cookie fallback: overwrite the place through the
-            //    hidden Data/Upload.ashx endpoint (§4 of the endpoints doc).
             if let Some(cookie) = cookie.as_deref() {
-                match roblox_api::RobloxApiClient::publish_place_legacy(cookie, &place, &bytes) {
-                    Ok(_msg) => {
+                match roblox_api::RobloxApiClient::publish_place_with_cookie(
+                    cookie,
+                    &universe,
+                    &place,
+                    &bytes,
+                    publish_live,
+                ) {
+                    Ok(_) => {
                         jni_bridge::queue_publish_result(
-                            format!("place {place} (cookie Upload.ashx)"),
+                            format!("place {place} (cookie auth)"),
                             Ok(()),
                         );
                         return;
                     }
-                    Err(e) => errors.push(format!("Upload.ashx: {e}")),
+                    Err(error) => errors.push(format!("Cookie auth: {error}")),
                 }
             }
             jni_bridge::queue_publish_result(

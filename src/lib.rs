@@ -36,6 +36,7 @@ mod selection_edit;
 mod live_session;
 mod lua_runtime;
 mod network_codec;
+mod ngtcp2_rustls;
 mod raknet_2022;
 mod connected_raknet;
 mod plugins;
