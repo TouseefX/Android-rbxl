@@ -584,10 +584,11 @@ const RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES: usize = 16;
 /// step drops ~100 bytes of datagram, and 800 stays far above any real
 /// ClientHello while being well under typical carrier thresholds.
 const RBX_TRANSPORT_UDP_PAYLOAD_TIERS: [usize; 5] = [1200, 1100, 1000, 900, 800];
-/// IP_TOS for the QUIC UDP socket: DSCP AF41 (100010) — the interactive
-/// low-delay class carriers QoS away from bulk DPI inspection. Flip to
+/// IP_TOS for the QUIC UDP socket: DSCP CS4 (100000), TOS byte 128 —
+/// the class the native client marks its traffic with; carrier QoS treats
+/// it as a named class instead of unmarked bulk UDP. Flip to 0x88 (AF41),
 /// 0xB8 (EF) or 0x00 (CS0) if a specific carrier reacts differently.
-const RBX_TRANSPORT_UDP_TOS: u8 = 0x88;
+const RBX_TRANSPORT_UDP_TOS: u8 = 0x80;
 /// Bail a route attempt when datagrams went out but the carrier returned
 /// nothing for this long (a healthy path answers the Initial well before
 /// it). This is what turns a 10 s deadlock per route/size into a ~2.5 s
@@ -901,7 +902,7 @@ impl RbxTransportConnectPlan {
             self.rcc_endpoint.port
         ));
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, all routes are RUPP-wrapped with the literal UDMUX IP as SNI (native ClientHello parity), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload cap is MTU-probed in descending tiers [1200, 1100, 1000, 900, 800] with IP_TOS AF41 and kernel fragmentation fallback for strict-carrier networks, 0-RX bail 2500 ms, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, all routes are RUPP-wrapped with the literal UDMUX IP as SNI (native ClientHello parity), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload cap is MTU-probed in descending tiers [1200, 1100, 1000, 900, 800] with IP_TOS CS4 (128) and kernel fragmentation fallback for strict-carrier networks, 0-RX bail 2500 ms, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
@@ -1973,8 +1974,8 @@ async fn attempt_rbx_transport_connection_async(
     let target_addr = resolve_endpoint(&route.target_endpoint)?;
     // socket2 (not std::net) so two options std does not expose can be set
     // before the socket leaves this function:
-    // - IP_TOS: mark the flow as interactive low-delay (DSCP AF41) so
-    //   carrier QoS treats it like real-time traffic instead of bulk UDP;
+    // - IP_TOS: mark the flow as DSCP CS4 (TOS byte 128) so carrier QoS
+    //   treats it as a named class instead of unmarked bulk UDP;
     // - IP_PMTUDISC_DONT: let the kernel FRAGMENT an oversized datagram
     //   instead of setting DF and failing silently when the carrier
     //   swallows the ICMP feedback - the "fragmentation fallback" the
