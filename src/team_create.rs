@@ -573,6 +573,26 @@ const RBX_TRANSPORT_NATIVE_QUIC_PROTECTION_KEY: [u8; 32] = [
 ];
 const RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES: usize = 18;
 const RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES: usize = 16;
+/// Max UDP payload (QUIC packet before the RUPP prefix) per route attempt.
+/// Strict Middle-East carriers (e&/du) drop long-haul "unverified" UDP
+/// datagrams above a size threshold — measured live: the 1231/1249-byte
+/// datagrams (1200-byte padded QUIC Initial + 31-byte RUPP, +18 trailer)
+/// got 4 tx / 0 rx. The native engine survives the same networks with MTU
+/// probing and fragmentation fallback, so the app probes the same way:
+/// each route is retried at a descending payload cap until the Initial
+/// comes back. 1200 is the QUIC-spec Initial maximum (status quo); each
+/// step drops ~100 bytes of datagram, and 800 stays far above any real
+/// ClientHello while being well under typical carrier thresholds.
+const RBX_TRANSPORT_UDP_PAYLOAD_TIERS: [usize; 5] = [1200, 1100, 1000, 900, 800];
+/// IP_TOS for the QUIC UDP socket: DSCP AF41 (100010) — the interactive
+/// low-delay class carriers QoS away from bulk DPI inspection. Flip to
+/// 0xB8 (EF) or 0x00 (CS0) if a specific carrier reacts differently.
+const RBX_TRANSPORT_UDP_TOS: u8 = 0x88;
+/// Bail a route attempt when datagrams went out but the carrier returned
+/// nothing for this long (a healthy path answers the Initial well before
+/// it). This is what turns a 10 s deadlock per route/size into a ~2.5 s
+/// probe so the MTU ladder can move on.
+const RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS: u64 = 2_500;
 const RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES: usize = 12;
 const RBX_TRANSPORT_NATIVE_QUIC_COUNTER_INITIAL: u64 = u64::from_le_bytes(*b"UniqueNu");
 const RBX_TRANSPORT_NATIVE_QUIC_NONCE_SUFFIX: [u8; 10] = *b"iqueNumbeR";
@@ -881,7 +901,7 @@ impl RbxTransportConnectPlan {
             self.rcc_endpoint.port
         ));
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, all routes are RUPP-wrapped with the literal UDMUX IP as SNI (native ClientHello parity), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, all routes are RUPP-wrapped with the literal UDMUX IP as SNI (native ClientHello parity), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload cap is MTU-probed in descending tiers [1200, 1100, 1000, 900, 800] with IP_TOS AF41 and kernel fragmentation fallback for strict-carrier networks, 0-RX bail 2500 ms, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
@@ -1635,7 +1655,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (MTU-ladder tier that survived the carrier), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1643,6 +1663,7 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.rupp_prefix_len,
             report.initial_dst_cid_len,
             report.native_quic_cid_trailer_len,
+            report.max_udp_payload_size,
             report.rpk_version,
             report.handshake_timeout_ms,
             report.requested_timeout_ms,
@@ -1670,6 +1691,10 @@ struct RbxTransportConnectionReport {
     rupp_prefix_len: usize,
     initial_dst_cid_len: usize,
     native_quic_cid_trailer_len: usize,
+    /// The max_tx_udp_payload_size (QUIC payload before RUPP) this
+    /// connection negotiated up to — reports the MTU-ladder tier that
+    /// actually survived the local carrier.
+    max_udp_payload_size: usize,
     rpk_version: u16,
     requested_timeout_ms: u64,
     handshake_timeout_ms: u64,
@@ -1687,7 +1712,7 @@ struct RbxTransportConnectionReport {
 }
 
 #[cfg(not(test))]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RbxTransportQuicRoute {
     target_endpoint: Endpoint,
     outgoing_prefix: Vec<u8>,
@@ -1859,42 +1884,55 @@ async fn run_rbx_transport_connection_async_with_session(
     let routes = build_rbx_transport_quic_routes(plan)?;
     let mut failures = Vec::new();
 
-    for route in routes {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("RbxTransport session cancelled before the next route attempt".into());
-        }
-        let route_label = route.route_label.clone();
-        if let Some(event_tx) = &event_tx {
-            let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
-                "Trying RbxTransport route: {route_label}; target {}",
-                route.target_endpoint.label()
-            )));
-        }
-        match attempt_rbx_transport_connection_async(
-            plan,
-            auth,
-            early_auth_payload_len,
-            route,
-            requested_timeout_ms,
-            handshake_timeout_ms,
-            operation_timeout,
-            handshake_timeout,
-            Arc::clone(&cancel),
-            persistent_session,
-            event_tx.clone(),
-        )
-        .await
-        {
-            Ok(report) => return Ok(report),
-            Err(reason) if cancel.load(Ordering::Relaxed) => {
-                return Err(format!("RbxTransport session cancelled: {reason}"));
+    // MTU ladder (outer) x route (inner): strict Middle-East carriers
+    // (e&/du) drop long-haul UDP datagrams above a size threshold, so the
+    // first tier (1200, datagram 1231/1249 with RUPP) may be filtered even
+    // though the path is otherwise fine. Probe descending payload caps the
+    // way the native engine does (MTU probing + fragmentation fallback);
+    // the 0-RX early bail keeps each probe to ~2.5 s.
+    for &max_udp_payload in &RBX_TRANSPORT_UDP_PAYLOAD_TIERS {
+        for route in &routes {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("RbxTransport session cancelled before the next route attempt".into());
             }
-            Err(reason) => failures.push(format!("{route_label} => {reason}")),
+            let route_label = route.route_label.clone();
+            if let Some(event_tx) = &event_tx {
+                let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
+                    "Trying RbxTransport route: {route_label} at UDP payload cap {max_udp_payload} (on-wire datagram <= {} with RUPP); target {}",
+                    max_udp_payload.saturating_add(route.outgoing_prefix.len()),
+                    route.target_endpoint.label()
+                )));
+            }
+            match attempt_rbx_transport_connection_async(
+                plan,
+                auth,
+                early_auth_payload_len,
+                route.clone(),
+                requested_timeout_ms,
+                handshake_timeout_ms,
+                operation_timeout,
+                handshake_timeout,
+                max_udp_payload,
+                Arc::clone(&cancel),
+                persistent_session,
+                event_tx.clone(),
+            )
+            .await
+            {
+                Ok(report) => return Ok(report),
+                Err(reason) if cancel.load(Ordering::Relaxed) => {
+                    return Err(format!("RbxTransport session cancelled: {reason}"));
+                }
+                Err(reason) => failures.push(format!(
+                    "{route_label} @ {max_udp_payload} => {reason}"
+                )),
+            }
         }
     }
 
     Err(format!(
-        "all RbxTransport QUIC route attempts failed: {}",
+        "all RbxTransport QUIC route attempts failed across every payload tier {:?}: {}",
+        RBX_TRANSPORT_UDP_PAYLOAD_TIERS,
         failures.join("; ")
     ))
 }
@@ -1927,16 +1965,46 @@ async fn attempt_rbx_transport_connection_async(
     handshake_timeout_ms: u64,
     operation_timeout: Duration,
     handshake_timeout: Duration,
+    max_udp_payload: usize,
     cancel: Arc<AtomicBool>,
     persistent_session: bool,
     event_tx: Option<Sender<RbxTransportSessionEvent>>,
 ) -> Result<RbxTransportConnectionReport, String> {
     let target_addr = resolve_endpoint(&route.target_endpoint)?;
-    let std_socket = UdpSocket::bind(route.target_endpoint.bind_address())
-        .map_err(|error| format!("failed to bind QUIC UDP socket: {error}"))?;
-    std_socket
-        .set_nonblocking(true)
+    // socket2 (not std::net) so two options std does not expose can be set
+    // before the socket leaves this function:
+    // - IP_TOS: mark the flow as interactive low-delay (DSCP AF41) so
+    //   carrier QoS treats it like real-time traffic instead of bulk UDP;
+    // - IP_PMTUDISC_DONT: let the kernel FRAGMENT an oversized datagram
+    //   instead of setting DF and failing silently when the carrier
+    //   swallows the ICMP feedback - the "fragmentation fallback" the
+    //   native engine relies on on strict networks.
+    let domain = if target_addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::SocketType::DGRAM, Some(socket2::Protocol::UDP))
+        .map_err(|error| format!("failed to create QUIC UDP socket: {error}"))?;
+    sock.set_nonblocking(true)
         .map_err(|error| format!("failed to set QUIC UDP socket nonblocking: {error}"))?;
+    if let Err(error) = sock.set_ip_tos(RBX_TRANSPORT_UDP_TOS) {
+        // Non-fatal: some platforms/carriers ignore IP_TOS; the payload
+        // ladder is the primary mechanism.
+        let _ = error;
+    }
+    if let Err(error) = sock.set_mtu_discover(socket2::MtuDiscover::Dont) {
+        // Non-fatal: without it the OS PMTUD default still applies.
+        let _ = error;
+    }
+    let bind_addr: SocketAddr = route
+        .target_endpoint
+        .bind_address()
+        .parse()
+        .map_err(|error| format!("failed to parse QUIC UDP bind address: {error}"))?;
+    sock.bind(&socket2::SockAddr::from(bind_addr))
+        .map_err(|error| format!("failed to bind QUIC UDP socket: {error}"))?;
+    let std_socket = std::net::UdpSocket::from(sock);
     let socket = tokio::net::UdpSocket::from_std(std_socket)
         .map_err(|error| format!("failed to wrap QUIC UDP socket: {error}"))?;
     let local_addr = socket
@@ -1983,7 +2051,13 @@ async fn attempt_rbx_transport_connection_async(
         u64::try_from(handshake_timeout.as_nanos())
             .map_err(|_| "RbxTransport handshake timeout exceeds ngtcp2's clock range")?,
     );
+    // Clamp the max UDP payload (QUIC packet before the RUPP prefix) to
+    // this MTU-ladder tier. ngtcp2 pads the Initial up to the clamp, so a
+    // tier of 1100 produces an on-wire datagram of at most
+    // 1100 + RUPP prefix (+ trailer) instead of the 1231/1249 the strict
+    // carriers were dropping.
     let settings = ngnet_quic::Settings::new(initial_ts)
+        .max_tx_udp_payload_size(max_udp_payload)
         .handshake_timeout(ng_handshake_timeout);
     let params = ngnet_quic::TransportParams::new()
         .max_datagram_frame_size(RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES as u64);
@@ -2070,6 +2144,24 @@ async fn attempt_rbx_transport_connection_async(
                 ));
             }
             break;
+        }
+        // 0-RX early bail: datagrams went out (Initial + retransmits) but
+        // the carrier returned nothing. On e&/du-class strict filtering
+        // that is a dropped-by-DPI signature, not a slow handshake — bail
+        // after the probe window so the MTU ladder / next route can try
+        // instead of deadlocking for the full 10 s native budget.
+        let zero_rx_bail_ms =
+            RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS.min(requested_timeout_ms);
+        if started.elapsed() >= Duration::from_millis(zero_rx_bail_ms)
+            && udp_stats.incoming_datagrams.load(Ordering::Relaxed) == 0
+            && udp_stats.outgoing_datagrams.load(Ordering::Relaxed) >= 1
+        {
+            return Err(format!(
+                "UDP 0-RX after {} ms (payload cap {}): {} datagrams sent, none received - this size looks filtered by the local carrier; the ladder will retry smaller",
+                zero_rx_bail_ms,
+                max_udp_payload,
+                udp_stats.outgoing_datagrams.load(Ordering::Relaxed)
+            ));
         }
         if tokio::time::Instant::now() >= handshake_deadline {
             return Err(rbx_transport_handshake_timeout_message(
@@ -2283,6 +2375,7 @@ async fn attempt_rbx_transport_connection_async(
         } else {
             0
         },
+        max_udp_payload_size: max_udp_payload,
         rpk_version: plan.early_key.version,
         requested_timeout_ms,
         handshake_timeout_ms,

@@ -44,6 +44,10 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # ngnet-quic provides the lower-level ngtcp2 transport; rustls drives TLS 1.3
 # directly so the app can retain RPK verification, custom CIDs and DATAGRAM hooks.
 ngnet-quic = { path = "vendor/ngnet-quic", default-features = false }
+# socket2 for the two socket options std::net does not expose on the QUIC UDP
+# socket: IP_TOS (traffic class) and IP_PMTUDISC_DONT (fragmentation
+# fallback for strict carriers). Same major version tokio already depends on.
+socket2 = "0.5"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
 ring = "0.17"

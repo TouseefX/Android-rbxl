@@ -87,9 +87,15 @@ pub(crate) const fn settings(
             "settings.max_stream_window exceeds the maximum QUIC varint",
         ));
     }
-    if max_tx_udp_payload_size < sys::NGTCP2_MAX_UDP_PAYLOAD_SIZE as usize {
+    // The lower bound is a practical one, not ngtcp2's: ngtcp2 asserts
+    // `>= NGTCP2_MAX_UDP_PAYLOAD_SIZE` (1200) in debug builds, but release
+    // builds honour any smaller value, and clamping below the QUIC-spec
+    // Initial maximum is exactly how strict carriers (e&/du-class DPI) are
+    // worked around — the Initial + TLS record must still fit in one
+    // datagram, so 512 is the floor this crate will accept.
+    if max_tx_udp_payload_size < 512 {
         return Err(Error::invalid_input(
-            "settings.max_tx_udp_payload_size is below NGTCP2_MAX_UDP_PAYLOAD_SIZE",
+            "settings.max_tx_udp_payload_size is below the 512-byte minimum",
         ));
     }
     if max_tx_udp_payload_size > sys::NGTCP2_MAX_TX_UDP_PAYLOAD_SIZE as usize {
