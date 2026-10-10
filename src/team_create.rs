@@ -453,13 +453,17 @@ pub fn probe_endpoint_rtt_ms(address: &str, port: u16, budget_ms: u32) -> Option
         .enable_all()
         .build()
         .ok()?;
+    // `TcpStream::connect_timeout` is tokio_unstable-only, so the stable
+    // pattern is `tokio::time::timeout` around a plain `connect` (both
+    // stable; the `net` and `time` features are already enabled).
     runtime.block_on(async {
         let started = std::time::Instant::now();
-        let stream = tokio::net::TcpStream::connect_timeout(
-            &addr,
+        let stream = tokio::time::timeout(
             std::time::Duration::from_millis(budget_ms as u64),
+            tokio::net::TcpStream::connect(&addr),
         )
         .await
+        .ok()?
         .ok()?;
         let rtt = started.elapsed().as_millis() as u32;
         let _ = stream.shutdown().await;
