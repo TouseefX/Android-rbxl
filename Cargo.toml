@@ -48,6 +48,9 @@ ngnet-quic = { path = "vendor/ngnet-quic", default-features = false }
 # socket: IP_TOS (traffic class) and IP_PMTUDISC_DONT (fragmentation
 # fallback for strict carriers). Same major version tokio already depends on.
 socket2 = "0.5"
+# libc for the raw setsockopt(IP_MTU_DISCOVER) call socket2 0.5 does not
+# expose (fragmentation fallback for strict carriers).
+libc = "0.2"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
 ring = "0.17"

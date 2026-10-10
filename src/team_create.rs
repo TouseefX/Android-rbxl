@@ -1984,18 +1984,33 @@ async fn attempt_rbx_transport_connection_async(
     } else {
         socket2::Domain::IPV6
     };
-    let sock = socket2::Socket::new(domain, socket2::SocketType::DGRAM, Some(socket2::Protocol::UDP))
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
         .map_err(|error| format!("failed to create QUIC UDP socket: {error}"))?;
     sock.set_nonblocking(true)
         .map_err(|error| format!("failed to set QUIC UDP socket nonblocking: {error}"))?;
-    if let Err(error) = sock.set_ip_tos(RBX_TRANSPORT_UDP_TOS) {
+    if let Err(error) = sock.set_tos(RBX_TRANSPORT_UDP_TOS as u32) {
         // Non-fatal: some platforms/carriers ignore IP_TOS; the payload
         // ladder is the primary mechanism.
         let _ = error;
     }
-    if let Err(error) = sock.set_mtu_discover(socket2::MtuDiscover::Dont) {
-        // Non-fatal: without it the OS PMTUD default still applies.
-        let _ = error;
+    // IP_PMTUDISC_DONT / IPV6_PMTUDISC_DONT (both = 0): let the kernel
+    // fragment an oversized datagram instead of silently failing PMTUD
+    // when the carrier swallows the ICMP feedback. socket2 0.5 does not
+    // expose this option, so setsockopt goes through libc directly.
+    let (sockopt_level, sockopt_name) = if target_addr.is_ipv4() {
+        (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
+    } else {
+        (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER)
+    };
+    let pmtudisc_dont: i32 = 0;
+    unsafe {
+        let _ = libc::setsockopt(
+            std::os::unix::io::AsRawFd::as_raw_fd(&sock),
+            sockopt_level,
+            sockopt_name,
+            &pmtudisc_dont as *const i32 as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        );
     }
     let bind_addr: SocketAddr = route
         .target_endpoint
