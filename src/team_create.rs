@@ -466,7 +466,9 @@ pub fn probe_endpoint_rtt_ms(address: &str, port: u16, budget_ms: u32) -> Option
         .ok()?
         .ok()?;
         let rtt = started.elapsed().as_millis() as u32;
-        let _ = stream.shutdown().await;
+        // Dropping the stream closes the socket and releases the
+        // ephemeral port; no AsyncWriteExt import is needed for that.
+        drop(stream);
         Some(rtt)
     })
 }
