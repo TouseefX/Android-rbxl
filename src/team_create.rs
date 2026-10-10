@@ -1058,7 +1058,7 @@ fn extract_join_ticket_fields(
 ) -> (Option<String>, Option<String>) {
     let ticket = match find_field_ci(config, "joinTicket", 0) {
         Some(serde_json::Value::String(text)) => {
-            match serde_json::from_str::<serde_json::Value>(text) {
+            match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(value) => Some(value),
                 Err(_) => None,
             }
@@ -2420,7 +2420,9 @@ impl RbxTransportStreamReceiver {
     /// Hand raw stream bytes to the app-flow pump.
     fn drain_raw_events(&mut self) -> Vec<(i64, Vec<u8>)> {
         self.raw_event_bytes = 0;
-        std::mem::take(&mut self.raw_events).collect()
+        std::mem::take(&mut self.raw_events)
+            .into_iter()
+            .collect()
     }
 
     fn stream_opened(&mut self, stream_id: ngnet_quic::StreamId) {
@@ -2707,7 +2709,7 @@ async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
     }
     actions.extend(flow.on_tick(now_ms));
 
-    let mut emit = |message: String| {
+    let emit = |message: String| {
         if let Some(tx) = event_tx {
             let _ = tx.send(RbxTransportSessionEvent::Status(message));
         }
@@ -2783,7 +2785,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
     origin: Instant,
     timeout: Option<Duration>,
     cancel: Option<Arc<AtomicBool>>,
-    flow: Option<&mut crate::appflow::AppFlow>,
+    mut flow: Option<&mut crate::appflow::AppFlow>,
     stream_receiver: &Arc<Mutex<RbxTransportStreamReceiver>>,
     event_tx: Option<&Sender<RbxTransportSessionEvent>>,
 ) -> String {

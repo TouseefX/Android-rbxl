@@ -95,6 +95,7 @@ pub fn xxh32(data: &[u8], seed: u32) -> u32 {
     h ^= h >> 13;
     h = h.wrapping_mul(PRIME32_3);
     h ^= h >> 16;
+    h
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +202,7 @@ pub fn decode_blob(blob: &[u8]) -> Result<Vec<u8>, String> {
     if payload.len() < 4 || &payload[..4] != b"\x28\xb5\x2f\xfd" {
         return Err("missing zstd frame magic in challenge blob".into());
     }
-    match zstd::stream::decode::all(payload) {
+    match zstd::stream::decode_all(payload) {
         Ok(out) => {
             if out.len() as u32 != mode {
                 return Err(format!(
@@ -382,7 +383,7 @@ pub fn standardize(buf: &mut [u8]) -> Result<StandardizeStats, String> {
         while pc < p.sizecode {
             let word_off = p.code_off + 4 * pc;
             let wire_op = buf[word_off];
-            let std = INTERNAL_OP_TO_STANDARD[WIRE_OP_REMAP[wire_op]];
+            let std = INTERNAL_OP_TO_STANDARD[WIRE_OP_REMAP[wire_op as usize] as usize];
             buf[word_off] = std;
             pc += op_length(std) as usize;
             stats.starts += 1; // instructions walked (reference semantics)
@@ -534,7 +535,7 @@ fn parse_proto_body(buf: &[u8], p: &ProtoExtent, tv: u8) -> Result<ProtoBody, St
 /// verbatim, so the instruction stream is bit-identical.
 pub fn normalize_for_luaur(buf: &[u8]) -> Result<Vec<u8>, String> {
     let version = buf.get(0).ok_or("empty bytecode")?;
-    if version < 12 {
+    if *version < 12 {
         return Ok(buf.to_vec());
     }
     let tv = buf[1];
@@ -625,7 +626,7 @@ impl RobloxRandom {
 
     fn out32(state: u64) -> u32 {
         let x = ((state >> 27) ^ (state >> 45)) as u32;
-        let r = (state >> 59) & 31;
+        let r = ((state >> 59) & 31) as u32;
         if r == 0 {
             x
         } else {
@@ -754,7 +755,7 @@ fn make_random_instance(lua: &luaur::Lua, state: u64) -> luaur::rt::Result<luaur
         lua.create_function(
             move |_, (_self, rest): (luaur::Table, luaur::Variadic<f64>)| {
                 let mut r = RobloxRandom { state: *nn.borrow() };
-                let v = match rest.into_vec().as_slice() {
+                let v = match rest.to_vec().as_slice() {
                     [] => r.next_number(0.0, 1.0),
                     [a, b, ..] => r.next_number(*a, *b),
                     _ => return Ok(r.next_number(0.0, 1.0)),
@@ -833,7 +834,7 @@ fn install_challenge_sandbox(lua: &luaur::Lua, job: &str) -> luaur::rt::Result<(
         "newproxy",
         lua.create_function(|lua, mt: Value| {
             let t = lua.create_table();
-            if let Value::Bool(true) = mt {
+            if let Value::Boolean(true) = mt {
                 t.set_metatable(Some(lua.create_table()))?;
             }
             Ok(t)
@@ -866,6 +867,8 @@ fn run_program(code: &[u8], arg1: u32, arg2: u32, job: &str) -> Result<u32, Stri
         .map_err(|e| format!("challenge sandbox setup failed: {e}"))?;
 
     let chunkname = b"=challenge\0";
+    // exec_raw and luau_load are unsafe fns in the luaur fork. The inner
+    // block trips `unused_unsafe` (nested under the outer) — cosmetic only.
     let loaded: MultiValue = unsafe {
         lua.exec_raw((), move |state| unsafe {
             let rc = luaur::vm::functions::luau_load::luau_load(

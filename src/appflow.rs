@@ -187,9 +187,9 @@ pub fn stream_header(app: u32, chan: u32) -> [u8; 7] {
 pub fn b64_decode(text: &str) -> Vec<u8> {
     fn val(b: u8) -> Option<u32> {
         match b {
-            b'A'..=b'Z' => Some(b - b'A'),
-            b'a'..=b'z' => Some(b - b'a' + 26),
-            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
             b'+' => Some(62),
             b'/' => Some(63),
             _ => None,
@@ -232,8 +232,7 @@ pub fn ticket_v31(ticket: &[u8]) -> u32 {
     let v17 = if v8 & 0x4000 != 0 { S } else { 1434170839 };
     let v18 = v13.wrapping_mul(v14);
     let v19 = if v8 & 0x10 != 0 { 13 } else { 19 };
-    let v20 = v16
-        .wrapping_xor(v15.wrapping_sub(v18.rotate_left(v19)))
+    let v20 = (v16 ^ v15.wrapping_sub(v18.rotate_left(v19)))
         .rotate_left(2 * ((v8 & 0xFF) >> 7) + 15);
     let v11 = if v8 & 0x100 != 0 { S } else { 0u32.wrapping_sub(S) };
     let v21 = v11.wrapping_add(1434170839);
@@ -474,7 +473,8 @@ impl AppFlow {
                 None
             }
         };
-        let mut v8_seed = self.now_ms.wrapping_mul(0x9E37_79B1).wrapping_add(0x51_7C_C1_B7);
+        let mut v8_seed =
+            (self.now_ms.wrapping_mul(0x9E37_79B1).wrapping_add(0x51_7C_C1_B7)) as u32;
         if v8_seed == 0 {
             v8_seed = 0x8000_0001;
         }
@@ -632,7 +632,7 @@ impl AppFlow {
         };
         self.events.push(FlowEvent::ChallengeAnswered {
             answer: report.answer,
-            elapsed_ms: report.solve_ms,
+            elapsed_ms: report.solve_ms as u64,
         });
         self.answered = true;
         self.routes_at_ms = self.now_ms.saturating_add(60) as i64;
@@ -673,7 +673,7 @@ impl AppFlow {
 
     /// A stream was reset by the peer.
     pub fn on_reset(&mut self, stream: i64) {
-        if stream == self.chan1 {
+        if Some(stream) == self.chan1 {
             self.chan1_reset = true;
             self.log(format!("chan1 stream {stream} reset by peer — will re-open for answer"));
         }
