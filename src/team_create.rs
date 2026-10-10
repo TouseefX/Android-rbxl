@@ -441,6 +441,32 @@ pub fn join_response_is_all_null(v: &serde_json::Value) -> bool {
     !has_value(v)
 }
 
+/// TCP-connect RTT probe used by the fresh-join endpoint preflight. The
+/// UDMUX answer port answers TCP handshakes on the same network path as its
+/// QUIC UDP, so a connect's round trip is an honest measurement of the path;
+/// a path that does not complete even a TCP handshake within the budget will
+/// also silently drop our QUIC Initials (observed: 0 bytes RX for the whole
+/// 10 s handshake budget). `None` = no route within `budget_ms`.
+pub fn probe_endpoint_rtt_ms(address: &str, port: u16, budget_ms: u32) -> Option<u32> {
+    let addr = (address, port).to_socket_addrs().ok()?.next()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        let started = std::time::Instant::now();
+        let stream = tokio::net::TcpStream::connect_timeout(
+            &addr,
+            std::time::Duration::from_millis(budget_ms as u64),
+        )
+        .await
+        .ok()?;
+        let rtt = started.elapsed().as_millis() as u32;
+        let _ = stream.shutdown().await;
+        Some(rtt)
+    })
+}
+
 /// RakNet offline-message magic, retained by Roblox's customized open
 /// handshake. The layouts below come from the exact 2022 Studio
 /// `sendRbxOpenRequest1`, `sendRbxOpenReply1`, and

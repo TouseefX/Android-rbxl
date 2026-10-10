@@ -6080,26 +6080,83 @@ ui.label("Place ID:");
         self.start_team_create_session_worker(
             "Requesting a fresh Team Create join config…".into(),
             move |event_tx, cancel| {
-                match RobloxApiClient::team_create_join(&cookie, &place_id, false) {
-                    Ok(config) => {
-                        let endpoints = crate::team_create::parse_join_config(&config);
-                        if endpoints.is_empty() {
-                            let reason = if crate::team_create::join_response_is_all_null(&config) {
-                                "gamejoin returned only null/empty values; no transport session was started"
-                            } else {
-                                "gamejoin returned no usable server endpoint; no transport session was started"
-                            };
+                // Endpoint preflight: gamejoin picks the server pool
+                // server-side (mostly by our egress IP), and from the UAE a
+                // US/India assignment makes the QUIC handshake stall on 0 RX.
+                // Each fresh request is a new one-use config, so a far
+                // endpoint is cheap to discard: probe it, re-request until we
+                // land close (Singapore/Japan-class RTT), then proceed.
+                const PREFLIGHT_MAX_ATTEMPTS: usize = 4;
+                const PREFLIGHT_RTT_CAP_MS: u32 = 150;
+                const PREFLIGHT_BUDGET_MS: u32 = 2500;
+
+                for attempt in 0..PREFLIGHT_MAX_ATTEMPTS {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = event_tx.send(
+                            crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                                "{report_prefix}Fresh join cancelled during endpoint preflight."
+                            )),
+                        );
+                        return;
+                    }
+                    let config = match RobloxApiClient::team_create_join(&cookie, &place_id, false)
+                    {
+                        Ok(config) => config,
+                        Err(error) => {
                             let _ = event_tx.send(
                                 crate::team_create::RbxTransportSessionEvent::Finished(format!(
-                                    "{report_prefix}{reason}"
+                                    "Fresh Team Create join failed: {error}"
                                 )),
                             );
                             return;
                         }
+                    };
+                    let endpoints = crate::team_create::parse_join_config(&config);
+                    if endpoints.is_empty() {
+                        let reason = if crate::team_create::join_response_is_all_null(&config) {
+                            "gamejoin returned only null/empty values; no transport session was started"
+                        } else {
+                            "gamejoin returned no usable server endpoint; no transport session was started"
+                        };
                         let _ = event_tx.send(
-                            crate::team_create::RbxTransportSessionEvent::Status(
-                                "Fresh gamejoin config received; entering the selected transport without a second UI step…".into(),
+                            crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                                "{report_prefix}{reason}"
+                            )),
+                        );
+                        return;
+                    }
+                    let target = &endpoints[0];
+                    let rtt = crate::team_create::probe_endpoint_rtt_ms(
+                        &target.address,
+                        target.port,
+                        PREFLIGHT_BUDGET_MS,
+                    );
+                    let acceptable = matches!(rtt, Some(ms) if ms <= PREFLIGHT_RTT_CAP_MS);
+                    let last_attempt = attempt + 1 == PREFLIGHT_MAX_ATTEMPTS;
+                    if acceptable || last_attempt {
+                        let detail = match rtt {
+                            Some(ms) => {
+                                let note = if acceptable {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " — over the {PREFLIGHT_RTT_CAP_MS} ms cap; proceeding anyway after {PREFLIGHT_MAX_ATTEMPTS} attempts"
+                                    )
+                                };
+                                format!("endpoint {} RTT {} ms{}", target.label(), ms, note)
+                            }
+                            None => format!(
+                                "endpoint {} unreachable during preflight ({} ms budget); proceeding anyway after {PREFLIGHT_MAX_ATTEMPTS} attempts",
+                                target.label(),
+                                PREFLIGHT_BUDGET_MS
                             ),
+                        };
+                        let _ = event_tx.send(
+                            crate::team_create::RbxTransportSessionEvent::Status(format!(
+                                "Fresh gamejoin config received (preflight attempt {}/{}): {detail}; entering the selected transport…",
+                                attempt + 1,
+                                PREFLIGHT_MAX_ATTEMPTS
+                            )),
                         );
                         crate::team_create::run_join_config_session(
                             config,
@@ -6110,15 +6167,22 @@ ui.label("Place ID:");
                             cancel,
                             event_tx,
                         );
+                        return;
                     }
-                    Err(error) => {
-                        let _ = event_tx.send(
-                            crate::team_create::RbxTransportSessionEvent::Finished(format!(
-                                "Fresh Team Create join failed: {error}"
-                            )),
-                        );
-                    }
+                    let reason = match rtt {
+                        Some(ms) => format!("RTT {} ms > {} ms cap", ms, PREFLIGHT_RTT_CAP_MS),
+                        None => format!("no TCP handshake within {} ms", PREFLIGHT_BUDGET_MS),
+                    };
+                    let _ = event_tx.send(
+                        crate::team_create::RbxTransportSessionEvent::Status(format!(
+                            "Preflight attempt {}/{}: {} is far ({reason}) — discarding the one-use config and requesting a closer server…",
+                            attempt + 1,
+                            PREFLIGHT_MAX_ATTEMPTS,
+                            target.label()
+                        )),
+                    );
                 }
+                unreachable!("preflight loop always returns from inside the loop");
             },
         );
     }
