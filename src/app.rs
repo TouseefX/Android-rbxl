@@ -5945,8 +5945,35 @@ ui.label("Place ID:");
                 crate::team_create::RbxTransportSessionEvent::QuicHandshakeComplete(status) => {
                     self.team_create_session_quic_handshake_complete = true;
                     self.team_create_session_status = status.clone();
-                    self.status = "RbxTransport QUIC/TLS handshake complete; receive loop running (Team Create acceptance not confirmed)".into();
+                    self.status = "RbxTransport QUIC/TLS handshake complete; app=4 join flow running (Team Create acceptance not confirmed)".into();
                     self.log_info(status);
+                }
+                crate::team_create::RbxTransportSessionEvent::ChallengeReceived {
+                    u1,
+                    u2,
+                    blob_len,
+                } => {
+                    self.status = format!(
+                        "0x9B challenge received (u1=0x{u1:08x} u2=0x{u2:08x}, blob {blob_len}B) — solving locally…"
+                    );
+                    self.log_info(self.status.clone());
+                }
+                crate::team_create::RbxTransportSessionEvent::ChallengeAnswered {
+                    answer,
+                    elapsed_ms,
+                } => {
+                    self.status = format!(
+                        "0x9B challenge answered 0x{answer:08x} in {elapsed_ms}ms — waiting for connected stage (world state)…"
+                    );
+                    self.log_info(self.status.clone());
+                }
+                crate::team_create::RbxTransportSessionEvent::ChallengeFailed(reason) => {
+                    self.status = format!("0x9B challenge solve failed: {reason}");
+                    self.log_info(self.status.clone());
+                }
+                crate::team_create::RbxTransportSessionEvent::ConnectedStageReached(detail) => {
+                    self.status = format!("BaseClient connected stage reached — {detail}");
+                    self.log_info(self.status.clone());
                 }
                 crate::team_create::RbxTransportSessionEvent::Finished(report) => {
                     self.team_create_response = report.clone();

@@ -33,7 +33,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce, Tag,
 };
 use sha2::Sha512;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{
@@ -79,6 +79,15 @@ pub enum RbxTransportSessionEvent {
     /// The QUIC/TLS handshake completed. This is deliberately distinct from
     /// BaseClient's post-WaitForConnection state and Team Create acceptance.
     QuicHandshakeComplete(String),
+    /// A complete 0x9B challenge frame arrived on channel 1.
+    ChallengeReceived { u1: u32, u2: u32, blob_len: u32 },
+    /// The challenge was solved locally and the 9-byte answer sent.
+    ChallengeAnswered { answer: u32, elapsed_ms: u64 },
+    /// Local solving of the challenge failed.
+    ChallengeFailed(String),
+    /// Post-answer traffic on channel 1 (world state / peer assignment) —
+    /// the BaseClient "connected" milestone.
+    ConnectedStageReached(String),
     Finished(String),
 }
 
@@ -592,6 +601,16 @@ struct RbxTransportConnectPlan {
     early_auth: Result<EarlyAuthData, String>,
     game_fqdn: Option<String>,
     qdmux_vip: Option<String>,
+    /// Post-handshake app-flow material (the BaseClient join burst and the
+    /// 0x9B challenge answer). All optional: the flow degrades to the
+    /// passive receive loop when any of them is missing.
+    join_user_id: Option<i64>,
+    join_client_ticket: Option<String>,
+    join_session_id: Option<String>,
+    join_random_seed1: Option<String>,
+    join_api_security_token: Option<String>,
+    join_serialized_client_fields: Option<String>,
+    join_encrypted_server_fields: Option<String>,
 }
 
 fn is_hex_field(text: &str, len: usize) -> bool {
@@ -1002,6 +1021,7 @@ fn extract_rbx_transport_connect_plan(
         .or_else(|| find_field_ci(config, "DebugRbxTransportQdmuxVip", 0))
         .and_then(|value| as_addr(&value))
         .filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok());
+    let (serialized_client_fields, encrypted_server_fields) = extract_join_ticket_fields(config);
     Ok(RbxTransportConnectPlan {
         public_endpoint,
         rcc_endpoint,
@@ -1014,7 +1034,46 @@ fn extract_rbx_transport_connect_plan(
         early_auth,
         game_fqdn,
         qdmux_vip,
+        join_user_id: find_field_ci(config, "UserId", 0)
+            .and_then(|v| v.as_i64())
+            .or_else(|| find_field_ci(config, "UserId", 0).and_then(|v| v.as_u64()).map(|v| v as i64)),
+        join_client_ticket: find_field_ci(config, "ClientTicket", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_session_id: find_field_ci(config, "SessionId", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_random_seed1: find_field_ci(config, "RandomSeed1", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_api_security_token: find_field_ci(config, "APIsecurityToken", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_serialized_client_fields: serialized_client_fields,
+        join_encrypted_server_fields: encrypted_server_fields,
     })
+}
+
+/// The joinTicket field carries the server-issued ticket; across fleet
+/// versions it appears as either a JSON object or a stringified JSON
+/// object with `SerializedClientFields` / `EncryptedServerFields`.
+fn extract_join_ticket_fields(
+    config: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let ticket = match find_field_ci(config, "joinTicket", 0) {
+        Some(serde_json::Value::String(text)) => {
+            match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(value) => Some(value),
+                Err(_) => None,
+            }
+        }
+        Some(value) => Some(value.clone()),
+        None => None,
+    };
+    let Some(ticket) = ticket else {
+        return (None, None);
+    };
+    let scf = find_field_ci(&ticket, "SerializedClientFields", 0)
+        .and_then(|v| v.as_str().map(str::to_owned));
+    let esf = find_field_ci(&ticket, "EncryptedServerFields", 0)
+        .and_then(|v| v.as_str().map(str::to_owned));
+    (scf, esf)
 }
 
 fn extract_rupp_probe_material(config: &serde_json::Value) -> Result<RuppProbeMaterial, String> {
@@ -1588,6 +1647,10 @@ struct RbxTransportConnectionReport {
     preauth_len: usize,
     auth_len: usize,
     early_auth_payload_len: usize,
+    /// Whether the app=4 flow (post-handshake burst + 0x9B answer) ran and
+    /// the challenge was answered.
+    flow_active: bool,
+    flow_answered: bool,
     inbound_summary: String,
 }
 
@@ -1741,6 +1804,61 @@ async fn run_rbx_transport_connection_async(
         None,
     )
     .await
+}
+
+/// Build the app=4 flow config from the connect plan. Returns None when
+/// required fields are missing; the session then stays in passive mode.
+#[cfg(not(test))]
+fn build_join_flow_config(
+    plan: &RbxTransportConnectPlan,
+) -> Option<crate::appflow::JoinConfig> {
+    let client_ticket = plan.join_client_ticket.clone()?;
+    let user_id = plan.join_user_id?;
+    let session_id = plan.join_session_id.clone().unwrap_or_default();
+    let early_auth = plan.early_auth.as_ref().ok().map(|auth| {
+        crate::appflow::EarlyAuth {
+            version: auth.auth_version,
+            pre: auth.preauth_blob.clone(),
+            auth: auth.auth_blob.clone(),
+        }
+    });
+    Some(crate::appflow::JoinConfig {
+        user_id,
+        client_ticket,
+        session_id,
+        random_seed1: plan.join_random_seed1.clone(),
+        api_security_token: plan.join_api_security_token.clone(),
+        serialized_client_fields: plan.join_serialized_client_fields.clone(),
+        encrypted_server_fields: plan.join_encrypted_server_fields.clone(),
+        early_auth,
+        a7_mode: crate::appflow::A7Mode::Real,
+    })
+}
+
+/// Execute one flow action: open a client stream (recording it in the flow)
+/// or write more bytes to an existing stream.
+#[cfg(not(test))]
+async fn execute_join_flow_action<S: ngnet_quic::Session>(
+    connection: &mut ngnet_quic::Conn<'_, S>,
+    socket: &RuppUdpSocket,
+    tx_buf: &mut [u8],
+    origin: Instant,
+    flow: &mut crate::appflow::AppFlow,
+    action: crate::appflow::Action,
+) -> Result<(), String> {
+    match action {
+        crate::appflow::Action::OpenStream { app, chan, data } => {
+            let id = connection.open_bidi_stream().map_err(|error| {
+                format!("open bidi stream app={app} chan={chan}: {error}")
+            })?;
+            let raw = id.get();
+            flow.note_opened(app, chan, raw);
+            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, raw, &data).await
+        }
+        crate::appflow::Action::Write { stream, data } => {
+            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data).await
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -2079,7 +2197,7 @@ async fn attempt_rbx_transport_connection_async(
     if persistent_session {
         if let Some(event_tx) = &event_tx {
             let _ = event_tx.send(RbxTransportSessionEvent::QuicHandshakeComplete(format!(
-                "RbxTransport QUIC/TLS handshake completed via {}; target {}, local {}, ALPN {}. The receive/dispatch loop is active; this is not BaseClient connected state or Team Create acceptance. Early-auth and channel-control bytes remain unsent.",
+                "RbxTransport QUIC/TLS handshake completed via {}; target {}, local {}, ALPN {}. The app=4 join flow is starting (early-auth, A7, 0x90/0x92/0x8A burst) and the receive/dispatch loop is active.",
                 route.route_label,
                 route.target_endpoint.label(),
                 local_addr,
@@ -2088,26 +2206,95 @@ async fn attempt_rbx_transport_connection_async(
         }
     }
 
-    // The native BaseClient request uses reliability enum 2. Its stream framing/channel
-    // assignment is still not verified, so no speculative early-auth or control bytes are sent.
-    let inbound_summary = receive_rbx_transport_session(
-        &mut connection,
-        &socket,
-        &receive_stats,
-        &datagram_buffer,
-        started,
-        if persistent_session {
-            None
-        } else {
-            Some(operation_timeout)
-        },
-        if persistent_session {
-            Some(Arc::clone(&cancel))
-        } else {
-            None
-        },
-    )
-    .await;
+    // App=4 join flow: the post-handshake burst (ctrl openU, early-auth, A7,
+    // 0x90, 0x92, 0x8A, 0x8F) plus the 0x9B challenge solve-and-answer and
+    // the ~60 ms route declarations — the Boblox session.cpp sequence.
+    let mut join_flow: Option<crate::appflow::AppFlow> = None;
+    if persistent_session {
+        let now_ms = started.elapsed().as_millis() as u64;
+        match build_join_flow_config(plan) {
+            Some(cfg) => {
+                let mut flow = crate::appflow::AppFlow::new(cfg, now_ms);
+                for action in flow.on_connected() {
+                    if let Err(error) = execute_join_flow_action(
+                        &mut connection,
+                        &socket,
+                        &mut tx_buf,
+                        started,
+                        &mut flow,
+                        action,
+                    )
+                    .await
+                    {
+                        if let Some(event_tx) = &event_tx {
+                            let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
+                                "app=4 flow burst: {error}"
+                            )));
+                        }
+                    }
+                }
+                if let Some(event_tx) = &event_tx {
+                    for event in flow.drain_events() {
+                        let _ = event_tx.send(match event {
+                            crate::appflow::FlowEvent::Log(msg) => {
+                                RbxTransportSessionEvent::Status(msg)
+                            }
+                            other => RbxTransportSessionEvent::Status(format!("{other:?}")),
+                        });
+                    }
+                }
+                join_flow = Some(flow);
+            }
+            None => {
+                if let Some(event_tx) = &event_tx {
+                    let _ = event_tx.send(RbxTransportSessionEvent::Status(
+                        "app=4 join flow skipped: join config is missing required fields (ClientTicket/UserId/joinTicket); staying in passive receive mode".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut flow_answered = false;
+    let inbound_summary = if let Some(flow) = &mut join_flow {
+        let summary = receive_rbx_transport_session(
+            &mut connection,
+            &socket,
+            &receive_stats,
+            &datagram_buffer,
+            started,
+            None,
+            Some(Arc::clone(&cancel)),
+            Some(flow),
+            &stream_receiver,
+            event_tx.as_ref(),
+        )
+        .await;
+        flow_answered = flow.answered();
+        summary
+    } else {
+        receive_rbx_transport_session(
+            &mut connection,
+            &socket,
+            &receive_stats,
+            &datagram_buffer,
+            started,
+            if persistent_session {
+                None
+            } else {
+                Some(operation_timeout)
+            },
+            if persistent_session {
+                Some(Arc::clone(&cancel))
+            } else {
+                None
+            },
+            None,
+            &stream_receiver,
+            event_tx.as_ref(),
+        )
+        .await
+    };
 
     Ok(RbxTransportConnectionReport {
         route_label: route.route_label,
@@ -2130,6 +2317,8 @@ async fn attempt_rbx_transport_connection_async(
         preauth_len: auth.preauth_blob.len(),
         auth_len: auth.auth_blob.len(),
         early_auth_payload_len,
+        flow_active: join_flow.is_some(),
+        flow_answered,
         inbound_summary,
     })
 }
@@ -2207,7 +2396,15 @@ struct RbxTransportStreamState {
 struct RbxTransportStreamReceiver {
     stats: Arc<Mutex<RbxTransportReceiveStats>>,
     streams: HashMap<ngnet_quic::StreamId, RbxTransportStreamState>,
+    /// Raw (stream id, bytes) events for the app=4 flow pump. The handler
+    /// runs inside ngtcp2's read path, so the flow drains this between
+    /// `read_pkt` calls. Capped so a bursty replication stream cannot grow
+    /// the queue without bound.
+    raw_events: VecDeque<(i64, Vec<u8>)>,
+    raw_event_bytes: usize,
 }
+
+const RBX_TRANSPORT_RAW_EVENT_QUEUE_BYTE_CAP: usize = 32 * 1024 * 1024;
 
 #[cfg(not(test))]
 impl RbxTransportStreamReceiver {
@@ -2215,7 +2412,15 @@ impl RbxTransportStreamReceiver {
         Self {
             stats,
             streams: HashMap::new(),
+            raw_events: VecDeque::new(),
+            raw_event_bytes: 0,
         }
+    }
+
+    /// Hand raw stream bytes to the app-flow pump.
+    fn drain_raw_events(&mut self) -> Vec<(i64, Vec<u8>)> {
+        self.raw_event_bytes = 0;
+        std::mem::take(&mut self.raw_events).collect()
     }
 
     fn stream_opened(&mut self, stream_id: ngnet_quic::StreamId) {
@@ -2231,6 +2436,18 @@ impl RbxTransportStreamReceiver {
     }
 
     fn stream_data(&mut self, stream_id: ngnet_quic::StreamId, bytes: &[u8], fin: bool) {
+        if !bytes.is_empty() {
+            self.raw_event_bytes += bytes.len();
+            self.raw_events.push_back((stream_id.get(), bytes.to_vec()));
+            while self.raw_event_bytes > RBX_TRANSPORT_RAW_EVENT_QUEUE_BYTE_CAP {
+                if let Some((_, dropped)) = self.raw_events.pop_front() {
+                    self.raw_event_bytes = self.raw_event_bytes.saturating_sub(dropped.len());
+                } else {
+                    break;
+                }
+            }
+        }
+        let _ = fin;
         let stats = Arc::clone(&self.stats);
         let state = self.streams.entry(stream_id).or_default();
         let mut cursor = 0usize;
@@ -2410,6 +2627,153 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
     Ok(())
 }
 
+/// Write `data` to a stream via `write_stream`, sending each produced
+/// datagram to the socket, until everything was accepted, the flow-control
+/// window is full, or ngtcp2 has nothing left to send. The main loop's
+/// `write_pending_rbx_transport_packets` flushes any residual state after.
+#[cfg(not(test))]
+async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
+    connection: &mut ngnet_quic::Conn<'_, S>,
+    socket: &RuppUdpSocket,
+    tx_buf: &mut [u8],
+    origin: Instant,
+    stream: i64,
+    data: &[u8],
+) -> Result<(), String> {
+    let id = ngnet_quic::StreamId::new(stream)
+        .map_err(|error| format!("invalid stream id {stream}: {error}"))?;
+    let mut off = 0usize;
+    let mut control_only = 0usize;
+    while off < data.len() {
+        let now = rbx_transport_timestamp(origin)?;
+        match connection.write_stream(tx_buf, id, &data[off..], false, now) {
+            Ok(ngnet_quic::StreamWrite::Datagram { len, accepted }) => {
+                if len > 0 {
+                    socket
+                        .send_to(&tx_buf[..len], connection.remote_addr())
+                        .await
+                        .map_err(|error| format!("stream datagram send failed: {error}"))?;
+                }
+                if accepted > 0 {
+                    off += accepted;
+                    control_only = 0;
+                } else if len == 0 {
+                    // Nothing usable this pass; the main loop retries on its
+                    // next wake (avoids a hot spin on a full window).
+                    break;
+                } else if control_only >= 16 {
+                    // Only control-frame datagrams in a row: stop and let
+                    // the main loop's write_pending pick it back up.
+                    break;
+                } else {
+                    // The packet was filled with control frames — offer the
+                    // same tail again.
+                    control_only += 1;
+                }
+            }
+            Ok(
+                ngnet_quic::StreamWrite::Idle
+                | ngnet_quic::StreamWrite::StreamBlocked
+                | ngnet_quic::StreamWrite::ConnectionBlocked
+                | ngnet_quic::StreamWrite::Blocked,
+            ) => break,
+            Err(error) => return Err(format!("ngtcp2 stream write failed: {error}")),
+        }
+    }
+    Ok(())
+}
+
+/// Drain raw stream events into the app=4 flow, execute the resulting
+/// actions (open streams / write bytes), fire flow timers, and forward
+/// flow events to the UI. Called from the receive loop on every wake.
+#[cfg(not(test))]
+async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
+    connection: &mut ngnet_quic::Conn<'_, S>,
+    socket: &RuppUdpSocket,
+    tx_buf: &mut [u8],
+    origin: Instant,
+    now_ms: u64,
+    flow: &mut crate::appflow::AppFlow,
+    stream_receiver: &Arc<Mutex<RbxTransportStreamReceiver>>,
+    event_tx: Option<&Sender<RbxTransportSessionEvent>>,
+) {
+    let mut events: Vec<(i64, Vec<u8>)> = Vec::new();
+    if let Ok(mut receiver) = stream_receiver.lock() {
+        events = receiver.drain_raw_events();
+    }
+    let mut actions = Vec::new();
+    for (sid, bytes) in events {
+        actions.extend(flow.on_raw_stream(sid, &bytes));
+    }
+    actions.extend(flow.on_tick(now_ms));
+
+    let mut emit = |message: String| {
+        if let Some(tx) = event_tx {
+            let _ = tx.send(RbxTransportSessionEvent::Status(message));
+        }
+    };
+    for action in actions {
+        match action {
+            crate::appflow::Action::OpenStream { app, chan, data } => {
+                match connection.open_bidi_stream() {
+                    Ok(id) => {
+                        let raw = id.get();
+                        flow.note_opened(app, chan, raw);
+                        emit(format!(
+                            "opened stream {raw} app={app} chan={chan} ({}B)",
+                            data.len()
+                        ));
+                        if let Err(error) = send_rbx_transport_stream_data(
+                            connection, socket, tx_buf, origin, raw, &data,
+                        )
+                        .await
+                        {
+                            emit(format!("stream {raw} first write failed: {error}"));
+                        }
+                    }
+                    Err(error) if error.kind() == ngnet_quic::ErrorKind::Blocked => {
+                        emit(format!(
+                            "stream limit reached — app={app} chan={chan} open deferred/dropped"
+                        ));
+                    }
+                    Err(error) => {
+                        emit(format!("failed to open stream app={app} chan={chan}: {error}"));
+                    }
+                }
+            }
+            crate::appflow::Action::Write { stream, data } => {
+                if let Err(error) =
+                    send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data)
+                        .await
+                {
+                    emit(format!("stream {stream} write failed: {error}"));
+                }
+            }
+        }
+    }
+
+    for event in flow.drain_events() {
+        let ui_event = match event {
+            crate::appflow::FlowEvent::Log(msg) => Some(RbxTransportSessionEvent::Status(msg)),
+            crate::appflow::FlowEvent::ChallengeReceived { u1, u2, blob_len } => {
+                Some(RbxTransportSessionEvent::ChallengeReceived { u1, u2, blob_len })
+            }
+            crate::appflow::FlowEvent::ChallengeAnswered { answer, elapsed_ms } => {
+                Some(RbxTransportSessionEvent::ChallengeAnswered { answer, elapsed_ms })
+            }
+            crate::appflow::FlowEvent::ChallengeFailed(msg) => {
+                Some(RbxTransportSessionEvent::ChallengeFailed(msg))
+            }
+            crate::appflow::FlowEvent::ConnectedStageReached { detail } => {
+                Some(RbxTransportSessionEvent::ConnectedStageReached(detail))
+            }
+        };
+        if let (Some(tx), Some(event)) = (event_tx, ui_event) {
+            let _ = tx.send(event);
+        }
+    }
+}
+
 #[cfg(not(test))]
 async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
     connection: &mut ngnet_quic::Conn<'_, S>,
@@ -2419,6 +2783,9 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
     origin: Instant,
     timeout: Option<Duration>,
     cancel: Option<Arc<AtomicBool>>,
+    flow: Option<&mut crate::appflow::AppFlow>,
+    stream_receiver: &Arc<Mutex<RbxTransportStreamReceiver>>,
+    event_tx: Option<&Sender<RbxTransportSessionEvent>>,
 ) -> String {
     let started = tokio::time::Instant::now();
     let deadline = timeout.map(|timeout| started + timeout);
@@ -2434,6 +2801,19 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         {
             connection_closed = Some(error);
             break;
+        }
+        if let Some(flow) = flow.as_deref_mut() {
+            pump_rbx_transport_app_flow(
+                connection,
+                socket,
+                &mut tx_buf,
+                origin,
+                origin.elapsed().as_millis() as u64,
+                flow,
+                stream_receiver,
+                event_tx,
+            )
+            .await;
         }
         let expiry = rbx_transport_expiry(connection, origin);
         let wake = tokio::select! {
@@ -2555,6 +2935,13 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
     summary.push_str(
         "\nApplication datagrams and post-prefix stream bytes are counted but not decoded; JoinData/change-item parsing is still outstanding.",
     );
+    if let Some(flow) = flow {
+        summary.push_str(&format!(
+            " App=4 flow: challenge-answered={} post-answer-chan1-bytes={}",
+            flow.answered(),
+            flow.post_answer_bytes()
+        ));
+    }
     summary
 }
 
@@ -4476,26 +4863,40 @@ pub fn run_join_config_session(
                 ))
             });
         match result {
-            Ok(connection_report) => report.push_str(&format!(
-                "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
-                connection_report.route_label,
-                connection_report.target,
-                connection_report.local_addr,
-                connection_report.alpn,
-                connection_report.rupp_prefix_len,
-                connection_report.initial_dst_cid_len,
-                connection_report.native_quic_cid_trailer_len,
-                connection_report.rpk_version,
-                connection_report.handshake_timeout_ms,
-                connection_report.requested_timeout_ms,
-                connection_report.handshake_completed_ms,
-                connection_report.udp_summary,
-                connection_report.auth_version,
-                connection_report.preauth_len,
-                connection_report.auth_len,
-                connection_report.early_auth_payload_len,
-                connection_report.inbound_summary
-            )),
+            Ok(connection_report) => {
+                let flow_status: String = if connection_report.flow_active {
+                    if connection_report.flow_answered {
+                        "🎯 app=4 join flow: burst sent, 0x9B challenge answered — BaseClient connected stage reached (post-answer world state on channel 1)".into()
+                    } else {
+                        "⚠️ app=4 join flow: burst sent, but the 0x9B challenge was not answered — connected stage NOT reached".into()
+                    }
+                } else {
+                    format!(
+                        "⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached",
+                        connection_report.auth_version,
+                        connection_report.preauth_len,
+                        connection_report.auth_len,
+                        connection_report.early_auth_payload_len
+                    )
+                };
+                report.push_str(&format!(
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}",
+                    connection_report.route_label,
+                    connection_report.target,
+                    connection_report.local_addr,
+                    connection_report.alpn,
+                    connection_report.rupp_prefix_len,
+                    connection_report.initial_dst_cid_len,
+                    connection_report.native_quic_cid_trailer_len,
+                    connection_report.rpk_version,
+                    connection_report.handshake_timeout_ms,
+                    connection_report.requested_timeout_ms,
+                    connection_report.handshake_completed_ms,
+                    connection_report.udp_summary,
+                    flow_status,
+                    connection_report.inbound_summary
+                ));
+            }
             Err(reason) => report.push_str(&format!(
                 "\nRbxTransport session ended before inbound Team Create traffic was accepted: {reason}"
             )),

@@ -1,0 +1,74 @@
+[
+ {
+  "name": "comb1",
+  "u1": 2153372264,
+  "u2": 3406069216,
+  "job": "472bd6de-39e8-44f7-9fe9-de91abce9dc2",
+  "answer": 2603781223,
+  "msg_len": 1971,
+  "file": "chal_comb1.bin"
+ },
+ {
+  "name": "comb2",
+  "u1": 3640360791,
+  "u2": 345659007,
+  "job": "472bd6de-39e8-44f7-9fe9-de91abce9dc2",
+  "answer": 4181992127,
+  "msg_len": 1971,
+  "file": "chal_comb2.bin"
+ },
+ {
+  "name": "comb3",
+  "u1": 759272077,
+  "u2": 2258879425,
+  "job": "472bd6de-39e8-44f7-9fe9-de91abce9dc2",
+  "answer": 1697138922,
+  "msg_len": 1971,
+  "file": "chal_comb3.bin"
+ },
+ {
+  "name": "full",
+  "u1": 2150227349,
+  "u2": 693451406,
+  "job": "e62f5d1f-24fc-464c-8d20-71431adc95b6",
+  "answer": 2193615038,
+  "msg_len": 1951,
+  "file": "chal_full.bin"
+ },
+ {
+  "name": "rounds_r1",
+  "u1": 975564607,
+  "u2": 223372620,
+  "job": "23c2e471-7b39-44bd-82b8-cd25661f9355",
+  "answer": 1902623592,
+  "msg_len": 1964,
+  "file": "chal_rounds_r1.bin"
+ },
+ {
+  "name": "rounds_r2",
+  "u1": 2029088579,
+  "u2": 909515379,
+  "job": "23c2e471-7b39-44bd-82b8-cd25661f9355",
+  "answer": 4121218490,
+  "msg_len": 1964,
+  "file": "chal_rounds_r2.bin"
+ },
+ {
+  "name": "rounds_r3",
+  "u1": 1100859792,
+  "u2": 3568226698,
+  "job": "23c2e471-7b39-44bd-82b8-cd25661f9355",
+  "answer": 108671631,
+  "msg_len": 1964,
+  "file": "chal_rounds_r3.bin"
+ },
+ {
+  "name": "rounds_r4",
+  "u1": 1884308164,
+  "u2": 1190118927,
+  "job": "23c2e471-7b39-44bd-82b8-cd25661f9355",
+  "answer": 1894668123,
+  "msg_len": 1964,
+  "file": "chal_rounds_r4.bin"
+ }
+]
