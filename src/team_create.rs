@@ -921,7 +921,7 @@ impl RbxTransportConnectPlan {
             self.rcc_endpoint.port
         ));
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, all routes are RUPP-wrapped with the literal UDMUX IP as SNI (native ClientHello parity), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload is pinned at the RFC 9000 client-Initial floor of 1200 bytes (server-side anti-amplification; sub-1200 Initials are blackholed by the UDMUX load balancer) and kernel-chopped into IP fragments under a 640-byte per-socket MTU for strict-carrier networks, with IP_TOS AF41 (136), 0-RX bail 2500 ms, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, all routes are RUPP-wrapped (flag byte 0x00 per the native capture) with the literal UDMUX IP as SNI and the 0xFF00 capabilities TLS extension spliced into every outgoing Initial (native ClientHello parity; native CH extension order, 0xff00 first), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload is pinned at the RFC 9000 client-Initial floor of 1200 bytes (server-side anti-amplification; sub-1200 Initials are blackholed by the UDMUX load balancer) and kernel-chopped into IP fragments under a 640-byte per-socket MTU for strict-carrier networks, with IP_TOS AF41 (136), 0-RX bail 2500 ms, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
@@ -1657,10 +1657,15 @@ fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec
         address: plan.rcc_endpoint.address.clone(),
         port: plan.rcc_endpoint.port,
     };
+    // FINDINGS.md byte layout for the RbxTransport game path:
+    // [01][00][u16 BE total][TLV1][TLV2] - the flag byte is 0x00. Both
+    // validated Boblox clients hardcode it (C++ rupp.h and Python
+    // rbx_client.py), and the native capture (rupp_tx001) shows 0x00; the
+    // join config's DSR bit is metadata for this path, not a wire flag.
     build_rupp_header_for(
         &plan.token,
         &rcc_endpoint,
-        plan.direct_server_return,
+        false,
         plan.token_type,
         RuppEndpointTlvKind::Endpoint,
     )
@@ -2753,6 +2758,213 @@ fn rbx_transport_expiry<S: ngnet_quic::Session>(
 }
 
 #[cfg(not(test))]
+/**
+ * The 0xFF00 capabilities TLS extension the native RbxTransport
+ * ClientHello carries: an 8-byte little-endian u64 capability bitmask.
+ * The UDMUX edge will not answer an Initial whose ClientHello lacks it
+ * (Boblox FINDINGS: the byte-parity C++ client completes the live
+ * handshake with the extension, native CH order has 0xff00 FIRST).
+ * rustls exposes no custom-extension API, so the value is spliced into
+ * the encoded ClientHello of every outgoing QUIC v1 Initial - including
+ * PTO retransmissions, which ngtcp2 regenerates from its internal CRYPTO
+ * copy without our patch. Native conn#0 value (byte-identical per
+ * FINDINGS; zeros are also tolerated, proven by native conn#1).
+ */
+const RBX_TRANSPORT_CAPS_EXT_TYPE: u16 = 0xFF00;
+const RBX_TRANSPORT_CAPS_WIRE: [u8; 8] = [0x92, 0x08, 0xB7, 0x50, 0xC7, 0xD3, 0x2D, 0x00];
+/// Set once the first 0xFF00 splice has been observed (diagnostic log).
+static RBX_TRANSPORT_CAPS_SPLICED: AtomicBool = AtomicBool::new(false);
+
+fn rbx_transport_varint_size(first: u8) -> usize {
+    match first & 0xC0 {
+        0x00 => 1,
+        0x40 => 2,
+        0x80 => 3,
+        _ => 4,
+    }
+}
+
+fn rbx_transport_read_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let first = *buf.get(pos)?;
+    let size = rbx_transport_varint_size(first);
+    let end = pos.checked_add(size)?;
+    let bytes = buf.get(pos..end)?;
+    let mut value = 0u64;
+    for (i, &raw) in bytes.iter().enumerate() {
+        let chunk = if i == 0 { raw & 0x3F } else { raw & 0x7F };
+        value = (value << 7) | u64::from(chunk);
+    }
+    Some((value, end))
+}
+
+/// Rewrite the varint at `pos` in place, keeping the original byte size.
+/// Fails (returns false) if `value` no longer fits in that size class.
+fn rbx_transport_write_varint_same_size(buf: &mut [u8], pos: usize, value: u64) -> bool {
+    let size = rbx_transport_varint_size(buf[pos]);
+    let prefix = match size {
+        1 => 0u8,
+        2 => 0x40,
+        3 => 0x80,
+        _ => 0xC0,
+    };
+    let mut out = [0u8; 4];
+    let mut v = value;
+    for i in (0..size).rev() {
+        let chunk = if i == 0 { v & 0x3F } else { v & 0x7F };
+        out[i] = chunk as u8;
+        v >>= 7;
+    }
+    if v != 0 {
+        return false;
+    }
+    out[0] |= prefix;
+    buf[pos..pos + size].copy_from_slice(&out[..size]);
+    true
+}
+
+/// Splice the 0xFF00 capabilities extension into the ClientHello carried
+/// by an outgoing QUIC v1 Initial, in place. The 12 inserted bytes are
+/// absorbed by the Initial's trailing PADDING, so the datagram length
+/// (1200) is unchanged. Returns true if the extension was inserted.
+/// Idempotent: a ClientHello that already carries 0xFF00 is left alone,
+/// and anything that is not a clean v1 Initial with a CRYPTO-offset-0
+/// ClientHello is left untouched (never breaks the packet).
+fn ensure_rbx_transport_caps_extension(packet: &mut [u8]) -> bool {
+    // Long header (form bit) with the fixed bit set, version 1.
+    if packet.len() < 6 || packet[0] & 0x80 == 0 || packet[0] & 0x40 == 0 {
+        return false;
+    }
+    if &packet[1..5] != &[0, 0, 0, 1] {
+        return false;
+    }
+    let mut p = 5usize;
+    for _ in 0..2 {
+        // destination CID, then source CID
+        let n = usize::from(*packet.get(p)?);
+        p = p.checked_add(1 + n)?;
+        if p > packet.len() {
+            return false;
+        }
+    }
+    // token
+    let token_len = usize::from(*packet.get(p)?);
+    p = p.checked_add(1 + token_len)?;
+    if p >= packet.len() || packet[p] != 0x40 {
+        // first frame must be CRYPTO
+        return false;
+    }
+    p += 1;
+    let (offset, q) = rbx_transport_read_varint(packet, p)?;
+    if offset != 0 {
+        return false;
+    }
+    let (crypto_len, d) = rbx_transport_read_varint(packet, q)?;
+    let crypto_len = usize::try_from(crypto_len).ok()?;
+    let crypto_end = d.checked_add(crypto_len)?;
+    if crypto_end > packet.len() {
+        return false;
+    }
+    let rec = &packet[d..crypto_end];
+    // TLS record: handshake content, legacy TLS 1.0 version, length.
+    if rec.len() < 6 || rec[0] != 0x16 || rec[1] != 0x03 || rec[2] != 0x01 {
+        return false;
+    }
+    let rec_len = usize::from(u16::from_be_bytes([rec[3], rec[4]]));
+    if rec.len() < rec_len + 5 {
+        return false;
+    }
+    let ch_base = d + 5;
+    if packet[ch_base] != 0x01 {
+        // ClientHello handshake type
+        return false;
+    }
+    let ch_len =
+        (usize::from(packet[ch_base + 1]) << 16) | (usize::from(packet[ch_base + 2]) << 8)
+            | usize::from(packet[ch_base + 3]);
+    // ch_base points at the handshake type byte; the 4-byte handshake
+    // header (type + 3-byte length) is NOT counted in ch_len.
+    let ch_end = ch_base + 4 + ch_len;
+    if ch_end > crypto_end {
+        return false;
+    }
+    // Walk the fixed ClientHello prefix to the extension list:
+    // legacy_version(2) random(32) session_id comp ciphers suites ext_len.
+    let mut c = ch_base + 4 + 2 + 32;
+    if c >= ch_end {
+        return false;
+    }
+    let sid_len = usize::from(packet[c]);
+    c = c.checked_add(1 + sid_len)?;
+    c += 1; // legacy compression
+    if c + 2 > ch_end {
+        return false;
+    }
+    let ciphers_len = usize::from(u16::from_be_bytes([packet[c], packet[c + 1]]));
+    c = c.checked_add(2 + ciphers_len)?;
+    if c + 1 > ch_end {
+        return false;
+    }
+    let suites_len = usize::from(packet[c]);
+    c = c.checked_add(1 + suites_len)?;
+    if c + 2 > ch_end {
+        return false;
+    }
+    let exts_len = usize::from(u16::from_be_bytes([packet[c], packet[c + 1]]));
+    let exts_start = c + 2;
+    let exts_end = exts_start.checked_add(exts_len)?;
+    if exts_end > ch_end {
+        return false;
+    }
+    // Idempotence: walk the extension list; bail if 0xFF00 is present.
+    let mut e = exts_start;
+    while e < exts_end {
+        if e + 4 > exts_end {
+            return false;
+        }
+        let etype = u16::from_be_bytes([packet[e], packet[e + 1]]);
+        let elen = usize::from(u16::from_be_bytes([packet[e + 2], packet[e + 3]]));
+        e = e.checked_add(4 + elen)?;
+        if etype == RBX_TRANSPORT_CAPS_EXT_TYPE {
+            return false;
+        }
+    }
+    // The trailing PADDING after the CRYPTO frame must absorb the insert.
+    if packet.len() - crypto_end < 12 {
+        return false;
+    }
+    // Length updates, all at offsets before the insertion point.
+    if !rbx_transport_write_varint_same_size(packet, q, (crypto_len + 12) as u64) {
+        return false;
+    }
+    let r = d + 3;
+    let rec_cur = u16::from_be_bytes([packet[r], packet[r + 1]]);
+    let rec_next = rec_cur.checked_add(12)?;
+    packet[r..r + 2].copy_from_slice(&rec_next.to_be_bytes());
+    let r = ch_base + 1;
+    let ch_cur = (u32::from(packet[r]) << 16) | (u32::from(packet[r + 1]) << 8) | u32::from(packet[r + 2]);
+    let ch_next = ch_cur.checked_add(12)?;
+    if ch_next > 0x00FFFFFF {
+        return false;
+    }
+    packet[r] = (ch_next >> 16) as u8;
+    packet[r + 1] = (ch_next >> 8) as u8;
+    packet[r + 2] = ch_next as u8;
+    let r = exts_start - 2;
+    let exts_cur = u16::from_be_bytes([packet[r], packet[r + 1]]);
+    let exts_next = exts_cur.checked_add(12)?;
+    packet[r..r + 2].copy_from_slice(&exts_next.to_be_bytes());
+    // Shift the extension list (and whatever followed it inside the
+    // CRYPTO data) right by 12 - the padding absorbs it - then write the
+    // new extension at the front of the list, matching the native order
+    // (0xff00 first).
+    packet.copy_within(exts_start..crypto_end, exts_start + 12);
+    let mut block = [0u8; 12];
+    block[..4].copy_from_slice(&[0xFF, 0x00, 0x00, 0x08]);
+    block[4..].copy_from_slice(&RBX_TRANSPORT_CAPS_WIRE);
+    packet[exts_start..exts_start + 12].copy_from_slice(&block);
+    true
+}
+
 async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
     connection: &mut ngnet_quic::Conn<'_, S>,
     socket: &RuppUdpSocket,
@@ -2766,6 +2978,13 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
             .map_err(|error| format!("ngtcp2 packet write failed: {error}"))?
         {
             ngnet_quic::WriteOutcome::Datagram { len } => {
+                if ensure_rbx_transport_caps_extension(&mut tx_buf[..len])
+                    && !RBX_TRANSPORT_CAPS_SPLICED.swap(true, Ordering::Relaxed)
+                {
+                    log::info!(
+                        "spliced the 0xFF00 capabilities extension (native conn#0 caps) into the outgoing QUIC Initial"
+                    );
+                }
                 socket
                     .send_to(&tx_buf[..len], connection.remote_addr())
                     .await
@@ -2799,6 +3018,7 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
         match connection.write_stream(tx_buf, id, &data[off..], false, now) {
             Ok(ngnet_quic::StreamWrite::Datagram { len, accepted }) => {
                 if len > 0 {
+                    ensure_rbx_transport_caps_extension(&mut tx_buf[..len]);
                     socket
                         .send_to(&tx_buf[..len], connection.remote_addr())
                         .await
