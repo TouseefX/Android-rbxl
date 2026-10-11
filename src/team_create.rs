@@ -37,7 +37,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc::Sender,
     Arc, Mutex,
 };
@@ -944,7 +944,7 @@ impl RbxTransportConnectPlan {
         ));
         match &self.early_auth {
             Ok(auth) => text.push_str(&format!(
-                "\nRbxTransport BaseClient early auth material: native sendEarlyAuthData uses active connection send slot argument 1, frame tag 0xA8; auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted). It is staged for diagnostics but not sent until the reliability-2 channel/wire-ID route is verified.",
+                "\nRbxTransport BaseClient early auth material: native sendEarlyAuthData uses active connection send slot argument 1, frame tag 0xA8; auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted). It is sent in the post-handshake burst on channel 1 (with A7, 0x90/0x92/0x8A, 0x8F) as soon as the QUIC handshake completes.",
                 auth.auth_version,
                 auth.preauth_blob.len(),
                 auth.auth_blob.len(),
@@ -1604,20 +1604,23 @@ impl RbxTransportControlDecoder {
     }
 }
 
+/// Decode an RFC 9000 sec.16 QUIC varint: the 2-bit prefix of the first
+/// byte selects the width (00 = 1 byte, 01 = 2, 10 = 3, 11 = 4) and every
+/// continuation byte contributes 7 payload bits.
 fn decode_rbx_transport_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let first = *bytes.first()?;
     let encoded_len = match first >> 6 {
         0 => 1,
         1 => 2,
-        2 => 4,
-        _ => 8,
+        2 => 3,
+        _ => 4,
     };
     if bytes.len() < encoded_len {
         return None;
     }
     let mut value = u64::from(first & 0x3f);
     for byte in bytes.iter().take(encoded_len).skip(1) {
-        value = (value << 8) | u64::from(*byte);
+        value = (value << 7) | u64::from(*byte & 0x7f);
     }
     Some((value, encoded_len))
 }
@@ -2366,48 +2369,56 @@ async fn attempt_rbx_transport_connection_async(
     // App=4 join flow: the post-handshake burst (ctrl openU, early-auth, A7,
     // 0x90, 0x92, 0x8A, 0x8F) plus the 0x9B challenge solve-and-answer and
     // the ~60 ms route declarations — the Boblox session.cpp sequence.
+    // Forced for every completed handshake (not just persistent
+    // sessions): once the keys are up, the appflow burst goes out
+    // immediately.
     let mut join_flow: Option<crate::appflow::AppFlow> = None;
-    if persistent_session {
-        let now_ms = started.elapsed().as_millis() as u64;
-        match build_join_flow_config(plan) {
-            Some(cfg) => {
-                let mut flow = crate::appflow::AppFlow::new(cfg, now_ms);
-                for action in flow.on_connected() {
-                    if let Err(error) = execute_join_flow_action(
-                        &mut connection,
-                        &socket,
-                        &mut tx_buf,
-                        started,
-                        &mut flow,
-                        action,
-                    )
-                    .await
-                    {
-                        if let Some(event_tx) = &event_tx {
-                            let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
-                                "app=4 flow burst: {error}"
-                            )));
-                        }
+    match build_join_flow_config(plan) {
+        Some(cfg) => {
+            let now_ms = started.elapsed().as_millis() as u64;
+            let mut flow = crate::appflow::AppFlow::new(cfg, now_ms);
+            log::info!(
+                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, A7, 0x90/0x92/0x8A, 0x8F)"
+            );
+            for action in flow.on_connected() {
+                if let Err(error) = execute_join_flow_action(
+                    &mut connection,
+                    &socket,
+                    &mut tx_buf,
+                    started,
+                    &mut flow,
+                    action,
+                )
+                .await
+                {
+                    if let Some(event_tx) = &event_tx {
+                        let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
+                            "app=4 flow burst: {error}"
+                        )));
                     }
+                    log::warn!("app=4 flow burst: {error}");
                 }
-                if let Some(event_tx) = &event_tx {
-                    for event in flow.drain_events() {
-                        let _ = event_tx.send(match event {
-                            crate::appflow::FlowEvent::Log(msg) => {
-                                RbxTransportSessionEvent::Status(msg)
-                            }
-                            other => RbxTransportSessionEvent::Status(format!("{other:?}")),
-                        });
-                    }
-                }
-                join_flow = Some(flow);
             }
-            None => {
-                if let Some(event_tx) = &event_tx {
-                    let _ = event_tx.send(RbxTransportSessionEvent::Status(
-                        "app=4 join flow skipped: join config is missing required fields (ClientTicket/UserId/joinTicket); staying in passive receive mode".into(),
-                    ));
+            if let Some(event_tx) = &event_tx {
+                for event in flow.drain_events() {
+                    let _ = event_tx.send(match event {
+                        crate::appflow::FlowEvent::Log(msg) => {
+                            RbxTransportSessionEvent::Status(msg)
+                        }
+                        other => RbxTransportSessionEvent::Status(format!("{other:?}")),
+                    });
                 }
+            }
+            join_flow = Some(flow);
+        }
+        None => {
+            log::warn!(
+                "app=4 join flow skipped: join config is missing required fields (ClientTicket/UserId/joinTicket)"
+            );
+            if let Some(event_tx) = &event_tx {
+                let _ = event_tx.send(RbxTransportSessionEvent::Status(
+                    "app=4 join flow skipped: join config is missing required fields (ClientTicket/UserId/joinTicket); staying in passive receive mode".into(),
+                ));
             }
         }
     }
@@ -2777,8 +2788,14 @@ fn rbx_transport_expiry<S: ngnet_quic::Session>(
  */
 const RBX_TRANSPORT_CAPS_EXT_TYPE: u16 = 0xFF00;
 const RBX_TRANSPORT_CAPS_WIRE: [u8; 8] = [0x92, 0x08, 0xB7, 0x50, 0xC7, 0xD3, 0x2D, 0x00];
-/// Set once the first 0xFF00 splice has been observed (diagnostic log).
-static RBX_TRANSPORT_CAPS_SPLICED: AtomicBool = AtomicBool::new(false);
+/// Bounded diagnostic-log counter for 0xFF00 splice outcomes: the first
+/// few outgoing datagrams get a log line (with a hex preview on layout
+/// mismatch) so a silently-skipped splice can never happen again.
+static RBX_TRANSPORT_CAPS_SPLICE_LOGGED: AtomicUsize = AtomicUsize::new(0);
+/// Bounded diagnostic-log counter for the first received datagrams (hex
+/// preview of the post-RUPP head) - the DCID in those first long headers
+/// is what settles whether ngtcp2 matches the server's replies.
+static RBX_TRANSPORT_RX_DUMP_LOGGED: AtomicUsize = AtomicUsize::new(0);
 
 fn rbx_transport_varint_size(first: u8) -> usize {
     match first & 0xC0 {
@@ -2827,142 +2844,173 @@ fn rbx_transport_write_varint_same_size(buf: &mut [u8], pos: usize, value: u64) 
     true
 }
 
+/// Outcome of an attempt to splice the 0xFF00 capabilities extension
+/// into an outgoing datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RbxCapsSpliceOutcome {
+    /// The extension was inserted into the ClientHello.
+    Spliced,
+    /// The ClientHello already carried 0xFF00 (left untouched).
+    AlreadyPresent,
+    /// The datagram is a v1 Initial whose first frame is a CRYPTO frame
+    /// at offset 0, but the ClientHello layout did not match expectations.
+    LayoutMismatch,
+    /// Not a v1 Initial at all (short header, other version, or the first
+    /// frame is not CRYPTO-offset-0). Nothing to do.
+    NotInitial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RbxCapsSpliceErr {
+    AlreadyPresent,
+    NotInitial,
+    Layout,
+}
+
 /// Splice the 0xFF00 capabilities extension into the ClientHello carried
 /// by an outgoing QUIC v1 Initial, in place. The 12 inserted bytes are
 /// absorbed by the Initial's trailing PADDING, so the datagram length
-/// (1200) is unchanged. Returns true if the extension was inserted.
-/// Idempotent: a ClientHello that already carries 0xFF00 is left alone,
-/// and anything that is not a clean v1 Initial with a CRYPTO-offset-0
-/// ClientHello is left untouched (never breaks the packet).
-fn ensure_rbx_transport_caps_extension(packet: &mut [u8]) -> bool {
-    splice_rbx_transport_caps_extension(packet).is_some()
+/// (1200) is unchanged. Idempotent: a ClientHello that already carries
+/// 0xFF00 is left alone, and anything that is not a clean v1 Initial with
+/// a CRYPTO-offset-0 ClientHello is left untouched (never breaks the
+/// packet).
+///
+/// CRYPTO framing: in this stack (rustls QUIC API under ngtcp2) the
+/// CRYPTO frame payload is the RAW TLS handshake message stream - there
+/// is no TLS record layer inside CRYPTO data (no `16 03 01` header;
+/// rustls `read_hs`/`write_hs` consume and emit handshake messages
+/// directly). The ClientHello therefore starts at the first CRYPTO byte:
+/// `01 <u24 length> 03 03 <32-byte random> ...`.
+fn splice_rbx_transport_caps_extension(packet: &mut [u8]) -> RbxCapsSpliceOutcome {
+    match splice_rbx_transport_caps_inner(packet) {
+        Ok(()) => RbxCapsSpliceOutcome::Spliced,
+        Err(RbxCapsSpliceErr::AlreadyPresent) => RbxCapsSpliceOutcome::AlreadyPresent,
+        Err(RbxCapsSpliceErr::NotInitial) => RbxCapsSpliceOutcome::NotInitial,
+        Err(RbxCapsSpliceErr::Layout) => RbxCapsSpliceOutcome::LayoutMismatch,
+    }
 }
 
-/// The actual splice; `None` = not a clean v1 Initial with a CRYPTO-
-/// offset-0 ClientHello, or the extension is already present.
-fn splice_rbx_transport_caps_extension(packet: &mut [u8]) -> Option<()> {
+fn splice_rbx_transport_caps_inner(packet: &mut [u8]) -> Result<(), RbxCapsSpliceErr> {
     // Long header (form bit) with the fixed bit set, version 1.
     if packet.len() < 6 || packet[0] & 0x80 == 0 || packet[0] & 0x40 == 0 {
-        return None;
+        return Err(RbxCapsSpliceErr::NotInitial);
     }
     if &packet[1..5] != &[0, 0, 0, 1] {
-        return None;
+        return Err(RbxCapsSpliceErr::NotInitial);
     }
     let mut p = 5usize;
     for _ in 0..2 {
         // destination CID, then source CID
-        let n = usize::from(*packet.get(p)?);
-        p = p.checked_add(1 + n)?;
+        let n = usize::from(*packet.get(p).ok_or(RbxCapsSpliceErr::NotInitial)?);
+        p = p.checked_add(1 + n).ok_or(RbxCapsSpliceErr::NotInitial)?;
         if p > packet.len() {
-            return None;
+            return Err(RbxCapsSpliceErr::NotInitial);
         }
     }
     // token
-    let token_len = usize::from(*packet.get(p)?);
-    p = p.checked_add(1 + token_len)?;
+    let token_len = usize::from(*packet.get(p).ok_or(RbxCapsSpliceErr::NotInitial)?);
+    p = p.checked_add(1 + token_len).ok_or(RbxCapsSpliceErr::NotInitial)?;
     if p >= packet.len() || packet[p] != 0x40 {
         // first frame must be CRYPTO
-        return None;
+        return Err(RbxCapsSpliceErr::NotInitial);
     }
     p += 1;
-    let (offset, q) = rbx_transport_read_varint(packet, p)?;
+    let (offset, q) = rbx_transport_read_varint(packet, p).ok_or(RbxCapsSpliceErr::Layout)?;
     if offset != 0 {
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
-    let (crypto_len, d) = rbx_transport_read_varint(packet, q)?;
-    let crypto_len = usize::try_from(crypto_len).ok()?;
-    let crypto_end = d.checked_add(crypto_len)?;
-    if crypto_end > packet.len() {
-        return None;
+    let (crypto_len, d) = rbx_transport_read_varint(packet, q).ok_or(RbxCapsSpliceErr::Layout)?;
+    let crypto_len = usize::try_from(crypto_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    let crypto_end = d.checked_add(crypto_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    if crypto_end > packet.len() || d + 4 > packet.len() {
+        return Err(RbxCapsSpliceErr::Layout);
     }
-    let rec = &packet[d..crypto_end];
-    // TLS record: handshake content, legacy TLS 1.0 version, length.
-    if rec.len() < 6 || rec[0] != 0x16 || rec[1] != 0x03 || rec[2] != 0x01 {
-        return None;
-    }
-    let rec_len = usize::from(u16::from_be_bytes([rec[3], rec[4]]));
-    if rec.len() < rec_len + 5 {
-        return None;
-    }
-    let ch_base = d + 5;
+    // The CRYPTO payload is the raw ClientHello (no TLS record layer).
+    let ch_base = d;
     if packet[ch_base] != 0x01 {
         // ClientHello handshake type
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
     let ch_len =
         (usize::from(packet[ch_base + 1]) << 16) | (usize::from(packet[ch_base + 2]) << 8)
             | usize::from(packet[ch_base + 3]);
     // ch_base points at the handshake type byte; the 4-byte handshake
-    // header (type + 3-byte length) is NOT counted in ch_len.
+    // header (type + 3-byte length) is NOT counted in ch_len. The first
+    // flight's CRYPTO frame carries exactly one message (the
+    // ClientHello), so the handshake must end exactly at the CRYPTO
+    // frame end.
     let ch_end = ch_base + 4 + ch_len;
-    if ch_end > crypto_end {
-        return None;
+    if ch_end != crypto_end {
+        return Err(RbxCapsSpliceErr::Layout);
     }
     // Walk the fixed ClientHello prefix to the extension list:
-    // legacy_version(2) random(32) session_id comp ciphers suites ext_len.
+    // legacy_version(2) random(32) session_id ciphers suites comp ext_len.
     let mut c = ch_base + 4 + 2 + 32;
     if c >= ch_end {
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
     let sid_len = usize::from(packet[c]);
-    c = c.checked_add(1 + sid_len)?;
-    c += 1; // legacy compression
+    c = c.checked_add(1 + sid_len).ok_or(RbxCapsSpliceErr::Layout)?;
     if c + 2 > ch_end {
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
     let ciphers_len = usize::from(u16::from_be_bytes([packet[c], packet[c + 1]]));
-    c = c.checked_add(2 + ciphers_len)?;
+    c = c.checked_add(2 + ciphers_len).ok_or(RbxCapsSpliceErr::Layout)?;
     if c + 1 > ch_end {
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
     let suites_len = usize::from(packet[c]);
-    c = c.checked_add(1 + suites_len)?;
+    c = c.checked_add(1 + suites_len).ok_or(RbxCapsSpliceErr::Layout)?;
     if c + 2 > ch_end {
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
     let exts_len = usize::from(u16::from_be_bytes([packet[c], packet[c + 1]]));
     let exts_start = c + 2;
-    let exts_end = exts_start.checked_add(exts_len)?;
-    if exts_end > ch_end {
-        return None;
+    let exts_end = exts_start.checked_add(exts_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    if exts_end != ch_end {
+        return Err(RbxCapsSpliceErr::Layout);
     }
     // Idempotence: walk the extension list; bail if 0xFF00 is present.
     let mut e = exts_start;
     while e < exts_end {
         if e + 4 > exts_end {
-            return None;
+            return Err(RbxCapsSpliceErr::Layout);
         }
         let etype = u16::from_be_bytes([packet[e], packet[e + 1]]);
         let elen = usize::from(u16::from_be_bytes([packet[e + 2], packet[e + 3]]));
-        e = e.checked_add(4 + elen)?;
-        if etype == RBX_TRANSPORT_CAPS_EXT_TYPE {
-            return None;
+        e = e.checked_add(4 + elen).ok_or(RbxCapsSpliceErr::Layout)?;
+        if e > exts_end {
+            return Err(RbxCapsSpliceErr::Layout);
         }
+        if etype == RBX_TRANSPORT_CAPS_EXT_TYPE {
+            return Err(RbxCapsSpliceErr::AlreadyPresent);
+        }
+    }
+    if e != exts_end {
+        return Err(RbxCapsSpliceErr::Layout);
     }
     // The trailing PADDING after the CRYPTO frame must absorb the insert.
     if packet.len() - crypto_end < 12 {
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
-    // Length updates, all at offsets before the insertion point.
+    // Length updates, all at offsets before the insertion point: CRYPTO
+    // frame length (varint, same size), ClientHello length (u24),
+    // extension list length (u16). No record length - no record layer.
     if !rbx_transport_write_varint_same_size(packet, q, (crypto_len + 12) as u64) {
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
-    let r = d + 3;
-    let rec_cur = u16::from_be_bytes([packet[r], packet[r + 1]]);
-    let rec_next = rec_cur.checked_add(12)?;
-    packet[r..r + 2].copy_from_slice(&rec_next.to_be_bytes());
     let r = ch_base + 1;
     let ch_cur = (u32::from(packet[r]) << 16) | (u32::from(packet[r + 1]) << 8) | u32::from(packet[r + 2]);
-    let ch_next = ch_cur.checked_add(12)?;
+    let ch_next = ch_cur.checked_add(12).ok_or(RbxCapsSpliceErr::Layout)?;
     if ch_next > 0x00FFFFFF {
-        return None;
+        return Err(RbxCapsSpliceErr::Layout);
     }
     packet[r] = (ch_next >> 16) as u8;
     packet[r + 1] = (ch_next >> 8) as u8;
     packet[r + 2] = ch_next as u8;
     let r = exts_start - 2;
     let exts_cur = u16::from_be_bytes([packet[r], packet[r + 1]]);
-    let exts_next = exts_cur.checked_add(12)?;
+    let exts_next = exts_cur.checked_add(12).ok_or(RbxCapsSpliceErr::Layout)?;
     packet[r..r + 2].copy_from_slice(&exts_next.to_be_bytes());
     // Shift the extension list (and whatever followed it inside the
     // CRYPTO data) right by 12 - the padding absorbs it - then write the
@@ -2973,7 +3021,7 @@ fn splice_rbx_transport_caps_extension(packet: &mut [u8]) -> Option<()> {
     block[..4].copy_from_slice(&[0xFF, 0x00, 0x00, 0x08]);
     block[4..].copy_from_slice(&RBX_TRANSPORT_CAPS_WIRE);
     packet[exts_start..exts_start + 12].copy_from_slice(&block);
-    Some(())
+    Ok(())
 }
 
 async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
@@ -2989,12 +3037,43 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
             .map_err(|error| format!("ngtcp2 packet write failed: {error}"))?
         {
             ngnet_quic::WriteOutcome::Datagram { len } => {
-                if ensure_rbx_transport_caps_extension(&mut tx_buf[..len])
-                    && !RBX_TRANSPORT_CAPS_SPLICED.swap(true, Ordering::Relaxed)
-                {
-                    log::info!(
-                        "spliced the 0xFF00 capabilities extension (native conn#0 caps) into the outgoing QUIC Initial"
-                    );
+                let splice_outcome = splice_rbx_transport_caps_extension(&mut tx_buf[..len]);
+                let splice_log_no =
+                    RBX_TRANSPORT_CAPS_SPLICE_LOGGED.fetch_add(1, Ordering::Relaxed);
+                match splice_outcome {
+                    RbxCapsSpliceOutcome::Spliced => {
+                        if splice_log_no < 2 {
+                            log::info!(
+                                "spliced the 0xFF00 capabilities extension (raw-ClientHello CRYPTO layout, no TLS record layer) into the outgoing QUIC v1 Initial"
+                            );
+                        }
+                    }
+                    RbxCapsSpliceOutcome::AlreadyPresent => {
+                        if splice_log_no < 3 {
+                            log::info!(
+                                "0xFF00 capabilities extension already present in the ClientHello; leaving the Initial untouched"
+                            );
+                        }
+                    }
+                    RbxCapsSpliceOutcome::LayoutMismatch => {
+                        if splice_log_no < 4 {
+                            let preview: String = tx_buf[..len.min(64)]
+                                .iter()
+                                .map(|byte| format!("{byte:02x} "))
+                                .collect();
+                            log::warn!(
+                                "0xFF00 splice: v1 Initial with CRYPTO-offset-0 data but unexpected layout (len={len}, head: {preview})"
+                            );
+                        }
+                    }
+                    RbxCapsSpliceOutcome::NotInitial => {
+                        if splice_log_no < 3 {
+                            log::info!(
+                                "0xFF00 splice: datagram is not a v1 Initial (first byte {:#04x}); nothing to splice",
+                                tx_buf[0]
+                            );
+                        }
+                    }
                 }
                 socket
                     .send_to(&tx_buf[..len], connection.remote_addr())
@@ -3029,7 +3108,7 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
         match connection.write_stream(tx_buf, id, &data[off..], false, now) {
             Ok(ngnet_quic::StreamWrite::Datagram { len, accepted }) => {
                 if len > 0 {
-                    ensure_rbx_transport_caps_extension(&mut tx_buf[..len]);
+                    let _ = splice_rbx_transport_caps_extension(&mut tx_buf[..len]);
                     socket
                         .send_to(&tx_buf[..len], connection.remote_addr())
                         .await
@@ -3654,6 +3733,14 @@ impl RuppUdpSocket {
                     .native_trailer_decrypt_failures
                     .fetch_add(1, Ordering::Relaxed);
             }
+        }
+        let rx_dump_no = RBX_TRANSPORT_RX_DUMP_LOGGED.fetch_add(1, Ordering::Relaxed);
+        if rx_dump_no < 2 {
+            let preview: String = buffer[..len.min(96)]
+                .iter()
+                .map(|byte| format!("{byte:02x} "))
+                .collect();
+            log::info!("RX datagram #{rx_dump_no} len={len} from {remote} head: {preview}");
         }
         if let Some(first) = buffer.get(..len).and_then(|payload| payload.first()).copied() {
             let counter = if first & 0x80 != 0 {
