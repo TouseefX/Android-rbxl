@@ -592,8 +592,13 @@ const RBX_TRANSPORT_UDP_TOS: u8 = 0x80;
 /// Bail a route attempt when datagrams went out but the carrier returned
 /// nothing for this long (a healthy path answers the Initial well before
 /// it). This is what turns a 10 s deadlock per route/size into a ~2.5 s
-/// probe so the MTU ladder can move on.
+/// probe so the MTU ladder can move on. Two-stage: the first observation
+/// grants one grace window (`RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS`) because
+/// on this network the first response was observed at ~3 s — a hard bail
+/// at 2.5 s killed an otherwise-alive path. A second observation with
+/// still zero RX bails (~3.5 s worst case per dead size).
 const RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS: u64 = 2_500;
+const RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS: u64 = 1_000;
 const RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES: usize = 12;
 const RBX_TRANSPORT_NATIVE_QUIC_COUNTER_INITIAL: u64 = u64::from_le_bytes(*b"UniqueNu");
 const RBX_TRANSPORT_NATIVE_QUIC_NONCE_SUFFIX: [u8; 10] = *b"iqueNumbeR";
@@ -2141,6 +2146,7 @@ async fn attempt_rbx_transport_connection_async(
 
     let mut tx_buf = vec![0u8; 65_535];
     let mut rx_buf = vec![0u8; 65_535];
+    let mut zero_rx_grace_given = false;
     let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
     loop {
         write_pending_rbx_transport_packets(
@@ -2161,23 +2167,39 @@ async fn attempt_rbx_transport_connection_async(
             }
             break;
         }
-        // 0-RX early bail: datagrams went out (Initial + retransmits) but
-        // the carrier returned nothing. On e&/du-class strict filtering
-        // that is a dropped-by-DPI signature, not a slow handshake — bail
-        // after the probe window so the MTU ladder / next route can try
-        // instead of deadlocking for the full 10 s native budget.
+        // 0-RX early bail (two-stage): datagrams went out (Initial +
+        // retransmits) but the carrier returned nothing. On e&/du-class
+        // strict filtering that is a dropped-by-DPI signature, not a slow
+        // handshake. The first observation only arms the grace window —
+        // the first response on this network has been observed at ~3 s, so
+        // a hard bail at 2.5 s killed an otherwise-alive path. The next
+        // loop wake (at most ~1 s later, usually immediately if a packet
+        // arrives) re-checks, and only a confirmed still-0-RX bails, so
+        // the MTU ladder / next route still moves on in ~3.5 s instead of
+        // the full 10 s native budget.
         let zero_rx_bail_ms =
             RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS.min(requested_timeout_ms);
         if started.elapsed() >= Duration::from_millis(zero_rx_bail_ms)
             && udp_stats.incoming_datagrams.load(Ordering::Relaxed) == 0
             && udp_stats.outgoing_datagrams.load(Ordering::Relaxed) >= 1
         {
-            return Err(format!(
-                "UDP 0-RX after {} ms (payload cap {}): {} datagrams sent, none received - this size looks filtered by the local carrier; the ladder will retry smaller",
+            if zero_rx_grace_given {
+                return Err(format!(
+                    "UDP 0-RX for {} ms + {} ms grace (payload cap {}): {} datagrams sent, none received - this size looks filtered by the local carrier; the ladder will retry smaller",
+                    zero_rx_bail_ms,
+                    RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS,
+                    max_udp_payload,
+                    udp_stats.outgoing_datagrams.load(Ordering::Relaxed)
+                ));
+            }
+            zero_rx_grace_given = true;
+            tracing::warn!(
+                target: "team_create",
+                "0-RX at {} ms (payload cap {}), granting {} ms grace window before bailing this size",
                 zero_rx_bail_ms,
                 max_udp_payload,
-                udp_stats.outgoing_datagrams.load(Ordering::Relaxed)
-            ));
+                RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS
+            );
         }
         if tokio::time::Instant::now() >= handshake_deadline {
             return Err(rbx_transport_handshake_timeout_message(
