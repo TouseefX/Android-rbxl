@@ -1249,11 +1249,7 @@ static int conn_new(ngtcp2_conn **pconn, const ngtcp2_cid *dcid,
 
   assert(settings->max_window <= NGTCP2_MAX_VARINT);
   assert(settings->max_stream_window <= NGTCP2_MAX_VARINT);
-  /* Sub-1200 clamps are deliberately allowed: they shrink the Initial
-     (and the padding around it) so strict carriers that drop large
-     "unverified" UDP still get a first flight. 512 is the crate-level
-     floor; a ClientHello + transport params must still fit. */
-  assert(settings->max_tx_udp_payload_size >= 512);
+  assert(settings->max_tx_udp_payload_size >= NGTCP2_MAX_UDP_PAYLOAD_SIZE);
   assert(settings->max_tx_udp_payload_size <= NGTCP2_MAX_TX_UDP_PAYLOAD_SIZE);
   assert(settings->initial_pkt_num <= INT32_MAX);
   assert(settings->initial_rtt);
