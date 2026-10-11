@@ -2193,8 +2193,7 @@ async fn attempt_rbx_transport_connection_async(
                 ));
             }
             zero_rx_grace_given = true;
-            tracing::warn!(
-                target: "team_create",
+            log::warn!(
                 "0-RX at {} ms (payload cap {}), granting {} ms grace window before bailing this size",
                 zero_rx_bail_ms,
                 max_udp_payload,
