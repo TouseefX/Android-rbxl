@@ -2835,12 +2835,18 @@ fn rbx_transport_write_varint_same_size(buf: &mut [u8], pos: usize, value: u64) 
 /// and anything that is not a clean v1 Initial with a CRYPTO-offset-0
 /// ClientHello is left untouched (never breaks the packet).
 fn ensure_rbx_transport_caps_extension(packet: &mut [u8]) -> bool {
+    splice_rbx_transport_caps_extension(packet).is_some()
+}
+
+/// The actual splice; `None` = not a clean v1 Initial with a CRYPTO-
+/// offset-0 ClientHello, or the extension is already present.
+fn splice_rbx_transport_caps_extension(packet: &mut [u8]) -> Option<()> {
     // Long header (form bit) with the fixed bit set, version 1.
     if packet.len() < 6 || packet[0] & 0x80 == 0 || packet[0] & 0x40 == 0 {
-        return false;
+        return None;
     }
     if &packet[1..5] != &[0, 0, 0, 1] {
-        return false;
+        return None;
     }
     let mut p = 5usize;
     for _ in 0..2 {
@@ -2848,7 +2854,7 @@ fn ensure_rbx_transport_caps_extension(packet: &mut [u8]) -> bool {
         let n = usize::from(*packet.get(p)?);
         p = p.checked_add(1 + n)?;
         if p > packet.len() {
-            return false;
+            return None;
         }
     }
     // token
@@ -2856,32 +2862,32 @@ fn ensure_rbx_transport_caps_extension(packet: &mut [u8]) -> bool {
     p = p.checked_add(1 + token_len)?;
     if p >= packet.len() || packet[p] != 0x40 {
         // first frame must be CRYPTO
-        return false;
+        return None;
     }
     p += 1;
     let (offset, q) = rbx_transport_read_varint(packet, p)?;
     if offset != 0 {
-        return false;
+        return None;
     }
     let (crypto_len, d) = rbx_transport_read_varint(packet, q)?;
     let crypto_len = usize::try_from(crypto_len).ok()?;
     let crypto_end = d.checked_add(crypto_len)?;
     if crypto_end > packet.len() {
-        return false;
+        return None;
     }
     let rec = &packet[d..crypto_end];
     // TLS record: handshake content, legacy TLS 1.0 version, length.
     if rec.len() < 6 || rec[0] != 0x16 || rec[1] != 0x03 || rec[2] != 0x01 {
-        return false;
+        return None;
     }
     let rec_len = usize::from(u16::from_be_bytes([rec[3], rec[4]]));
     if rec.len() < rec_len + 5 {
-        return false;
+        return None;
     }
     let ch_base = d + 5;
     if packet[ch_base] != 0x01 {
         // ClientHello handshake type
-        return false;
+        return None;
     }
     let ch_len =
         (usize::from(packet[ch_base + 1]) << 16) | (usize::from(packet[ch_base + 2]) << 8)
@@ -2890,56 +2896,56 @@ fn ensure_rbx_transport_caps_extension(packet: &mut [u8]) -> bool {
     // header (type + 3-byte length) is NOT counted in ch_len.
     let ch_end = ch_base + 4 + ch_len;
     if ch_end > crypto_end {
-        return false;
+        return None;
     }
     // Walk the fixed ClientHello prefix to the extension list:
     // legacy_version(2) random(32) session_id comp ciphers suites ext_len.
     let mut c = ch_base + 4 + 2 + 32;
     if c >= ch_end {
-        return false;
+        return None;
     }
     let sid_len = usize::from(packet[c]);
     c = c.checked_add(1 + sid_len)?;
     c += 1; // legacy compression
     if c + 2 > ch_end {
-        return false;
+        return None;
     }
     let ciphers_len = usize::from(u16::from_be_bytes([packet[c], packet[c + 1]]));
     c = c.checked_add(2 + ciphers_len)?;
     if c + 1 > ch_end {
-        return false;
+        return None;
     }
     let suites_len = usize::from(packet[c]);
     c = c.checked_add(1 + suites_len)?;
     if c + 2 > ch_end {
-        return false;
+        return None;
     }
     let exts_len = usize::from(u16::from_be_bytes([packet[c], packet[c + 1]]));
     let exts_start = c + 2;
     let exts_end = exts_start.checked_add(exts_len)?;
     if exts_end > ch_end {
-        return false;
+        return None;
     }
     // Idempotence: walk the extension list; bail if 0xFF00 is present.
     let mut e = exts_start;
     while e < exts_end {
         if e + 4 > exts_end {
-            return false;
+            return None;
         }
         let etype = u16::from_be_bytes([packet[e], packet[e + 1]]);
         let elen = usize::from(u16::from_be_bytes([packet[e + 2], packet[e + 3]]));
         e = e.checked_add(4 + elen)?;
         if etype == RBX_TRANSPORT_CAPS_EXT_TYPE {
-            return false;
+            return None;
         }
     }
     // The trailing PADDING after the CRYPTO frame must absorb the insert.
     if packet.len() - crypto_end < 12 {
-        return false;
+        return None;
     }
     // Length updates, all at offsets before the insertion point.
     if !rbx_transport_write_varint_same_size(packet, q, (crypto_len + 12) as u64) {
-        return false;
+        return None;
     }
     let r = d + 3;
     let rec_cur = u16::from_be_bytes([packet[r], packet[r + 1]]);
@@ -2949,7 +2955,7 @@ fn ensure_rbx_transport_caps_extension(packet: &mut [u8]) -> bool {
     let ch_cur = (u32::from(packet[r]) << 16) | (u32::from(packet[r + 1]) << 8) | u32::from(packet[r + 2]);
     let ch_next = ch_cur.checked_add(12)?;
     if ch_next > 0x00FFFFFF {
-        return false;
+        return None;
     }
     packet[r] = (ch_next >> 16) as u8;
     packet[r + 1] = (ch_next >> 8) as u8;
@@ -2967,7 +2973,7 @@ fn ensure_rbx_transport_caps_extension(packet: &mut [u8]) -> bool {
     block[..4].copy_from_slice(&[0xFF, 0x00, 0x00, 0x08]);
     block[4..].copy_from_slice(&RBX_TRANSPORT_CAPS_WIRE);
     packet[exts_start..exts_start + 12].copy_from_slice(&block);
-    true
+    Some(())
 }
 
 async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
