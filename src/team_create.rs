@@ -2282,10 +2282,42 @@ async fn attempt_rbx_transport_connection_async(
             } => RbxTransportWake::Cancelled,
         };
         match wake {
-            RbxTransportWake::Datagram(Ok((len, _remote))) if len != 0 => {
+            RbxTransportWake::Datagram(Ok((len, remote))) if len != 0 => {
                 let timestamp = rbx_transport_timestamp(started)?;
                 let read_result = connection.read_pkt(&rx_buf[..len], timestamp);
                 account_rbx_transport_datagrams(&datagram_buffer, &receive_stats);
+                let rx_diag_no =
+                    RBX_TRANSPORT_RX_DIAG_LOGGED.fetch_add(1, Ordering::Relaxed);
+                if rx_diag_no < 8 {
+                    let source_note = if remote != connection.remote_addr() {
+                        format!(
+                            " (SOURCE {remote} != dialed {})",
+                            connection.remote_addr()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let dcid_note = rbx_transport_rx_dcid_note(&rx_buf[..len]);
+                    match &read_result {
+                        Ok(ngnet_quic::ReadOutcome::DropSilently) => {
+                            log::warn!(
+                                "ngtcp2 DROPPED handshake datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note} (no close sent: unknown DCID/version, or unauthenticated-level source mismatch)"
+                            );
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "ngtcp2 REJECTED handshake datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note}: {error}"
+                            );
+                        }
+                        Ok(other) => {
+                            if rx_diag_no < 4 {
+                                log::info!(
+                                    "ngtcp2 processed handshake datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note} ({other:?})"
+                                );
+                            }
+                        }
+                    }
+                }
                 match read_result {
                     Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
                         return Err(format!(
@@ -2758,6 +2790,30 @@ async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
 }
 
 #[cfg(not(test))]
+/// Describe the DCID carried by an inbound datagram (v1 long header) so
+/// a silent ngtcp2 drop can be compared against the SCID this
+/// connection announced. Non-long-header or non-v1 packets get a short
+/// hex head instead.
+fn rbx_transport_rx_dcid_note(datagram: &[u8]) -> String {
+    let format_hex = |bytes: &[u8]| -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ")
+    };
+    let Some(first) = datagram.first().copied() else {
+        return String::new();
+    };
+    if first & 0x80 == 0 {
+        let n = datagram.len().min(16);
+        return format!(" (short header, head {})", format_hex(&datagram[..n]));
+    }
+    if datagram.len() < 6 || &datagram[1..5] != &[0, 0, 0, 1] {
+        let n = datagram.len().min(16);
+        return format!(" (non-v1 long header, head {})", format_hex(&datagram[..n]));
+    }
+    let dcid_len = usize::from(datagram[5]);
+    let end = (6 + dcid_len).min(datagram.len());
+    format!(" (v1 DCID {})", format_hex(&datagram[6..end]))
+}
+
 fn rbx_transport_timestamp(origin: Instant) -> Result<ngnet_quic::Timestamp, String> {
     let nanos = u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
     ngnet_quic::Timestamp::from_nanos(nanos)
@@ -2799,6 +2855,12 @@ static RBX_TRANSPORT_CAPS_SPLICE_LOGGED: AtomicUsize = AtomicUsize::new(0);
 /// preview of the post-RUPP head) - the DCID in those first long headers
 /// is what settles whether ngtcp2 matches the server's replies.
 static RBX_TRANSPORT_RX_DUMP_LOGGED: AtomicUsize = AtomicUsize::new(0);
+/// Bounded diagnostic counter for how ngtcp2 classified received
+/// datagrams (accepted / DROPPED-silently / REJECTED). A silent drop
+/// during the handshake is the only signal that a packet was refused
+/// without a close (unknown DCID, version, or unauthenticated source)
+/// and was previously invisible - it looked like a plain timeout.
+static RBX_TRANSPORT_RX_DIAG_LOGGED: AtomicUsize = AtomicUsize::new(0);
 
 /// Width (in bytes) of the transport varint starting at `first`, using
 /// the Roblox transport varint widths: 1 / 2 / 4 / 8. The CRYPTO-frame
@@ -3307,7 +3369,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
             } => RbxTransportWake::Cancelled,
         };
         match wake {
-            RbxTransportWake::Datagram(Ok((len, _remote))) if len != 0 => {
+            RbxTransportWake::Datagram(Ok((len, remote))) if len != 0 => {
                 let timestamp = match rbx_transport_timestamp(origin) {
                     Ok(timestamp) => timestamp,
                     Err(error) => {
@@ -3317,6 +3379,38 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
                 };
                 let read_result = connection.read_pkt(&rx_buf[..len], timestamp);
                 account_rbx_transport_datagrams(datagram_buffer, stats);
+                let rx_diag_no =
+                    RBX_TRANSPORT_RX_DIAG_LOGGED.fetch_add(1, Ordering::Relaxed);
+                if rx_diag_no < 12 {
+                    let source_note = if remote != connection.remote_addr() {
+                        format!(
+                            " (SOURCE {remote} != dialed {})",
+                            connection.remote_addr()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let dcid_note = rbx_transport_rx_dcid_note(&rx_buf[..len]);
+                    match &read_result {
+                        Ok(ngnet_quic::ReadOutcome::DropSilently) => {
+                            log::warn!(
+                                "ngtcp2 DROPPED datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note}"
+                            );
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "ngtcp2 REJECTED datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note}: {error}"
+                            );
+                        }
+                        Ok(other) => {
+                            if rx_diag_no < 8 {
+                                log::info!(
+                                    "ngtcp2 processed datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note} ({other:?})"
+                                );
+                            }
+                        }
+                    }
+                }
                 match read_result {
                     Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
                         connection_closed = Some(connection.close_error().to_string());
