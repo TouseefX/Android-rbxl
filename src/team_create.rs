@@ -574,21 +574,35 @@ const RBX_TRANSPORT_NATIVE_QUIC_PROTECTION_KEY: [u8; 32] = [
 const RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES: usize = 18;
 const RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES: usize = 16;
 /// Max UDP payload (QUIC packet before the RUPP prefix) per route attempt.
-/// Strict Middle-East carriers (e&/du) drop long-haul "unverified" UDP
-/// datagrams above a size threshold — measured live: the 1231/1249-byte
-/// datagrams (1200-byte padded QUIC Initial + 31-byte RUPP, +18 trailer)
-/// got 4 tx / 0 rx. The native engine survives the same networks with MTU
-/// probing and fragmentation fallback, so the app probes the same way:
-/// each route is retried at a descending payload cap until the Initial
-/// comes back. 1200 is the QUIC-spec Initial maximum (status quo); each
-/// step drops ~100 bytes of datagram, and 800 stays far above any real
-/// ClientHello while being well under typical carrier thresholds.
-const RBX_TRANSPORT_UDP_PAYLOAD_TIERS: [usize; 5] = [1200, 1100, 1000, 900, 800];
-/// IP_TOS for the QUIC UDP socket: DSCP CS4 (100000), TOS byte 128 —
-/// the class the native client marks its traffic with; carrier QoS treats
-/// it as a named class instead of unmarked bulk UDP. Flip to 0x88 (AF41),
-/// 0xB8 (EF) or 0x00 (CS0) if a specific carrier reacts differently.
-const RBX_TRANSPORT_UDP_TOS: u8 = 0x80;
+/// Pinned at the RFC 9000 client-Initial floor of 1200: the US Google Cloud
+/// UDMUX load balancer enforces the anti-amplification rule and blackholes
+/// client Initials whose UDP payload is below 1200 bytes — verified live:
+/// the sub-1200 tiers (831-1131 on the wire) cleared the local carrier but
+/// got zero answers from the UDMUX endpoint. So the Initial is NOT shrunk
+/// (the old descending "MTU ladder" is dead); instead the kernel chops the
+/// oversized UDP datagram into IP fragments (RBX_TRANSPORT_UDP_CHOP_MTU +
+/// IP_PMTUDISC_DONT) — the "Initial-Chop" strategy — keeping the physical
+/// frames under the strict carrier's threshold while the reassembled UDP
+/// payload stays 1231/1249, exactly what the server's front door expects.
+const RBX_TRANSPORT_UDP_PAYLOAD_TIERS: [usize; 1] = [1200];
+/// Per-socket path-MTU cap (IP_MTU / IPV6_MTU) that forces the kernel to
+/// chop the 1231/1249-byte RUPP-wrapped Initial (1259/1277 with IP+UDP
+/// headers) into ~two IP fragments of <= 640 bytes each.
+/// IP_PMTUDISC_DONT (DF=0, no PMTUD) is what allows the fragments; the
+/// phone's 1500-byte interface MTU would otherwise ship the datagram whole
+/// and let the strict carrier drop it. 640 = the "two ~600-byte fragments"
+/// shape; drop it to 576 (three fragments) if the carrier still eats
+/// 640-byte frames.
+const RBX_TRANSPORT_UDP_CHOP_MTU: u32 = 640;
+/// Kernel-ABI setsockopt numbers (stable across Linux/Android/bionic):
+/// IP_MTU=14 at IPPROTO_IP level, IPV6_MTU=20 at IPPROTO_IPV6 level.
+const RBX_TRANSPORT_SOCKOPT_IP_MTU: i32 = 14;
+const RBX_TRANSPORT_SOCKOPT_IPV6_MTU: i32 = 20;
+/// IP_TOS for the QUIC UDP socket: DSCP AF41 (101001), TOS byte 136.
+/// CS4 (0x80/128) was tried live first and Roblox/carrier did not take it
+/// — switched to AF41 on 2026-10-11. Flip to 0x80 (CS4), 0xB8 (EF) or
+/// 0x00 (CS0) if a specific carrier reacts differently.
+const RBX_TRANSPORT_UDP_TOS: u8 = 0x88;
 /// Bail a route attempt when datagrams went out but the carrier returned
 /// nothing for this long (a healthy path answers the Initial well before
 /// it). This is what turns a 10 s deadlock per route/size into a ~2.5 s
@@ -907,7 +921,7 @@ impl RbxTransportConnectPlan {
             self.rcc_endpoint.port
         ));
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, all routes are RUPP-wrapped with the literal UDMUX IP as SNI (native ClientHello parity), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload cap is MTU-probed in descending tiers [1200, 1100, 1000, 900, 800] with IP_TOS CS4 (128) and kernel fragmentation fallback for strict-carrier networks, 0-RX bail 2500 ms, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, all routes are RUPP-wrapped with the literal UDMUX IP as SNI (native ClientHello parity), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload is pinned at the RFC 9000 client-Initial floor of 1200 bytes (server-side anti-amplification; sub-1200 Initials are blackholed by the UDMUX load balancer) and kernel-chopped into IP fragments under a 640-byte per-socket MTU for strict-carrier networks, with IP_TOS AF41 (136), 0-RX bail 2500 ms, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
@@ -1661,7 +1675,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (MTU-ladder tier that survived the carrier), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1698,8 +1712,9 @@ struct RbxTransportConnectionReport {
     initial_dst_cid_len: usize,
     native_quic_cid_trailer_len: usize,
     /// The max_tx_udp_payload_size (QUIC payload before RUPP) this
-    /// connection negotiated up to — reports the MTU-ladder tier that
-    /// actually survived the local carrier.
+    /// connection used — pinned at the RFC 9000 client-Initial floor of
+    /// 1200 (the datagram is kernel-chopped into IP fragments instead of
+    /// being shrunk).
     max_udp_payload_size: usize,
     rpk_version: u16,
     requested_timeout_ms: u64,
@@ -1890,12 +1905,13 @@ async fn run_rbx_transport_connection_async_with_session(
     let routes = build_rbx_transport_quic_routes(plan)?;
     let mut failures = Vec::new();
 
-    // MTU ladder (outer) x route (inner): strict Middle-East carriers
-    // (e&/du) drop long-haul UDP datagrams above a size threshold, so the
-    // first tier (1200, datagram 1231/1249 with RUPP) may be filtered even
-    // though the path is otherwise fine. Probe descending payload caps the
-    // way the native engine does (MTU probing + fragmentation fallback);
-    // the 0-RX early bail keeps each probe to ~2.5 s.
+    // Route sweep at a fixed 1200-byte payload cap: the UDMUX load
+    // balancer blackholes sub-1200 client Initials (RFC 9000
+    // anti-amplification floor), so the strict-carrier problem is solved
+    // socket-side instead — the kernel chops the 1231/1249-byte datagram
+    // into ~two 640-byte IP fragments (RBX_TRANSPORT_UDP_CHOP_MTU +
+    // IP_PMTUDISC_DONT), the native engine's fragmentation fallback. The
+    // two-stage 0-RX bail keeps each route attempt to ~3.5 s.
     for &max_udp_payload in &RBX_TRANSPORT_UDP_PAYLOAD_TIERS {
         for route in &routes {
             if cancel.load(Ordering::Relaxed) {
@@ -1977,14 +1993,20 @@ async fn attempt_rbx_transport_connection_async(
     event_tx: Option<Sender<RbxTransportSessionEvent>>,
 ) -> Result<RbxTransportConnectionReport, String> {
     let target_addr = resolve_endpoint(&route.target_endpoint)?;
-    // socket2 (not std::net) so two options std does not expose can be set
+    // socket2 (not std::net) so the options std does not expose can be set
     // before the socket leaves this function:
-    // - IP_TOS: mark the flow as DSCP CS4 (TOS byte 128) so carrier QoS
+    // - IP_TOS: mark the flow as DSCP AF41 (TOS byte 136) so carrier QoS
     //   treats it as a named class instead of unmarked bulk UDP;
     // - IP_PMTUDISC_DONT: let the kernel FRAGMENT an oversized datagram
     //   instead of setting DF and failing silently when the carrier
     //   swallows the ICMP feedback - the "fragmentation fallback" the
-    //   native engine relies on on strict networks.
+    //   native engine relies on on strict networks;
+    // - IP_MTU: cap the per-socket path MTU at RBX_TRANSPORT_UDP_CHOP_MTU
+    //   so the DONT above actually triggers - without it the 1500-byte
+    //   interface MTU ships the 1277-byte Initial whole and the strict
+    //   carrier drops it. Together they are the "Initial-Chop": the
+    //   reassembled UDP payload stays >= 1200 (UDMUX requirement) while
+    //   each physical frame is a small, carrier-safe fragment.
     let domain = if target_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -1995,8 +2017,8 @@ async fn attempt_rbx_transport_connection_async(
     sock.set_nonblocking(true)
         .map_err(|error| format!("failed to set QUIC UDP socket nonblocking: {error}"))?;
     if let Err(error) = sock.set_tos(RBX_TRANSPORT_UDP_TOS as u32) {
-        // Non-fatal: some platforms/carriers ignore IP_TOS; the payload
-        // ladder is the primary mechanism.
+        // Non-fatal: some platforms/carriers ignore IP_TOS; the socket MTU
+        // chop is the primary mechanism.
         let _ = error;
     }
     // IP_PMTUDISC_DONT / IPV6_PMTUDISC_DONT (both = 0): let the kernel
@@ -2015,6 +2037,26 @@ async fn attempt_rbx_transport_connection_async(
             sockopt_level,
             sockopt_name,
             &pmtudisc_dont as *const i32 as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        );
+    }
+    // IP_MTU / IPV6_MTU: per-socket path-MTU cap (Linux >= 4.5). This is
+    // what makes the kernel chop the Initial into fragments; DONT alone
+    // only permits it. Best-effort: if the kernel rejects the option the
+    // datagram goes out whole (old behaviour) rather than failing the
+    // connection.
+    let (chop_level, chop_name) = if target_addr.is_ipv4() {
+        (libc::IPPROTO_IP, RBX_TRANSPORT_SOCKOPT_IP_MTU)
+    } else {
+        (libc::IPPROTO_IPV6, RBX_TRANSPORT_SOCKOPT_IPV6_MTU)
+    };
+    let chop_mtu: i32 = RBX_TRANSPORT_UDP_CHOP_MTU as i32;
+    unsafe {
+        let _ = libc::setsockopt(
+            std::os::unix::io::AsRawFd::as_raw_fd(&sock),
+            chop_level,
+            chop_name,
+            &chop_mtu as *const i32 as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
         );
     }
@@ -2072,11 +2114,12 @@ async fn attempt_rbx_transport_connection_async(
         u64::try_from(handshake_timeout.as_nanos())
             .map_err(|_| "RbxTransport handshake timeout exceeds ngtcp2's clock range")?,
     );
-    // Clamp the max UDP payload (QUIC packet before the RUPP prefix) to
-    // this MTU-ladder tier. ngtcp2 pads the Initial up to the clamp, so a
-    // tier of 1100 produces an on-wire datagram of at most
-    // 1100 + RUPP prefix (+ trailer) instead of the 1231/1249 the strict
-    // carriers were dropping.
+    // Pin the max UDP payload (QUIC packet before the RUPP prefix) to
+    // this tier - currently always 1200, the RFC 9000 client-Initial floor
+    // the UDMUX load balancer enforces (sub-1200 Initials are blackholed
+    // server-side). ngtcp2 pads the Initial up to the clamp; the oversized
+    // on-wire datagram (1231/1249) is then chopped into IP fragments by
+    // the socket's chop MTU. Never shrink this below 1200.
     let settings = ngnet_quic::Settings::new(initial_ts)
         .max_tx_udp_payload_size(max_udp_payload)
         .handshake_timeout(ng_handshake_timeout);
@@ -2175,7 +2218,7 @@ async fn attempt_rbx_transport_connection_async(
         // a hard bail at 2.5 s killed an otherwise-alive path. The next
         // loop wake (at most ~1 s later, usually immediately if a packet
         // arrives) re-checks, and only a confirmed still-0-RX bails, so
-        // the MTU ladder / next route still moves on in ~3.5 s instead of
+        // the next route variant still gets its chance in ~3.5 s instead of
         // the full 10 s native budget.
         let zero_rx_bail_ms =
             RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS.min(requested_timeout_ms);
@@ -2185,7 +2228,7 @@ async fn attempt_rbx_transport_connection_async(
         {
             if zero_rx_grace_given {
                 return Err(format!(
-                    "UDP 0-RX for {} ms + {} ms grace (payload cap {}): {} datagrams sent, none received - this size looks filtered by the local carrier; the ladder will retry smaller",
+                    "UDP 0-RX for {} ms + {} ms grace (payload cap {}): {} datagrams sent, none received - the path looks filtered or the Initial is blackholed; the next route variant will retry",
                     zero_rx_bail_ms,
                     RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS,
                     max_udp_payload,
