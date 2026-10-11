@@ -1604,23 +1604,26 @@ impl RbxTransportControlDecoder {
     }
 }
 
-/// Decode an RFC 9000 sec.16 QUIC varint: the 2-bit prefix of the first
-/// byte selects the width (00 = 1 byte, 01 = 2, 10 = 3, 11 = 4) and every
-/// continuation byte contributes 7 payload bits.
+/// Decode Roblox's compact varint (top-2-bit size scheme, Boblox util.h
+/// compactVarintDecode): 00 = 1 byte, 01 = 2, 10 = 4, 11 = 8; value =
+/// (first & 0x3F) followed by n-1 raw big-endian bytes. This is the
+/// stream-framing / ctrl / chan varint (same encoding as
+/// appflow::compact_varint) - NOT the RFC 9000 QUIC-wire varint, which is
+/// 1/2/3/4 with 7-bit groups and lives inside ngtcp2.
 fn decode_rbx_transport_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let first = *bytes.first()?;
     let encoded_len = match first >> 6 {
         0 => 1,
         1 => 2,
-        2 => 3,
-        _ => 4,
+        2 => 4,
+        _ => 8,
     };
     if bytes.len() < encoded_len {
         return None;
     }
     let mut value = u64::from(first & 0x3f);
     for byte in bytes.iter().take(encoded_len).skip(1) {
-        value = (value << 7) | u64::from(*byte & 0x7f);
+        value = (value << 8) | u64::from(*byte);
     }
     Some((value, encoded_len))
 }
@@ -2797,15 +2800,24 @@ static RBX_TRANSPORT_CAPS_SPLICE_LOGGED: AtomicUsize = AtomicUsize::new(0);
 /// is what settles whether ngtcp2 matches the server's replies.
 static RBX_TRANSPORT_RX_DUMP_LOGGED: AtomicUsize = AtomicUsize::new(0);
 
+/// Width (in bytes) of the transport varint starting at `first`, using
+/// the Roblox transport varint widths: 1 / 2 / 4 / 8. The CRYPTO-frame
+/// varints this is used on are written by ngtcp2 and on the first flight
+/// only ever use the 1- and 2-byte widths, where these widths and the
+/// RFC 9000 widths agree.
 fn rbx_transport_varint_size(first: u8) -> usize {
     match first & 0xC0 {
         0x00 => 1,
         0x40 => 2,
-        0x80 => 3,
-        _ => 4,
+        0x80 => 4,
+        _ => 8,
     }
 }
 
+/// Read the CRYPTO-frame varint at `pos`. ngtcp2 writes these in the
+/// RFC 9000 7-bit-group value layout, so the value extraction matches
+/// what ngtcp2 actually put on the wire (widths used on the first flight
+/// are 1 and 2 bytes, which both width tables agree on).
 fn rbx_transport_read_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
     let first = *buf.get(pos)?;
     let size = rbx_transport_varint_size(first);
@@ -2920,7 +2932,7 @@ fn splice_rbx_transport_caps_inner(packet: &mut [u8]) -> Result<(), RbxCapsSplic
         return Err(RbxCapsSpliceErr::Layout);
     }
     let (crypto_len, d) = rbx_transport_read_varint(packet, q).ok_or(RbxCapsSpliceErr::Layout)?;
-    let crypto_len = usize::try_from(crypto_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    let crypto_len = usize::try_from(crypto_len).map_err(|_| RbxCapsSpliceErr::Layout)?;
     let crypto_end = d.checked_add(crypto_len).ok_or(RbxCapsSpliceErr::Layout)?;
     if crypto_end > packet.len() || d + 4 > packet.len() {
         return Err(RbxCapsSpliceErr::Layout);
