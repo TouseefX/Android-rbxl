@@ -472,6 +472,16 @@ fn generate_bindings(
             .allowlist_function("SSL_set_ex_data")
             .allowlist_function("SSL_get_ex_data")
             // ALPN. Mandatory in QUIC rather than optional as it is over TCP.
+            // Custom extensions. The only way to put an extension OpenSSL does
+            // not know about into the ClientHello, and the only way to control
+            // where it sits in the list.
+            .allowlist_function("SSL_CTX_add_custom_ext")
+            .allowlist_type("SSL_custom_ext_add_cb_ex")
+            .allowlist_type("SSL_custom_ext_free_cb_ex")
+            .allowlist_type("SSL_custom_ext_parse_cb_ex")
+            // SSL_EXT_CLIENT_HELLO and friends select which handshake message a
+            // custom extension is written into.
+            .allowlist_var("SSL_EXT_.*")
             .allowlist_function("SSL_set_alpn_protos")
             .allowlist_function("SSL_CTX_set_alpn_select_cb")
             .allowlist_function("SSL_get0_alpn_selected")

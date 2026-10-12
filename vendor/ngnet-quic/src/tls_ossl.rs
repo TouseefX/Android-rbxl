@@ -1527,9 +1527,15 @@ unsafe extern "C" fn custom_ext_add(
     if add_arg.is_null() || out.is_null() || outlen.is_null() {
         return 0;
     }
-    let payload = &*add_arg.cast::<Vec<u8>>();
-    *out = payload.as_ptr();
-    *outlen = payload.len();
+    // Edition 2024 does not treat an `unsafe fn` body as an implicit unsafe
+    // block, so the dereference is marked at the point it happens. `add_arg` is
+    // the address of the `Arc<Vec<u8>>` payload registered with
+    // `SSL_CTX_add_custom_ext`, which the backend and every session keep alive.
+    let payload = unsafe { &*add_arg.cast::<Vec<u8>>() };
+    unsafe {
+        *out = payload.as_ptr();
+        *outlen = payload.len();
+    }
     1
 }
 
