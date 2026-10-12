@@ -2139,7 +2139,34 @@ async fn attempt_rbx_transport_connection_async(
     let settings = ngnet_quic::Settings::new(initial_ts)
         .max_tx_udp_payload_size(max_udp_payload)
         .handshake_timeout(ng_handshake_timeout);
+    // Transport parameters, stated explicitly rather than inherited.
+    //
+    // The first group has to match what a native client advertises: the UDMUX
+    // load balancer fronts a fleet whose flow-control windows are sized for a
+    // long-lived, high-throughput session, and the defaults in
+    // `ngnet_quic::TransportParams::new` (256 KiB per stream, 1 MiB for the
+    // connection, 100 streams) describe a short request instead.
+    //
+    // The second group is already what ngtcp2 defaults to, and is written out
+    // anyway so the code says what we put on the wire. ngtcp2 encodes a
+    // parameter only when it differs from its own default, so restating these
+    // four costs no bytes - but an ngtcp2 bump that moved a default would
+    // otherwise change what we advertise without anything here noticing.
+    //
+    // `initial_max_streams_bidi` is deliberately left at the crate default: it
+    // was not part of the set being matched, and lowering it to zero would
+    // refuse server-initiated bidirectional streams outright.
     let params = ngnet_quic::TransportParams::new()
+        .initial_max_stream_data_bidi_local(1_410_065_407)
+        .initial_max_stream_data_bidi_remote(1_410_065_407)
+        .initial_max_stream_data_uni(1_410_065_407)
+        .initial_max_data(141_006_550_700)
+        .initial_max_streams_uni(1024)
+        .max_idle_timeout(ngnet_quic::Duration::from_nanos(20_000_000_000))
+        .max_udp_payload_size(65527)
+        .active_connection_id_limit(2)
+        .ack_delay_exponent(3)
+        .max_ack_delay(ngnet_quic::Duration::from_nanos(25_000_000))
         .max_datagram_frame_size(RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES as u64);
     let backend = RbxTransportRustlsBackend::new(
         plan.early_key.public_key,

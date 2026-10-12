@@ -22,7 +22,7 @@
 use ngnet_quic_sys as sys;
 
 use crate::cid::ConnectionId;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::time::Duration;
 use crate::validate;
 
@@ -122,6 +122,30 @@ impl TransportParams {
         self
     }
 
+    /// Advertises the largest UDP payload this endpoint will receive.
+    ///
+    /// This is what the peer reads to decide how big its datagrams may be, and
+    /// it is distinct from `Settings::max_tx_udp_payload_size`, which clamps what
+    /// this endpoint *sends*. ngtcp2 defaults it to
+    /// `NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE` (65527, the largest UDP payload
+    /// that fits in an IPv4 datagram), so leaving it alone already advertises the
+    /// QUIC maximum. RFC 9000 section 18.2 rejects values below 1200.
+    pub fn max_udp_payload_size(mut self, bytes: u64) -> Self {
+        self.raw.max_udp_payload_size = bytes;
+        self
+    }
+
+    /// Sets the exponent applied to the ACK Delay field of ACK frames.
+    ///
+    /// The peer multiplies the delay it reports by `2^exponent` to recover
+    /// microseconds, so both endpoints have to agree on the scale. ngtcp2
+    /// defaults it to `NGTCP2_DEFAULT_ACK_DELAY_EXPONENT` (3), which is also the
+    /// RFC 9000 section 18.2 default; that section rejects values above 20.
+    pub fn ack_delay_exponent(mut self, exponent: u64) -> Self {
+        self.raw.ack_delay_exponent = exponent;
+        self
+    }
+
     /// Sets how many connection IDs the peer may keep active.
     ///
     /// Must be at least 2 and at most 8; ngtcp2 cannot track more.
@@ -190,6 +214,23 @@ impl TransportParams {
             self.raw.max_datagram_frame_size,
             "params.max_datagram_frame_size exceeds the maximum QUIC varint",
         )?;
+        validate::varint(
+            self.raw.max_udp_payload_size,
+            "params.max_udp_payload_size exceeds the maximum QUIC varint",
+        )?;
+        // RFC 9000 section 18.2: a peer may not advertise a receive limit below
+        // the 1200-byte Initial floor, and an ack_delay_exponent above 20 cannot
+        // be scaled back to a sane delay.
+        if self.raw.max_udp_payload_size < sys::NGTCP2_MAX_UDP_PAYLOAD_SIZE as u64 {
+            return Err(Error::invalid_input(
+                "params.max_udp_payload_size is below the QUIC minimum of 1200",
+            ));
+        }
+        if self.raw.ack_delay_exponent > 20 {
+            return Err(Error::invalid_input(
+                "params.ack_delay_exponent exceeds the QUIC maximum of 20",
+            ));
+        }
         validate::transport_params_role(
             server,
             self.raw.original_dcid_present != 0,
@@ -296,6 +337,57 @@ mod tests {
         let raw = params.as_raw();
         assert_eq!(raw.original_dcid_present, 1);
         assert_eq!(&raw.original_dcid.data[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn the_library_defaults_are_the_rfc9000_ones() {
+        // Pinned because a peer that hard-codes its expectations of us has to
+        // see these exact numbers, and an ngtcp2 bump could move them.
+        let raw = TransportParams::new().as_raw();
+        assert_eq!(
+            raw.max_udp_payload_size,
+            u64::from(sys::NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE)
+        );
+        assert_eq!(raw.max_udp_payload_size, 65527);
+        assert_eq!(
+            raw.ack_delay_exponent,
+            u64::from(sys::NGTCP2_DEFAULT_ACK_DELAY_EXPONENT)
+        );
+        assert_eq!(raw.ack_delay_exponent, 3);
+        assert_eq!(raw.active_connection_id_limit, 2);
+        // Compared through `Duration` rather than against
+        // `NGTCP2_DEFAULT_MAX_ACK_DELAY`: that macro is `25 * NGTCP2_MILLISECONDS`
+        // and `NGTCP2_MILLISECONDS` is a cast expression bindgen does not emit.
+        assert_eq!(
+            raw.max_ack_delay,
+            Duration::from_millis(25).unwrap().as_raw()
+        );
+    }
+
+    #[test]
+    fn the_ack_delay_and_payload_setters_reach_the_raw_struct() {
+        let raw = TransportParams::new()
+            .ack_delay_exponent(7)
+            .max_udp_payload_size(1400)
+            .as_raw();
+        assert_eq!(raw.ack_delay_exponent, 7);
+        assert_eq!(raw.max_udp_payload_size, 1400);
+    }
+
+    #[test]
+    fn an_ack_delay_exponent_above_twenty_is_rejected() {
+        let Err(err) = TransportParams::new().ack_delay_exponent(21).build(false) else {
+            panic!("an ack_delay_exponent above 20 must be rejected");
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_receive_limit_below_the_initial_floor_is_rejected() {
+        let Err(err) = TransportParams::new().max_udp_payload_size(1199).build(false) else {
+            panic!("a max_udp_payload_size below 1200 must be rejected");
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

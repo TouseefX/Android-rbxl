@@ -300,6 +300,9 @@ jobs:
           set -o pipefail
           cargo test --lib plugin_ 2>&1 | tee /tmp/cargo.log
           cargo test --lib rbx_caps_splice_tests 2>&1 | tee -a /tmp/cargo.log
+          # The vendored QUIC crate has its own unit tests; `cargo test --lib`
+          # on the workspace root never reaches them.
+          cargo test -p ngnet-quic --lib 2>&1 | tee -a /tmp/cargo.log
 
       - name: Full suite (informational)
         if: always()
