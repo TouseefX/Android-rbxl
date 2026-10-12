@@ -5973,7 +5973,9 @@ mod tests {
             }]
         );
 
-        let mut coalesced = reliable;
+        // Clone rather than move: `reliable` is asserted against again below,
+        // once the decoder has been driven into its desynchronized state.
+        let mut coalesced = reliable.clone();
         coalesced.extend_from_slice(&unreliable);
         coalesced.extend_from_slice(&close_unreliable);
         assert_eq!(
