@@ -531,11 +531,14 @@ jobs:
           "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" t "$OPENSSL_DIR/lib/libssl.a" | head -3
           # ngtcp2 refuses to build its OpenSSL backend unless it can see this
           # symbol, so confirm it is really in the archive we built.
-          echo "--- SSL_set_quic_tls_cbs in libssl.a ---"
-          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-            "$OPENSSL_DIR/lib/libssl.a" 2>/dev/null | grep -c "SSL_set_quic_tls_cbs" || true
-          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-            "$OPENSSL_DIR/lib/libssl.a" 2>/dev/null | grep "SSL_set_quic_tls_cbs" | head -3 || true
+          # ngtcp2 refuses to build its OpenSSL backend unless it can see this
+          # symbol, so confirm it is really in the archive we built. Emitted as
+          # an annotation because runner log archives are not reachable from
+          # every environment.
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          hits="$("$NM" "$OPENSSL_DIR/lib/libssl.a" 2>/dev/null | grep "SSL_set_quic_tls_cbs" | head -3 | tr '\n' ';')"
+          echo "SSL_set_quic_tls_cbs in libssl.a: ${hits:-NONE}"
+          echo "::notice title=openssl symbols::${hits:-NONE}"
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
@@ -579,14 +582,23 @@ jobs:
           '
           # `check_symbol_exists` reports only pass or fail; the compiler and
           # linker output behind the decision lands here and nowhere else.
-          for log in target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeError.log; do
+          # CMake 3.26 replaced CMakeError.log with CMakeConfigureLog.yaml, so
+          # both are looked for. The probe's output is embedded in the YAML with
+          # escaped newlines, hence pulling the interesting lines rather than the
+          # tail.
+          for log in target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeConfigureLog.yaml \
+                     target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeError.log; do
             [ -s "$log" ] || continue
-            tail -n 45 "$log" | awk '
+            {
+              grep -oE "ld: error[^\\]*|undefined (reference to|symbol)[^\\]*|cannot find -l[a-z0-9_]*|error: [^\\]*" "$log" | sort -u | head -n 25
+              echo "--- last check event ---"
+              tail -n 30 "$log"
+            } | awk '
               {
                 gsub(/%/, "%25")
                 gsub(/\r/, "%0D")
                 out = (out == "" ? $0 : out "%0A" $0)
               }
-              END { print "::error title=CMakeError.log::" out }
+              END { print "::error title=configure log::" out }
             '
           done
