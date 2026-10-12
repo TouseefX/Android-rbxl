@@ -6574,10 +6574,20 @@ mod rbx_caps_splice_tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn synthetic_client_hello() -> Vec<u8> {
+    /// Returns the ClientHello and the length of its extension list.
+    fn synthetic_client_hello() -> (Vec<u8>, usize) {
         let mut extensions = Vec::new();
         // supported_versions, so the extension list is not empty.
         extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+        // A padding extension to bring the ClientHello to a realistic size.
+        // This matters: the splice grows the CRYPTO length by 12 and refuses
+        // to change the varint's width, so a ClientHello short enough to use a
+        // one-byte length (< 52 bytes of body) cannot be spliced at all. Real
+        // ones are 300-500 bytes.
+        let padding = 250u16;
+        extensions.extend_from_slice(&[0x00, 0x15]);
+        extensions.extend_from_slice(&padding.to_be_bytes());
+        extensions.extend_from_slice(&vec![0x00; padding as usize]);
 
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // legacy_version
@@ -6595,7 +6605,7 @@ mod rbx_caps_splice_tests {
         out.push((len >> 8) as u8);
         out.push(len as u8);
         out.extend_from_slice(&body);
-        out
+        (out, extensions.len())
     }
 
     /// An Initial shaped the way ngtcp2 emits one: CRYPTO as the one-byte
@@ -6622,7 +6632,7 @@ mod rbx_caps_splice_tests {
     /// splices, keeps the packet the same size, and puts 0xFF00 first.
     #[test]
     fn splices_0xff00_first_and_keeps_the_packet_size() {
-        let client_hello = synthetic_client_hello();
+        let (client_hello, exts_len) = synthetic_client_hello();
         let mut packet = synthetic_initial(&client_hello);
         let original_len = packet.len();
 
@@ -6646,12 +6656,9 @@ mod rbx_caps_splice_tests {
         // It must sit at the front of the extension list, matching the native
         // ClientHello order, and the list length must have grown by 12.
         let list_len = u16::from_be_bytes([packet[at - 2], packet[at - 1]]);
-        // supported_versions, the only extension the synthetic ClientHello
-        // starts with.
-        let original_exts_len = 7usize;
         assert_eq!(
             list_len as usize,
-            original_exts_len + 12,
+            exts_len + 12,
             "extension list length was not updated"
         );
 
