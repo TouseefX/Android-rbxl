@@ -675,3 +675,36 @@ fn files_dir_from_application_context() -> Option<String> {
     let jstr = JString::from(abs_path);
     env.get_string(&jstr).map(|s| s.into()).ok()
 }
+
+/// Whether this app runs inside the Android container on ChromeOS (a
+/// Chromebook with Android app support). Resolved once via
+/// `MainActivity.isChromeOsStatic` and cached for the app's lifetime -
+/// the answer cannot change at runtime.
+static CHROMEOS_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+pub fn is_chromeos() -> bool {
+    let state = CHROMEOS_STATE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = state.lock().unwrap();
+        if let Some(value) = *guard {
+            return value;
+        }
+    }
+    let mut detected = false;
+    with_env(|env, class| {
+        if let Ok(jval) = env.call_static_method(class, "isChromeOsStatic", "()Z", &[]) {
+            let value: jni::sys::jboolean = jval.get().unwrap_or(0);
+            detected = value != 0;
+        }
+        Ok(())
+    });
+    *state.lock().unwrap() = Some(detected);
+    detected
+}
+
+/// Desktop builds (and any non-Android target) are never a Chromebook.
+#[cfg(not(target_os = "android"))]
+pub fn is_chromeos() -> bool {
+    false
+}

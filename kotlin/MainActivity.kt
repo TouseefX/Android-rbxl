@@ -1200,6 +1200,34 @@ class MainActivity : GameActivity() {
             return sInstance?.getClipboardText() ?: ""
         }
 
+        /**
+         * True when this app runs in the Android container on ChromeOS
+         * (a Chromebook). Two independent signals:
+         *  1. The `android.os.service.ChromeOsManager` framework class
+         *     exists only on ChromeOS images.
+         *  2. A Google-branded device whose model/product/device/hardware
+         *     identity contains "chrome" (Chromebook naming convention).
+         */
+        @JvmStatic
+        fun isChromeOsStatic(): Boolean {
+            try {
+                Class.forName("android.os.service.ChromeOsManager")
+                return true
+            } catch (_: Throwable) {
+                // Class absent: not a ChromeOS system image.
+            }
+            if (android.os.Build.MANUFACTURER.equals("Google", ignoreCase = true)) {
+                val identity = listOf(
+                    android.os.Build.MODEL,
+                    android.os.Build.PRODUCT,
+                    android.os.Build.DEVICE,
+                    android.os.Build.HARDWARE,
+                ).any { it.contains("chrome", ignoreCase = true) }
+                if (identity) return true
+            }
+            return false
+        }
+
         // ---- Audio playback -------------------------------------------------
 
         /** Called from Rust via JNI to play a cached ogg/mp3 file. */

@@ -191,6 +191,10 @@ pub struct EditorApp {
     explorer_search: String,
     font_size: f32,
     compact_toolbar: bool,
+    /// UI layout mode: "auto" | "phone" | "tablet" | "desktop" (persisted).
+    ui_mode: String,
+    /// True when running on ChromeOS (a Chromebook); resolved once at startup.
+    is_chromeos: bool,
     show_tablet_explorer: bool,
     explorer_width: f32,
     editor_word_wrap: bool,
@@ -427,6 +431,8 @@ impl Default for EditorApp {
             show_replace: false,
             explorer_search: String::new(),
             font_size: saved_settings.editor_font_size.clamp(10.0, 32.0),
+            ui_mode: saved_settings.ui_mode.clone(),
+            is_chromeos: crate::jni_bridge::is_chromeos(),
             compact_toolbar: saved_settings.compact_toolbar,
             show_tablet_explorer: saved_settings.show_tablet_explorer,
             explorer_width: saved_settings.explorer_width.clamp(180.0, 520.0),
@@ -537,6 +543,18 @@ impl Default for EditorApp {
             pending_document_bytes: None,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
+        app.log_info(&format!(
+            "UI layout: mode={} chromeos={} ({})",
+            app.ui_mode,
+            app.is_chromeos,
+            if app.is_chromeos {
+                "Chromebook detected: desktop layout with Ctrl+1..9 tabs and Ctrl+E sidebar"
+            } else if app.ui_mode == "auto" {
+                "width-based: top tabs above 720 px, bottom navigation below"
+            } else {
+                "explicit layout override"
+            }
+        ));
         app.log_info(&format!(
             "Loaded {} installed plugin(s)",
             app.plugin_index.plugins.len()
@@ -691,6 +709,66 @@ impl EditorApp {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::O)) {
             self.show_workspace_symbols = true;
         }
+
+        // Layout mode resolution (drives the phone/tablet/desktop split
+        // further down): "auto" gives ChromeOS (Chromebook) the desktop
+        // layout and everything else the width-based split; explicit modes
+        // override detection entirely.
+        let (is_tablet, is_desktop): (bool, bool) = match self.ui_mode.as_str() {
+            "phone" => (false, false),
+            "tablet" => (true, false),
+            "desktop" => (true, true),
+            _ => {
+                if self.is_chromeos {
+                    (true, true)
+                } else {
+                    (ctx.available_rect().width() > 720.0, false)
+                }
+            }
+        };
+
+        // Desktop-mode keyboard shortcuts (Chromebooks - and desktop builds -
+        // have real keyboards; the classic Android touch path has no Ctrl
+        // key). consume_key() eats the event so text fields never see it.
+        // Ctrl+1..9 jumps to the first nine tabs, Ctrl+E toggles the
+        // Explorer sidebar.
+        if is_desktop {
+            let mut tab_index: Option<usize> = None;
+            for (index, key) in [
+                (1usize, egui::Key::Digit1),
+                (2, egui::Key::Digit2),
+                (3, egui::Key::Digit3),
+                (4, egui::Key::Digit4),
+                (5, egui::Key::Digit5),
+                (6, egui::Key::Digit6),
+                (7, egui::Key::Digit7),
+                (8, egui::Key::Digit8),
+                (9, egui::Key::Digit9),
+            ] {
+                if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key)) {
+                    tab_index = Some(index);
+                    break;
+                }
+            }
+            if tab_index.is_none()
+                && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::E))
+            {
+                self.show_tablet_explorer = !self.show_tablet_explorer;
+            }
+            if let Some(index) = tab_index {
+                self.active_tab = match index {
+                    1 => ActiveTab::Explorer,
+                    2 => ActiveTab::Viewport3D,
+                    3 => ActiveTab::ScriptEditor,
+                    4 => ActiveTab::Properties,
+                    5 => ActiveTab::Animation,
+                    6 => ActiveTab::Insert,
+                    7 => ActiveTab::Toolbox,
+                    8 => ActiveTab::Snippets,
+                    _ => ActiveTab::Assets,
+                };
+            }
+        }
         if self.editor_focus_mode && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.editor_focus_mode = false;
         }
@@ -834,9 +912,8 @@ impl EditorApp {
             });
         }
 
-        // Phones use thumb-reachable bottom navigation; tablets keep a top
-        // tab strip plus the resizable Explorer workspace sidebar.
-        let is_tablet = ctx.available_rect().width() > 720.0;
+        // is_tablet / is_desktop were resolved at the top of draw_editor
+        // (UI mode + ChromeOS detection + width fallback).
 
         let nav_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
             top: 4,
@@ -894,6 +971,10 @@ impl EditorApp {
                             tab_btn(ui, "▶ Command Bar", ActiveTab::Command);
                             tab_btn(ui, "🖥️ Output", ActiveTab::Output);
                             tab_btn(ui, "⚙️ Settings", ActiveTab::Settings);
+                            if is_desktop {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new("Ctrl+1..9 tabs · Ctrl+E Explorer").weak().small());
+                            }
                         });
                     });
             });
@@ -6530,7 +6611,26 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 ui.add_space(12.0);
                 ui.group(|ui| {
                     ui.label(RichText::new("📱 Adaptive editor layout").heading().color(Color32::from_rgb(100, 200, 255)));
-                    ui.label("Phones use a bottom navigation bar. Tablets use top tabs and an optional resizable Explorer sidebar.");
+                    ui.label("Auto: phones get a bottom navigation bar; tablets get top tabs with an optional Explorer sidebar; Chromebooks (ChromeOS) get the desktop layout with keyboard shortcuts.");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("UI mode:");
+                        for (value, label) in [
+                            ("auto", "Auto (recommended)"),
+                            ("phone", "Phone"),
+                            ("tablet", "Tablet"),
+                            ("desktop", "Desktop"),
+                        ] {
+                            if ui.selectable_label(self.ui_mode == value, label).clicked() {
+                                self.ui_mode = value.to_string();
+                            }
+                        }
+                    });
+                    ui.label(RichText::new(if self.is_chromeos {
+                        "Detected platform: ChromeOS (Chromebook)"
+                    } else {
+                        "Detected platform: Android (not a Chromebook)"
+                    })
+                    .weak());
                     ui.add(egui::Slider::new(&mut self.font_size, 10.0..=32.0).text("Editor font size"));
                     ui.checkbox(&mut self.editor_word_wrap, "Wrap long editor lines");
                     ui.checkbox(&mut self.compact_toolbar, "Always use compact toolbar");
@@ -6541,6 +6641,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                         self.font_size = 14.0;
                         self.editor_word_wrap = false;
                         self.compact_toolbar = false;
+                        self.ui_mode = "auto".into();
                         self.show_tablet_explorer = true;
                         self.explorer_width = 280.0;
                         self.editor_focus_mode = false;
@@ -6557,6 +6658,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             open_cloud_api_key: self.open_cloud_api_key.clone(),
                             open_cloud_universe_id: self.open_cloud_universe_id.clone(),
                             open_cloud_place_id: self.open_cloud_place_id.clone(),
+                            ui_mode: self.ui_mode.clone(),
                             auto_download_meshes: true,
                             show_skybox: true,
                             editor_font_size: self.font_size,
@@ -6591,6 +6693,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                         self.open_cloud_universe_id.clear();
                         self.open_cloud_place_id.clear();
                         let cleared = EditorSettings {
+                            ui_mode: self.ui_mode.clone(),
                             editor_font_size: self.font_size,
                             compact_toolbar: self.compact_toolbar,
                             show_tablet_explorer: self.show_tablet_explorer,
