@@ -255,6 +255,14 @@ jobs:
   check-and-test:
     name: Check and test (host)
     runs-on: ubuntu-latest
+    env:
+      # Cargo colourises even when stdout is not a TTY under Actions, which
+      # prefixed every diagnostic with escape codes and defeated the error
+      # extraction below.
+      CARGO_TERM_COLOR: never
+      # Bevy is wide; two parallel rustc invocations keeps the peak memory of a
+      # cold target/ build inside the runner's budget.
+      CARGO_BUILD_JOBS: 2
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -283,7 +291,7 @@ jobs:
         id: test
         run: |
           set -o pipefail
-          cargo test --lib --verbose 2>&1 | tee /tmp/cargo.log
+          cargo test --lib 2>&1 | tee /tmp/cargo.log
 
       # Runner log archives are served from results-receiver.actions.githubusercontent.com,
       # which is not reachable from every environment. Republishing the failure
@@ -292,14 +300,15 @@ jobs:
       - name: Surface failures as annotations
         if: failure() && steps.test.outcome == 'failure'
         run: |
-          tail -n 120 /tmp/cargo.log | awk '
+          diag="$(awk '/^error/{flag=1} flag' /tmp/cargo.log | head -n 50)"
+          if [ -z "$diag" ]; then
+            diag="$(tail -n 30 /tmp/cargo.log)"
+          fi
+          printf '%s\n' "$diag" | awk '
             {
               gsub(/%/, "%25")
               gsub(/\r/, "%0D")
               out = (out == "" ? $0 : out "%0A" $0)
             }
-            END {
-              if (out == "") out = "empty cargo log"
-              print "::error title=cargo::" out
-            }
+            END { print "::error title=cargo::" out }
           '
