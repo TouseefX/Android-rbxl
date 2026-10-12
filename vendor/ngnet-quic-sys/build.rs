@@ -238,6 +238,43 @@ fn build_ngtcp2(source_dir: &Path, openssl: Option<&OpenSsl>) -> PathBuf {
         }
     }
 
+    // Android: hand CMake the NDK's own toolchain file.
+    //
+    // Without it, cmake-rs passes the target to the `cc` crate, which resolves a
+    // bare `aarch64-linux-android` to the NDK's **API 21** clang wrapper. Bionic
+    // does not export stdin, stdout or stderr before API 23, and libcrypto's
+    // cryptlib.c references stderr, so ngtcp2's `check_symbol_exists` probe for
+    // SSL_set_quic_tls_cbs fails to *link* -- and CMake then reports the OpenSSL
+    // as having no QUIC support, even though the symbol is in the archive.
+    //
+    // Defining `ANDROID_ABI` is what actually changes this: cmake-rs treats that
+    // as "the caller is driving the NDK", stops asking `cc` for a compiler, and
+    // lets the toolchain file choose one using ANDROID_PLATFORM.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
+            let toolchain = Path::new(&ndk).join("build/cmake/android.toolchain.cmake");
+            if toolchain.is_file() {
+                let abi = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+                    Ok("aarch64") => "arm64-v8a",
+                    Ok("arm") => "armeabi-v7a",
+                    Ok("x86_64") => "x86_64",
+                    _ => "x86",
+                };
+                config.define("CMAKE_TOOLCHAIN_FILE", &toolchain);
+                config.define("ANDROID_ABI", abi);
+                // manifest.yaml declares min_sdk_version 26; the check jobs
+                // export ANDROID_PLATFORM to match. Left to the NDK default
+                // when the caller has no opinion.
+                if let Ok(platform) = env::var("ANDROID_PLATFORM") {
+                    config.define("ANDROID_PLATFORM", &platform);
+                }
+                if let Ok(stl) = env::var("ANDROID_STL") {
+                    config.define("ANDROID_STL", &stl);
+                }
+            }
+        }
+    }
+
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let static_crt = env::var("CARGO_ENCODED_RUSTFLAGS")
             .unwrap_or_default()

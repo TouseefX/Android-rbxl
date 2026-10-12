@@ -616,13 +616,6 @@ jobs:
         id: check
         run: |
           set -o pipefail
-          # The cmake crate detects its own compiler and overrides any
-          # -DCMAKE_C_COMPILER a build script passes, but it does read these two
-          # from the environment. Without them CMake gets the NDK's API-21
-          # wrapper, whose sysroot lacks stderr before API 23, and ngtcp2's QUIC
-          # symbol probe fails at link time.
-          export CMAKE_C_COMPILER="$NDK_CLANG26"
-          export CMAKE_CXX_COMPILER="$NDK_CLANGXX26"
           cargo check --lib --target aarch64-linux-android --features ossl-tls 2>&1 | tee /tmp/ossl-check.log
 
       - name: Surface failures as annotations
