@@ -1426,7 +1426,7 @@ fn install_plugin_host(
                     // `args` includes the receiver, and Roblox's signature is
                     // CreateButton(buttonId, tooltip, icon).
                     let field = |index: usize| match args.get(index) {
-                        Some(Value::String(text)) => text.to_str().unwrap_or("").to_string(),
+                        Some(Value::String(text)) => text.to_str().unwrap_or_default(),
                         _ => String::new(),
                     };
                     let (id, tooltip, icon) = (field(1), field(2), field(3));
