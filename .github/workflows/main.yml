@@ -603,6 +603,16 @@ jobs:
           workspaces: ". -> target"
           key: android-ossl-check-${{ hashFiles('Cargo.toml') }}
 
+      # Swatinem/rust-cache restores target/, and with it the CMake build tree
+      # ngnet-quic-sys configured on an earlier run. CMake then reuses the
+      # CMAKE_C_COMPILER pinned in its cache and ignores CC_aarch64_linux_android
+      # entirely - which is why the compile line kept saying android21 after the
+      # toolchain env vars were added. Drop the configuration, not the objects.
+      - name: Drop any stale CMake configuration
+        run: |
+          rm -rf target/aarch64-linux-android/debug/build/ngnet-quic-sys*/out/build
+          touch vendor/ngnet-quic-sys/build.rs
+
       - name: cargo check with the OpenSSL backend
         id: check
         run: |
