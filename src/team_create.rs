@@ -2887,10 +2887,15 @@ fn rbx_transport_read_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
     let size = rbx_transport_varint_size(first);
     let end = pos.checked_add(size)?;
     let bytes = buf.get(pos..end)?;
-    let mut value = 0u64;
-    for (i, &raw) in bytes.iter().enumerate() {
-        let chunk = if i == 0 { raw & 0x3F } else { raw & 0x7F };
-        value = (value << 7) | u64::from(chunk);
+    // RFC 9000 section 16: the top two bits of the first byte select the
+    // length, the remaining six bits are the value's most significant bits, and
+    // every following byte contributes a full eight bits. The previous version
+    // shifted by seven and masked continuation bytes with 0x7F, which read 300
+    // as 172 and 15293 as 7613 - and because the writer was wrong the same way,
+    // a round-trip test passed while every real packet decoded wrong.
+    let mut value = u64::from(first & 0x3F);
+    for &raw in &bytes[1..] {
+        value = (value << 8) | u64::from(raw);
     }
     Some((value, end))
 }
@@ -2902,20 +2907,27 @@ fn rbx_transport_write_varint_same_size(buf: &mut [u8], pos: usize, value: u64) 
     let prefix = match size {
         1 => 0u8,
         2 => 0x40,
-        3 => 0x80,
+        4 => 0x80,
         _ => 0xC0,
     };
-    let mut out = [0u8; 4];
-    let mut v = value;
-    for i in (0..size).rev() {
-        let chunk = if i == 0 { v & 0x3F } else { v & 0x7F };
-        out[i] = chunk as u8;
-        v >>= 7;
-    }
-    if v != 0 {
+    // The value has to fit in the width the existing prefix already declares;
+    // this function never changes the encoding length.
+    let max = match size {
+        1 => (1u64 << 6) - 1,
+        2 => (1u64 << 14) - 1,
+        4 => (1u64 << 30) - 1,
+        _ => (1u64 << 62) - 1,
+    };
+    if value > max {
         return false;
     }
-    out[0] |= prefix;
+    let mut out = [0u8; 8];
+    let mut v = value;
+    for i in (0..size).rev() {
+        out[i] = (v & 0xFF) as u8;
+        v >>= 8;
+    }
+    out[0] = (out[0] & 0x3F) | prefix;
     buf[pos..pos + size].copy_from_slice(&out[..size]);
     true
 }
@@ -2986,12 +2998,22 @@ fn splice_rbx_transport_caps_inner(packet: &mut [u8]) -> Result<(), RbxCapsSplic
     // token
     let token_len = usize::from(*packet.get(p).ok_or(RbxCapsSpliceErr::NotInitial)?);
     p = p.checked_add(1 + token_len).ok_or(RbxCapsSpliceErr::NotInitial)?;
-    if p >= packet.len() || packet[p] != 0x40 {
-        // first frame must be CRYPTO
+    if p >= packet.len() {
         return Err(RbxCapsSpliceErr::NotInitial);
     }
-    p += 1;
-    let (offset, q) = rbx_transport_read_varint(packet, p).ok_or(RbxCapsSpliceErr::Layout)?;
+    // The first frame must be CRYPTO. Frame types are varints, so this has to
+    // be read as one: CRYPTO is 0x06, which ngtcp2 emits as the single byte
+    // 0x06. The old check compared one byte against 0x40 and then treated the
+    // next byte as the offset varint, so a real Initial always bailed - with
+    // NotInitial when the type was 0x06, or with Layout when it was the
+    // two-byte form 40 06 (offset then read as 6).
+    let (frame_type, after_type) =
+        rbx_transport_read_varint(packet, p).ok_or(RbxCapsSpliceErr::NotInitial)?;
+    if frame_type != 0x06 {
+        return Err(RbxCapsSpliceErr::NotInitial);
+    }
+    let (offset, q) =
+        rbx_transport_read_varint(packet, after_type).ok_or(RbxCapsSpliceErr::Layout)?;
     if offset != 0 {
         return Err(RbxCapsSpliceErr::Layout);
     }
@@ -6491,5 +6513,153 @@ mod tests {
         assert!(!join_response_is_all_null(&serde_json::json!({
             "message": "starting"
         })));
+    }
+}
+
+#[cfg(test)]
+mod rbx_caps_splice_tests {
+    use super::*;
+
+    /// RFC 9000 section 16 encoding, written independently of the code under
+    /// test so a shared mistake cannot hide.
+    fn rfc9000_encode(value: u64) -> Vec<u8> {
+        if value < 1 << 6 {
+            vec![value as u8]
+        } else if value < 1 << 14 {
+            vec![0x40 | (value >> 8) as u8, (value & 0xFF) as u8]
+        } else if value < 1 << 30 {
+            vec![
+                0x80 | (value >> 24) as u8,
+                (value >> 16) as u8,
+                (value >> 8) as u8,
+                (value & 0xFF) as u8,
+            ]
+        } else {
+            panic!("test value too large")
+        }
+    }
+
+    /// The old codec shifted by seven bits per byte instead of eight, so it
+    /// agreed with itself on a round trip and disagreed with every real
+    /// packet. These are wire vectors, not round trips.
+    #[test]
+    fn varint_matches_rfc9000_wire_vectors() {
+        for value in [0u64, 37, 63, 64, 127, 128, 255, 300, 373, 512, 1024, 4096, 15293, 16383] {
+            let wire = rfc9000_encode(value);
+            let (decoded, end) = rbx_transport_read_varint(&wire, 0)
+                .unwrap_or_else(|| panic!("failed to decode {value}"));
+            assert_eq!(decoded, value, "wire {} decoded wrong", hex(&wire));
+            assert_eq!(end, wire.len());
+        }
+    }
+
+    /// The writer feeds the splice's CRYPTO-length update, so it has to put
+    /// RFC bytes on the wire, not just bytes the reader happens to accept.
+    #[test]
+    fn varint_writer_emits_rfc9000_bytes() {
+        for value in [37u64, 128, 300, 373, 512, 1024, 15293] {
+            let wire = rfc9000_encode(value);
+            let mut buf = vec![0u8; wire.len()];
+            // Seed the prefix so the writer keeps the same width.
+            buf[0] = wire[0] & 0xC0;
+            assert!(
+                rbx_transport_write_varint_same_size(&mut buf, 0, value),
+                "writer refused {value}"
+            );
+            assert_eq!(buf, wire, "writer produced wrong bytes for {value}");
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn synthetic_client_hello() -> Vec<u8> {
+        let mut extensions = Vec::new();
+        // supported_versions, so the extension list is not empty.
+        extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0xAB; 32]); // random
+        body.push(0x00); // session id length
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
+        body.push(0x01); // compression methods length
+        body.push(0x00); // null compression
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut out = vec![0x01]; // ClientHello handshake type
+        let len = body.len();
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// An Initial shaped the way ngtcp2 emits one: CRYPTO as the one-byte
+    /// varint 0x06, offset 0, then the ClientHello, then PADDING.
+    fn synthetic_initial(client_hello: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0xC3]; // long header with the fixed bit
+        packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // QUIC v1
+        packet.push(0x08);
+        packet.extend_from_slice(&[0x11; 8]); // destination CID
+        packet.push(0x04);
+        packet.extend_from_slice(&[0x22; 4]); // source CID
+        packet.push(0x00); // token length
+        packet.push(0x06); // CRYPTO frame type
+        packet.push(0x00); // offset
+        packet.extend_from_slice(&rfc9000_encode(client_hello.len() as u64));
+        packet.extend_from_slice(client_hello);
+        packet.extend_from_slice(&vec![0x00; 64]); // PADDING
+        packet
+    }
+
+    /// The splice never ran on a real Initial: it demanded the frame's first
+    /// byte be 0x40 and then read the CRYPTO length with a seven-bit varint,
+    /// so it always bailed before touching a byte. This pins that it now
+    /// splices, keeps the packet the same size, and puts 0xFF00 first.
+    #[test]
+    fn splices_0xff00_first_and_keeps_the_packet_size() {
+        let client_hello = synthetic_client_hello();
+        let mut packet = synthetic_initial(&client_hello);
+        let original_len = packet.len();
+
+        let outcome = splice_rbx_transport_caps_extension(&mut packet);
+        assert!(
+            matches!(outcome, RbxCapsSpliceOutcome::Spliced),
+            "expected Spliced, got {outcome:?}"
+        );
+        assert_eq!(
+            packet.len(),
+            original_len,
+            "packet grew; the PADDING was supposed to absorb the insert"
+        );
+
+        let block: Vec<u8> = [[0xFF, 0x00, 0x00, 0x08].as_slice(), &RBX_TRANSPORT_CAPS_WIRE].concat();
+        let at = packet
+            .windows(block.len())
+            .position(|window| window == block.as_slice())
+            .expect("0xFF00 extension was not written into the packet");
+
+        // It must sit at the front of the extension list, matching the native
+        // ClientHello order, and the list length must have grown by 12.
+        let list_len = u16::from_be_bytes([packet[at - 2], packet[at - 1]]);
+        // supported_versions, the only extension the synthetic ClientHello
+        // starts with.
+        let original_exts_len = 7usize;
+        assert_eq!(
+            list_len as usize,
+            original_exts_len + 12,
+            "extension list length was not updated"
+        );
+
+        // Idempotence: a second pass must recognise it is already there.
+        let again = splice_rbx_transport_caps_extension(&mut packet);
+        assert!(
+            matches!(again, RbxCapsSpliceOutcome::AlreadyPresent),
+            "expected AlreadyPresent, got {again:?}"
+        );
     }
 }

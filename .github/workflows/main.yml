@@ -299,6 +299,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --lib plugin_ 2>&1 | tee /tmp/cargo.log
+          cargo test --lib rbx_caps_splice_tests 2>&1 | tee -a /tmp/cargo.log
 
       - name: Full suite (informational)
         if: always()
