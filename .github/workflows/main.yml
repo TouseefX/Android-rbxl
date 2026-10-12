@@ -292,16 +292,14 @@ jobs:
       - name: Surface failures as annotations
         if: failure() && steps.test.outcome == 'failure'
         run: |
-          awk '
-            /^(error(\[E[0-9]+\])?:|failures:|---- .* stdout ----)/ { flag = 1 }
-            flag && n < 80 {
-              n++
+          tail -n 120 /tmp/cargo.log | awk '
+            {
               gsub(/%/, "%25")
               gsub(/\r/, "%0D")
               out = (out == "" ? $0 : out "%0A" $0)
             }
             END {
-              if (out == "") out = "cargo failed with no recognisable diagnostic"
+              if (out == "") out = "empty cargo log"
               print "::error title=cargo::" out
             }
-          ' /tmp/cargo.log
+          '
