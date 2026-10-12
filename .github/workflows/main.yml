@@ -231,3 +231,42 @@ jobs:
           name: symbols
           path: dist-symbols/
           if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Host-side typecheck + unit tests.
+  #
+  # `x build` only ever cross-compiles the aarch64 cdylib, so the crate's ~128
+  # `#[test]`s never ran and a Rust type error could only be caught by a full
+  # 10-minute Android build. This job compiles and tests on the host target in
+  # a couple of minutes, and runs in parallel with the APK build rather than
+  # gating it.
+  # ---------------------------------------------------------------------------
+  check-and-test:
+    name: Check and test (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # bevy_winit/bevy_render only need these at link time on Linux; installing
+      # them keeps `cargo test` from failing on a missing native library.
+      - name: Install native build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev libasound2-dev libxkbcommon-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: host-test-${{ hashFiles('Cargo.toml') }}
+
+      - name: cargo test
+        run: cargo test --lib --verbose
