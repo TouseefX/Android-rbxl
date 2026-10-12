@@ -87,9 +87,18 @@ pub(crate) const fn settings(
             "settings.max_stream_window exceeds the maximum QUIC varint",
         ));
     }
-    if max_tx_udp_payload_size < sys::NGTCP2_MAX_UDP_PAYLOAD_SIZE as usize {
+    // The floor is the RFC 9000 spec floor, not a practical one: a client
+    // Initial must carry a UDP payload of at least 1200 bytes
+    // (anti-amplification), and the US Google Cloud UDMUX load balancer
+    // enforces it — sub-1200 client Initials are blackholed at the server
+    // front door (verified live 2026-10-11: 831-1131-byte datagrams
+    // cleared the local carrier but never got an answer). The strict
+    // carrier workaround is kernel-side IP fragmentation (per-socket
+    // IP_MTU cap + IP_PMTUDISC_DONT), never shrinking the Initial, so a
+    // sub-1200 value here can only produce a silently dead connection.
+    if max_tx_udp_payload_size < 1200 {
         return Err(Error::invalid_input(
-            "settings.max_tx_udp_payload_size is below NGTCP2_MAX_UDP_PAYLOAD_SIZE",
+            "settings.max_tx_udp_payload_size is below the 1200-byte client-Initial floor (RFC 9000; strict carriers are worked around with kernel fragmentation, not a smaller Initial)",
         ));
     }
     if max_tx_udp_payload_size > sys::NGTCP2_MAX_TX_UDP_PAYLOAD_SIZE as usize {

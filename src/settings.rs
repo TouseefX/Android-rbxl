@@ -14,6 +14,10 @@ pub struct EditorSettings {
     pub show_skybox: bool,
     pub editor_font_size: f32,
     pub compact_toolbar: bool,
+    /// UI layout mode: "auto" | "phone" | "tablet" | "desktop". "auto"
+    /// resolves at runtime: ChromeOS gets the desktop layout, everything
+    /// else falls back to the width-based phone/tablet split.
+    pub ui_mode: String,
     pub show_tablet_explorer: bool,
     pub explorer_width: f32,
     pub editor_word_wrap: bool,
@@ -30,6 +34,7 @@ impl Default for EditorSettings {
             show_skybox: true,
             editor_font_size: 14.0,
             compact_toolbar: false,
+            ui_mode: "auto".into(),
             show_tablet_explorer: true,
             explorer_width: 280.0,
             editor_word_wrap: false,

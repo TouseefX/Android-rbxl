@@ -191,6 +191,16 @@ pub struct EditorApp {
     explorer_search: String,
     font_size: f32,
     compact_toolbar: bool,
+    /// UI layout mode: "auto" | "phone" | "tablet" | "desktop" (persisted).
+    ui_mode: String,
+    /// True when running on ChromeOS (a Chromebook); resolved once at startup.
+    is_chromeos: bool,
+    /// Desktop (Chromebook) layout: show the Properties dock (right side).
+    show_desktop_properties: bool,
+    /// Desktop (Chromebook) layout: show the Output/Scripts dock (bottom).
+    show_desktop_output: bool,
+    /// Desktop (Chromebook) layout: panel active in the bottom dock.
+    desktop_bottom_tab: ActiveTab,
     show_tablet_explorer: bool,
     explorer_width: f32,
     editor_word_wrap: bool,
@@ -427,6 +437,11 @@ impl Default for EditorApp {
             show_replace: false,
             explorer_search: String::new(),
             font_size: saved_settings.editor_font_size.clamp(10.0, 32.0),
+            ui_mode: saved_settings.ui_mode.clone(),
+            is_chromeos: crate::jni_bridge::is_chromeos(),
+            show_desktop_properties: true,
+            show_desktop_output: true,
+            desktop_bottom_tab: ActiveTab::Output,
             compact_toolbar: saved_settings.compact_toolbar,
             show_tablet_explorer: saved_settings.show_tablet_explorer,
             explorer_width: saved_settings.explorer_width.clamp(180.0, 520.0),
@@ -537,6 +552,18 @@ impl Default for EditorApp {
             pending_document_bytes: None,
         };
         app.log_info("Roblox Studio Lite initialized with persistent settings");
+        app.log_info(&format!(
+            "UI layout: mode={} chromeos={} ({})",
+            app.ui_mode,
+            app.is_chromeos,
+            if app.is_chromeos {
+                "Chromebook detected: docked Studio layout (Explorer left, Properties right, Output/Scripts bottom; Ctrl+1..9 / Ctrl+E toggle docks)"
+            } else if app.ui_mode == "auto" {
+                "width-based: top tabs above 720 px, bottom navigation below"
+            } else {
+                "explicit layout override"
+            }
+        ));
         app.log_info(&format!(
             "Loaded {} installed plugin(s)",
             app.plugin_index.plugins.len()
@@ -691,6 +718,83 @@ impl EditorApp {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::O)) {
             self.show_workspace_symbols = true;
         }
+
+        // Layout mode resolution (drives the phone/tablet/desktop split
+        // further down): "auto" gives ChromeOS (Chromebook) the desktop
+        // layout and everything else the width-based split; explicit modes
+        // override detection entirely.
+        let (is_tablet, is_desktop): (bool, bool) = match self.ui_mode.as_str() {
+            "phone" => (false, false),
+            "tablet" => (true, false),
+            "desktop" => (true, true),
+            _ => {
+                if self.is_chromeos {
+                    (true, true)
+                } else {
+                    (ctx.available_rect().width() > 720.0, false)
+                }
+            }
+        };
+
+        // Desktop-mode keyboard shortcuts: toggle the Studio docks
+        // (Chromebooks - and desktop builds - have real keyboards; the
+        // classic Android touch path has no Ctrl key). consume_key() eats
+        // the event so text fields never see it.
+        // Ctrl+1/Ctrl+E Explorer, Ctrl+3 Scripts, Ctrl+4 Properties,
+        // Ctrl+5 Animation, Ctrl+6 Insert, Ctrl+7 Toolbox, Ctrl+8 Snippets,
+        // Ctrl+9 Output dock.
+        if is_desktop {
+            let mut shortcut: Option<usize> = None;
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
+                shortcut = Some(0);
+            } else {
+                for (index, key) in [
+                    (1usize, egui::Key::Digit1),
+                    (2, egui::Key::Digit2),
+                    (3, egui::Key::Digit3),
+                    (4, egui::Key::Digit4),
+                    (5, egui::Key::Digit5),
+                    (6, egui::Key::Digit6),
+                    (7, egui::Key::Digit7),
+                    (8, egui::Key::Digit8),
+                    (9, egui::Key::Digit9),
+                ] {
+                    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key)) {
+                        shortcut = Some(index);
+                        break;
+                    }
+                }
+            }
+            if let Some(index) = shortcut {
+                match index {
+                    0 | 1 => self.show_tablet_explorer = !self.show_tablet_explorer,
+                    2 => {} // the 3D viewport is always the center in desktop mode
+                    3 => {
+                        self.desktop_bottom_tab = ActiveTab::ScriptEditor;
+                        self.show_desktop_output = true;
+                    }
+                    4 => self.show_desktop_properties = !self.show_desktop_properties,
+                    5 => {
+                        self.desktop_bottom_tab = ActiveTab::Animation;
+                        self.show_desktop_output = true;
+                    }
+                    6 => {
+                        self.desktop_bottom_tab = ActiveTab::Insert;
+                        self.show_desktop_output = true;
+                    }
+                    7 => {
+                        self.desktop_bottom_tab = ActiveTab::Toolbox;
+                        self.show_desktop_output = true;
+                    }
+                    8 => {
+                        self.desktop_bottom_tab = ActiveTab::Snippets;
+                        self.show_desktop_output = true;
+                    }
+                    9 => self.show_desktop_output = !self.show_desktop_output,
+                    _ => {}
+                }
+            }
+        }
         if self.editor_focus_mode && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.editor_focus_mode = false;
         }
@@ -834,9 +938,8 @@ impl EditorApp {
             });
         }
 
-        // Phones use thumb-reachable bottom navigation; tablets keep a top
-        // tab strip plus the resizable Explorer workspace sidebar.
-        let is_tablet = ctx.available_rect().width() > 720.0;
+        // is_tablet / is_desktop were resolved at the top of draw_editor
+        // (UI mode + ChromeOS detection + width fallback).
 
         let nav_frame = egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
             top: 4,
@@ -845,7 +948,109 @@ impl EditorApp {
             right: 10,
         });
 
-        if !self.editor_focus_mode {
+        if is_desktop && !self.editor_focus_mode {
+            // Roblox Studio-style menu bar. Studio itself does not run on
+            // ChromeOS, so this menu + the docked panels are the
+            // Chromebook user's Studio.
+            egui::TopBottomPanel::top("studio_menu_bar")
+                .frame(egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
+                    top: 2,
+                    bottom: 2,
+                    left: 8,
+                    right: 8,
+                }))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🎮 Roblox Studio Lite").strong());
+                        ui.add_space(8.0);
+                        ui.menu_button("🏠 Home", |ui| {
+                            if ui.button("📄 New").clicked() {
+                                crate::jni_bridge::trigger_create_document("new_place");
+                                ui.close();
+                            }
+                            if ui.button("📂 Open…").clicked() {
+                                crate::jni_bridge::trigger_open_document();
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("💾 Save").clicked() {
+                                self.save();
+                                ui.close();
+                            }
+                            if ui.button("💾 Save As…").clicked() {
+                                self.save_as();
+                                ui.close();
+                            }
+                            if ui.button("🚀 Publish to Roblox").clicked() {
+                                self.publish_place_to_roblox();
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("📥 Import Local .rbxm…").clicked() {
+                                self.prompt_import_local_model();
+                                ui.close();
+                            }
+                            if ui.button("⌘ Quick Open").clicked() {
+                                self.show_quick_open = true;
+                                ui.close();
+                            }
+                            if ui.button("⌕ Symbols").clicked() {
+                                self.show_workspace_symbols = true;
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("📦 Model", |ui| {
+                            ui.add_enabled(false, egui::Label::new("Model tools — coming soon"));
+                        });
+                        ui.menu_button("🔨 Build", |ui| {
+                            ui.add_enabled(false, egui::Label::new("Build tools — coming soon"));
+                        });
+                        ui.menu_button("👁 View", |ui| {
+                            ui.checkbox(&mut self.show_tablet_explorer, "Explorer (Ctrl+1 / Ctrl+E)");
+                            ui.checkbox(&mut self.show_desktop_properties, "Properties (Ctrl+4)");
+                            ui.checkbox(&mut self.show_desktop_output, "Output / Scripts (Ctrl+9)");
+                            ui.separator();
+                            if ui.button(if self.show_gui_preview { "🙈 Hide GUI Preview" } else { "👁 Show GUI Preview" }).clicked() {
+                                self.show_gui_preview = !self.show_gui_preview;
+                                ui.close();
+                            }
+                            if ui.button(if self.show_stats { "📊 Hide Stats" } else { "📊 Show Stats" }).clicked() {
+                                self.show_stats = !self.show_stats;
+                                ui.close();
+                            }
+                            if ui.button(if self.show_skybox { "🌫 Hide Skybox" } else { "🌫 Show Skybox" }).clicked() {
+                                self.show_skybox = !self.show_skybox;
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("▶ Play", |ui| {
+                            ui.add_enabled(false, egui::Label::new("Run experience — coming soon"));
+                        });
+                        ui.menu_button("🧩 Plug-in", |ui| {
+                            if ui.button("🧩 Plugins…").clicked() {
+                                self.desktop_bottom_tab = ActiveTab::Plugins;
+                                self.show_desktop_output = true;
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("❓ Help", |ui| {
+                            if ui.button("⚙ Settings…").clicked() {
+                                self.desktop_bottom_tab = ActiveTab::Settings;
+                                self.show_desktop_output = true;
+                                ui.close();
+                            }
+                            if ui.button("ℹ About").clicked() {
+                                self.status = "Roblox Studio Lite — docked Studio layout for Chromebook".into();
+                                self.log_info("About: Roblox Studio Lite (docked Studio layout)");
+                                ui.close();
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("Ctrl+1 Explorer · 3 Scripts · 4 Properties · 9 Output · E Explorer").weak().small());
+                        });
+                    });
+                });
+        } else if !self.editor_focus_mode {
         let nav_panel = if is_tablet {
             egui::TopBottomPanel::top("nav_tabs")
         } else {
@@ -902,7 +1107,7 @@ impl EditorApp {
         // Do not render the same large tree twice when Explorer itself is the
         // active page; that doubled traversal was especially costly on phones
         // whose landscape width crosses the tablet breakpoint.
-        if is_tablet && self.show_tablet_explorer && !self.editor_focus_mode
+        if is_tablet && !is_desktop && self.show_tablet_explorer && !self.editor_focus_mode
             && self.active_tab != ActiveTab::Explorer
         {
             egui::SidePanel::left("landscape_left")
@@ -915,8 +1120,80 @@ impl EditorApp {
                 });
         }
 
+        // ===== Desktop (Chromebook) docked layout =========================
+        // Classic Roblox Studio arrangement: Explorer on the left, the 3D
+        // viewport in the center, Properties on the right, and an
+        // Output/Scripts dock along the bottom - everything visible at once
+        // instead of tab switching.
+        if is_desktop && self.show_tablet_explorer && !self.editor_focus_mode {
+            egui::SidePanel::left("studio_explorer")
+                .resizable(true)
+                .default_width(self.explorer_width)
+                .width_range(180.0..=520.0)
+                .show(ctx, |ui| {
+                    self.explorer_width = ui.max_rect().width();
+                    self.show_explorer_ui(ui);
+                });
+        }
+        if is_desktop && self.show_desktop_properties && !self.editor_focus_mode {
+            egui::SidePanel::right("studio_properties")
+                .resizable(true)
+                .default_width(260.0)
+                .width_range(180.0..=460.0)
+                .show(ctx, |ui| {
+                    self.show_properties_ui(ui);
+                });
+        }
+        if is_desktop && self.show_desktop_output && !self.editor_focus_mode {
+            egui::TopBottomPanel::bottom("studio_bottom_dock")
+                .resizable(true)
+                .default_height(240.0)
+                .min_height(90.0)
+                .max_height(640.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+                        let mut dock_tab_btn = |ui: &mut egui::Ui, tab: ActiveTab, label: &str| {
+                            let is_active = self.desktop_bottom_tab == tab;
+                            let text = if is_active {
+                                RichText::new(label).strong().color(Color32::from_rgb(100, 200, 255))
+                            } else {
+                                RichText::new(label)
+                            };
+                            if ui.selectable_label(is_active, text).clicked() {
+                                self.desktop_bottom_tab = tab;
+                            }
+                        };
+                        dock_tab_btn(ui, ActiveTab::Output, "🖥️ Output");
+                        dock_tab_btn(ui, ActiveTab::ScriptEditor, &format!("📝 Scripts ({})", self.open_tabs.len()));
+                        dock_tab_btn(ui, ActiveTab::Toolbox, "🧰 Toolbox");
+                        dock_tab_btn(ui, ActiveTab::Snippets, "📜 Snippets");
+                        dock_tab_btn(ui, ActiveTab::Animation, "🎬 Animation");
+                        dock_tab_btn(ui, ActiveTab::Insert, "➕ Insert");
+                        dock_tab_btn(ui, ActiveTab::Assets, "☁️ Creator Store");
+                        dock_tab_btn(ui, ActiveTab::Plugins, "🧩 Plugins");
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            match self.desktop_bottom_tab {
+                                ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
+                                ActiveTab::Toolbox => self.show_toolbox_ui(ui),
+                                ActiveTab::Snippets => self.show_snippets_ui(ui),
+                                ActiveTab::Animation => self.show_animation_ui(ui),
+                                ActiveTab::Insert => self.show_insert_ui(ui),
+                                ActiveTab::Assets => self.show_assets_ui(ui),
+                                ActiveTab::Plugins => self.show_plugins_ui(ui),
+                                _ => self.show_output_ui(ui),
+                            }
+                        });
+                });
+        }
+
         // Main work area.
-        if self.active_tab == ActiveTab::Viewport3D {
+        if is_desktop || self.active_tab == ActiveTab::Viewport3D {
             // SOLID top control bar (guaranteed to render over the 3D): camera
             // presets, distance/zoom, speed, up/down.
             egui::TopBottomPanel::top("viewport_controls")
@@ -5945,8 +6222,35 @@ ui.label("Place ID:");
                 crate::team_create::RbxTransportSessionEvent::QuicHandshakeComplete(status) => {
                     self.team_create_session_quic_handshake_complete = true;
                     self.team_create_session_status = status.clone();
-                    self.status = "RbxTransport QUIC/TLS handshake complete; receive loop running (Team Create acceptance not confirmed)".into();
+                    self.status = "RbxTransport QUIC/TLS handshake complete; app=4 join flow running (Team Create acceptance not confirmed)".into();
                     self.log_info(status);
+                }
+                crate::team_create::RbxTransportSessionEvent::ChallengeReceived {
+                    u1,
+                    u2,
+                    blob_len,
+                } => {
+                    self.status = format!(
+                        "0x9B challenge received (u1=0x{u1:08x} u2=0x{u2:08x}, blob {blob_len}B) — solving locally…"
+                    );
+                    self.log_info(self.status.clone());
+                }
+                crate::team_create::RbxTransportSessionEvent::ChallengeAnswered {
+                    answer,
+                    elapsed_ms,
+                } => {
+                    self.status = format!(
+                        "0x9B challenge answered 0x{answer:08x} in {elapsed_ms}ms — waiting for connected stage (world state)…"
+                    );
+                    self.log_info(self.status.clone());
+                }
+                crate::team_create::RbxTransportSessionEvent::ChallengeFailed(reason) => {
+                    self.status = format!("0x9B challenge solve failed: {reason}");
+                    self.log_info(self.status.clone());
+                }
+                crate::team_create::RbxTransportSessionEvent::ConnectedStageReached(detail) => {
+                    self.status = format!("BaseClient connected stage reached — {detail}");
+                    self.log_info(self.status.clone());
                 }
                 crate::team_create::RbxTransportSessionEvent::Finished(report) => {
                     self.team_create_response = report.clone();
@@ -6053,26 +6357,83 @@ ui.label("Place ID:");
         self.start_team_create_session_worker(
             "Requesting a fresh Team Create join config…".into(),
             move |event_tx, cancel| {
-                match RobloxApiClient::team_create_join(&cookie, &place_id, false) {
-                    Ok(config) => {
-                        let endpoints = crate::team_create::parse_join_config(&config);
-                        if endpoints.is_empty() {
-                            let reason = if crate::team_create::join_response_is_all_null(&config) {
-                                "gamejoin returned only null/empty values; no transport session was started"
-                            } else {
-                                "gamejoin returned no usable server endpoint; no transport session was started"
-                            };
+                // Endpoint preflight: gamejoin picks the server pool
+                // server-side (mostly by our egress IP), and from the UAE a
+                // US/India assignment makes the QUIC handshake stall on 0 RX.
+                // Each fresh request is a new one-use config, so a far
+                // endpoint is cheap to discard: probe it, re-request until we
+                // land close (Singapore/Japan-class RTT), then proceed.
+                const PREFLIGHT_MAX_ATTEMPTS: usize = 4;
+                const PREFLIGHT_RTT_CAP_MS: u32 = 150;
+                const PREFLIGHT_BUDGET_MS: u32 = 2500;
+
+                for attempt in 0..PREFLIGHT_MAX_ATTEMPTS {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = event_tx.send(
+                            crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                                "{report_prefix}Fresh join cancelled during endpoint preflight."
+                            )),
+                        );
+                        return;
+                    }
+                    let config = match RobloxApiClient::team_create_join(&cookie, &place_id, false)
+                    {
+                        Ok(config) => config,
+                        Err(error) => {
                             let _ = event_tx.send(
                                 crate::team_create::RbxTransportSessionEvent::Finished(format!(
-                                    "{report_prefix}{reason}"
+                                    "Fresh Team Create join failed: {error}"
                                 )),
                             );
                             return;
                         }
+                    };
+                    let endpoints = crate::team_create::parse_join_config(&config);
+                    if endpoints.is_empty() {
+                        let reason = if crate::team_create::join_response_is_all_null(&config) {
+                            "gamejoin returned only null/empty values; no transport session was started"
+                        } else {
+                            "gamejoin returned no usable server endpoint; no transport session was started"
+                        };
                         let _ = event_tx.send(
-                            crate::team_create::RbxTransportSessionEvent::Status(
-                                "Fresh gamejoin config received; entering the selected transport without a second UI step…".into(),
+                            crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                                "{report_prefix}{reason}"
+                            )),
+                        );
+                        return;
+                    }
+                    let target = &endpoints[0];
+                    let rtt = crate::team_create::probe_endpoint_rtt_ms(
+                        &target.address,
+                        target.port,
+                        PREFLIGHT_BUDGET_MS,
+                    );
+                    let acceptable = matches!(rtt, Some(ms) if ms <= PREFLIGHT_RTT_CAP_MS);
+                    let last_attempt = attempt + 1 == PREFLIGHT_MAX_ATTEMPTS;
+                    if acceptable || last_attempt {
+                        let detail = match rtt {
+                            Some(ms) => {
+                                let note = if acceptable {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " — over the {PREFLIGHT_RTT_CAP_MS} ms cap; proceeding anyway after {PREFLIGHT_MAX_ATTEMPTS} attempts"
+                                    )
+                                };
+                                format!("endpoint {} RTT {} ms{}", target.label(), ms, note)
+                            }
+                            None => format!(
+                                "endpoint {} unreachable during preflight ({} ms budget); proceeding anyway after {PREFLIGHT_MAX_ATTEMPTS} attempts",
+                                target.label(),
+                                PREFLIGHT_BUDGET_MS
                             ),
+                        };
+                        let _ = event_tx.send(
+                            crate::team_create::RbxTransportSessionEvent::Status(format!(
+                                "Fresh gamejoin config received (preflight attempt {}/{}): {detail}; entering the selected transport…",
+                                attempt + 1,
+                                PREFLIGHT_MAX_ATTEMPTS
+                            )),
                         );
                         crate::team_create::run_join_config_session(
                             config,
@@ -6083,15 +6444,22 @@ ui.label("Place ID:");
                             cancel,
                             event_tx,
                         );
+                        return;
                     }
-                    Err(error) => {
-                        let _ = event_tx.send(
-                            crate::team_create::RbxTransportSessionEvent::Finished(format!(
-                                "Fresh Team Create join failed: {error}"
-                            )),
-                        );
-                    }
+                    let reason = match rtt {
+                        Some(ms) => format!("RTT {} ms > {} ms cap", ms, PREFLIGHT_RTT_CAP_MS),
+                        None => format!("no TCP handshake within {} ms", PREFLIGHT_BUDGET_MS),
+                    };
+                    let _ = event_tx.send(
+                        crate::team_create::RbxTransportSessionEvent::Status(format!(
+                            "Preflight attempt {}/{}: {} is far ({reason}) — discarding the one-use config and requesting a closer server…",
+                            attempt + 1,
+                            PREFLIGHT_MAX_ATTEMPTS,
+                            target.label()
+                        )),
+                    );
                 }
+                unreachable!("preflight loop always returns from inside the loop");
             },
         );
     }
@@ -6439,7 +6807,26 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 ui.add_space(12.0);
                 ui.group(|ui| {
                     ui.label(RichText::new("📱 Adaptive editor layout").heading().color(Color32::from_rgb(100, 200, 255)));
-                    ui.label("Phones use a bottom navigation bar. Tablets use top tabs and an optional resizable Explorer sidebar.");
+                    ui.label("Auto: phones get a bottom navigation bar; tablets get top tabs with an optional Explorer sidebar; Chromebooks (ChromeOS) get the docked Studio layout (menu bar, Explorer left, Properties right, Output/Scripts bottom) with keyboard shortcuts.");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("UI mode:");
+                        for (value, label) in [
+                            ("auto", "Auto (recommended)"),
+                            ("phone", "Phone"),
+                            ("tablet", "Tablet"),
+                            ("desktop", "Desktop"),
+                        ] {
+                            if ui.selectable_label(self.ui_mode == value, label).clicked() {
+                                self.ui_mode = value.to_string();
+                            }
+                        }
+                    });
+                    ui.label(RichText::new(if self.is_chromeos {
+                        "Detected platform: ChromeOS (Chromebook)"
+                    } else {
+                        "Detected platform: Android (not a Chromebook)"
+                    })
+                    .weak());
                     ui.add(egui::Slider::new(&mut self.font_size, 10.0..=32.0).text("Editor font size"));
                     ui.checkbox(&mut self.editor_word_wrap, "Wrap long editor lines");
                     ui.checkbox(&mut self.compact_toolbar, "Always use compact toolbar");
@@ -6450,6 +6837,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                         self.font_size = 14.0;
                         self.editor_word_wrap = false;
                         self.compact_toolbar = false;
+                        self.ui_mode = "auto".into();
                         self.show_tablet_explorer = true;
                         self.explorer_width = 280.0;
                         self.editor_focus_mode = false;
@@ -6466,6 +6854,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             open_cloud_api_key: self.open_cloud_api_key.clone(),
                             open_cloud_universe_id: self.open_cloud_universe_id.clone(),
                             open_cloud_place_id: self.open_cloud_place_id.clone(),
+                            ui_mode: self.ui_mode.clone(),
                             auto_download_meshes: true,
                             show_skybox: true,
                             editor_font_size: self.font_size,
@@ -6500,6 +6889,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                         self.open_cloud_universe_id.clear();
                         self.open_cloud_place_id.clear();
                         let cleared = EditorSettings {
+                            ui_mode: self.ui_mode.clone(),
                             editor_font_size: self.font_size,
                             compact_toolbar: self.compact_toolbar,
                             show_tablet_explorer: self.show_tablet_explorer,

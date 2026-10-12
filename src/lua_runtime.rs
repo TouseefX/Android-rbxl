@@ -709,11 +709,11 @@ fn install_color3(lua: &Lua) -> LuaResult<()> {
     methods.set(
         "ToHSV",
         lua.create_function(|_, value: Table| {
-            color3_to_hsv(
+            Ok(color3_to_hsv(
                 value.get("R")?,
                 value.get("G")?,
                 value.get("B")?,
-            )
+            ))
         })?,
     )?;
     methods.set(
@@ -2916,7 +2916,9 @@ mod command_api_tests {
     #[test]
     fn command_bar_supports_properties_math_enums_and_edit_run_service() {
         let dom = Rc::new(RefCell::new(WeakDom::new(InstanceBuilder::new("DataModel"))));
-        let command = r#"
+        // r## (not r#): the Luau body below contains ("#ff0000"), whose "#
+        // sequence would terminate a single-hash raw string early.
+        let command = r##"
             local part = Instance.new("Part")
             assert(part:IsA("BasePart"))
             assert(part.Anchored == false)
@@ -2972,7 +2974,7 @@ mod command_api_tests {
             runService.RenderStepped:Fire(0.016)
             assert(rendered)
             runService:UnbindFromRenderStep("command-test")
-        "#;
+        "##;
         run_command(dom.clone(), command, "=command-api-behavior-test")
             .expect("the reflected property, value, and edit-mode service APIs should work");
     }

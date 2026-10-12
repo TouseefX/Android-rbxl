@@ -33,11 +33,11 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce, Tag,
 };
 use sha2::Sha512;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc::Sender,
     Arc, Mutex,
 };
@@ -79,6 +79,15 @@ pub enum RbxTransportSessionEvent {
     /// The QUIC/TLS handshake completed. This is deliberately distinct from
     /// BaseClient's post-WaitForConnection state and Team Create acceptance.
     QuicHandshakeComplete(String),
+    /// A complete 0x9B challenge frame arrived on channel 1.
+    ChallengeReceived { u1: u32, u2: u32, blob_len: u32 },
+    /// The challenge was solved locally and the 9-byte answer sent.
+    ChallengeAnswered { answer: u32, elapsed_ms: u64 },
+    /// Local solving of the challenge failed.
+    ChallengeFailed(String),
+    /// Post-answer traffic on channel 1 (world state / peer assignment) —
+    /// the BaseClient "connected" milestone.
+    ConnectedStageReached(String),
     Finished(String),
 }
 
@@ -432,6 +441,38 @@ pub fn join_response_is_all_null(v: &serde_json::Value) -> bool {
     !has_value(v)
 }
 
+/// TCP-connect RTT probe used by the fresh-join endpoint preflight. The
+/// UDMUX answer port answers TCP handshakes on the same network path as its
+/// QUIC UDP, so a connect's round trip is an honest measurement of the path;
+/// a path that does not complete even a TCP handshake within the budget will
+/// also silently drop our QUIC Initials (observed: 0 bytes RX for the whole
+/// 10 s handshake budget). `None` = no route within `budget_ms`.
+pub fn probe_endpoint_rtt_ms(address: &str, port: u16, budget_ms: u32) -> Option<u32> {
+    let addr = (address, port).to_socket_addrs().ok()?.next()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    // `TcpStream::connect_timeout` is tokio_unstable-only, so the stable
+    // pattern is `tokio::time::timeout` around a plain `connect` (both
+    // stable; the `net` and `time` features are already enabled).
+    runtime.block_on(async {
+        let started = std::time::Instant::now();
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms as u64),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let rtt = started.elapsed().as_millis() as u32;
+        // Dropping the stream closes the socket and releases the
+        // ephemeral port; no AsyncWriteExt import is needed for that.
+        drop(stream);
+        Some(rtt)
+    })
+}
+
 /// RakNet offline-message magic, retained by Roblox's customized open
 /// handshake. The layouts below come from the exact 2022 Studio
 /// `sendRbxOpenRequest1`, `sendRbxOpenReply1`, and
@@ -532,6 +573,46 @@ const RBX_TRANSPORT_NATIVE_QUIC_PROTECTION_KEY: [u8; 32] = [
 ];
 const RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES: usize = 18;
 const RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES: usize = 16;
+/// Max UDP payload (QUIC packet before the RUPP prefix) per route attempt.
+/// Pinned at the RFC 9000 client-Initial floor of 1200: the US Google Cloud
+/// UDMUX load balancer enforces the anti-amplification rule and blackholes
+/// client Initials whose UDP payload is below 1200 bytes — verified live:
+/// the sub-1200 tiers (831-1131 on the wire) cleared the local carrier but
+/// got zero answers from the UDMUX endpoint. So the Initial is NOT shrunk
+/// (the old descending "MTU ladder" is dead); instead the kernel chops the
+/// oversized UDP datagram into IP fragments (RBX_TRANSPORT_UDP_CHOP_MTU +
+/// IP_PMTUDISC_DONT) — the "Initial-Chop" strategy — keeping the physical
+/// frames under the strict carrier's threshold while the reassembled UDP
+/// payload stays 1231/1249, exactly what the server's front door expects.
+const RBX_TRANSPORT_UDP_PAYLOAD_TIERS: [usize; 1] = [1200];
+/// Per-socket path-MTU cap (IP_MTU / IPV6_MTU) that forces the kernel to
+/// chop the 1231/1249-byte RUPP-wrapped Initial (1259/1277 with IP+UDP
+/// headers) into ~two IP fragments of <= 640 bytes each.
+/// IP_PMTUDISC_DONT (DF=0, no PMTUD) is what allows the fragments; the
+/// phone's 1500-byte interface MTU would otherwise ship the datagram whole
+/// and let the strict carrier drop it. 640 = the "two ~600-byte fragments"
+/// shape; drop it to 576 (three fragments) if the carrier still eats
+/// 640-byte frames.
+const RBX_TRANSPORT_UDP_CHOP_MTU: u32 = 640;
+/// Kernel-ABI setsockopt numbers (stable across Linux/Android/bionic):
+/// IP_MTU=14 at IPPROTO_IP level, IPV6_MTU=20 at IPPROTO_IPV6 level.
+const RBX_TRANSPORT_SOCKOPT_IP_MTU: i32 = 14;
+const RBX_TRANSPORT_SOCKOPT_IPV6_MTU: i32 = 20;
+/// IP_TOS for the QUIC UDP socket: DSCP AF41 (101001), TOS byte 136.
+/// CS4 (0x80/128) was tried live first and Roblox/carrier did not take it
+/// — switched to AF41 on 2026-10-11. Flip to 0x80 (CS4), 0xB8 (EF) or
+/// 0x00 (CS0) if a specific carrier reacts differently.
+const RBX_TRANSPORT_UDP_TOS: u8 = 0x88;
+/// Bail a route attempt when datagrams went out but the carrier returned
+/// nothing for this long (a healthy path answers the Initial well before
+/// it). This is what turns a 10 s deadlock per route/size into a ~2.5 s
+/// probe so the MTU ladder can move on. Two-stage: the first observation
+/// grants one grace window (`RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS`) because
+/// on this network the first response was observed at ~3 s — a hard bail
+/// at 2.5 s killed an otherwise-alive path. A second observation with
+/// still zero RX bails (~3.5 s worst case per dead size).
+const RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS: u64 = 2_500;
+const RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS: u64 = 1_000;
 const RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES: usize = 12;
 const RBX_TRANSPORT_NATIVE_QUIC_COUNTER_INITIAL: u64 = u64::from_le_bytes(*b"UniqueNu");
 const RBX_TRANSPORT_NATIVE_QUIC_NONCE_SUFFIX: [u8; 10] = *b"iqueNumbeR";
@@ -592,6 +673,16 @@ struct RbxTransportConnectPlan {
     early_auth: Result<EarlyAuthData, String>,
     game_fqdn: Option<String>,
     qdmux_vip: Option<String>,
+    /// Post-handshake app-flow material (the BaseClient join burst and the
+    /// 0x9B challenge answer). All optional: the flow degrades to the
+    /// passive receive loop when any of them is missing.
+    join_user_id: Option<i64>,
+    join_client_ticket: Option<String>,
+    join_session_id: Option<String>,
+    join_random_seed1: Option<String>,
+    join_api_security_token: Option<String>,
+    join_serialized_client_fields: Option<String>,
+    join_encrypted_server_fields: Option<String>,
 }
 
 fn is_hex_field(text: &str, len: usize) -> bool {
@@ -651,7 +742,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// RCC endpoint, and advertised public UDMUX VIP.  The returned value contains
 /// the redacted-by-policy Team Create token; callers must never print it.
 fn derive_qdmux_game_fqdn(plan: &RbxTransportConnectPlan) -> Option<String> {
-    derive_qdmux_game_fqdn_for_port(plan, plan.rcc_endpoint.port)
+    derive_qdmux_game_fqdn_for_port(plan, plan.rbx_transport_port)
 }
 
 fn derive_qdmux_game_fqdn_for_port(
@@ -720,7 +811,9 @@ fn native_qdmux_cid_config(
     };
     Some(NativeQdmuxCidConfig {
         rcc_ipv4,
-        rcc_port: plan.rcc_endpoint.port,
+        // Native 0xd1 CID shape: rccIpv4 + the port the native carries in
+        // its RUPP TLV (NetStackPort, per the validated clients).
+        rcc_port: plan.rbx_transport_port,
         server_rupp_config_empty,
     })
 }
@@ -810,7 +903,7 @@ impl RbxTransportConnectPlan {
     fn summary(&self) -> String {
         let quic_endpoint = rbx_transport_quic_endpoint(self);
         let mut text = format!(
-            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public/UDMUX endpoint; native RUPP/qdmux routing fields use the RCC/server endpoint port)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with separate NetStackPort metadata {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
+            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public UDMUX IP on the NetStackPort - the RbxTransport UDP port per the validated Boblox clients; RUPP TLV2 and 0xd1 qdmux CID carry the RCC IP with the same NetStackPort)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with separate NetStackPort metadata {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
             quic_endpoint.label(),
             self.public_endpoint.label(),
             self.rcc_endpoint.label(),
@@ -824,13 +917,13 @@ impl RbxTransportConnectPlan {
             self.early_key.public_key.len(),
         );
         text.push_str(&format!(
-            "\nPort routing distinction: NetStackPort {} is separate selector/config metadata; the legacy connected NetStackTokenValue reverse-endpoint route is not used on this selected RbxTransport session. QUIC targets public UDMUX port {}, while ClientRuppGenerator/qdmux fields use RCC/server port {}.",
+            "\nPort routing: NetStackPort {} is the RbxTransport UDP port - QUIC targets the public UDMUX IP on that port ({}), and the RUPP TLV2 / 0xd1 qdmux CID fields carry the RCC IP ({}) with the same NetStackPort (validated Boblox client parity; FINDINGS.md's 'separate metadata, not the UDP destination' sentence is contradicted by all three live-joining clients). The legacy connected NetStackTokenValue reverse-endpoint route is not used on this selected RbxTransport session.",
             self.rbx_transport_port,
             quic_endpoint.port,
-            self.rcc_endpoint.port
+            self.rcc_endpoint.address
         ));
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC/server endpoint port, QUIC first-flight packet protection now follows the native +0x2d enabler evidence instead of forcing the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer on every route, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC IP + NetStackPort, all routes are RUPP-wrapped (flag byte 0x00 per the native capture) with the literal UDMUX IP as SNI and the 0xFF00 capabilities TLS extension spliced into every outgoing Initial (native ClientHello parity; native CH extension order, 0xff00 first), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload is pinned at the RFC 9000 client-Initial floor of 1200 bytes (server-side anti-amplification; sub-1200 Initials are blackholed by the UDMUX load balancer) and kernel-chopped into IP fragments under a 640-byte per-socket MTU for strict-carrier networks, with IP_TOS AF41 (136), 0-RX bail 2500 ms, handshake timeout floor {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
@@ -851,7 +944,7 @@ impl RbxTransportConnectPlan {
         ));
         match &self.early_auth {
             Ok(auth) => text.push_str(&format!(
-                "\nRbxTransport BaseClient early auth material: native sendEarlyAuthData uses active connection send slot argument 1, frame tag 0xA8; auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted). It is staged for diagnostics but not sent until the reliability-2 channel/wire-ID route is verified.",
+                "\nRbxTransport BaseClient early auth material: native sendEarlyAuthData uses active connection send slot argument 1, frame tag 0xA8; auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted). It is sent in the post-handshake burst on channel 1 (with A7, 0x90/0x92/0x8A, 0x8F) as soon as the QUIC handshake completes.",
                 auth.auth_version,
                 auth.preauth_blob.len(),
                 auth.auth_blob.len(),
@@ -868,7 +961,7 @@ impl RbxTransportConnectPlan {
             ));
         } else if derive_qdmux_game_fqdn(self).is_some() {
             text.push_str(
-                "\nRbxTransport generated qdmux SNI candidate: redacted native token-ip-port.vip.qdmux.roblox.com shape; when the join config omits GameFqdn, the app now also supplies ngtcp2 with the recovered 20-byte native qdmux initial destination-CID shape (0xd1/RCC IPv4/RCC server port/inner-CID entropy or counter, bytes redacted) while keeping the first QUIC Initial visible because the 18-byte trailer helper is gated by native state.",
+                "\nRbxTransport SNI: every route now uses the literal UDMUX IP as SNI (byte-exact native ClientHello parity; the token-ip-port.vip.qdmux.roblox.com shape is retained only as a redacted report candidate) and ngtcp2 gets the recovered 20-byte native qdmux initial destination-CID shape (0xd1/RCC IPv4/RCC server port/inner-CID entropy or counter, bytes redacted); the 18-byte CID trailer is forced on the primary route, while the fallback route omits it (Boblox C++ parity).",
             );
         }
         text.push_str(
@@ -1002,6 +1095,7 @@ fn extract_rbx_transport_connect_plan(
         .or_else(|| find_field_ci(config, "DebugRbxTransportQdmuxVip", 0))
         .and_then(|value| as_addr(&value))
         .filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok());
+    let (serialized_client_fields, encrypted_server_fields) = extract_join_ticket_fields(config);
     Ok(RbxTransportConnectPlan {
         public_endpoint,
         rcc_endpoint,
@@ -1014,7 +1108,46 @@ fn extract_rbx_transport_connect_plan(
         early_auth,
         game_fqdn,
         qdmux_vip,
+        join_user_id: find_field_ci(config, "UserId", 0)
+            .and_then(|v| v.as_i64())
+            .or_else(|| find_field_ci(config, "UserId", 0).and_then(|v| v.as_u64()).map(|v| v as i64)),
+        join_client_ticket: find_field_ci(config, "ClientTicket", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_session_id: find_field_ci(config, "SessionId", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_random_seed1: find_field_ci(config, "RandomSeed1", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_api_security_token: find_field_ci(config, "APIsecurityToken", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_serialized_client_fields: serialized_client_fields,
+        join_encrypted_server_fields: encrypted_server_fields,
     })
+}
+
+/// The joinTicket field carries the server-issued ticket; across fleet
+/// versions it appears as either a JSON object or a stringified JSON
+/// object with `SerializedClientFields` / `EncryptedServerFields`.
+fn extract_join_ticket_fields(
+    config: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let ticket = match find_field_ci(config, "joinTicket", 0) {
+        Some(serde_json::Value::String(text)) => {
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(value) => Some(value),
+                Err(_) => None,
+            }
+        }
+        Some(value) => Some(value.clone()),
+        None => None,
+    };
+    let Some(ticket) = ticket else {
+        return (None, None);
+    };
+    let scf = find_field_ci(&ticket, "SerializedClientFields", 0)
+        .and_then(|v| v.as_str().map(str::to_owned));
+    let esf = find_field_ci(&ticket, "EncryptedServerFields", 0)
+        .and_then(|v| v.as_str().map(str::to_owned));
+    (scf, esf)
 }
 
 fn extract_rupp_probe_material(config: &serde_json::Value) -> Result<RuppProbeMaterial, String> {
@@ -1471,6 +1604,12 @@ impl RbxTransportControlDecoder {
     }
 }
 
+/// Decode Roblox's compact varint (top-2-bit size scheme, Boblox util.h
+/// compactVarintDecode): 00 = 1 byte, 01 = 2, 10 = 4, 11 = 8; value =
+/// (first & 0x3F) followed by n-1 raw big-endian bytes. This is the
+/// stream-framing / ctrl / chan varint (same encoding as
+/// appflow::compact_varint) - NOT the RFC 9000 QUIC-wire varint, which is
+/// 1/2/3/4 with 7-bit groups and lives inside ngtcp2.
 fn decode_rbx_transport_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let first = *bytes.first()?;
     let encoded_len = match first >> 6 {
@@ -1497,12 +1636,17 @@ const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
 ];
 
 fn rbx_transport_quic_endpoint(plan: &RbxTransportConnectPlan) -> Endpoint {
-    // Native PlayerConfigurer passes MachineAddress/ServerPort as the logical
-    // server endpoint and the advertised UDMUX/public endpoint as the UDP
-    // socket destination. NetStackPort remains separate selector/config
-    // metadata; the native ClientRuppConfiguration and qdmux fields use the
-    // RCC/server endpoint port.
-    plan.public_endpoint.clone()
+    // NetStackPort is the RbxTransport UDP port: all three validated Boblox
+    // clients join on udmuxIp:NetStackPort (py/rbx_client.py header,
+    // py/probe10.py, C++ quic_client.cpp sin_port = cfg.port =
+    // NetStackPort; live runs landed on udmux 128.116.2.33:61269 =
+    // NetStackPort). FINDINGS.md's sentence calling it "separate metadata,
+    // not the UDP destination" is contradicted by the working
+    // implementations, so the validated wire shape wins.
+    Endpoint {
+        address: plan.public_endpoint.address.clone(),
+        port: plan.rbx_transport_port,
+    }
 }
 
 fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr, String> {
@@ -1517,19 +1661,22 @@ fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr, String> {
 }
 
 fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec<u8>, String> {
-    // Native NetworkClient fills ClientRuppConfiguration from the same
-    // FinalConnectionArgs server address/port used in the "will connect to
-    // server {}|{}, udmux {}|{}" log, not from NetStackPort. NetStackPort is
-    // still parsed and reported as separate metadata, but the RUPP endpoint TLV
-    // must carry the RCC/server port.
-    let rcc_endpoint = Endpoint {
+    // TLV2 = RCC IPv4 + NetStackPort: "TLV2: 02 06 <rccIp 4B><NetStackPort
+    // u16 BE>" (py/rbx_client.py), rupp_.rcc_port = cfg.port in the C++
+    // client - same NetStackPort as the UDP destination.
+    let rupp_endpoint = Endpoint {
         address: plan.rcc_endpoint.address.clone(),
-        port: plan.rcc_endpoint.port,
+        port: plan.rbx_transport_port,
     };
+    // FINDINGS.md byte layout for the RbxTransport game path:
+    // [01][00][u16 BE total][TLV1][TLV2] - the flag byte is 0x00. Both
+    // validated Boblox clients hardcode it (C++ rupp.h and Python
+    // rbx_client.py), and the native capture (rupp_tx001) shows 0x00; the
+    // join config's DSR bit is metadata for this path, not a wire flag.
     build_rupp_header_for(
         &plan.token,
-        &rcc_endpoint,
-        plan.direct_server_return,
+        &rupp_endpoint,
+        false,
         plan.token_type,
         RuppEndpointTlvKind::Endpoint,
     )
@@ -1544,7 +1691,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1552,6 +1699,7 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.rupp_prefix_len,
             report.initial_dst_cid_len,
             report.native_quic_cid_trailer_len,
+            report.max_udp_payload_size,
             report.rpk_version,
             report.handshake_timeout_ms,
             report.requested_timeout_ms,
@@ -1579,6 +1727,11 @@ struct RbxTransportConnectionReport {
     rupp_prefix_len: usize,
     initial_dst_cid_len: usize,
     native_quic_cid_trailer_len: usize,
+    /// The max_tx_udp_payload_size (QUIC payload before RUPP) this
+    /// connection used — pinned at the RFC 9000 client-Initial floor of
+    /// 1200 (the datagram is kernel-chopped into IP fragments instead of
+    /// being shrunk).
+    max_udp_payload_size: usize,
     rpk_version: u16,
     requested_timeout_ms: u64,
     handshake_timeout_ms: u64,
@@ -1588,11 +1741,15 @@ struct RbxTransportConnectionReport {
     preauth_len: usize,
     auth_len: usize,
     early_auth_payload_len: usize,
+    /// Whether the app=4 flow (post-handshake burst + 0x9B answer) ran and
+    /// the challenge was answered.
+    flow_active: bool,
+    flow_answered: bool,
     inbound_summary: String,
 }
 
 #[cfg(not(test))]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RbxTransportQuicRoute {
     target_endpoint: Endpoint,
     outgoing_prefix: Vec<u8>,
@@ -1608,111 +1765,54 @@ fn build_rbx_transport_quic_routes(
     plan: &RbxTransportConnectPlan,
 ) -> Result<Vec<RbxTransportQuicRoute>, String> {
     let target_endpoint = rbx_transport_quic_endpoint(plan);
-    let mut routes = Vec::new();
-
-    if let Some(game_fqdn) = plan
-        .game_fqdn
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let use_qdmux_initial_dcid = game_fqdn_has_qdmux_token_ip_port_fields(game_fqdn);
-        let pure_initial_dcid = if use_qdmux_initial_dcid {
-            derive_native_qdmux_initial_dcid(plan, true)?
-        } else {
-            None
-        };
-        let rupp_initial_dcid = if use_qdmux_initial_dcid {
-            derive_native_qdmux_initial_dcid(plan, false)?
-        } else {
-            None
-        };
-        let cid_label = if pure_initial_dcid.is_some() && rupp_initial_dcid.is_some() {
-            " with native 0xd1 qdmux initial DCID using RCC server-port field"
-        } else {
-            ""
-        };
-
-        routes.push(RbxTransportQuicRoute {
+    // SNI: the byte-exact native game ClientHello (Boblox
+    // run/native_clienthello_tx001.bin) carries the *literal UDMUX IP* as
+    // SNI; the token-ip-port.vip.qdmux.roblox.com grammar only exists on
+    // debug/pure-QUIC paths and the qdmux zone has no DNS records yet. The
+    // production udmux edge SNI-routes on that literal IP and silently drops
+    // datagrams carrying a different (or no) SNI, so every route below uses
+    // it. pki-types validates an IP literal as a DNS name, so rustls emits
+    // it as the SNI extension instead of suppressing SNI.
+    let server_name = target_endpoint.address.clone();
+    // RUPP: every native game UDP packet is RUPP-wrapped (Boblox FINDINGS:
+    // "the production edge (udmux) routes on RUPP and silently drops
+    // RUPP-less UDP"; raw-QUIC Initials were captured and verified dropped
+    // in October 2026). The 31-byte prefix built here (token TLV + RCC
+    // endpoint TLV2) is byte-identical to Boblox's rupp_wrap output.
+    let rupp_prefix = build_rbx_transport_rupp_header(plan)?;
+    // Recovered native 0xd1 qdmux initial destination-CID shape (20 bytes);
+    // server_rupp_config_empty=false because both routes are RUPP-wrapped.
+    let initial_dst_cid = derive_native_qdmux_initial_dcid(plan, false)?;
+    let routes = vec![
+        // Method 1 (strict): force the native +0x2d packet-protection state
+        // so the recovered 18-byte ChaCha20-Poly1305 CID trailer rides on
+        // every datagram. The pinned US pool still verifies that trailer;
+        // the inbound side accepts it under both nonce suffixes (primary,
+        // then the fallback suffix).
+        RbxTransportQuicRoute {
             target_endpoint: target_endpoint.clone(),
-            outgoing_prefix: Vec::new(),
-            server_name: game_fqdn.to_string(),
+            outgoing_prefix: rupp_prefix.clone(),
+            server_name: server_name.clone(),
             enable_sni: true,
-            initial_dst_cid: pure_initial_dcid,
-            native_quic_packet_protection: false,
-            route_label: format!(
-                "qdmux-visible pure QUIC{cid_label} with join GameFqdn/SNI {} and native +0x2d trailer gate not forced",
-                game_fqdn_report_label(game_fqdn)
-            ),
-        });
-        let (rupp_server_name, rupp_enable_sni, rupp_route_label) = if use_qdmux_initial_dcid {
-            (
-                "roblox.com".to_string(),
-                false,
-                format!(
-                    "ClientRuppGenerator RUPP prefix with RCC server-port endpoint TLV and without SNI{cid_label} paired with join qdmux GameFqdn {} and native +0x2d trailer gate not forced",
-                    game_fqdn_report_label(game_fqdn)
-                ),
-            )
-        } else {
-            (
-                game_fqdn.to_string(),
-                true,
-                format!(
-                    "ClientRuppGenerator RUPP prefix with RCC server-port endpoint TLV{cid_label} and join GameFqdn/SNI {} plus native +0x2d trailer gate not forced",
-                    game_fqdn_report_label(game_fqdn)
-                ),
-            )
-        };
-        routes.push(RbxTransportQuicRoute {
+            initial_dst_cid: initial_dst_cid.clone(),
+            native_quic_packet_protection: true,
+            route_label:
+                "RUPP-wrapped QUIC, literal-UDMUX-IP SNI, forced 18-byte native +0x2d CID trailer (strict method), 0xd1 qdmux initial DCID".into(),
+        },
+        // Method 2 (non-fallback / Boblox C++ byte parity): RUPP-wrapped
+        // QUIC with no CID trailer — the exact shape the Boblox client
+        // completes live handshakes with on public udmux pools.
+        RbxTransportQuicRoute {
             target_endpoint,
-            outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
-            server_name: rupp_server_name,
-            enable_sni: rupp_enable_sni,
-            initial_dst_cid: rupp_initial_dcid,
-            native_quic_packet_protection: false,
-            route_label: rupp_route_label,
-        });
-    } else if let Some(generated_game_fqdn) = derive_qdmux_game_fqdn(plan) {
-        // Native QuicConnectionIdGenerator::generate emits a 20-byte initial
-        // qdmux CID with prefix 0xd1, RCC IPv4, RCC server port, and inner
-        // CID/counter bytes before QUIC connects. The DebugRbxTransport
-        // generated-GameFqdn path clears the RUPP config for a pure qdmux/SNI
-        // route; the normal ClientRuppGenerator route keeps the RUPP prefix and
-        // runs without SNI. Both shapes get the recovered qdmux CID family while
-        // keeping QUIC byte zero visible (the native 18-byte protector remains
-        // gated by +0x2d state).
-        routes.push(RbxTransportQuicRoute {
-            target_endpoint: target_endpoint.clone(),
-            outgoing_prefix: Vec::new(),
-            server_name: generated_game_fqdn.clone(),
+            outgoing_prefix: rupp_prefix,
+            server_name,
             enable_sni: true,
-            initial_dst_cid: derive_native_qdmux_initial_dcid(plan, true)?,
+            initial_dst_cid,
             native_quic_packet_protection: false,
             route_label:
-                "qdmux-visible pure QUIC with generated GameFqdn/SNI, native 0xd1 qdmux initial DCID using RCC server-port field, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
-        });
-        routes.push(RbxTransportQuicRoute {
-            target_endpoint,
-            outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
-            server_name: "roblox.com".into(),
-            enable_sni: false,
-            initial_dst_cid: derive_native_qdmux_initial_dcid(plan, false)?,
-            native_quic_packet_protection: false,
-            route_label:
-                "ClientRuppGenerator RUPP prefix with RCC server-port endpoint TLV, without SNI, native 0xd1 qdmux initial DCID using RCC server-port field, and native +0x2d trailer gate not forced (token/ip/port/CID redacted)".into(),
-        });
-    } else {
-        routes.push(RbxTransportQuicRoute {
-            target_endpoint,
-            outgoing_prefix: build_rbx_transport_rupp_header(plan)?,
-            server_name: "roblox.com".into(),
-            enable_sni: false,
-            initial_dst_cid: None,
-            native_quic_packet_protection: false,
-            route_label: "ClientRuppGenerator RUPP prefix with RCC server-port endpoint TLV, without SNI, and native +0x2d trailer gate not forced".into(),
-        });
-    }
-
+                "RUPP-wrapped QUIC, literal-UDMUX-IP SNI, no CID trailer (Boblox C++ parity method), 0xd1 qdmux initial DCID".into(),
+        },
+    ];
     Ok(routes)
 }
 
@@ -1743,6 +1843,61 @@ async fn run_rbx_transport_connection_async(
     .await
 }
 
+/// Build the app=4 flow config from the connect plan. Returns None when
+/// required fields are missing; the session then stays in passive mode.
+#[cfg(not(test))]
+fn build_join_flow_config(
+    plan: &RbxTransportConnectPlan,
+) -> Option<crate::appflow::JoinConfig> {
+    let client_ticket = plan.join_client_ticket.clone()?;
+    let user_id = plan.join_user_id?;
+    let session_id = plan.join_session_id.clone().unwrap_or_default();
+    let early_auth = plan.early_auth.as_ref().ok().map(|auth| {
+        crate::appflow::EarlyAuth {
+            version: auth.auth_version,
+            pre: auth.preauth_blob.clone(),
+            auth: auth.auth_blob.clone(),
+        }
+    });
+    Some(crate::appflow::JoinConfig {
+        user_id,
+        client_ticket,
+        session_id,
+        random_seed1: plan.join_random_seed1.clone(),
+        api_security_token: plan.join_api_security_token.clone(),
+        serialized_client_fields: plan.join_serialized_client_fields.clone(),
+        encrypted_server_fields: plan.join_encrypted_server_fields.clone(),
+        early_auth,
+        a7_mode: crate::appflow::A7Mode::Real,
+    })
+}
+
+/// Execute one flow action: open a client stream (recording it in the flow)
+/// or write more bytes to an existing stream.
+#[cfg(not(test))]
+async fn execute_join_flow_action<S: ngnet_quic::Session>(
+    connection: &mut ngnet_quic::Conn<'_, S>,
+    socket: &RuppUdpSocket,
+    tx_buf: &mut [u8],
+    origin: Instant,
+    flow: &mut crate::appflow::AppFlow,
+    action: crate::appflow::Action,
+) -> Result<(), String> {
+    match action {
+        crate::appflow::Action::OpenStream { app, chan, data } => {
+            let id = connection.open_bidi_stream().map_err(|error| {
+                format!("open bidi stream app={app} chan={chan}: {error}")
+            })?;
+            let raw = id.get();
+            flow.note_opened(app, chan, raw);
+            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, raw, &data).await
+        }
+        crate::appflow::Action::Write { stream, data } => {
+            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data).await
+        }
+    }
+}
+
 #[cfg(not(test))]
 async fn run_rbx_transport_connection_async_with_session(
     plan: &RbxTransportConnectPlan,
@@ -1766,42 +1921,56 @@ async fn run_rbx_transport_connection_async_with_session(
     let routes = build_rbx_transport_quic_routes(plan)?;
     let mut failures = Vec::new();
 
-    for route in routes {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("RbxTransport session cancelled before the next route attempt".into());
-        }
-        let route_label = route.route_label.clone();
-        if let Some(event_tx) = &event_tx {
-            let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
-                "Trying RbxTransport route: {route_label}; target {}",
-                route.target_endpoint.label()
-            )));
-        }
-        match attempt_rbx_transport_connection_async(
-            plan,
-            auth,
-            early_auth_payload_len,
-            route,
-            requested_timeout_ms,
-            handshake_timeout_ms,
-            operation_timeout,
-            handshake_timeout,
-            Arc::clone(&cancel),
-            persistent_session,
-            event_tx.clone(),
-        )
-        .await
-        {
-            Ok(report) => return Ok(report),
-            Err(reason) if cancel.load(Ordering::Relaxed) => {
-                return Err(format!("RbxTransport session cancelled: {reason}"));
+    // Route sweep at a fixed 1200-byte payload cap: the UDMUX load
+    // balancer blackholes sub-1200 client Initials (RFC 9000
+    // anti-amplification floor), so the strict-carrier problem is solved
+    // socket-side instead — the kernel chops the 1231/1249-byte datagram
+    // into ~two 640-byte IP fragments (RBX_TRANSPORT_UDP_CHOP_MTU +
+    // IP_PMTUDISC_DONT), the native engine's fragmentation fallback. The
+    // two-stage 0-RX bail keeps each route attempt to ~3.5 s.
+    for &max_udp_payload in &RBX_TRANSPORT_UDP_PAYLOAD_TIERS {
+        for route in &routes {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("RbxTransport session cancelled before the next route attempt".into());
             }
-            Err(reason) => failures.push(format!("{route_label} => {reason}")),
+            let route_label = route.route_label.clone();
+            if let Some(event_tx) = &event_tx {
+                let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
+                    "Trying RbxTransport route: {route_label} at UDP payload cap {max_udp_payload} (on-wire datagram <= {} with RUPP); target {}",
+                    max_udp_payload.saturating_add(route.outgoing_prefix.len()),
+                    route.target_endpoint.label()
+                )));
+            }
+            match attempt_rbx_transport_connection_async(
+                plan,
+                auth,
+                early_auth_payload_len,
+                route.clone(),
+                requested_timeout_ms,
+                handshake_timeout_ms,
+                operation_timeout,
+                handshake_timeout,
+                max_udp_payload,
+                Arc::clone(&cancel),
+                persistent_session,
+                event_tx.clone(),
+            )
+            .await
+            {
+                Ok(report) => return Ok(report),
+                Err(reason) if cancel.load(Ordering::Relaxed) => {
+                    return Err(format!("RbxTransport session cancelled: {reason}"));
+                }
+                Err(reason) => failures.push(format!(
+                    "{route_label} @ {max_udp_payload} => {reason}"
+                )),
+            }
         }
     }
 
     Err(format!(
-        "all RbxTransport QUIC route attempts failed: {}",
+        "all RbxTransport QUIC route attempts failed across every payload tier {:?}: {}",
+        RBX_TRANSPORT_UDP_PAYLOAD_TIERS,
         failures.join("; ")
     ))
 }
@@ -1834,16 +2003,87 @@ async fn attempt_rbx_transport_connection_async(
     handshake_timeout_ms: u64,
     operation_timeout: Duration,
     handshake_timeout: Duration,
+    max_udp_payload: usize,
     cancel: Arc<AtomicBool>,
     persistent_session: bool,
     event_tx: Option<Sender<RbxTransportSessionEvent>>,
 ) -> Result<RbxTransportConnectionReport, String> {
     let target_addr = resolve_endpoint(&route.target_endpoint)?;
-    let std_socket = UdpSocket::bind(route.target_endpoint.bind_address())
-        .map_err(|error| format!("failed to bind QUIC UDP socket: {error}"))?;
-    std_socket
-        .set_nonblocking(true)
+    // socket2 (not std::net) so the options std does not expose can be set
+    // before the socket leaves this function:
+    // - IP_TOS: mark the flow as DSCP AF41 (TOS byte 136) so carrier QoS
+    //   treats it as a named class instead of unmarked bulk UDP;
+    // - IP_PMTUDISC_DONT: let the kernel FRAGMENT an oversized datagram
+    //   instead of setting DF and failing silently when the carrier
+    //   swallows the ICMP feedback - the "fragmentation fallback" the
+    //   native engine relies on on strict networks;
+    // - IP_MTU: cap the per-socket path MTU at RBX_TRANSPORT_UDP_CHOP_MTU
+    //   so the DONT above actually triggers - without it the 1500-byte
+    //   interface MTU ships the 1277-byte Initial whole and the strict
+    //   carrier drops it. Together they are the "Initial-Chop": the
+    //   reassembled UDP payload stays >= 1200 (UDMUX requirement) while
+    //   each physical frame is a small, carrier-safe fragment.
+    let domain = if target_addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .map_err(|error| format!("failed to create QUIC UDP socket: {error}"))?;
+    sock.set_nonblocking(true)
         .map_err(|error| format!("failed to set QUIC UDP socket nonblocking: {error}"))?;
+    if let Err(error) = sock.set_tos(RBX_TRANSPORT_UDP_TOS as u32) {
+        // Non-fatal: some platforms/carriers ignore IP_TOS; the socket MTU
+        // chop is the primary mechanism.
+        let _ = error;
+    }
+    // IP_PMTUDISC_DONT / IPV6_PMTUDISC_DONT (both = 0): let the kernel
+    // fragment an oversized datagram instead of silently failing PMTUD
+    // when the carrier swallows the ICMP feedback. socket2 0.5 does not
+    // expose this option, so setsockopt goes through libc directly.
+    let (sockopt_level, sockopt_name) = if target_addr.is_ipv4() {
+        (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
+    } else {
+        (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER)
+    };
+    let pmtudisc_dont: i32 = 0;
+    unsafe {
+        let _ = libc::setsockopt(
+            std::os::unix::io::AsRawFd::as_raw_fd(&sock),
+            sockopt_level,
+            sockopt_name,
+            &pmtudisc_dont as *const i32 as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        );
+    }
+    // IP_MTU / IPV6_MTU: per-socket path-MTU cap (Linux >= 4.5). This is
+    // what makes the kernel chop the Initial into fragments; DONT alone
+    // only permits it. Best-effort: if the kernel rejects the option the
+    // datagram goes out whole (old behaviour) rather than failing the
+    // connection.
+    let (chop_level, chop_name) = if target_addr.is_ipv4() {
+        (libc::IPPROTO_IP, RBX_TRANSPORT_SOCKOPT_IP_MTU)
+    } else {
+        (libc::IPPROTO_IPV6, RBX_TRANSPORT_SOCKOPT_IPV6_MTU)
+    };
+    let chop_mtu: i32 = RBX_TRANSPORT_UDP_CHOP_MTU as i32;
+    unsafe {
+        let _ = libc::setsockopt(
+            std::os::unix::io::AsRawFd::as_raw_fd(&sock),
+            chop_level,
+            chop_name,
+            &chop_mtu as *const i32 as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        );
+    }
+    let bind_addr: SocketAddr = route
+        .target_endpoint
+        .bind_address()
+        .parse()
+        .map_err(|error| format!("failed to parse QUIC UDP bind address: {error}"))?;
+    sock.bind(&socket2::SockAddr::from(bind_addr))
+        .map_err(|error| format!("failed to bind QUIC UDP socket: {error}"))?;
+    let std_socket = std::net::UdpSocket::from(sock);
     let socket = tokio::net::UdpSocket::from_std(std_socket)
         .map_err(|error| format!("failed to wrap QUIC UDP socket: {error}"))?;
     let local_addr = socket
@@ -1890,7 +2130,14 @@ async fn attempt_rbx_transport_connection_async(
         u64::try_from(handshake_timeout.as_nanos())
             .map_err(|_| "RbxTransport handshake timeout exceeds ngtcp2's clock range")?,
     );
+    // Pin the max UDP payload (QUIC packet before the RUPP prefix) to
+    // this tier - currently always 1200, the RFC 9000 client-Initial floor
+    // the UDMUX load balancer enforces (sub-1200 Initials are blackholed
+    // server-side). ngtcp2 pads the Initial up to the clamp; the oversized
+    // on-wire datagram (1231/1249) is then chopped into IP fragments by
+    // the socket's chop MTU. Never shrink this below 1200.
     let settings = ngnet_quic::Settings::new(initial_ts)
+        .max_tx_udp_payload_size(max_udp_payload)
         .handshake_timeout(ng_handshake_timeout);
     let params = ngnet_quic::TransportParams::new()
         .max_datagram_frame_size(RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES as u64);
@@ -1958,6 +2205,7 @@ async fn attempt_rbx_transport_connection_async(
 
     let mut tx_buf = vec![0u8; 65_535];
     let mut rx_buf = vec![0u8; 65_535];
+    let mut zero_rx_grace_given = false;
     let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
     loop {
         write_pending_rbx_transport_packets(
@@ -1977,6 +2225,39 @@ async fn attempt_rbx_transport_connection_async(
                 ));
             }
             break;
+        }
+        // 0-RX early bail (two-stage): datagrams went out (Initial +
+        // retransmits) but the carrier returned nothing. On e&/du-class
+        // strict filtering that is a dropped-by-DPI signature, not a slow
+        // handshake. The first observation only arms the grace window —
+        // the first response on this network has been observed at ~3 s, so
+        // a hard bail at 2.5 s killed an otherwise-alive path. The next
+        // loop wake (at most ~1 s later, usually immediately if a packet
+        // arrives) re-checks, and only a confirmed still-0-RX bails, so
+        // the next route variant still gets its chance in ~3.5 s instead of
+        // the full 10 s native budget.
+        let zero_rx_bail_ms =
+            RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS.min(requested_timeout_ms);
+        if started.elapsed() >= Duration::from_millis(zero_rx_bail_ms)
+            && udp_stats.incoming_datagrams.load(Ordering::Relaxed) == 0
+            && udp_stats.outgoing_datagrams.load(Ordering::Relaxed) >= 1
+        {
+            if zero_rx_grace_given {
+                return Err(format!(
+                    "UDP 0-RX for {} ms + {} ms grace (payload cap {}): {} datagrams sent, none received - the path looks filtered or the Initial is blackholed; the next route variant will retry",
+                    zero_rx_bail_ms,
+                    RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS,
+                    max_udp_payload,
+                    udp_stats.outgoing_datagrams.load(Ordering::Relaxed)
+                ));
+            }
+            zero_rx_grace_given = true;
+            log::warn!(
+                "0-RX at {} ms (payload cap {}), granting {} ms grace window before bailing this size",
+                zero_rx_bail_ms,
+                max_udp_payload,
+                RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS
+            );
         }
         if tokio::time::Instant::now() >= handshake_deadline {
             return Err(rbx_transport_handshake_timeout_message(
@@ -2001,10 +2282,42 @@ async fn attempt_rbx_transport_connection_async(
             } => RbxTransportWake::Cancelled,
         };
         match wake {
-            RbxTransportWake::Datagram(Ok((len, _remote))) if len != 0 => {
+            RbxTransportWake::Datagram(Ok((len, remote))) if len != 0 => {
                 let timestamp = rbx_transport_timestamp(started)?;
                 let read_result = connection.read_pkt(&rx_buf[..len], timestamp);
                 account_rbx_transport_datagrams(&datagram_buffer, &receive_stats);
+                let rx_diag_no =
+                    RBX_TRANSPORT_RX_DIAG_LOGGED.fetch_add(1, Ordering::Relaxed);
+                if rx_diag_no < 8 {
+                    let source_note = if remote != connection.remote_addr() {
+                        format!(
+                            " (SOURCE {remote} != dialed {})",
+                            connection.remote_addr()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let dcid_note = rbx_transport_rx_dcid_note(&rx_buf[..len]);
+                    match &read_result {
+                        Ok(ngnet_quic::ReadOutcome::DropSilently) => {
+                            log::warn!(
+                                "ngtcp2 DROPPED handshake datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note} (no close sent: unknown DCID/version, or unauthenticated-level source mismatch)"
+                            );
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "ngtcp2 REJECTED handshake datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note}: {error}"
+                            );
+                        }
+                        Ok(other) => {
+                            if rx_diag_no < 4 {
+                                log::info!(
+                                    "ngtcp2 processed handshake datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note} ({other:?})"
+                                );
+                            }
+                        }
+                    }
+                }
                 match read_result {
                     Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
                         return Err(format!(
@@ -2079,7 +2392,7 @@ async fn attempt_rbx_transport_connection_async(
     if persistent_session {
         if let Some(event_tx) = &event_tx {
             let _ = event_tx.send(RbxTransportSessionEvent::QuicHandshakeComplete(format!(
-                "RbxTransport QUIC/TLS handshake completed via {}; target {}, local {}, ALPN {}. The receive/dispatch loop is active; this is not BaseClient connected state or Team Create acceptance. Early-auth and channel-control bytes remain unsent.",
+                "RbxTransport QUIC/TLS handshake completed via {}; target {}, local {}, ALPN {}. The app=4 join flow is starting (early-auth, A7, 0x90/0x92/0x8A burst) and the receive/dispatch loop is active.",
                 route.route_label,
                 route.target_endpoint.label(),
                 local_addr,
@@ -2088,26 +2401,103 @@ async fn attempt_rbx_transport_connection_async(
         }
     }
 
-    // The native BaseClient request uses reliability enum 2. Its stream framing/channel
-    // assignment is still not verified, so no speculative early-auth or control bytes are sent.
-    let inbound_summary = receive_rbx_transport_session(
-        &mut connection,
-        &socket,
-        &receive_stats,
-        &datagram_buffer,
-        started,
-        if persistent_session {
-            None
-        } else {
-            Some(operation_timeout)
-        },
-        if persistent_session {
-            Some(Arc::clone(&cancel))
-        } else {
-            None
-        },
-    )
-    .await;
+    // App=4 join flow: the post-handshake burst (ctrl openU, early-auth, A7,
+    // 0x90, 0x92, 0x8A, 0x8F) plus the 0x9B challenge solve-and-answer and
+    // the ~60 ms route declarations — the Boblox session.cpp sequence.
+    // Forced for every completed handshake (not just persistent
+    // sessions): once the keys are up, the appflow burst goes out
+    // immediately.
+    let mut join_flow: Option<crate::appflow::AppFlow> = None;
+    match build_join_flow_config(plan) {
+        Some(cfg) => {
+            let now_ms = started.elapsed().as_millis() as u64;
+            let mut flow = crate::appflow::AppFlow::new(cfg, now_ms);
+            log::info!(
+                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, A7, 0x90/0x92/0x8A, 0x8F)"
+            );
+            for action in flow.on_connected() {
+                if let Err(error) = execute_join_flow_action(
+                    &mut connection,
+                    &socket,
+                    &mut tx_buf,
+                    started,
+                    &mut flow,
+                    action,
+                )
+                .await
+                {
+                    if let Some(event_tx) = &event_tx {
+                        let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
+                            "app=4 flow burst: {error}"
+                        )));
+                    }
+                    log::warn!("app=4 flow burst: {error}");
+                }
+            }
+            if let Some(event_tx) = &event_tx {
+                for event in flow.drain_events() {
+                    let _ = event_tx.send(match event {
+                        crate::appflow::FlowEvent::Log(msg) => {
+                            RbxTransportSessionEvent::Status(msg)
+                        }
+                        other => RbxTransportSessionEvent::Status(format!("{other:?}")),
+                    });
+                }
+            }
+            join_flow = Some(flow);
+        }
+        None => {
+            log::warn!(
+                "app=4 join flow skipped: join config is missing required fields (ClientTicket/UserId/joinTicket)"
+            );
+            if let Some(event_tx) = &event_tx {
+                let _ = event_tx.send(RbxTransportSessionEvent::Status(
+                    "app=4 join flow skipped: join config is missing required fields (ClientTicket/UserId/joinTicket); staying in passive receive mode".into(),
+                ));
+            }
+        }
+    }
+
+    let mut flow_answered = false;
+    let inbound_summary = if let Some(flow) = &mut join_flow {
+        let summary = receive_rbx_transport_session(
+            &mut connection,
+            &socket,
+            &receive_stats,
+            &datagram_buffer,
+            started,
+            None,
+            Some(Arc::clone(&cancel)),
+            Some(flow),
+            &stream_receiver,
+            event_tx.as_ref(),
+        )
+        .await;
+        flow_answered = flow.answered();
+        summary
+    } else {
+        receive_rbx_transport_session(
+            &mut connection,
+            &socket,
+            &receive_stats,
+            &datagram_buffer,
+            started,
+            if persistent_session {
+                None
+            } else {
+                Some(operation_timeout)
+            },
+            if persistent_session {
+                Some(Arc::clone(&cancel))
+            } else {
+                None
+            },
+            None,
+            &stream_receiver,
+            event_tx.as_ref(),
+        )
+        .await
+    };
 
     Ok(RbxTransportConnectionReport {
         route_label: route.route_label,
@@ -2121,6 +2511,7 @@ async fn attempt_rbx_transport_connection_async(
         } else {
             0
         },
+        max_udp_payload_size: max_udp_payload,
         rpk_version: plan.early_key.version,
         requested_timeout_ms,
         handshake_timeout_ms,
@@ -2130,6 +2521,8 @@ async fn attempt_rbx_transport_connection_async(
         preauth_len: auth.preauth_blob.len(),
         auth_len: auth.auth_blob.len(),
         early_auth_payload_len,
+        flow_active: join_flow.is_some(),
+        flow_answered,
         inbound_summary,
     })
 }
@@ -2207,7 +2600,15 @@ struct RbxTransportStreamState {
 struct RbxTransportStreamReceiver {
     stats: Arc<Mutex<RbxTransportReceiveStats>>,
     streams: HashMap<ngnet_quic::StreamId, RbxTransportStreamState>,
+    /// Raw (stream id, bytes) events for the app=4 flow pump. The handler
+    /// runs inside ngtcp2's read path, so the flow drains this between
+    /// `read_pkt` calls. Capped so a bursty replication stream cannot grow
+    /// the queue without bound.
+    raw_events: VecDeque<(i64, Vec<u8>)>,
+    raw_event_bytes: usize,
 }
+
+const RBX_TRANSPORT_RAW_EVENT_QUEUE_BYTE_CAP: usize = 32 * 1024 * 1024;
 
 #[cfg(not(test))]
 impl RbxTransportStreamReceiver {
@@ -2215,7 +2616,17 @@ impl RbxTransportStreamReceiver {
         Self {
             stats,
             streams: HashMap::new(),
+            raw_events: VecDeque::new(),
+            raw_event_bytes: 0,
         }
+    }
+
+    /// Hand raw stream bytes to the app-flow pump.
+    fn drain_raw_events(&mut self) -> Vec<(i64, Vec<u8>)> {
+        self.raw_event_bytes = 0;
+        std::mem::take(&mut self.raw_events)
+            .into_iter()
+            .collect()
     }
 
     fn stream_opened(&mut self, stream_id: ngnet_quic::StreamId) {
@@ -2231,6 +2642,18 @@ impl RbxTransportStreamReceiver {
     }
 
     fn stream_data(&mut self, stream_id: ngnet_quic::StreamId, bytes: &[u8], fin: bool) {
+        if !bytes.is_empty() {
+            self.raw_event_bytes += bytes.len();
+            self.raw_events.push_back((stream_id.get(), bytes.to_vec()));
+            while self.raw_event_bytes > RBX_TRANSPORT_RAW_EVENT_QUEUE_BYTE_CAP {
+                if let Some((_, dropped)) = self.raw_events.pop_front() {
+                    self.raw_event_bytes = self.raw_event_bytes.saturating_sub(dropped.len());
+                } else {
+                    break;
+                }
+            }
+        }
+        let _ = fin;
         let stats = Arc::clone(&self.stats);
         let state = self.streams.entry(stream_id).or_default();
         let mut cursor = 0usize;
@@ -2367,6 +2790,30 @@ async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
 }
 
 #[cfg(not(test))]
+/// Describe the DCID carried by an inbound datagram (v1 long header) so
+/// a silent ngtcp2 drop can be compared against the SCID this
+/// connection announced. Non-long-header or non-v1 packets get a short
+/// hex head instead.
+fn rbx_transport_rx_dcid_note(datagram: &[u8]) -> String {
+    let format_hex = |bytes: &[u8]| -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ")
+    };
+    let Some(first) = datagram.first().copied() else {
+        return String::new();
+    };
+    if first & 0x80 == 0 {
+        let n = datagram.len().min(16);
+        return format!(" (short header, head {})", format_hex(&datagram[..n]));
+    }
+    if datagram.len() < 6 || &datagram[1..5] != &[0, 0, 0, 1] {
+        let n = datagram.len().min(16);
+        return format!(" (non-v1 long header, head {})", format_hex(&datagram[..n]));
+    }
+    let dcid_len = usize::from(datagram[5]);
+    let end = (6 + dcid_len).min(datagram.len());
+    format!(" (v1 DCID {})", format_hex(&datagram[6..end]))
+}
+
 fn rbx_transport_timestamp(origin: Instant) -> Result<ngnet_quic::Timestamp, String> {
     let nanos = u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
     ngnet_quic::Timestamp::from_nanos(nanos)
@@ -2386,6 +2833,271 @@ fn rbx_transport_expiry<S: ngnet_quic::Session>(
 }
 
 #[cfg(not(test))]
+/**
+ * The 0xFF00 capabilities TLS extension the native RbxTransport
+ * ClientHello carries: an 8-byte little-endian u64 capability bitmask.
+ * The UDMUX edge will not answer an Initial whose ClientHello lacks it
+ * (Boblox FINDINGS: the byte-parity C++ client completes the live
+ * handshake with the extension, native CH order has 0xff00 FIRST).
+ * rustls exposes no custom-extension API, so the value is spliced into
+ * the encoded ClientHello of every outgoing QUIC v1 Initial - including
+ * PTO retransmissions, which ngtcp2 regenerates from its internal CRYPTO
+ * copy without our patch. Native conn#0 value (byte-identical per
+ * FINDINGS; zeros are also tolerated, proven by native conn#1).
+ */
+const RBX_TRANSPORT_CAPS_EXT_TYPE: u16 = 0xFF00;
+const RBX_TRANSPORT_CAPS_WIRE: [u8; 8] = [0x92, 0x08, 0xB7, 0x50, 0xC7, 0xD3, 0x2D, 0x00];
+/// Bounded diagnostic-log counter for 0xFF00 splice outcomes: the first
+/// few outgoing datagrams get a log line (with a hex preview on layout
+/// mismatch) so a silently-skipped splice can never happen again.
+static RBX_TRANSPORT_CAPS_SPLICE_LOGGED: AtomicUsize = AtomicUsize::new(0);
+/// Bounded diagnostic-log counter for the first received datagrams (hex
+/// preview of the post-RUPP head) - the DCID in those first long headers
+/// is what settles whether ngtcp2 matches the server's replies.
+static RBX_TRANSPORT_RX_DUMP_LOGGED: AtomicUsize = AtomicUsize::new(0);
+/// Bounded diagnostic counter for how ngtcp2 classified received
+/// datagrams (accepted / DROPPED-silently / REJECTED). A silent drop
+/// during the handshake is the only signal that a packet was refused
+/// without a close (unknown DCID, version, or unauthenticated source)
+/// and was previously invisible - it looked like a plain timeout.
+static RBX_TRANSPORT_RX_DIAG_LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+/// Width (in bytes) of the transport varint starting at `first`, using
+/// the Roblox transport varint widths: 1 / 2 / 4 / 8. The CRYPTO-frame
+/// varints this is used on are written by ngtcp2 and on the first flight
+/// only ever use the 1- and 2-byte widths, where these widths and the
+/// RFC 9000 widths agree.
+fn rbx_transport_varint_size(first: u8) -> usize {
+    match first & 0xC0 {
+        0x00 => 1,
+        0x40 => 2,
+        0x80 => 4,
+        _ => 8,
+    }
+}
+
+/// Read the CRYPTO-frame varint at `pos`. ngtcp2 writes these in the
+/// RFC 9000 7-bit-group value layout, so the value extraction matches
+/// what ngtcp2 actually put on the wire (widths used on the first flight
+/// are 1 and 2 bytes, which both width tables agree on).
+fn rbx_transport_read_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let first = *buf.get(pos)?;
+    let size = rbx_transport_varint_size(first);
+    let end = pos.checked_add(size)?;
+    let bytes = buf.get(pos..end)?;
+    let mut value = 0u64;
+    for (i, &raw) in bytes.iter().enumerate() {
+        let chunk = if i == 0 { raw & 0x3F } else { raw & 0x7F };
+        value = (value << 7) | u64::from(chunk);
+    }
+    Some((value, end))
+}
+
+/// Rewrite the varint at `pos` in place, keeping the original byte size.
+/// Fails (returns false) if `value` no longer fits in that size class.
+fn rbx_transport_write_varint_same_size(buf: &mut [u8], pos: usize, value: u64) -> bool {
+    let size = rbx_transport_varint_size(buf[pos]);
+    let prefix = match size {
+        1 => 0u8,
+        2 => 0x40,
+        3 => 0x80,
+        _ => 0xC0,
+    };
+    let mut out = [0u8; 4];
+    let mut v = value;
+    for i in (0..size).rev() {
+        let chunk = if i == 0 { v & 0x3F } else { v & 0x7F };
+        out[i] = chunk as u8;
+        v >>= 7;
+    }
+    if v != 0 {
+        return false;
+    }
+    out[0] |= prefix;
+    buf[pos..pos + size].copy_from_slice(&out[..size]);
+    true
+}
+
+/// Outcome of an attempt to splice the 0xFF00 capabilities extension
+/// into an outgoing datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RbxCapsSpliceOutcome {
+    /// The extension was inserted into the ClientHello.
+    Spliced,
+    /// The ClientHello already carried 0xFF00 (left untouched).
+    AlreadyPresent,
+    /// The datagram is a v1 Initial whose first frame is a CRYPTO frame
+    /// at offset 0, but the ClientHello layout did not match expectations.
+    LayoutMismatch,
+    /// Not a v1 Initial at all (short header, other version, or the first
+    /// frame is not CRYPTO-offset-0). Nothing to do.
+    NotInitial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RbxCapsSpliceErr {
+    AlreadyPresent,
+    NotInitial,
+    Layout,
+}
+
+/// Splice the 0xFF00 capabilities extension into the ClientHello carried
+/// by an outgoing QUIC v1 Initial, in place. The 12 inserted bytes are
+/// absorbed by the Initial's trailing PADDING, so the datagram length
+/// (1200) is unchanged. Idempotent: a ClientHello that already carries
+/// 0xFF00 is left alone, and anything that is not a clean v1 Initial with
+/// a CRYPTO-offset-0 ClientHello is left untouched (never breaks the
+/// packet).
+///
+/// CRYPTO framing: in this stack (rustls QUIC API under ngtcp2) the
+/// CRYPTO frame payload is the RAW TLS handshake message stream - there
+/// is no TLS record layer inside CRYPTO data (no `16 03 01` header;
+/// rustls `read_hs`/`write_hs` consume and emit handshake messages
+/// directly). The ClientHello therefore starts at the first CRYPTO byte:
+/// `01 <u24 length> 03 03 <32-byte random> ...`.
+fn splice_rbx_transport_caps_extension(packet: &mut [u8]) -> RbxCapsSpliceOutcome {
+    match splice_rbx_transport_caps_inner(packet) {
+        Ok(()) => RbxCapsSpliceOutcome::Spliced,
+        Err(RbxCapsSpliceErr::AlreadyPresent) => RbxCapsSpliceOutcome::AlreadyPresent,
+        Err(RbxCapsSpliceErr::NotInitial) => RbxCapsSpliceOutcome::NotInitial,
+        Err(RbxCapsSpliceErr::Layout) => RbxCapsSpliceOutcome::LayoutMismatch,
+    }
+}
+
+fn splice_rbx_transport_caps_inner(packet: &mut [u8]) -> Result<(), RbxCapsSpliceErr> {
+    // Long header (form bit) with the fixed bit set, version 1.
+    if packet.len() < 6 || packet[0] & 0x80 == 0 || packet[0] & 0x40 == 0 {
+        return Err(RbxCapsSpliceErr::NotInitial);
+    }
+    if &packet[1..5] != &[0, 0, 0, 1] {
+        return Err(RbxCapsSpliceErr::NotInitial);
+    }
+    let mut p = 5usize;
+    for _ in 0..2 {
+        // destination CID, then source CID
+        let n = usize::from(*packet.get(p).ok_or(RbxCapsSpliceErr::NotInitial)?);
+        p = p.checked_add(1 + n).ok_or(RbxCapsSpliceErr::NotInitial)?;
+        if p > packet.len() {
+            return Err(RbxCapsSpliceErr::NotInitial);
+        }
+    }
+    // token
+    let token_len = usize::from(*packet.get(p).ok_or(RbxCapsSpliceErr::NotInitial)?);
+    p = p.checked_add(1 + token_len).ok_or(RbxCapsSpliceErr::NotInitial)?;
+    if p >= packet.len() || packet[p] != 0x40 {
+        // first frame must be CRYPTO
+        return Err(RbxCapsSpliceErr::NotInitial);
+    }
+    p += 1;
+    let (offset, q) = rbx_transport_read_varint(packet, p).ok_or(RbxCapsSpliceErr::Layout)?;
+    if offset != 0 {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    let (crypto_len, d) = rbx_transport_read_varint(packet, q).ok_or(RbxCapsSpliceErr::Layout)?;
+    let crypto_len = usize::try_from(crypto_len).map_err(|_| RbxCapsSpliceErr::Layout)?;
+    let crypto_end = d.checked_add(crypto_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    if crypto_end > packet.len() || d + 4 > packet.len() {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    // The CRYPTO payload is the raw ClientHello (no TLS record layer).
+    let ch_base = d;
+    if packet[ch_base] != 0x01 {
+        // ClientHello handshake type
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    let ch_len =
+        (usize::from(packet[ch_base + 1]) << 16) | (usize::from(packet[ch_base + 2]) << 8)
+            | usize::from(packet[ch_base + 3]);
+    // ch_base points at the handshake type byte; the 4-byte handshake
+    // header (type + 3-byte length) is NOT counted in ch_len. The first
+    // flight's CRYPTO frame carries exactly one message (the
+    // ClientHello), so the handshake must end exactly at the CRYPTO
+    // frame end.
+    let ch_end = ch_base + 4 + ch_len;
+    if ch_end != crypto_end {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    // Walk the fixed ClientHello prefix to the extension list:
+    // legacy_version(2) random(32) session_id ciphers suites comp ext_len.
+    let mut c = ch_base + 4 + 2 + 32;
+    if c >= ch_end {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    let sid_len = usize::from(packet[c]);
+    c = c.checked_add(1 + sid_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    if c + 2 > ch_end {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    let ciphers_len = usize::from(u16::from_be_bytes([packet[c], packet[c + 1]]));
+    c = c.checked_add(2 + ciphers_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    if c + 1 > ch_end {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    let suites_len = usize::from(packet[c]);
+    c = c.checked_add(1 + suites_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    if c + 2 > ch_end {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    let exts_len = usize::from(u16::from_be_bytes([packet[c], packet[c + 1]]));
+    let exts_start = c + 2;
+    let exts_end = exts_start.checked_add(exts_len).ok_or(RbxCapsSpliceErr::Layout)?;
+    if exts_end != ch_end {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    // Idempotence: walk the extension list; bail if 0xFF00 is present.
+    let mut e = exts_start;
+    while e < exts_end {
+        if e + 4 > exts_end {
+            return Err(RbxCapsSpliceErr::Layout);
+        }
+        let etype = u16::from_be_bytes([packet[e], packet[e + 1]]);
+        let elen = usize::from(u16::from_be_bytes([packet[e + 2], packet[e + 3]]));
+        e = e.checked_add(4 + elen).ok_or(RbxCapsSpliceErr::Layout)?;
+        if e > exts_end {
+            return Err(RbxCapsSpliceErr::Layout);
+        }
+        if etype == RBX_TRANSPORT_CAPS_EXT_TYPE {
+            return Err(RbxCapsSpliceErr::AlreadyPresent);
+        }
+    }
+    if e != exts_end {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    // The trailing PADDING after the CRYPTO frame must absorb the insert.
+    if packet.len() - crypto_end < 12 {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    // Length updates, all at offsets before the insertion point: CRYPTO
+    // frame length (varint, same size), ClientHello length (u24),
+    // extension list length (u16). No record length - no record layer.
+    if !rbx_transport_write_varint_same_size(packet, q, (crypto_len + 12) as u64) {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    let r = ch_base + 1;
+    let ch_cur = (u32::from(packet[r]) << 16) | (u32::from(packet[r + 1]) << 8) | u32::from(packet[r + 2]);
+    let ch_next = ch_cur.checked_add(12).ok_or(RbxCapsSpliceErr::Layout)?;
+    if ch_next > 0x00FFFFFF {
+        return Err(RbxCapsSpliceErr::Layout);
+    }
+    packet[r] = (ch_next >> 16) as u8;
+    packet[r + 1] = (ch_next >> 8) as u8;
+    packet[r + 2] = ch_next as u8;
+    let r = exts_start - 2;
+    let exts_cur = u16::from_be_bytes([packet[r], packet[r + 1]]);
+    let exts_next = exts_cur.checked_add(12).ok_or(RbxCapsSpliceErr::Layout)?;
+    packet[r..r + 2].copy_from_slice(&exts_next.to_be_bytes());
+    // Shift the extension list (and whatever followed it inside the
+    // CRYPTO data) right by 12 - the padding absorbs it - then write the
+    // new extension at the front of the list, matching the native order
+    // (0xff00 first).
+    packet.copy_within(exts_start..crypto_end, exts_start + 12);
+    let mut block = [0u8; 12];
+    block[..4].copy_from_slice(&[0xFF, 0x00, 0x00, 0x08]);
+    block[4..].copy_from_slice(&RBX_TRANSPORT_CAPS_WIRE);
+    packet[exts_start..exts_start + 12].copy_from_slice(&block);
+    Ok(())
+}
+
 async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
     connection: &mut ngnet_quic::Conn<'_, S>,
     socket: &RuppUdpSocket,
@@ -2399,6 +3111,44 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
             .map_err(|error| format!("ngtcp2 packet write failed: {error}"))?
         {
             ngnet_quic::WriteOutcome::Datagram { len } => {
+                let splice_outcome = splice_rbx_transport_caps_extension(&mut tx_buf[..len]);
+                let splice_log_no =
+                    RBX_TRANSPORT_CAPS_SPLICE_LOGGED.fetch_add(1, Ordering::Relaxed);
+                match splice_outcome {
+                    RbxCapsSpliceOutcome::Spliced => {
+                        if splice_log_no < 2 {
+                            log::info!(
+                                "spliced the 0xFF00 capabilities extension (raw-ClientHello CRYPTO layout, no TLS record layer) into the outgoing QUIC v1 Initial"
+                            );
+                        }
+                    }
+                    RbxCapsSpliceOutcome::AlreadyPresent => {
+                        if splice_log_no < 3 {
+                            log::info!(
+                                "0xFF00 capabilities extension already present in the ClientHello; leaving the Initial untouched"
+                            );
+                        }
+                    }
+                    RbxCapsSpliceOutcome::LayoutMismatch => {
+                        if splice_log_no < 4 {
+                            let preview: String = tx_buf[..len.min(64)]
+                                .iter()
+                                .map(|byte| format!("{byte:02x} "))
+                                .collect();
+                            log::warn!(
+                                "0xFF00 splice: v1 Initial with CRYPTO-offset-0 data but unexpected layout (len={len}, head: {preview})"
+                            );
+                        }
+                    }
+                    RbxCapsSpliceOutcome::NotInitial => {
+                        if splice_log_no < 3 {
+                            log::info!(
+                                "0xFF00 splice: datagram is not a v1 Initial (first byte {:#04x}); nothing to splice",
+                                tx_buf[0]
+                            );
+                        }
+                    }
+                }
                 socket
                     .send_to(&tx_buf[..len], connection.remote_addr())
                     .await
@@ -2410,6 +3160,154 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
     Ok(())
 }
 
+/// Write `data` to a stream via `write_stream`, sending each produced
+/// datagram to the socket, until everything was accepted, the flow-control
+/// window is full, or ngtcp2 has nothing left to send. The main loop's
+/// `write_pending_rbx_transport_packets` flushes any residual state after.
+#[cfg(not(test))]
+async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
+    connection: &mut ngnet_quic::Conn<'_, S>,
+    socket: &RuppUdpSocket,
+    tx_buf: &mut [u8],
+    origin: Instant,
+    stream: i64,
+    data: &[u8],
+) -> Result<(), String> {
+    let id = ngnet_quic::StreamId::new(stream)
+        .map_err(|error| format!("invalid stream id {stream}: {error}"))?;
+    let mut off = 0usize;
+    let mut control_only = 0usize;
+    while off < data.len() {
+        let now = rbx_transport_timestamp(origin)?;
+        match connection.write_stream(tx_buf, id, &data[off..], false, now) {
+            Ok(ngnet_quic::StreamWrite::Datagram { len, accepted }) => {
+                if len > 0 {
+                    let _ = splice_rbx_transport_caps_extension(&mut tx_buf[..len]);
+                    socket
+                        .send_to(&tx_buf[..len], connection.remote_addr())
+                        .await
+                        .map_err(|error| format!("stream datagram send failed: {error}"))?;
+                }
+                if accepted > 0 {
+                    off += accepted;
+                    control_only = 0;
+                } else if len == 0 {
+                    // Nothing usable this pass; the main loop retries on its
+                    // next wake (avoids a hot spin on a full window).
+                    break;
+                } else if control_only >= 16 {
+                    // Only control-frame datagrams in a row: stop and let
+                    // the main loop's write_pending pick it back up.
+                    break;
+                } else {
+                    // The packet was filled with control frames — offer the
+                    // same tail again.
+                    control_only += 1;
+                }
+            }
+            Ok(
+                ngnet_quic::StreamWrite::Idle
+                | ngnet_quic::StreamWrite::StreamBlocked
+                | ngnet_quic::StreamWrite::ConnectionBlocked
+                | ngnet_quic::StreamWrite::Blocked,
+            ) => break,
+            Err(error) => return Err(format!("ngtcp2 stream write failed: {error}")),
+        }
+    }
+    Ok(())
+}
+
+/// Drain raw stream events into the app=4 flow, execute the resulting
+/// actions (open streams / write bytes), fire flow timers, and forward
+/// flow events to the UI. Called from the receive loop on every wake.
+#[cfg(not(test))]
+async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
+    connection: &mut ngnet_quic::Conn<'_, S>,
+    socket: &RuppUdpSocket,
+    tx_buf: &mut [u8],
+    origin: Instant,
+    now_ms: u64,
+    flow: &mut crate::appflow::AppFlow,
+    stream_receiver: &Arc<Mutex<RbxTransportStreamReceiver>>,
+    event_tx: Option<&Sender<RbxTransportSessionEvent>>,
+) {
+    let mut events: Vec<(i64, Vec<u8>)> = Vec::new();
+    if let Ok(mut receiver) = stream_receiver.lock() {
+        events = receiver.drain_raw_events();
+    }
+    let mut actions = Vec::new();
+    for (sid, bytes) in events {
+        actions.extend(flow.on_raw_stream(sid, &bytes));
+    }
+    actions.extend(flow.on_tick(now_ms));
+
+    let emit = |message: String| {
+        if let Some(tx) = event_tx {
+            let _ = tx.send(RbxTransportSessionEvent::Status(message));
+        }
+    };
+    for action in actions {
+        match action {
+            crate::appflow::Action::OpenStream { app, chan, data } => {
+                match connection.open_bidi_stream() {
+                    Ok(id) => {
+                        let raw = id.get();
+                        flow.note_opened(app, chan, raw);
+                        emit(format!(
+                            "opened stream {raw} app={app} chan={chan} ({}B)",
+                            data.len()
+                        ));
+                        if let Err(error) = send_rbx_transport_stream_data(
+                            connection, socket, tx_buf, origin, raw, &data,
+                        )
+                        .await
+                        {
+                            emit(format!("stream {raw} first write failed: {error}"));
+                        }
+                    }
+                    Err(error) if error.kind() == ngnet_quic::ErrorKind::Blocked => {
+                        emit(format!(
+                            "stream limit reached — app={app} chan={chan} open deferred/dropped"
+                        ));
+                    }
+                    Err(error) => {
+                        emit(format!("failed to open stream app={app} chan={chan}: {error}"));
+                    }
+                }
+            }
+            crate::appflow::Action::Write { stream, data } => {
+                if let Err(error) =
+                    send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data)
+                        .await
+                {
+                    emit(format!("stream {stream} write failed: {error}"));
+                }
+            }
+        }
+    }
+
+    for event in flow.drain_events() {
+        let ui_event = match event {
+            crate::appflow::FlowEvent::Log(msg) => Some(RbxTransportSessionEvent::Status(msg)),
+            crate::appflow::FlowEvent::ChallengeReceived { u1, u2, blob_len } => {
+                Some(RbxTransportSessionEvent::ChallengeReceived { u1, u2, blob_len })
+            }
+            crate::appflow::FlowEvent::ChallengeAnswered { answer, elapsed_ms } => {
+                Some(RbxTransportSessionEvent::ChallengeAnswered { answer, elapsed_ms })
+            }
+            crate::appflow::FlowEvent::ChallengeFailed(msg) => {
+                Some(RbxTransportSessionEvent::ChallengeFailed(msg))
+            }
+            crate::appflow::FlowEvent::ConnectedStageReached { detail } => {
+                Some(RbxTransportSessionEvent::ConnectedStageReached(detail))
+            }
+        };
+        if let (Some(tx), Some(event)) = (event_tx, ui_event) {
+            let _ = tx.send(event);
+        }
+    }
+}
+
 #[cfg(not(test))]
 async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
     connection: &mut ngnet_quic::Conn<'_, S>,
@@ -2419,6 +3317,9 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
     origin: Instant,
     timeout: Option<Duration>,
     cancel: Option<Arc<AtomicBool>>,
+    mut flow: Option<&mut crate::appflow::AppFlow>,
+    stream_receiver: &Arc<Mutex<RbxTransportStreamReceiver>>,
+    event_tx: Option<&Sender<RbxTransportSessionEvent>>,
 ) -> String {
     let started = tokio::time::Instant::now();
     let deadline = timeout.map(|timeout| started + timeout);
@@ -2434,6 +3335,19 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         {
             connection_closed = Some(error);
             break;
+        }
+        if let Some(flow) = flow.as_deref_mut() {
+            pump_rbx_transport_app_flow(
+                connection,
+                socket,
+                &mut tx_buf,
+                origin,
+                origin.elapsed().as_millis() as u64,
+                flow,
+                stream_receiver,
+                event_tx,
+            )
+            .await;
         }
         let expiry = rbx_transport_expiry(connection, origin);
         let wake = tokio::select! {
@@ -2455,7 +3369,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
             } => RbxTransportWake::Cancelled,
         };
         match wake {
-            RbxTransportWake::Datagram(Ok((len, _remote))) if len != 0 => {
+            RbxTransportWake::Datagram(Ok((len, remote))) if len != 0 => {
                 let timestamp = match rbx_transport_timestamp(origin) {
                     Ok(timestamp) => timestamp,
                     Err(error) => {
@@ -2465,6 +3379,38 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
                 };
                 let read_result = connection.read_pkt(&rx_buf[..len], timestamp);
                 account_rbx_transport_datagrams(datagram_buffer, stats);
+                let rx_diag_no =
+                    RBX_TRANSPORT_RX_DIAG_LOGGED.fetch_add(1, Ordering::Relaxed);
+                if rx_diag_no < 12 {
+                    let source_note = if remote != connection.remote_addr() {
+                        format!(
+                            " (SOURCE {remote} != dialed {})",
+                            connection.remote_addr()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let dcid_note = rbx_transport_rx_dcid_note(&rx_buf[..len]);
+                    match &read_result {
+                        Ok(ngnet_quic::ReadOutcome::DropSilently) => {
+                            log::warn!(
+                                "ngtcp2 DROPPED datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note}"
+                            );
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "ngtcp2 REJECTED datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note}: {error}"
+                            );
+                        }
+                        Ok(other) => {
+                            if rx_diag_no < 8 {
+                                log::info!(
+                                    "ngtcp2 processed datagram #{rx_diag_no} len={len} from {remote}{source_note}{dcid_note} ({other:?})"
+                                );
+                            }
+                        }
+                    }
+                }
                 match read_result {
                     Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
                         connection_closed = Some(connection.close_error().to_string());
@@ -2555,6 +3501,13 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
     summary.push_str(
         "\nApplication datagrams and post-prefix stream bytes are counted but not decoded; JoinData/change-item parsing is still outstanding.",
     );
+    if let Some(flow) = flow {
+        summary.push_str(&format!(
+            " App=4 flow: challenge-answered={} post-answer-chan1-bytes={}",
+            flow.answered(),
+            flow.post_answer_bytes()
+        ));
+    }
     summary
 }
 
@@ -2886,6 +3839,14 @@ impl RuppUdpSocket {
                     .native_trailer_decrypt_failures
                     .fetch_add(1, Ordering::Relaxed);
             }
+        }
+        let rx_dump_no = RBX_TRANSPORT_RX_DUMP_LOGGED.fetch_add(1, Ordering::Relaxed);
+        if rx_dump_no < 2 {
+            let preview: String = buffer[..len.min(96)]
+                .iter()
+                .map(|byte| format!("{byte:02x} "))
+                .collect();
+            log::info!("RX datagram #{rx_dump_no} len={len} from {remote} head: {preview}");
         }
         if let Some(first) = buffer.get(..len).and_then(|payload| payload.first()).copied() {
             let counter = if first & 0x80 != 0 {
@@ -4476,26 +5437,40 @@ pub fn run_join_config_session(
                 ))
             });
         match result {
-            Ok(connection_report) => report.push_str(&format!(
-                "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
-                connection_report.route_label,
-                connection_report.target,
-                connection_report.local_addr,
-                connection_report.alpn,
-                connection_report.rupp_prefix_len,
-                connection_report.initial_dst_cid_len,
-                connection_report.native_quic_cid_trailer_len,
-                connection_report.rpk_version,
-                connection_report.handshake_timeout_ms,
-                connection_report.requested_timeout_ms,
-                connection_report.handshake_completed_ms,
-                connection_report.udp_summary,
-                connection_report.auth_version,
-                connection_report.preauth_len,
-                connection_report.auth_len,
-                connection_report.early_auth_payload_len,
-                connection_report.inbound_summary
-            )),
+            Ok(connection_report) => {
+                let flow_status: String = if connection_report.flow_active {
+                    if connection_report.flow_answered {
+                        "🎯 app=4 join flow: burst sent, 0x9B challenge answered — BaseClient connected stage reached (post-answer world state on channel 1)".into()
+                    } else {
+                        "⚠️ app=4 join flow: burst sent, but the 0x9B challenge was not answered — connected stage NOT reached".into()
+                    }
+                } else {
+                    format!(
+                        "⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached",
+                        connection_report.auth_version,
+                        connection_report.preauth_len,
+                        connection_report.auth_len,
+                        connection_report.early_auth_payload_len
+                    )
+                };
+                report.push_str(&format!(
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}",
+                    connection_report.route_label,
+                    connection_report.target,
+                    connection_report.local_addr,
+                    connection_report.alpn,
+                    connection_report.rupp_prefix_len,
+                    connection_report.initial_dst_cid_len,
+                    connection_report.native_quic_cid_trailer_len,
+                    connection_report.rpk_version,
+                    connection_report.handshake_timeout_ms,
+                    connection_report.requested_timeout_ms,
+                    connection_report.handshake_completed_ms,
+                    connection_report.udp_summary,
+                    flow_status,
+                    connection_report.inbound_summary
+                ));
+            }
             Err(reason) => report.push_str(&format!(
                 "\nRbxTransport session ended before inbound Team Create traffic was accepted: {reason}"
             )),
@@ -4694,7 +5669,7 @@ mod tests {
         let derived_qdmux = derive_qdmux_game_fqdn(&plan).unwrap();
         assert_eq!(
             derived_qdmux,
-            "202122232425262728292a2b2c2d2e2f-0a2008d0-c610.80743621.qdmux.roblox.com"
+            "202122232425262728292a2b2c2d2e2f-0a2008d0-dac0.80743621.qdmux.roblox.com"
         );
         assert_eq!(
             game_fqdn_report_label(&derived_qdmux),
@@ -4707,20 +5682,20 @@ mod tests {
         ];
         let qdmux_initial_dcid = build_native_qdmux_initial_dcid_with_entropy(
             [10, 32, 8, 208],
-            plan.rcc_endpoint.port,
+            plan.rbx_transport_port,
             cid_entropy,
         );
         assert_eq!(qdmux_initial_dcid.len(), 20);
         assert_eq!(
             &qdmux_initial_dcid[..7],
-            &[0xd1, 10, 32, 8, 208, 0xc6, 0x10]
+            &[0xd1, 10, 32, 8, 208, 0xda, 0xc0]
         );
         assert_eq!(&qdmux_initial_dcid[7..], cid_entropy.as_slice());
         let rbx_transport_rupp = build_rbx_transport_rupp_header(&plan).unwrap();
         assert_eq!(rbx_transport_rupp.len(), 31);
         assert_eq!(
             &rbx_transport_rupp[..7],
-            &[RUPP_PROTOCOL_RAKNET, RUPP_FLAG_DIRECT_SERVER_RETURN, 0, 31, RUPP_TLV_TOKEN, 17, 1]
+            &[RUPP_PROTOCOL_RAKNET, 0, 0, 31, RUPP_TLV_TOKEN, 17, 1]
         );
         assert_eq!(&rbx_transport_rupp[7..23], &plan.token);
         // Native ClientRuppGenerator::generateHeader calls addIpv4EndpointTlv
@@ -4857,11 +5832,11 @@ mod tests {
             rbx_transport_quic_endpoint(&plan),
             Endpoint {
                 address: "128.116.54.33".into(),
-                port: 58526,
+                port: 51433,
             }
         );
         let rbx_header = build_rbx_transport_rupp_header(&plan).unwrap();
-        assert_eq!(&rbx_header[rbx_header.len() - 2..], &58526u16.to_be_bytes());
+        assert_eq!(&rbx_header[rbx_header.len() - 2..], &51433u16.to_be_bytes());
         let native_sni = derive_qdmux_game_fqdn(&plan).unwrap();
         let qdmux_sni_port = native_sni
             .split('.')
@@ -4870,7 +5845,7 @@ mod tests {
             .rsplit('-')
             .next()
             .unwrap();
-        assert_eq!(qdmux_sni_port, "e49e");
+        assert_eq!(qdmux_sni_port, "c8a1");
 
         let legacy = extract_rupp_probe_material(&config).unwrap();
         assert_eq!(

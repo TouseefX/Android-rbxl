@@ -48,7 +48,9 @@ impl RbxTransportRustlsBackend {
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
         config.alpn_protocols = vec![RBX_TRANSPORT_ALPN.to_vec()];
-        // The pure qdmux route uses GameFqdn as SNI. The RUPP route intentionally omits it.
+        // All RbxTransport routes use the literal UDMUX IP as SNI (native
+        // ClientHello parity — the edge SNI-routes on it). enable_sni stays
+        // per-route so a future pure-QUIC fallback can opt out.
         config.enable_sni = enable_sni;
         Ok(Self {
             config: Arc::new(config),
