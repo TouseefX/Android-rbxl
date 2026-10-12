@@ -1320,10 +1320,188 @@ fn install_task_scheduler(lua: &Lua) -> LuaResult<()> {
 /// thread. That makes a slow plugin block the editor for as long as it runs —
 /// accepted here in exchange for the session actually working, and the same
 /// tradeoff `GuiPlaySession` already makes.
+/// One button on a plugin toolbar.
+pub struct PluginButton {
+    pub id: String,
+    pub tooltip: String,
+    pub icon: String,
+    pub active: bool,
+    pub enabled: bool,
+    /// The Lua table backing this button, held so the editor toolbar can fire
+    /// the button's real `Click` signal instead of a noop.
+    table: Table,
+}
+
+pub struct PluginToolbar {
+    pub name: String,
+    pub buttons: Vec<PluginButton>,
+}
+
+/// Everything the editor needs to render and drive a running plugin's UI.
+#[derive(Default)]
+pub struct PluginHost {
+    pub toolbars: Vec<PluginToolbar>,
+    settings: std::collections::HashMap<String, String>,
+}
+
+/// Toolbar/button snapshots for the editor to render, so `app.rs` never has to
+/// touch the Lua tables behind them.
+#[derive(Clone)]
+pub struct PluginButtonView {
+    pub id: String,
+    pub tooltip: String,
+    pub icon: String,
+    pub active: bool,
+    pub enabled: bool,
+}
+
+#[derive(Clone)]
+pub struct PluginToolbarView {
+    pub name: String,
+    pub buttons: Vec<PluginButtonView>,
+}
+
+/// Replace the noop `plugin` stub that `build_vm` installs with a real one.
+///
+/// `install_plugin_stub` handed back one shared noop table for every
+/// `CreateButton` call, so buttons had no identity and `Click` could not fire.
+/// Here each button is its own table with its own `Click` signal, recorded in
+/// `PluginHost` so the editor can draw the toolbar and fire the right signal.
+fn install_plugin_host(
+    lua: &Lua,
+    host: Rc<RefCell<PluginHost>>,
+    plugin_name: &str,
+) -> LuaResult<()> {
+    let plugin = lua.create_table();
+    plugin.set("Name", plugin_name)?;
+
+    let settings_for_get = host.clone();
+    plugin.set(
+        "GetSetting",
+        lua.create_function(move |lua, (_self, key): (Table, String)| {
+            match settings_for_get.borrow().settings.get(&key) {
+                Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+                    Ok(value) => json_to_lua(lua, &value, 0),
+                    Err(_) => Ok(Value::Nil),
+                },
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+    let settings_for_set = host.clone();
+    plugin.set(
+        "SetSetting",
+        lua.create_function(move |lua, (_self, key, value): (Table, String, Value)| {
+            if value.is_nil() {
+                settings_for_set.borrow_mut().settings.remove(&key);
+            } else {
+                let json = lua_to_json(value, 0)?;
+                let text =
+                    serde_json::to_string(&json).map_err(|e| LuaError::runtime(e.to_string()))?;
+                settings_for_set.borrow_mut().settings.insert(key, text);
+            }
+            Ok(())
+        })?,
+    )?;
+
+    let host_for_toolbar = host.clone();
+    plugin.set(
+        "CreateToolbar",
+        lua.create_function(move |lua, (_self, name): (Table, String)| {
+            let toolbar_index = {
+                let mut borrowed = host_for_toolbar.borrow_mut();
+                borrowed.toolbars.push(PluginToolbar {
+                    name: name.clone(),
+                    buttons: Vec::new(),
+                });
+                borrowed.toolbars.len() - 1
+            };
+            let toolbar = lua.create_table();
+            toolbar.set("Name", name.as_str())?;
+
+            let host_for_button = host_for_toolbar.clone();
+            toolbar.set(
+                "CreateButton",
+                lua.create_function(move |lua, args: Variadic<Value>| {
+                    // `args` includes the receiver, and Roblox's signature is
+                    // CreateButton(buttonId, tooltip, icon).
+                    let field = |index: usize| match args.get(index) {
+                        Some(Value::String(text)) => text.to_str().unwrap_or("").to_string(),
+                        _ => String::new(),
+                    };
+                    let (id, tooltip, icon) = (field(1), field(2), field(3));
+
+                    let button = lua.create_table();
+                    button.set("Name", id.as_str())?;
+                    button.set("Tooltip", tooltip.as_str())?;
+                    button.set("Icon", icon.as_str())?;
+                    button.set("Enabled", true)?;
+                    button.set("Active", false)?;
+                    button.set("Click", make_signal(lua)?)?;
+
+                    let button_index = {
+                        let mut borrowed = host_for_button.borrow_mut();
+                        let Some(entry) = borrowed.toolbars.get_mut(toolbar_index) else {
+                            return Err(LuaError::runtime("toolbar no longer exists"));
+                        };
+                        entry.buttons.push(PluginButton {
+                            id: id.clone(),
+                            tooltip: tooltip.clone(),
+                            icon: icon.clone(),
+                            active: false,
+                            enabled: true,
+                            table: button.clone(),
+                        });
+                        entry.buttons.len() - 1
+                    };
+
+                    let host_for_active = host_for_button.clone();
+                    button.set(
+                        "SetActive",
+                        lua.create_function(move |_, (_button, active): (Table, bool)| {
+                            if let Some(entry) = host_for_active
+                                .borrow_mut()
+                                .toolbars
+                                .get_mut(toolbar_index)
+                                .and_then(|t| t.buttons.get_mut(button_index))
+                            {
+                                entry.active = active;
+                            }
+                            Ok(())
+                        })?,
+                    )?;
+                    let host_for_enabled = host_for_button.clone();
+                    button.set(
+                        "SetEnabled",
+                        lua.create_function(move |_, (_button, enabled): (Table, bool)| {
+                            if let Some(entry) = host_for_enabled
+                                .borrow_mut()
+                                .toolbars
+                                .get_mut(toolbar_index)
+                                .and_then(|t| t.buttons.get_mut(button_index))
+                            {
+                                entry.enabled = enabled;
+                            }
+                            Ok(())
+                        })?,
+                    )?;
+                    Ok(button)
+                })?,
+            )?;
+            Ok(toolbar)
+        })?,
+    )?;
+
+    lua.globals().set("plugin", plugin)?;
+    Ok(())
+}
+
 pub struct PluginSession {
     lua: Lua,
     run_service: Table,
     scheduler_step: Function,
+    plugin_host: Rc<RefCell<PluginHost>>,
+    settings_path: Option<std::path::PathBuf>,
     last_tick: std::time::Instant,
 }
 
@@ -1342,8 +1520,21 @@ const STEP_SIGNALS: [&str; 8] = [
 ];
 
 impl PluginSession {
-    /// Build a plugin VM against the editor's live DOM.
+    /// Build a plugin VM against a DOM. No plugin name and no persisted
+    /// settings; the `plugin` global still works, it just reports an empty
+    /// name and keeps settings in memory.
     pub fn new(dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult<Self> {
+        Self::new_for_plugin(dom_rc, "Plugin", None)
+    }
+
+    /// Build a plugin VM for a named plugin, with settings persisted to
+    /// `settings_path` (a JSON object) so `plugin:GetSetting` survives a
+    /// restart the way Studio's does.
+    pub fn new_for_plugin(
+        dom_rc: Rc<RefCell<WeakDom>>,
+        plugin_name: &str,
+        settings_path: Option<std::path::PathBuf>,
+    ) -> LuaResult<Self> {
         let lua = build_vm()?;
         LOG.with(|log| log.borrow_mut().clear());
         // Real DOM access. Passing `None` for the script context leaves the
@@ -1357,12 +1548,80 @@ impl PluginSession {
             .set_name("plugin_run_service")
             .eval()?;
         let scheduler_step: Function = lua.globals().get("_arena_step_tasks")?;
+        let plugin_host = Rc::new(RefCell::new(PluginHost {
+            toolbars: Vec::new(),
+            settings: settings_path
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|text| serde_json::from_str::<std::collections::HashMap<String, String>>(&text).ok())
+                .unwrap_or_default(),
+        }));
+        install_plugin_host(&lua, plugin_host.clone(), plugin_name)?;
         Ok(Self {
             lua,
             run_service,
             scheduler_step,
+            plugin_host,
+            settings_path,
             last_tick: std::time::Instant::now(),
         })
+    }
+
+    /// The toolbars a plugin has created, for the editor to render.
+    pub fn plugin_toolbars(&self) -> Vec<PluginToolbarView> {
+        self.plugin_host
+            .borrow()
+            .toolbars
+            .iter()
+            .map(|toolbar| PluginToolbarView {
+                name: toolbar.name.clone(),
+                buttons: toolbar
+                    .buttons
+                    .iter()
+                    .map(|button| PluginButtonView {
+                        id: button.id.clone(),
+                        tooltip: button.tooltip.clone(),
+                        icon: button.icon.clone(),
+                        active: button.active,
+                        enabled: button.enabled,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Fire a toolbar button's `Click` signal, as the editor's toolbar UI does
+    /// when the user presses it. Returns the output the handlers produced.
+    pub fn click_button(&mut self, toolbar: usize, button: usize) -> Vec<OutputLine> {
+        LOG.with(|log| log.borrow_mut().clear());
+        let target = self
+            .plugin_host
+            .borrow()
+            .toolbars
+            .get(toolbar)
+            .and_then(|t| t.buttons.get(button))
+            .map(|b| b.table.clone());
+        let Some(table) = target else { return take_log() };
+        if let Err(error) = fire_instance_signal(&table, "Click", Vec::new()) {
+            LOG.with(|log| {
+                log.borrow_mut().push(OutputLine {
+                    level: Level::Error,
+                    text: format!("plugin button Click: {error}"),
+                })
+            });
+        }
+        // Handlers commonly defer; let the scheduler run them in the same
+        // frame the click happened in.
+        let _ = self.scheduler_step.call::<()>(0.0f64);
+        take_log()
+    }
+
+    /// Write the plugin's settings back to disk.
+    pub fn save_settings(&self) -> Result<(), String> {
+        let Some(path) = self.settings_path.as_ref() else { return Ok(()) };
+        let settings = self.plugin_host.borrow().settings.clone();
+        let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+        std::fs::write(path, text).map_err(|e| e.to_string())
     }
 
     /// Run one plugin script in the persistent VM and return the output it
@@ -3289,5 +3548,105 @@ mod plugin_session_tests {
             !lines.iter().any(|line| matches!(line.level, Level::Error)),
             "BindToRenderStep did not run: {lines:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_host_tests {
+    use super::*;
+
+    fn assert_clean(lines: &[OutputLine], what: &str) {
+        let failures: Vec<String> = lines
+            .iter()
+            .filter(|line| matches!(line.level, Level::Error))
+            .map(|line| line.text.clone())
+            .collect();
+        assert!(failures.is_empty(), "{what}: {failures:?}");
+    }
+
+    /// `install_plugin_stub` returned one shared noop table for every
+    /// `CreateButton`, so buttons had no identity and `Click` never fired.
+    #[test]
+    fn buttons_carry_identity_and_fire_their_own_click() {
+        let dom = Rc::new(RefCell::new(WeakDom::new(InstanceBuilder::new("DataModel"))));
+        let mut session = PluginSession::new(dom).expect("plugin session builds");
+        let setup = session.exec(
+            r#"
+                clicked = {}
+                local toolbar = plugin:CreateToolbar("Probe")
+                local alpha = toolbar:CreateButton("alpha", "Alpha tooltip", "rbxassetid://1")
+                local beta = toolbar:CreateButton("beta", "Beta tooltip", "rbxassetid://2")
+                alpha.Click:Connect(function() table.insert(clicked, "alpha") end)
+                beta.Click:Connect(function() table.insert(clicked, "beta") end)
+                beta:SetActive(true)
+                alpha:SetEnabled(false)
+            "#,
+            "=plugin",
+        );
+        assert_clean(&setup, "toolbar setup");
+
+        let toolbars = session.plugin_toolbars();
+        assert_eq!(toolbars.len(), 1, "expected one toolbar");
+        assert_eq!(toolbars[0].name, "Probe");
+        assert_eq!(toolbars[0].buttons.len(), 2, "expected two distinct buttons");
+        assert_eq!(toolbars[0].buttons[0].id, "alpha");
+        assert_eq!(toolbars[0].buttons[0].tooltip, "Alpha tooltip");
+        assert_eq!(toolbars[0].buttons[1].id, "beta");
+        assert!(toolbars[0].buttons[1].active, "SetActive(true) was not recorded");
+        assert!(!toolbars[0].buttons[0].enabled, "SetEnabled(false) was not recorded");
+
+        // Pressing the second button must run only the second handler.
+        let click = session.click_button(0, 1);
+        assert_clean(&click, "click_button");
+        let after = session.exec(
+            r#"assert(#clicked == 1, "handlers run: " .. tostring(#clicked))
+               assert(clicked[1] == "beta", "wrong handler ran: " .. tostring(clicked[1]))"#,
+            "=plugin",
+        );
+        assert_clean(&after, "click routing");
+    }
+
+    /// Settings must survive the session, the way Studio persists them.
+    #[test]
+    fn settings_round_trip_through_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-plugin-settings-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let dom = Rc::new(RefCell::new(WeakDom::new(InstanceBuilder::new("DataModel"))));
+
+        {
+            let mut session = PluginSession::new_for_plugin(
+                dom.clone(),
+                "SettingsProbe",
+                Some(path.clone()),
+            )
+            .expect("plugin session builds");
+            let write = session.exec(
+                r#"
+                    assert(plugin.Name == "SettingsProbe", "Name = " .. tostring(plugin.Name))
+                    plugin:SetSetting("count", 7)
+                    plugin:SetSetting("label", "hello")
+                    assert(plugin:GetSetting("count") == 7, "count read back wrong")
+                    assert(plugin:GetSetting("label") == "hello", "label read back wrong")
+                    assert(plugin:GetSetting("missing") == nil, "unknown key was not nil")
+                "#,
+                "=plugin",
+            );
+            assert_clean(&write, "settings write");
+            session.save_settings().expect("settings save");
+        }
+
+        let mut session =
+            PluginSession::new_for_plugin(dom, "SettingsProbe", Some(path.clone()))
+                .expect("plugin session rebuilds");
+        let read = session.exec(
+            r#"assert(plugin:GetSetting("count") == 7, "count did not persist")
+               assert(plugin:GetSetting("label") == "hello", "label did not persist")"#,
+            "=plugin",
+        );
+        assert_clean(&read, "settings persistence");
+        let _ = std::fs::remove_file(&path);
     }
 }

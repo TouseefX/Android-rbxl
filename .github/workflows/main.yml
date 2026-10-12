@@ -294,11 +294,11 @@ jobs:
       # whole process (a Luau null-pointer deref panics non-unwinding from the
       # extern "C" boundary in luaur-vm/src/functions/loadsafe.rs), and three
       # appflow tests fail. Any of those would otherwise mask the signal here.
-      - name: cargo test (PluginSession)
+      - name: cargo test (plugin runtime)
         id: test
         run: |
           set -o pipefail
-          cargo test --lib plugin_session_tests 2>&1 | tee /tmp/cargo.log
+          cargo test --lib plugin_ 2>&1 | tee /tmp/cargo.log
 
       - name: Full suite (informational)
         if: always()
