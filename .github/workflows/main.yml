@@ -552,7 +552,10 @@ jobs:
         run: |
           # A build script's panic message lands in the "--- stderr" section,
           # which a grep anchored on "^error" cuts off before reaching.
-          diag="$(awk '/--- stderr/{f=1} f' /tmp/ossl-check.log | head -n 40)"
+          # The tail, not the head: CMake's Android platform modules print
+          # three deprecation warnings before anything interesting, which is
+          # enough to push the actual error out of a head-anchored capture.
+          diag="$(awk '/--- stderr/{f=1} f' /tmp/ossl-check.log | tail -n 45)"
           if [ -z "$diag" ]; then
             diag="$(grep -A 25 '^error' /tmp/ossl-check.log | head -n 45)"
           fi
