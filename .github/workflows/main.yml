@@ -487,15 +487,39 @@ jobs:
       # the documentation is not part of the dependency.
       - name: Cross-compile OpenSSL ${{ env.OPENSSL_VERSION }} for aarch64-linux-android
         if: steps.ossl-cache.outputs.cache-hit != 'true'
+        id: ossl-build
         run: |
           set -euo pipefail
           curl -fsSL "https://codeload.github.com/openssl/openssl/tar.gz/refs/tags/openssl-${OPENSSL_VERSION}" -o /tmp/ossl.tar.gz
-          tar -xzf /tmp/ossl.tar.gz -C /tmp
-          cd "/tmp/openssl-${OPENSSL_VERSION}"
+          mkdir -p /tmp/ossl-src
+          # The archive's top-level directory is named after the repo *and* the
+          # ref, so it cannot be predicted from the version alone. Strip it.
+          tar -xzf /tmp/ossl.tar.gz -C /tmp/ossl-src --strip-components=1
+          cd /tmp/ossl-src
           ./Configure android-arm64 no-shared no-tests no-docs \
-            --prefix="${GITHUB_WORKSPACE}/ossl-android" --libdir=lib
-          make -j"$(nproc)"
-          make install_sw
+            --prefix="${GITHUB_WORKSPACE}/ossl-android" --libdir=lib > /tmp/ossl-configure.log 2>&1 \
+            || { tail -n 40 /tmp/ossl-configure.log; exit 1; }
+          make -j"$(nproc)" > /tmp/ossl-make.log 2>&1 \
+            || { tail -n 60 /tmp/ossl-make.log; exit 1; }
+          make install_sw > /tmp/ossl-install.log 2>&1 \
+            || { tail -n 40 /tmp/ossl-install.log; exit 1; }
+
+      # Runner log archives are not reachable from every environment, so a
+      # failing build has to put its own diagnostics into the run summary.
+      - name: Surface OpenSSL build failures as annotations
+        if: failure() && steps.ossl-build.outcome == 'failure'
+        run: |
+          for f in /tmp/ossl-configure.log /tmp/ossl-make.log /tmp/ossl-install.log; do
+            [ -s "$f" ] || continue
+            tail -n 40 "$f" | awk -v t="$(basename "$f")" '
+              {
+                gsub(/%/, "%25")
+                gsub(/\r/, "%0D")
+                out = (out == "" ? $0 : out "%0A" $0)
+              }
+              END { print "::error title=" t "::" out }
+            '
+          done
 
       - name: Report what was built
         run: |

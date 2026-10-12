@@ -1185,6 +1185,7 @@ pub struct OsslBackendBuilder {
     trust_anchors_pem: Vec<Vec<u8>>,
     use_system_trust_store: bool,
     verify: Verify,
+    custom_extensions: Vec<(u16, Vec<u8>)>,
 }
 
 impl OsslBackendBuilder {
@@ -1198,7 +1199,30 @@ impl OsslBackendBuilder {
             trust_anchors_pem: Vec::new(),
             use_system_trust_store: role == Role::Client,
             verify: Verify::Peer,
+            custom_extensions: Vec::new(),
         }
+    }
+
+    /// Registers a TLS extension OpenSSL does not know about, to be written
+    /// into the ClientHello.
+    ///
+    /// This is the only way to control where an extension sits in the list.
+    /// OpenSSL writes custom extensions before every built-in one --
+    /// `ssl/statem/extensions.c:1188`, "Add custom extensions first", inside the
+    /// same `WPACKET` sub-packet as the rest of the extensions -- so a peer that
+    /// expects a particular extension at the front can be matched exactly, and
+    /// without editing the ClientHello after it has been built.
+    ///
+    /// Extensions are written in the order they are registered, so with a single
+    /// registration this one is first overall.
+    ///
+    /// The payload is copied and reference counted, because OpenSSL keeps the
+    /// address and reads it from the add callback for as long as any `SSL` made
+    /// from the context lives -- which outlives the backend, so every session
+    /// holds a count. See `alpn_offers` for the same reasoning.
+    pub fn custom_extension(mut self, ext_type: u16, payload: impl Into<Vec<u8>>) -> Self {
+        self.custom_extensions.push((ext_type, payload.into()));
+        self
     }
 
     /// Adds an ALPN protocol, in preference order.
@@ -1339,12 +1363,41 @@ impl OsslBackendBuilder {
             alpn_offers = Some(offers);
         }
 
+        let mut custom_ext_payloads: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
+        for (ext_type, payload) in &self.custom_extensions {
+            let shared = std::sync::Arc::new(payload.clone());
+            let arg = std::sync::Arc::as_ptr(&shared);
+            // SAFETY: `ctx` is valid. `arg` addresses a `Vec<u8>` owned by an
+            // `Arc` that is stored on the backend being returned and cloned into
+            // every session, so it outlives the context and the callback reading
+            // it. `SSL_EXT_CLIENT_HELLO` restricts it to the ClientHello.
+            let added = unsafe {
+                sys::SSL_CTX_add_custom_ext(
+                    ctx.0,
+                    u32::from(*ext_type),
+                    sys::SSL_EXT_CLIENT_HELLO as u32,
+                    Some(custom_ext_add),
+                    // Nothing is allocated in the add callback, so there is
+                    // nothing to free.
+                    None,
+                    arg.cast_mut().cast::<c_void>(),
+                    Some(custom_ext_parse),
+                    arg.cast_mut().cast::<c_void>(),
+                )
+            };
+            if added != 1 {
+                return Err(tls_error("SSL_CTX_add_custom_ext failed"));
+            }
+            custom_ext_payloads.push(shared);
+        }
+
         Ok(OsslBackend {
             ctx,
             alpn_wire,
             role: self.role,
             verify: self.verify,
             alpn_offers,
+            custom_ext_payloads,
         })
     }
 }
@@ -1455,6 +1508,51 @@ fn add_trust_anchor(ctx: *mut sys::SSL_CTX, pem: &[u8]) -> Result<()> {
 /// Runs inside OpenSSL during the handshake. Returning a fatal alert here is what turns "no
 /// protocol in common" into a handshake failure that names ALPN, rather than a connection
 /// that completes and then behaves strangely.
+/// Writes a registered custom extension into the handshake message.
+///
+/// The payload belongs to the backend and is shared with every session, so the
+/// pointer handed to OpenSSL stays valid for as long as the `SSL` does. Nothing
+/// is allocated here, which is why no free callback is registered.
+unsafe extern "C" fn custom_ext_add(
+    _ssl: *mut sys::SSL,
+    _ext_type: u32,
+    _context: u32,
+    out: *mut *const c_uchar,
+    outlen: *mut usize,
+    _x: *mut sys::X509,
+    _chainidx: usize,
+    _al: *mut c_int,
+    add_arg: *mut c_void,
+) -> c_int {
+    if add_arg.is_null() || out.is_null() || outlen.is_null() {
+        return 0;
+    }
+    let payload = &*add_arg.cast::<Vec<u8>>();
+    *out = payload.as_ptr();
+    *outlen = payload.len();
+    1
+}
+
+/// Accepts the extension if a peer ever offers one back.
+///
+/// Registered with `SSL_EXT_CLIENT_HELLO` only, so the contexts a server would
+/// use are not in play and this is never reached. `SSL_CTX_add_custom_ext` wants
+/// a parse callback regardless, and rejecting an unexpected extension would fail
+/// the handshake for no gain.
+unsafe extern "C" fn custom_ext_parse(
+    _ssl: *mut sys::SSL,
+    _ext_type: u32,
+    _context: u32,
+    _in: *const c_uchar,
+    _inlen: usize,
+    _x: *mut sys::X509,
+    _chainidx: usize,
+    _al: *mut c_int,
+    _parse_arg: *mut c_void,
+) -> c_int {
+    1
+}
+
 unsafe extern "C" fn alpn_select_cb(
     _ssl: *mut sys::SSL,
     out: *mut *const c_uchar,
@@ -1652,6 +1750,13 @@ pub struct OsslBackend {
     /// with the context. Every session therefore holds a count.
     #[allow(clippy::box_collection)]
     alpn_offers: Option<std::sync::Arc<Vec<u8>>>,
+    /// Payloads for the registered custom extensions, each at a fixed address
+    /// for the add callback that reads it.
+    ///
+    /// Reference counted for the same reason as `alpn_offers`: a session made
+    /// from this backend keeps the `SSL_CTX` alive after the backend is dropped,
+    /// and the callbacks go with the context.
+    custom_ext_payloads: Vec<std::sync::Arc<Vec<u8>>>,
 }
 
 impl OsslBackend {
@@ -1680,6 +1785,10 @@ pub struct OsslSession {
     /// A share of the backend's ALPN offer list, keeping it alive for the selection
     /// callback that reads it -- which outlives the backend whenever a session does.
     _alpn_offers: Option<std::sync::Arc<Vec<u8>>>,
+    /// Shares of the backend's custom-extension payloads, keeping them alive for
+    /// the add callbacks that read them -- which outlive the backend whenever a
+    /// session does.
+    _custom_ext_payloads: Vec<std::sync::Arc<Vec<u8>>>,
     /// The handshake state OpenSSL's callbacks reach through their argument.
     ///
     /// A raw pointer rather than a `Box` on purpose. OpenSSL holds this same address and
@@ -1706,6 +1815,7 @@ impl OsslSession {
             ossl_ctx: ptr::null_mut(),
             ssl,
             _alpn_offers: backend.alpn_offers.clone(),
+            _custom_ext_payloads: backend.custom_ext_payloads.clone(),
             engine: ptr::null_mut(),
             verify: backend.verify,
             role,
