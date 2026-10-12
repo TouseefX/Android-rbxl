@@ -474,9 +474,12 @@ jobs:
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
+      # restore/save rather than the combined action: the combined one saves in
+      # a post step that is skipped when the job fails, so every iteration that
+      # got past OpenSSL but failed later rebuilt it from scratch.
       - name: Restore a previously built OpenSSL
         id: ossl-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/ossl-android
           key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-${{ env.NDK_VERSION }}
@@ -539,6 +542,13 @@ jobs:
           hits="$("$NM" "$OPENSSL_DIR/lib/libssl.a" 2>/dev/null | grep "SSL_set_quic_tls_cbs" | head -3 | tr '\n' ';')"
           echo "SSL_set_quic_tls_cbs in libssl.a: ${hits:-NONE}"
           echo "::notice title=openssl symbols::${hits:-NONE}"
+
+      - name: Keep the built OpenSSL
+        if: always() && steps.ossl-cache.outputs.cache-hit != 'true' && steps.ossl-build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/ossl-android
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-${{ env.NDK_VERSION }}
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
