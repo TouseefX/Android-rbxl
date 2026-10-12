@@ -749,15 +749,15 @@ impl EditorApp {
                 shortcut = Some(0);
             } else {
                 for (index, key) in [
-                    (1usize, egui::Key::Digit1),
-                    (2, egui::Key::Digit2),
-                    (3, egui::Key::Digit3),
-                    (4, egui::Key::Digit4),
-                    (5, egui::Key::Digit5),
-                    (6, egui::Key::Digit6),
-                    (7, egui::Key::Digit7),
-                    (8, egui::Key::Digit8),
-                    (9, egui::Key::Digit9),
+                    (1usize, egui::Key::Num1),
+                    (2, egui::Key::Num2),
+                    (3, egui::Key::Num3),
+                    (4, egui::Key::Num4),
+                    (5, egui::Key::Num5),
+                    (6, egui::Key::Num6),
+                    (7, egui::Key::Num7),
+                    (8, egui::Key::Num8),
+                    (9, egui::Key::Num9),
                 ] {
                     if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key)) {
                         shortcut = Some(index);
