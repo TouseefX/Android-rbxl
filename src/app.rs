@@ -206,6 +206,9 @@ pub struct EditorApp {
     editor_word_wrap: bool,
     editor_focus_mode: bool,
     show_stats: bool,
+    /// View-menu skybox toggle. Persisted through `EditorSettings`; the renderer
+    /// does not read it yet, so flipping it currently only changes the label.
+    show_skybox: bool,
     /// Whether StarterGui/BillboardGui/SurfaceGui previews are drawn over the viewport.
     show_gui_preview: bool,
     /// Hide all editor chrome and dedicate the window to the 3D viewport.
@@ -448,6 +451,7 @@ impl Default for EditorApp {
             editor_word_wrap: saved_settings.editor_word_wrap,
             editor_focus_mode: false,
             show_stats: false,
+            show_skybox: saved_settings.show_skybox,
             show_gui_preview: true,
             viewport_fullscreen: false,
             roblox_fonts_installed: false,
@@ -6856,7 +6860,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             open_cloud_place_id: self.open_cloud_place_id.clone(),
                             ui_mode: self.ui_mode.clone(),
                             auto_download_meshes: true,
-                            show_skybox: true,
+                            show_skybox: self.show_skybox,
                             editor_font_size: self.font_size,
                             compact_toolbar: self.compact_toolbar,
                             show_tablet_explorer: self.show_tablet_explorer,
