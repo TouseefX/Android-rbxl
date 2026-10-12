@@ -238,61 +238,6 @@ fn build_ngtcp2(source_dir: &Path, openssl: Option<&OpenSsl>) -> PathBuf {
         }
     }
 
-    // The NDK's clang comes as per-API-level wrappers, and which one is used
-    // decides which libc symbols are allowed at link time. The `cc` crate picks
-    // the API-21 wrapper for a bare `aarch64-linux-android` target, and neither
-    // `ANDROID_PLATFORM` nor `CC_aarch64_linux_android` changes that here -- the
-    // compile line stays `--target=aarch64-none-linux-android21` either way.
-    //
-    // That matters beyond tidiness: Bionic does not export `stdin`, `stdout` or
-    // `stderr` before API 23, and libcrypto's `eng_openssl.c` references
-    // `stderr`. Against an API-21 sysroot ngtcp2's `check_symbol_exists` probe
-    // therefore fails to *link* and reports the OpenSSL as having no QUIC
-    // support, when the symbol is demonstrably in the archive.
-    //
-    // So name the wrapper directly rather than hoping an env convention reaches
-    // CMake. Callers that want a different level set `ANDROID_API_LEVEL`.
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
-        let arch = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
-            Ok("aarch64") => "aarch64",
-            Ok("arm") => "armv7a",
-            Ok("x86_64") => "x86_64",
-            Ok("x86") => "i686",
-            _ => "",
-        };
-        let host_tag = match (env::consts::OS, env::consts::ARCH) {
-            ("linux", "x86_64") => "linux-x86_64",
-            ("macos", "x86_64") => "darwin-x86_64",
-            ("macos", "aarch64") => "darwin-x86_64",
-            ("windows", "x86_64") => "windows-x86_64",
-            _ => "",
-        };
-        if !arch.is_empty() && !host_tag.is_empty() {
-            if let (Ok(ndk), Ok(api)) =
-                (env::var("ANDROID_NDK_HOME"), env::var("ANDROID_API_LEVEL"))
-            {
-                let bin = Path::new(&ndk)
-                    .join("toolchains/llvm/prebuilt")
-                    .join(host_tag)
-                    .join("bin");
-                let prefix = format!("{arch}-linux-android{api}");
-                let clang = bin.join(format!("{prefix}-clang"));
-                let clangxx = bin.join(format!("{prefix}-clang++"));
-                if clang.is_file() {
-                    config.define("CMAKE_C_COMPILER", &clang);
-                    config.define("CMAKE_CXX_COMPILER", &clangxx);
-                    config.define("CMAKE_ANDROID_NDK", &ndk);
-                    config.define("ANDROID_ABI", match arch {
-                        "aarch64" => "arm64-v8a",
-                        "armv7a" => "armeabi-v7a",
-                        "x86_64" => "x86_64",
-                        _ => "x86",
-                    });
-                }
-            }
-        }
-    }
-
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let static_crt = env::var("CARGO_ENCODED_RUSTFLAGS")
             .unwrap_or_default()

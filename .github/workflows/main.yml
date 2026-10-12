@@ -420,13 +420,12 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
-          # Pin the API level the way cc and cmake actually read it. Without
-          # these the bare `aarch64-linux-android` triple builds against API 21,
-          # while manifest.yaml declares min_sdk_version 26.
+          # The API-26 clang wrappers, named for the check step to point CMake
+          # at. Scoped there rather than exported, because a plain CC would also
+          # be picked up by every other build script in the tree.
           HOST="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "CC_aarch64_linux_android=$HOST/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
-          echo "CXX_aarch64_linux_android=$HOST/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
-          echo "AR_aarch64_linux_android=$HOST/llvm-ar" >> "$GITHUB_ENV"
+          echo "NDK_CLANG26=$HOST/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "NDK_CLANGXX26=$HOST/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
@@ -503,13 +502,12 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
-          # Pin the API level the way cc and cmake actually read it. Without
-          # these the bare `aarch64-linux-android` triple builds against API 21,
-          # while manifest.yaml declares min_sdk_version 26.
+          # The API-26 clang wrappers, named for the check step to point CMake
+          # at. Scoped there rather than exported, because a plain CC would also
+          # be picked up by every other build script in the tree.
           HOST="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "CC_aarch64_linux_android=$HOST/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
-          echo "CXX_aarch64_linux_android=$HOST/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
-          echo "AR_aarch64_linux_android=$HOST/llvm-ar" >> "$GITHUB_ENV"
+          echo "NDK_CLANG26=$HOST/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "NDK_CLANGXX26=$HOST/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
 
       # restore/save rather than the combined action: the combined one saves in
       # a post step that is skipped when the job fails, so every iteration that
@@ -617,6 +615,13 @@ jobs:
         id: check
         run: |
           set -o pipefail
+          # The cmake crate detects its own compiler and overrides any
+          # -DCMAKE_C_COMPILER a build script passes, but it does read these two
+          # from the environment. Without them CMake gets the NDK's API-21
+          # wrapper, whose sysroot lacks stderr before API 23, and ngtcp2's QUIC
+          # symbol probe fails at link time.
+          export CMAKE_C_COMPILER="$NDK_CLANG26"
+          export CMAKE_CXX_COMPILER="$NDK_CLANGXX26"
           cargo check --lib --target aarch64-linux-android --features ossl-tls 2>&1 | tee /tmp/ossl-check.log
 
       - name: Surface failures as annotations
