@@ -343,7 +343,8 @@ mod tests {
     fn the_library_defaults_are_the_rfc9000_ones() {
         // Pinned because a peer that hard-codes its expectations of us has to
         // see these exact numbers, and an ngtcp2 bump could move them.
-        let raw = TransportParams::new().as_raw();
+        let params = TransportParams::new();
+        let raw = params.as_raw();
         assert_eq!(
             raw.max_udp_payload_size,
             u64::from(sys::NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE)
@@ -366,10 +367,10 @@ mod tests {
 
     #[test]
     fn the_ack_delay_and_payload_setters_reach_the_raw_struct() {
-        let raw = TransportParams::new()
+        let params = TransportParams::new()
             .ack_delay_exponent(7)
-            .max_udp_payload_size(1400)
-            .as_raw();
+            .max_udp_payload_size(1400);
+        let raw = params.as_raw();
         assert_eq!(raw.ack_delay_exponent, 7);
         assert_eq!(raw.max_udp_payload_size, 1400);
     }

@@ -441,3 +441,100 @@ jobs:
             }
             END { print "::error title=android check::" out }
           '
+
+  # The OpenSSL path is the one that can put 0xFF00 into the ClientHello as a
+  # real extension, but ngnet-quic-sys refuses to build against anything older
+  # than OpenSSL 3.5.0 and neither the runner nor the NDK ships it. So this job
+  # builds one for aarch64-linux-android and type-checks the crate against it.
+  check-openssl-android:
+    name: Check Android with OpenSSL 3.5
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      OPENSSL_VERSION: "3.5.9"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      - name: Point the NDK env vars at the real sysroot
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Restore a previously built OpenSSL
+        id: ossl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ossl-android
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-${{ env.NDK_VERSION }}
+
+      # OpenSSL's android-arm64 target picks its toolchain up from
+      # ANDROID_NDK_ROOT, so the NDK step above is all it needs. `no-shared`
+      # because ngnet-quic-sys links static archives, and `install_sw` because
+      # the documentation is not part of the dependency.
+      - name: Cross-compile OpenSSL ${{ env.OPENSSL_VERSION }} for aarch64-linux-android
+        if: steps.ossl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://codeload.github.com/openssl/openssl/tar.gz/refs/tags/openssl-${OPENSSL_VERSION}" -o /tmp/ossl.tar.gz
+          tar -xzf /tmp/ossl.tar.gz -C /tmp
+          cd "/tmp/openssl-${OPENSSL_VERSION}"
+          ./Configure android-arm64 no-shared no-tests no-docs \
+            --prefix="${GITHUB_WORKSPACE}/ossl-android" --libdir=lib
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Report what was built
+        run: |
+          set -euo pipefail
+          export OPENSSL_DIR="${GITHUB_WORKSPACE}/ossl-android"
+          echo "OPENSSL_DIR=$OPENSSL_DIR" >> "$GITHUB_ENV"
+          ls "$OPENSSL_DIR/include/openssl/ssl.h"
+          ls "$OPENSSL_DIR/lib"/libssl.a "$OPENSSL_DIR/lib"/libcrypto.a
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" t "$OPENSSL_DIR/lib/libssl.a" | head -3
+
+      - name: Install Rust nightly and the Android target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: android-ossl-check-${{ hashFiles('Cargo.toml') }}
+
+      - name: cargo check with the OpenSSL backend
+        id: check
+        run: |
+          set -o pipefail
+          cargo check --lib --target aarch64-linux-android --features ossl-tls 2>&1 | tee /tmp/ossl-check.log
+
+      - name: Surface failures as annotations
+        if: failure() && steps.check.outcome == 'failure'
+        run: |
+          diag="$(grep -A 10 '^error' /tmp/ossl-check.log | head -n 45)"
+          if [ -z "$diag" ]; then
+            diag="$(tail -n 40 /tmp/ossl-check.log)"
+          fi
+          printf '%s\n' "$diag" | awk '
+            {
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END { print "::error title=openssl android check::" out }
+          '
