@@ -294,6 +294,18 @@ jobs:
           set -o pipefail
           cargo test --lib 2>&1 | tee /tmp/cargo.log
 
+      - name: Publish test summary
+        if: always() && steps.test.outcome == 'success'
+        run: |
+          grep -E '^(test result:|running [0-9]+ tests?|     Running)' /tmp/cargo.log | awk '
+            {
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END { print "::notice title=cargo test::" out }
+          '
+
       # Runner log archives are served from results-receiver.actions.githubusercontent.com,
       # which is not reachable from every environment. Republishing the failure
       # as a check-run annotation keeps the compiler output readable through
