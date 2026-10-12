@@ -392,9 +392,11 @@ jobs:
       # libc symbol slipped through here.
       ANDROID_PLATFORM: "android-26"
       ANDROID_API_LEVEL: "26"
-      # The cargo target is aarch64-linux-android26 rather than the bare triple:
-      # ANDROID_PLATFORM does not reach the cc crate, which derives the API from
-      # the target suffix, and a bare triple builds against API 21.
+      # ANDROID_PLATFORM does not reach the cc crate, and `--target
+      # aarch64-linux-android26` is not a target rustc has - it rejects it with
+      # "could not find specification for target". The API level is selected by
+      # naming the NDK's versioned clang wrapper through CC_<target>, which the
+      # cc and cmake crates do read. Set in the NDK step, where the path exists.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -418,6 +420,13 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          # Pin the API level the way cc and cmake actually read it. Without
+          # these the bare `aarch64-linux-android` triple builds against API 21,
+          # while manifest.yaml declares min_sdk_version 26.
+          HOST="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$HOST/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$HOST/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$HOST/llvm-ar" >> "$GITHUB_ENV"
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
@@ -434,7 +443,7 @@ jobs:
         id: check
         run: |
           set -o pipefail
-          cargo check --lib --target aarch64-linux-android26 2>&1 | tee /tmp/android-check.log
+          cargo check --lib --target aarch64-linux-android 2>&1 | tee /tmp/android-check.log
 
       - name: Surface failures as annotations
         if: failure() && steps.check.outcome == 'failure'
@@ -469,9 +478,11 @@ jobs:
       # 21-level build cannot even be linked against by CMake's symbol probe.
       ANDROID_PLATFORM: "android-26"
       ANDROID_API_LEVEL: "26"
-      # The cargo target is aarch64-linux-android26 rather than the bare triple:
-      # ANDROID_PLATFORM does not reach the cc crate, which derives the API from
-      # the target suffix, and a bare triple builds against API 21.
+      # ANDROID_PLATFORM does not reach the cc crate, and `--target
+      # aarch64-linux-android26` is not a target rustc has - it rejects it with
+      # "could not find specification for target". The API level is selected by
+      # naming the NDK's versioned clang wrapper through CC_<target>, which the
+      # cc and cmake crates do read. Set in the NDK step, where the path exists.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -492,6 +503,13 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          # Pin the API level the way cc and cmake actually read it. Without
+          # these the bare `aarch64-linux-android` triple builds against API 21,
+          # while manifest.yaml declares min_sdk_version 26.
+          HOST="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$HOST/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$HOST/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$HOST/llvm-ar" >> "$GITHUB_ENV"
 
       # restore/save rather than the combined action: the combined one saves in
       # a post step that is skipped when the job fails, so every iteration that
@@ -589,7 +607,7 @@ jobs:
         id: check
         run: |
           set -o pipefail
-          cargo check --lib --target aarch64-linux-android26 --features ossl-tls 2>&1 | tee /tmp/ossl-check.log
+          cargo check --lib --target aarch64-linux-android --features ossl-tls 2>&1 | tee /tmp/ossl-check.log
 
       - name: Surface failures as annotations
         if: failure() && steps.check.outcome == 'failure'
@@ -620,8 +638,8 @@ jobs:
           # both are looked for. The probe's output is embedded in the YAML with
           # escaped newlines, hence pulling the interesting lines rather than the
           # tail.
-          for log in target/aarch64-linux-android26/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeConfigureLog.yaml \
-                     target/aarch64-linux-android26/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeError.log; do
+          for log in target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeConfigureLog.yaml \
+                     target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeError.log; do
             [ -s "$log" ] || continue
             {
               grep -oE "ld: error[^\\]*|undefined (reference to|symbol)[^\\]*|cannot find -l[a-z0-9_]*|error: [^\\]*" "$log" | sort -u | head -n 25
