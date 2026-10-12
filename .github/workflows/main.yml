@@ -280,4 +280,28 @@ jobs:
           key: host-test-${{ hashFiles('Cargo.toml') }}
 
       - name: cargo test
-        run: cargo test --lib --verbose
+        id: test
+        run: |
+          set -o pipefail
+          cargo test --lib --verbose 2>&1 | tee /tmp/cargo.log
+
+      # Runner log archives are served from results-receiver.actions.githubusercontent.com,
+      # which is not reachable from every environment. Republishing the failure
+      # as a check-run annotation keeps the compiler output readable through
+      # api.github.com alone.
+      - name: Surface failures as annotations
+        if: failure() && steps.test.outcome == 'failure'
+        run: |
+          awk '
+            /^(error(\[E[0-9]+\])?:|failures:|---- .* stdout ----)/ { flag = 1 }
+            flag && n < 80 {
+              n++
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END {
+              if (out == "") out = "cargo failed with no recognisable diagnostic"
+              print "::error title=cargo::" out
+            }
+          ' /tmp/cargo.log
