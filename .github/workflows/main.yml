@@ -1,7 +1,14 @@
-name: Build Android APK
+name: Build and test
 
 on:
   workflow_dispatch:
+  # Every push to a working branch or master runs the host check-and-test job.
+  # The APK build stays manual-only (see the `if` on build-android below) so a
+  # push does not burn 10+ minutes cross-compiling and uploading artifacts.
+  push:
+    branches:
+      - master
+      - 'arena/**'
 
 # ---------------------------------------------------------------------------
 # Build pipeline: xbuild (https://github.com/rust-mobile/xbuild)
@@ -41,6 +48,10 @@ env:
 jobs:
   build-android:
     name: Build Android APK
+    # Manual-only: the full NDK/Gradle/APK pipeline is expensive, so it is not
+    # run on every push. Dispatch it from the Actions tab (or `gh workflow run`)
+    # when an APK is actually wanted.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
