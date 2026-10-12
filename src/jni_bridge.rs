@@ -694,8 +694,9 @@ pub fn is_chromeos() -> bool {
     let mut detected = false;
     with_env(|env, class| {
         if let Ok(jval) = env.call_static_method(class, "isChromeOsStatic", "()Z", &[]) {
-            let value: jni::sys::jboolean = jval.get().unwrap_or(0);
-            detected = value != 0;
+            // JValueGen has no `get`; `z()` is the jboolean accessor and yields
+            // a bool, the same way is_ime_visible reads its "()Z" result.
+            detected = jval.z().unwrap_or(false);
         }
         Ok(())
     });

@@ -362,3 +362,78 @@ jobs:
             }
             END { print "::error title=cargo::" out }
           '
+
+  # ---------------------------------------------------------------------------
+  # Type-check for the Android target.
+  #
+  # The host job compiles for x86_64-linux, so nothing behind
+  # `#[cfg(target_os = "android")]` is ever compiled there. That is how
+  # jni_bridge::is_chromeos shipped a call to a JValueGen method that does not
+  # exist - it is only reachable on Android, and the only job that builds for
+  # Android costs 10+ minutes of NDK, Gradle and APK packaging.
+  #
+  # `cargo check` type-checks without linking, so it covers the same cfg gate
+  # in a few minutes and needs no Gradle.
+  # ---------------------------------------------------------------------------
+  check-android:
+    name: Check Android target
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      # ngnet-quic-sys cross-compiles ngtcp2 in its build script, so the NDK's
+      # clang has to be on PATH and the NDK location exported, exactly as the
+      # APK job does.
+      - name: Point the NDK env vars at the real sysroot
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust nightly and the Android target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: android-check-${{ hashFiles('Cargo.toml') }}
+
+      - name: cargo check (aarch64-linux-android)
+        id: check
+        run: |
+          set -o pipefail
+          cargo check --lib --target aarch64-linux-android 2>&1 | tee /tmp/android-check.log
+
+      - name: Surface failures as annotations
+        if: failure() && steps.check.outcome == 'failure'
+        run: |
+          diag="$(grep -A 10 '^error' /tmp/android-check.log | head -n 45)"
+          if [ -z "$diag" ]; then
+            diag="$(tail -n 40 /tmp/android-check.log)"
+          fi
+          printf '%s\n' "$diag" | awk '
+            {
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END { print "::error title=android check::" out }
+          '
