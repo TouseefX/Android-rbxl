@@ -385,6 +385,13 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       CARGO_BUILD_JOBS: 2
+      # manifest.yaml sets min_sdk_version 26 and xbuild compiles the native
+      # lib against the target SDK. Without this the cmake crate defaults to
+      # API 21, so the check would build against a platform the app never
+      # ships on - which is exactly how an OpenSSL link against a 23-only
+      # libc symbol slipped through here.
+      ANDROID_PLATFORM: "android-26"
+      ANDROID_API_LEVEL: "26"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -453,6 +460,12 @@ jobs:
       CARGO_TERM_COLOR: never
       CARGO_BUILD_JOBS: 2
       OPENSSL_VERSION: "3.5.9"
+      # Same floor as the APK (manifest.yaml min_sdk_version 26). OpenSSL's
+      # android-arm64 target defaults to API 21, where Bionic does not export
+      # stdin/stderr, and libcrypto's ui_openssl.o references both - so a
+      # 21-level build cannot even be linked against by CMake's symbol probe.
+      ANDROID_PLATFORM: "android-26"
+      ANDROID_API_LEVEL: "26"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -482,7 +495,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/ossl-android
-          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-${{ env.NDK_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-api${{ env.ANDROID_API_LEVEL }}-${{ env.NDK_VERSION }}
 
       # OpenSSL's android-arm64 target picks its toolchain up from
       # ANDROID_NDK_ROOT, so the NDK step above is all it needs. `no-shared`
@@ -548,7 +561,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/ossl-android
-          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-${{ env.NDK_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-api${{ env.ANDROID_API_LEVEL }}-${{ env.NDK_VERSION }}
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
