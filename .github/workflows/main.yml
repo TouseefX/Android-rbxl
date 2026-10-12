@@ -517,7 +517,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/ossl-android
-          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-api${{ env.ANDROID_API_LEVEL }}-nouic-${{ env.NDK_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-noeng-${{ env.NDK_VERSION }}
 
       # OpenSSL's android-arm64 target picks its toolchain up from
       # ANDROID_NDK_ROOT, so the NDK step above is all it needs. `no-shared`
@@ -534,12 +534,13 @@ jobs:
           # ref, so it cannot be predicted from the version alone. Strip it.
           tar -xzf /tmp/ossl.tar.gz -C /tmp/ossl-src --strip-components=1
           cd /tmp/ossl-src
-          # `no-ui-console` drops the terminal UI, whose ui_openssl.c is the
-          # only thing in libcrypto that references stdin and stderr - symbols
+          # `no-ui-console` and `no-engine` drop the two libcrypto objects that
+          # reference stdin/stderr - ui_openssl.c and eng_openssl.c - which
           # Bionic does not export before API 23. Nothing here drives a console
-          # prompt, and without this the link fails regardless of the API level
-          # the Rust side asks for.
-          ./Configure android-arm64 no-shared no-tests no-docs no-ui-console \
+          # prompt or loads a legacy ENGINE, and removing them means the archive
+          # links at any API level instead of depending on the NDK wrapper the
+          # cmake crate happens to pick.
+          ./Configure android-arm64 no-shared no-tests no-docs no-ui-console no-engine \
             --prefix="${GITHUB_WORKSPACE}/ossl-android" --libdir=lib > /tmp/ossl-configure.log 2>&1 \
             || { tail -n 40 /tmp/ossl-configure.log; exit 1; }
           make -j"$(nproc)" > /tmp/ossl-make.log 2>&1 \
@@ -588,7 +589,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/ossl-android
-          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-api${{ env.ANDROID_API_LEVEL }}-nouic-${{ env.NDK_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-noeng-${{ env.NDK_VERSION }}
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
