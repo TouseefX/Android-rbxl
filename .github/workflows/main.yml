@@ -392,6 +392,9 @@ jobs:
       # libc symbol slipped through here.
       ANDROID_PLATFORM: "android-26"
       ANDROID_API_LEVEL: "26"
+      # The cargo target is aarch64-linux-android26 rather than the bare triple:
+      # ANDROID_PLATFORM does not reach the cc crate, which derives the API from
+      # the target suffix, and a bare triple builds against API 21.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -431,7 +434,7 @@ jobs:
         id: check
         run: |
           set -o pipefail
-          cargo check --lib --target aarch64-linux-android 2>&1 | tee /tmp/android-check.log
+          cargo check --lib --target aarch64-linux-android26 2>&1 | tee /tmp/android-check.log
 
       - name: Surface failures as annotations
         if: failure() && steps.check.outcome == 'failure'
@@ -466,6 +469,9 @@ jobs:
       # 21-level build cannot even be linked against by CMake's symbol probe.
       ANDROID_PLATFORM: "android-26"
       ANDROID_API_LEVEL: "26"
+      # The cargo target is aarch64-linux-android26 rather than the bare triple:
+      # ANDROID_PLATFORM does not reach the cc crate, which derives the API from
+      # the target suffix, and a bare triple builds against API 21.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -495,7 +501,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/ossl-android
-          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-api${{ env.ANDROID_API_LEVEL }}-${{ env.NDK_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-api${{ env.ANDROID_API_LEVEL }}-nouic-${{ env.NDK_VERSION }}
 
       # OpenSSL's android-arm64 target picks its toolchain up from
       # ANDROID_NDK_ROOT, so the NDK step above is all it needs. `no-shared`
@@ -512,7 +518,12 @@ jobs:
           # ref, so it cannot be predicted from the version alone. Strip it.
           tar -xzf /tmp/ossl.tar.gz -C /tmp/ossl-src --strip-components=1
           cd /tmp/ossl-src
-          ./Configure android-arm64 no-shared no-tests no-docs \
+          # `no-ui-console` drops the terminal UI, whose ui_openssl.c is the
+          # only thing in libcrypto that references stdin and stderr - symbols
+          # Bionic does not export before API 23. Nothing here drives a console
+          # prompt, and without this the link fails regardless of the API level
+          # the Rust side asks for.
+          ./Configure android-arm64 no-shared no-tests no-docs no-ui-console \
             --prefix="${GITHUB_WORKSPACE}/ossl-android" --libdir=lib > /tmp/ossl-configure.log 2>&1 \
             || { tail -n 40 /tmp/ossl-configure.log; exit 1; }
           make -j"$(nproc)" > /tmp/ossl-make.log 2>&1 \
@@ -561,7 +572,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/ossl-android
-          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-api${{ env.ANDROID_API_LEVEL }}-${{ env.NDK_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-api${{ env.ANDROID_API_LEVEL }}-nouic-${{ env.NDK_VERSION }}
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
@@ -578,7 +589,7 @@ jobs:
         id: check
         run: |
           set -o pipefail
-          cargo check --lib --target aarch64-linux-android --features ossl-tls 2>&1 | tee /tmp/ossl-check.log
+          cargo check --lib --target aarch64-linux-android26 --features ossl-tls 2>&1 | tee /tmp/ossl-check.log
 
       - name: Surface failures as annotations
         if: failure() && steps.check.outcome == 'failure'
@@ -609,8 +620,8 @@ jobs:
           # both are looked for. The probe's output is embedded in the YAML with
           # escaped newlines, hence pulling the interesting lines rather than the
           # tail.
-          for log in target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeConfigureLog.yaml \
-                     target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeError.log; do
+          for log in target/aarch64-linux-android26/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeConfigureLog.yaml \
+                     target/aarch64-linux-android26/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeError.log; do
             [ -s "$log" ] || continue
             {
               grep -oE "ld: error[^\\]*|undefined (reference to|symbol)[^\\]*|cannot find -l[a-z0-9_]*|error: [^\\]*" "$log" | sort -u | head -n 25
