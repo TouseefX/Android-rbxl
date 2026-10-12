@@ -211,6 +211,23 @@ fn build_ngtcp2(source_dir: &Path, openssl: Option<&OpenSsl>) -> PathBuf {
             config.define("ENABLE_OPENSSL", "ON");
             if let Some(root) = &openssl.root {
                 config.define("OPENSSL_ROOT_DIR", root);
+                // Cross-compiling sets `CMAKE_SYSTEM_NAME`, which makes CMake
+                // re-root every `find_path` and `find_library` under
+                // `CMAKE_FIND_ROOT_PATH` (the target sysroot) and ignore
+                // absolute hints. `FindOpenSSL` then fails with "Could NOT find
+                // OpenSSL ... missing OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR"
+                // even though the tree is exactly where `OPENSSL_ROOT_DIR` says.
+                //
+                // `BOTH` lets the search consider the hint as written. The hints
+                // are absolute paths into the OpenSSL we were pointed at, so
+                // nothing from the host can be picked up by accident -- and
+                // `OPENSSL_ROOT_DIR` still pins which tree wins.
+                for mode in ["LIBRARY", "INCLUDE", "PACKAGE", "PROGRAM"] {
+                    config.define(
+                        format!("CMAKE_FIND_ROOT_PATH_MODE_{mode}"),
+                        "BOTH",
+                    );
+                }
             }
         }
         // Not merely "leave it default": ngtcp2 defaults ENABLE_OPENSSL to ON,
