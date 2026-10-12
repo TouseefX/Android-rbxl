@@ -2832,7 +2832,9 @@ fn rbx_transport_expiry<S: ngnet_quic::Session>(
     })
 }
 
-#[cfg(not(test))]
+// Deliberately NOT `#[cfg(not(test))]`: `splice_rbx_transport_caps_inner` is
+// compiled in test builds and compares against this value, so gating the const
+// out left the splice function referencing a symbol that did not exist.
 /**
  * The 0xFF00 capabilities TLS extension the native RbxTransport
  * ClientHello carries: an 8-byte little-endian u64 capability bitmask.
@@ -3098,6 +3100,10 @@ fn splice_rbx_transport_caps_inner(packet: &mut [u8]) -> Result<(), RbxCapsSplic
     Ok(())
 }
 
+// Missed when the rest of this region was gated: the body takes a
+// `RuppUdpSocket`, which is `#[cfg(not(test))]`, so an ungated signature here
+// could not resolve the type in a test build.
+#[cfg(not(test))]
 async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
     connection: &mut ngnet_quic::Conn<'_, S>,
     socket: &RuppUdpSocket,
