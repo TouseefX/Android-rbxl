@@ -313,9 +313,12 @@ jobs:
       - name: Surface failures as annotations
         if: failure() && steps.test.outcome == 'failure'
         run: |
-          diag="$(awk '/^error/{flag=1} flag' /tmp/cargo.log | head -n 50)"
+          # Prefer the test-harness failure block; fall back to the raw tail so
+          # an abort (SIGABRT/SIGSEGV) that prints no `error:` line is still
+          # visible.
+          diag="$(awk '/^(failures:|running [0-9]+ tests?)/{flag=1} flag' /tmp/cargo.log | tail -n 70)"
           if [ -z "$diag" ]; then
-            diag="$(tail -n 30 /tmp/cargo.log)"
+            diag="$(tail -n 70 /tmp/cargo.log)"
           fi
           printf '%s\n' "$diag" | awk '
             {
