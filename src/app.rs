@@ -334,7 +334,10 @@ pub struct EditorApp {
     // mid-run (checked between scripts in the batch, and exposed to
     // long-running Luau via a hook if needed).
     running_plugin_id: Option<String>,
-    plugin_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Live Luau VM for the running plugin. Persistent, so `RunService`
+    /// connections and `task.defer` survive past the script body instead of
+    /// dying with a throwaway VM; ticked once per editor frame.
+    plugin_session: Option<lua_runtime::PluginSession>,
 
     // Live Session bridge state.
     live_session: live_session::LiveSessionState,
@@ -522,7 +525,7 @@ impl Default for EditorApp {
             browse_places: Vec::new(),
             browse_status: String::new(),
             running_plugin_id: None,
-            plugin_stop_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            plugin_session: None,
             live_session: live_session::LiveSessionState::default(),
             anim_upload_name: "NewAnimation".into(),
             anim_id_input: "522635533".into(),
@@ -1575,6 +1578,10 @@ impl EditorApp {
             self.gui_hovered.clear(); self.gui_runtime_events.clear(); None
         };
         if let Some(session)=self.gui_play_session.as_mut() { if let Err(error)=session.tick(){log::error!("GUI tween tick: {error}");} }
+        // Drive the running plugin's RunService signals. Collect before
+        // pushing so the mutable borrow of the session has ended.
+        let plugin_lines=self.plugin_session.as_mut().map(|session|session.tick()).unwrap_or_default();
+        for line in plugin_lines { self.command_output.push(line); }
         let keyboard_events:Vec<(String,bool)>=ui.input(|input|input.events.iter().filter_map(|event|match event {egui::Event::Key{key,pressed,repeat,..} if !*repeat=>Some((format!("{key:?}"),*pressed)),_=>None}).collect());
         let keyboard_processed=ui.ctx().wants_keyboard_input();
         if let Some(session)=self.gui_play_session.as_ref() {
@@ -5698,7 +5705,7 @@ ui.label("Place ID:");
             if ui.button("🔄 Reload list").clicked() {
                 self.plugin_index = plugins::load_index();
             }
-            // Stop a running sandbox plugin.
+            // Stop a running plugin.
             if self.running_plugin_id.is_some() {
                 if ui.button(RichText::new("⏹ Stop running plugin").color(Color32::from_rgb(255,120,120))).clicked() {
                     self.stop_running_plugin();
@@ -5708,6 +5715,9 @@ ui.label("Place ID:");
                 }
             }
         });
+
+        // Toolbars the running plugin created through plugin:CreateToolbar.
+        self.show_plugin_toolbars(ui);
 
         // Fetch thumbnails for all installed plugins that have an icon
         // asset id, in the background.
@@ -5966,7 +5976,6 @@ ui.label("Place ID:");
     }
 
     fn run_plugin(&mut self, id: &str) {
-        use std::sync::atomic::Ordering;
         let Some(rec) = self.plugin_index.get(id).cloned() else { return; };
         if !rec.enabled {
             self.status = "Enable the plugin before running it".into();
@@ -5976,47 +5985,114 @@ ui.label("Place ID:");
             self.status = "A plugin is already running; stop it first".into();
             return;
         }
-        // Reset stop flag and mark running.
-        self.plugin_stop_flag.store(false, Ordering::SeqCst);
-        self.running_plugin_id = Some(rec.id.clone());
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
-        let flag = self.plugin_stop_flag.clone();
-        let plugin_id = rec.id.clone();
-        std::thread::spawn(move || {
-            let dom = match plugins::load_plugin_dom(&rec) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = plugin_log_channel().0.send(PluginLogLine::Error(format!("load failed: {e}")));
-                    let _ = plugin_running_channel().0.send(plugin_id);
-                    return;
-                }
-            };
-            let mut ran = 0usize;
-            for &child in dom.root().children() {
-                if flag.load(Ordering::SeqCst) { break; }
-                if let Some(inst) = dom.get_by_ref(child) {
-                    if matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
-                        let src = rbxl::get_source(&dom, child).unwrap_or_default();
-                        let result = if inst.class == "ModuleScript" {
-                            lua_runtime::run_module(&src, &rec.name)
-                        } else {
-                            lua_runtime::run_source(&src, &rec.name)
-                        };
-                        for line in result.lines { let _ = plugin_log_channel().0.send(PluginLogLine::Output(line)); }
-                        ran += 1;
-                    }
-                }
+        // The session holds an Rc<RefCell<WeakDom>> for its whole lifetime, but
+        // EditorApp owns the place as Option<WeakDom> and dozens of sites read
+        // it that way. Hand the plugin a serialized snapshot instead: it gets a
+        // real, fully populated `game` to read and write, isolated from the
+        // editor. WeakDom is not Clone, so the round trip goes through bytes.
+        let Some(snapshot) = self
+            .dom
+            .as_ref()
+            .and_then(|dom| rbxl::save_place(dom).ok())
+            .and_then(|bytes| rbxl::load_place(bytes).ok())
+        else {
+            self.status = "Load a place before running a plugin".into();
+            return;
+        };
+
+        let mut session = match lua_runtime::PluginSession::new_for_plugin(
+            Rc::new(RefCell::new(snapshot)),
+            &rec.name,
+            plugins::settings_path(&rec.id),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.status = format!("Plugin VM failed: {error}");
+                return;
             }
-            let _ = plugin_log_channel().0.send(PluginLogLine::Done(ran));
-            let _ = plugin_running_channel().0.send(plugin_id);
-        });
+        };
+
+        let plugin_dom = match plugins::load_plugin_dom(&rec) {
+            Ok(dom) => dom,
+            Err(error) => {
+                self.status = format!("load failed: {error}");
+                return;
+            }
+        };
+
+        // Runs on the UI thread, like GuiPlaySession: Lua is not Send, so a
+        // session built on a worker thread could not be ticked from here. A
+        // slow plugin therefore blocks the editor while it runs.
+        let mut ran = 0usize;
+        for &child in plugin_dom.root().children() {
+            let Some(inst) = plugin_dom.get_by_ref(child) else { continue };
+            if !matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+                continue;
+            }
+            let src = rbxl::get_source(&plugin_dom, child).unwrap_or_default();
+            for line in session.exec(&src, &rec.name) {
+                self.command_output.push(line);
+            }
+            ran += 1;
+        }
+
+        self.plugin_session = Some(session);
+        self.running_plugin_id = Some(rec.id.clone());
+        self.log_info(format!("Plugin ran {ran} script(s) in a persistent VM"));
         self.active_tab = ActiveTab::Command;
     }
 
+    /// Draw the toolbars a running plugin created and dispatch clicks into its
+    /// real `Click` signals.
+    fn show_plugin_toolbars(&mut self, ui: &mut egui::Ui) {
+        let toolbars = match self.plugin_session.as_ref() {
+            Some(session) => session.plugin_toolbars(),
+            None => return,
+        };
+        if toolbars.is_empty() {
+            return;
+        }
+        ui.separator();
+        let mut clicked: Option<(usize, usize)> = None;
+        for (toolbar_index, toolbar) in toolbars.iter().enumerate() {
+            ui.label(RichText::new(format!("🧩 {}", toolbar.name)).weak());
+            ui.horizontal_wrapped(|ui| {
+                for (button_index, button) in toolbar.buttons.iter().enumerate() {
+                    let id = if button.id.is_empty() { "button" } else { button.id.as_str() };
+                    let label = if button.active { format!("▣ {id}") } else { id.to_string() };
+                    let mut response = ui.add_enabled(button.enabled, egui::Button::new(label));
+                    if !button.tooltip.is_empty() {
+                        response = response.on_hover_text(button.tooltip.as_str());
+                    }
+                    if response.clicked() {
+                        clicked = Some((toolbar_index, button_index));
+                    }
+                }
+            });
+        }
+        if let Some((toolbar_index, button_index)) = clicked {
+            let lines = self
+                .plugin_session
+                .as_mut()
+                .map(|session| session.click_button(toolbar_index, button_index))
+                .unwrap_or_default();
+            for line in lines {
+                self.command_output.push(line);
+            }
+        }
+    }
+
     fn stop_running_plugin(&mut self) {
-        use std::sync::atomic::Ordering;
-        self.plugin_stop_flag.store(true, Ordering::SeqCst);
-        self.status = "Stopping plugin...".into();
+        // Dropping the session tears down the VM and every connection in it.
+        let saved = self.plugin_session.take().map(|session| session.save_settings());
+        if let Some(Err(error)) = saved {
+            log::error!("Plugin settings save: {error}");
+        }
+        self.running_plugin_id = None;
+        self.status = "Plugin stopped".into();
     }
 
     fn pump_plugin_thumbnails(&mut self) {
