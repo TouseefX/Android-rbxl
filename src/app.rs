@@ -195,6 +195,12 @@ pub struct EditorApp {
     ui_mode: String,
     /// True when running on ChromeOS (a Chromebook); resolved once at startup.
     is_chromeos: bool,
+    /// Desktop (Chromebook) layout: show the Properties dock (right side).
+    show_desktop_properties: bool,
+    /// Desktop (Chromebook) layout: show the Output/Scripts dock (bottom).
+    show_desktop_output: bool,
+    /// Desktop (Chromebook) layout: panel active in the bottom dock.
+    desktop_bottom_tab: ActiveTab,
     show_tablet_explorer: bool,
     explorer_width: f32,
     editor_word_wrap: bool,
@@ -433,6 +439,9 @@ impl Default for EditorApp {
             font_size: saved_settings.editor_font_size.clamp(10.0, 32.0),
             ui_mode: saved_settings.ui_mode.clone(),
             is_chromeos: crate::jni_bridge::is_chromeos(),
+            show_desktop_properties: true,
+            show_desktop_output: true,
+            desktop_bottom_tab: ActiveTab::Output,
             compact_toolbar: saved_settings.compact_toolbar,
             show_tablet_explorer: saved_settings.show_tablet_explorer,
             explorer_width: saved_settings.explorer_width.clamp(180.0, 520.0),
@@ -548,7 +557,7 @@ impl Default for EditorApp {
             app.ui_mode,
             app.is_chromeos,
             if app.is_chromeos {
-                "Chromebook detected: desktop layout with Ctrl+1..9 tabs and Ctrl+E sidebar"
+                "Chromebook detected: docked Studio layout (Explorer left, Properties right, Output/Scripts bottom; Ctrl+1..9 / Ctrl+E toggle docks)"
             } else if app.ui_mode == "auto" {
                 "width-based: top tabs above 720 px, bottom navigation below"
             } else {
@@ -727,46 +736,63 @@ impl EditorApp {
             }
         };
 
-        // Desktop-mode keyboard shortcuts (Chromebooks - and desktop builds -
-        // have real keyboards; the classic Android touch path has no Ctrl
-        // key). consume_key() eats the event so text fields never see it.
-        // Ctrl+1..9 jumps to the first nine tabs, Ctrl+E toggles the
-        // Explorer sidebar.
+        // Desktop-mode keyboard shortcuts: toggle the Studio docks
+        // (Chromebooks - and desktop builds - have real keyboards; the
+        // classic Android touch path has no Ctrl key). consume_key() eats
+        // the event so text fields never see it.
+        // Ctrl+1/Ctrl+E Explorer, Ctrl+3 Scripts, Ctrl+4 Properties,
+        // Ctrl+5 Animation, Ctrl+6 Insert, Ctrl+7 Toolbox, Ctrl+8 Snippets,
+        // Ctrl+9 Output dock.
         if is_desktop {
-            let mut tab_index: Option<usize> = None;
-            for (index, key) in [
-                (1usize, egui::Key::Digit1),
-                (2, egui::Key::Digit2),
-                (3, egui::Key::Digit3),
-                (4, egui::Key::Digit4),
-                (5, egui::Key::Digit5),
-                (6, egui::Key::Digit6),
-                (7, egui::Key::Digit7),
-                (8, egui::Key::Digit8),
-                (9, egui::Key::Digit9),
-            ] {
-                if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key)) {
-                    tab_index = Some(index);
-                    break;
+            let mut shortcut: Option<usize> = None;
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
+                shortcut = Some(0);
+            } else {
+                for (index, key) in [
+                    (1usize, egui::Key::Digit1),
+                    (2, egui::Key::Digit2),
+                    (3, egui::Key::Digit3),
+                    (4, egui::Key::Digit4),
+                    (5, egui::Key::Digit5),
+                    (6, egui::Key::Digit6),
+                    (7, egui::Key::Digit7),
+                    (8, egui::Key::Digit8),
+                    (9, egui::Key::Digit9),
+                ] {
+                    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key)) {
+                        shortcut = Some(index);
+                        break;
+                    }
                 }
             }
-            if tab_index.is_none()
-                && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::E))
-            {
-                self.show_tablet_explorer = !self.show_tablet_explorer;
-            }
-            if let Some(index) = tab_index {
-                self.active_tab = match index {
-                    1 => ActiveTab::Explorer,
-                    2 => ActiveTab::Viewport3D,
-                    3 => ActiveTab::ScriptEditor,
-                    4 => ActiveTab::Properties,
-                    5 => ActiveTab::Animation,
-                    6 => ActiveTab::Insert,
-                    7 => ActiveTab::Toolbox,
-                    8 => ActiveTab::Snippets,
-                    _ => ActiveTab::Assets,
-                };
+            if let Some(index) = shortcut {
+                match index {
+                    0 | 1 => self.show_tablet_explorer = !self.show_tablet_explorer,
+                    2 => {} // the 3D viewport is always the center in desktop mode
+                    3 => {
+                        self.desktop_bottom_tab = ActiveTab::ScriptEditor;
+                        self.show_desktop_output = true;
+                    }
+                    4 => self.show_desktop_properties = !self.show_desktop_properties,
+                    5 => {
+                        self.desktop_bottom_tab = ActiveTab::Animation;
+                        self.show_desktop_output = true;
+                    }
+                    6 => {
+                        self.desktop_bottom_tab = ActiveTab::Insert;
+                        self.show_desktop_output = true;
+                    }
+                    7 => {
+                        self.desktop_bottom_tab = ActiveTab::Toolbox;
+                        self.show_desktop_output = true;
+                    }
+                    8 => {
+                        self.desktop_bottom_tab = ActiveTab::Snippets;
+                        self.show_desktop_output = true;
+                    }
+                    9 => self.show_desktop_output = !self.show_desktop_output,
+                    _ => {}
+                }
             }
         }
         if self.editor_focus_mode && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -922,7 +948,109 @@ impl EditorApp {
             right: 10,
         });
 
-        if !self.editor_focus_mode {
+        if is_desktop && !self.editor_focus_mode {
+            // Roblox Studio-style menu bar. Studio itself does not run on
+            // ChromeOS, so this menu + the docked panels are the
+            // Chromebook user's Studio.
+            egui::TopBottomPanel::top("studio_menu_bar")
+                .frame(egui::Frame::side_top_panel(&style).inner_margin(egui::Margin {
+                    top: 2,
+                    bottom: 2,
+                    left: 8,
+                    right: 8,
+                }))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🎮 Roblox Studio Lite").strong());
+                        ui.add_space(8.0);
+                        ui.menu_button("🏠 Home", |ui| {
+                            if ui.button("📄 New").clicked() {
+                                crate::jni_bridge::trigger_create_document("new_place");
+                                ui.close();
+                            }
+                            if ui.button("📂 Open…").clicked() {
+                                crate::jni_bridge::trigger_open_document();
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("💾 Save").clicked() {
+                                self.save();
+                                ui.close();
+                            }
+                            if ui.button("💾 Save As…").clicked() {
+                                self.save_as();
+                                ui.close();
+                            }
+                            if ui.button("🚀 Publish to Roblox").clicked() {
+                                self.publish_place_to_roblox();
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("📥 Import Local .rbxm…").clicked() {
+                                self.prompt_import_local_model();
+                                ui.close();
+                            }
+                            if ui.button("⌘ Quick Open").clicked() {
+                                self.show_quick_open = true;
+                                ui.close();
+                            }
+                            if ui.button("⌕ Symbols").clicked() {
+                                self.show_workspace_symbols = true;
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("📦 Model", |ui| {
+                            ui.add_enabled(false, egui::Label::new("Model tools — coming soon"));
+                        });
+                        ui.menu_button("🔨 Build", |ui| {
+                            ui.add_enabled(false, egui::Label::new("Build tools — coming soon"));
+                        });
+                        ui.menu_button("👁 View", |ui| {
+                            ui.checkbox(&mut self.show_tablet_explorer, "Explorer (Ctrl+1 / Ctrl+E)");
+                            ui.checkbox(&mut self.show_desktop_properties, "Properties (Ctrl+4)");
+                            ui.checkbox(&mut self.show_desktop_output, "Output / Scripts (Ctrl+9)");
+                            ui.separator();
+                            if ui.button(if self.show_gui_preview { "🙈 Hide GUI Preview" } else { "👁 Show GUI Preview" }).clicked() {
+                                self.show_gui_preview = !self.show_gui_preview;
+                                ui.close();
+                            }
+                            if ui.button(if self.show_stats { "📊 Hide Stats" } else { "📊 Show Stats" }).clicked() {
+                                self.show_stats = !self.show_stats;
+                                ui.close();
+                            }
+                            if ui.button(if self.show_skybox { "🌫 Hide Skybox" } else { "🌫 Show Skybox" }).clicked() {
+                                self.show_skybox = !self.show_skybox;
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("▶ Play", |ui| {
+                            ui.add_enabled(false, egui::Label::new("Run experience — coming soon"));
+                        });
+                        ui.menu_button("🧩 Plug-in", |ui| {
+                            if ui.button("🧩 Plugins…").clicked() {
+                                self.desktop_bottom_tab = ActiveTab::Plugins;
+                                self.show_desktop_output = true;
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("❓ Help", |ui| {
+                            if ui.button("⚙ Settings…").clicked() {
+                                self.desktop_bottom_tab = ActiveTab::Settings;
+                                self.show_desktop_output = true;
+                                ui.close();
+                            }
+                            if ui.button("ℹ About").clicked() {
+                                self.status = "Roblox Studio Lite — docked Studio layout for Chromebook".into();
+                                self.log_info("About: Roblox Studio Lite (docked Studio layout)");
+                                ui.close();
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("Ctrl+1 Explorer · 3 Scripts · 4 Properties · 9 Output · E Explorer").weak().small());
+                        });
+                    });
+                });
+        } else if !self.editor_focus_mode {
         let nav_panel = if is_tablet {
             egui::TopBottomPanel::top("nav_tabs")
         } else {
@@ -971,10 +1099,6 @@ impl EditorApp {
                             tab_btn(ui, "▶ Command Bar", ActiveTab::Command);
                             tab_btn(ui, "🖥️ Output", ActiveTab::Output);
                             tab_btn(ui, "⚙️ Settings", ActiveTab::Settings);
-                            if is_desktop {
-                                ui.add_space(8.0);
-                                ui.label(RichText::new("Ctrl+1..9 tabs · Ctrl+E Explorer").weak().small());
-                            }
                         });
                     });
             });
@@ -983,7 +1107,7 @@ impl EditorApp {
         // Do not render the same large tree twice when Explorer itself is the
         // active page; that doubled traversal was especially costly on phones
         // whose landscape width crosses the tablet breakpoint.
-        if is_tablet && self.show_tablet_explorer && !self.editor_focus_mode
+        if is_tablet && !is_desktop && self.show_tablet_explorer && !self.editor_focus_mode
             && self.active_tab != ActiveTab::Explorer
         {
             egui::SidePanel::left("landscape_left")
@@ -996,8 +1120,80 @@ impl EditorApp {
                 });
         }
 
+        // ===== Desktop (Chromebook) docked layout =========================
+        // Classic Roblox Studio arrangement: Explorer on the left, the 3D
+        // viewport in the center, Properties on the right, and an
+        // Output/Scripts dock along the bottom - everything visible at once
+        // instead of tab switching.
+        if is_desktop && self.show_tablet_explorer && !self.editor_focus_mode {
+            egui::SidePanel::left("studio_explorer")
+                .resizable(true)
+                .default_width(self.explorer_width)
+                .width_range(180.0..=520.0)
+                .show(ctx, |ui| {
+                    self.explorer_width = ui.max_rect().width();
+                    self.show_explorer_ui(ui);
+                });
+        }
+        if is_desktop && self.show_desktop_properties && !self.editor_focus_mode {
+            egui::SidePanel::right("studio_properties")
+                .resizable(true)
+                .default_width(260.0)
+                .width_range(180.0..=460.0)
+                .show(ctx, |ui| {
+                    self.show_properties_ui(ui);
+                });
+        }
+        if is_desktop && self.show_desktop_output && !self.editor_focus_mode {
+            egui::TopBottomPanel::bottom("studio_bottom_dock")
+                .resizable(true)
+                .default_height(240.0)
+                .min_height(90.0)
+                .max_height(640.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+                        let mut dock_tab_btn = |ui: &mut egui::Ui, tab: ActiveTab, label: &str| {
+                            let is_active = self.desktop_bottom_tab == tab;
+                            let text = if is_active {
+                                RichText::new(label).strong().color(Color32::from_rgb(100, 200, 255))
+                            } else {
+                                RichText::new(label)
+                            };
+                            if ui.selectable_label(is_active, text).clicked() {
+                                self.desktop_bottom_tab = tab;
+                            }
+                        };
+                        dock_tab_btn(ui, ActiveTab::Output, "🖥️ Output");
+                        dock_tab_btn(ui, ActiveTab::ScriptEditor, &format!("📝 Scripts ({})", self.open_tabs.len()));
+                        dock_tab_btn(ui, ActiveTab::Toolbox, "🧰 Toolbox");
+                        dock_tab_btn(ui, ActiveTab::Snippets, "📜 Snippets");
+                        dock_tab_btn(ui, ActiveTab::Animation, "🎬 Animation");
+                        dock_tab_btn(ui, ActiveTab::Insert, "➕ Insert");
+                        dock_tab_btn(ui, ActiveTab::Assets, "☁️ Creator Store");
+                        dock_tab_btn(ui, ActiveTab::Plugins, "🧩 Plugins");
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            match self.desktop_bottom_tab {
+                                ActiveTab::ScriptEditor => self.show_script_editor_ui(ui),
+                                ActiveTab::Toolbox => self.show_toolbox_ui(ui),
+                                ActiveTab::Snippets => self.show_snippets_ui(ui),
+                                ActiveTab::Animation => self.show_animation_ui(ui),
+                                ActiveTab::Insert => self.show_insert_ui(ui),
+                                ActiveTab::Assets => self.show_assets_ui(ui),
+                                ActiveTab::Plugins => self.show_plugins_ui(ui),
+                                _ => self.show_output_ui(ui),
+                            }
+                        });
+                });
+        }
+
         // Main work area.
-        if self.active_tab == ActiveTab::Viewport3D {
+        if is_desktop || self.active_tab == ActiveTab::Viewport3D {
             // SOLID top control bar (guaranteed to render over the 3D): camera
             // presets, distance/zoom, speed, up/down.
             egui::TopBottomPanel::top("viewport_controls")
@@ -6611,7 +6807,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                 ui.add_space(12.0);
                 ui.group(|ui| {
                     ui.label(RichText::new("📱 Adaptive editor layout").heading().color(Color32::from_rgb(100, 200, 255)));
-                    ui.label("Auto: phones get a bottom navigation bar; tablets get top tabs with an optional Explorer sidebar; Chromebooks (ChromeOS) get the desktop layout with keyboard shortcuts.");
+                    ui.label("Auto: phones get a bottom navigation bar; tablets get top tabs with an optional Explorer sidebar; Chromebooks (ChromeOS) get the docked Studio layout (menu bar, Explorer left, Properties right, Output/Scripts bottom) with keyboard shortcuts.");
                     ui.horizontal_wrapped(|ui| {
                         ui.label("UI mode:");
                         for (value, label) in [
