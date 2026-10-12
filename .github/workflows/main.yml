@@ -550,7 +550,12 @@ jobs:
       - name: Surface failures as annotations
         if: failure() && steps.check.outcome == 'failure'
         run: |
-          diag="$(grep -A 10 '^error' /tmp/ossl-check.log | head -n 45)"
+          # A build script's panic message lands in the "--- stderr" section,
+          # which a grep anchored on "^error" cuts off before reaching.
+          diag="$(awk '/--- stderr/{f=1} f' /tmp/ossl-check.log | head -n 40)"
+          if [ -z "$diag" ]; then
+            diag="$(grep -A 25 '^error' /tmp/ossl-check.log | head -n 45)"
+          fi
           if [ -z "$diag" ]; then
             diag="$(tail -n 40 /tmp/ossl-check.log)"
           fi
