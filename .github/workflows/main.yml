@@ -269,14 +269,15 @@ jobs:
         with:
           fetch-depth: 1
 
-      # bevy_winit/bevy_render only need these at link time on Linux; installing
-      # them keeps `cargo test` from failing on a missing native library.
+      # bevy_winit pulls in wayland-sys, whose build script shells out to
+      # pkg-config for wayland-client and hard-fails without it. The rest are
+      # needed at link time by winit/wgpu on Linux.
       - name: Install native build dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev libasound2-dev libxkbcommon-dev
+            libwayland-dev libxkbcommon-dev libudev-dev libasound2-dev
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
