@@ -529,6 +529,13 @@ jobs:
           ls "$OPENSSL_DIR/include/openssl/ssl.h"
           ls "$OPENSSL_DIR/lib"/libssl.a "$OPENSSL_DIR/lib"/libcrypto.a
           "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" t "$OPENSSL_DIR/lib/libssl.a" | head -3
+          # ngtcp2 refuses to build its OpenSSL backend unless it can see this
+          # symbol, so confirm it is really in the archive we built.
+          echo "--- SSL_set_quic_tls_cbs in libssl.a ---"
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+            "$OPENSSL_DIR/lib/libssl.a" 2>/dev/null | grep -c "SSL_set_quic_tls_cbs" || true
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+            "$OPENSSL_DIR/lib/libssl.a" 2>/dev/null | grep "SSL_set_quic_tls_cbs" | head -3 || true
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
@@ -570,3 +577,16 @@ jobs:
             }
             END { print "::error title=openssl android check::" out }
           '
+          # `check_symbol_exists` reports only pass or fail; the compiler and
+          # linker output behind the decision lands here and nowhere else.
+          for log in target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeError.log; do
+            [ -s "$log" ] || continue
+            tail -n 45 "$log" | awk '
+              {
+                gsub(/%/, "%25")
+                gsub(/\r/, "%0D")
+                out = (out == "" ? $0 : out "%0A" $0)
+              }
+              END { print "::error title=CMakeError.log::" out }
+            '
+          done
