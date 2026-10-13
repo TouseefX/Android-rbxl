@@ -760,6 +760,28 @@ impl AppFlow {
         }
     }
 
+    /// Every complete framed record on channel 1, as (first body byte, body
+    /// length). The first frame alone answered nothing - this shows the whole
+    /// record vocabulary the peer used, so a challenge or marker buried after
+    /// the settings dictionary cannot hide.
+    fn chan1_frames(&self) -> Vec<(u8, usize)> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off < self.chan1_rx.len() {
+            let Some((len, used)) = compact_varint_decode(&self.chan1_rx[off..]) else {
+                break;
+            };
+            let end = off + used + len as usize;
+            if len == 0 || end > self.chan1_rx.len() {
+                break;
+            }
+            let body = &self.chan1_rx[off + used..end];
+            out.push((body[0], body.len()));
+            off = end;
+        }
+        out
+    }
+
     /// Records how the queued-write drain went.
     pub fn set_drain_summary(&mut self, summary: String) {
         self.drain_summary = summary;
@@ -817,11 +839,18 @@ impl AppFlow {
             .take(8)
             .map(|(offset, _)| format!("@{offset}"))
             .collect();
+        let frames: Vec<String> = self
+            .chan1_frames()
+            .iter()
+            .take(24)
+            .map(|(tag, len)| format!("0x{tag:02x}/{len}B"))
+            .collect();
         format!(
-            "chan1 {} bytes buffered, challenge_seen={}, answered={}; 0x9B tag at offsets [{}]; first bytes: {}",
+            "chan1 {} bytes buffered, challenge_seen={}, answered={}; framed records [{}]; 0x9B tag at offsets [{}]; first bytes: {}",
             self.chan1_rx.len(),
             self.challenge_seen,
             self.answered,
+            frames.join(" "),
             tags.join(" "),
             head.join(" ")
         ) + &format!("; printable runs ({}): {}", strings.len(), strings.join(" | "))

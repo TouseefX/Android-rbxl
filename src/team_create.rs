@@ -1956,6 +1956,21 @@ fn build_join_flow_config(
     })
 }
 
+/// Why the connection ended, including the frame type that carried the close.
+///
+/// The close error alone reports only the code. Which frame it arrived on says
+/// whether the peer rejected something specific we sent, which is the difference
+/// between an application that disliked our join and one that tripped over the
+/// transport.
+fn rbx_transport_close_detail(error: ngnet_quic::CloseError) -> String {
+    let frame_type = error.frame_type();
+    if frame_type == 0 {
+        error.to_string()
+    } else {
+        format!("{error} (frame type 0x{frame_type:x})")
+    }
+}
+
 /// Worst-case time the drain loop will spend retrying before handing the
 /// remainder back to the next wake.
 ///
@@ -3782,7 +3797,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
                 }
                 match read_result {
                     Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
-                        connection_closed = Some(connection.close_error().to_string());
+                        connection_closed = Some(rbx_transport_close_detail(connection.close_error()));
                         break;
                     }
                     Ok(_) => {}
@@ -3802,7 +3817,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
                     .and_then(|timestamp| connection.handle_expiry(timestamp).map_err(|error| error.to_string()))
                 {
                     Ok(ngnet_quic::ExpiryOutcome::IdleClose | ngnet_quic::ExpiryOutcome::Terminal) => {
-                        connection_closed = Some(connection.close_error().to_string());
+                        connection_closed = Some(rbx_transport_close_detail(connection.close_error()));
                         break;
                     }
                     Ok(ngnet_quic::ExpiryOutcome::Handled) => {}
