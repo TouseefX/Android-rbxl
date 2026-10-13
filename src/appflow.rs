@@ -611,7 +611,21 @@ impl AppFlow {
         };
         let msg = &self.chan1_rx[off..off + len];
         let Some((blob, u1, u2)) = challenge::extract_challenge(msg).ok() else {
-            self.challenge_seen = true; // malformed; do not re-scan forever
+            // A frame with the 0x9B tag arrived but did not parse. Saying nothing
+            // here made that look identical to "no challenge was ever sent", which
+            // is the difference between a wrong reader and a protocol that does not
+            // use one - so report the bytes instead of going quiet.
+            self.challenge_seen = true; // do not re-scan the same frame forever
+            let head: Vec<String> = msg
+                .iter()
+                .take(64)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            self.events.push(FlowEvent::ChallengeFailed(format!(
+                "0x9B frame received ({} bytes) but did not parse as [9b][u1][u2][len][blob]; first bytes: {}",
+                msg.len(),
+                head.join(" ")
+            )));
             return Vec::new();
         };
         self.challenge_seen = true;
