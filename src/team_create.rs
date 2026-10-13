@@ -3338,13 +3338,27 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
                     off += accepted;
                     control_only = 0;
                 } else if len == 0 {
-                    // Nothing usable this pass; the main loop retries on its
-                    // next wake (avoids a hot spin on a full window).
-                    break;
+                    // The peer's stream window is full. The old code broke out
+                    // and returned Ok, which reported a partial write as a
+                    // successful send - and the unaccepted tail was never handed
+                    // to ngtcp2, so nothing downstream could recover it. The main
+                    // loop's write_pending only flushes what ngtcp2 already has.
+                    return Err(format!(
+                        "stream {stream} stalled with a full window after {off} of {} bytes; \
+                         the remaining {} were NOT sent",
+                        data.len(),
+                        data.len() - off
+                    ));
                 } else if control_only >= 16 {
-                    // Only control-frame datagrams in a row: stop and let
-                    // the main loop's write_pending pick it back up.
-                    break;
+                    // Same failure, reached by a different route: sixteen packets
+                    // in a row carried only control frames, so no stream data was
+                    // accepted. Report it rather than claiming success.
+                    return Err(format!(
+                        "stream {stream} made no progress for 16 packets after {off} of {} bytes; \
+                         the remaining {} were NOT sent",
+                        data.len(),
+                        data.len() - off
+                    ));
                 } else {
                     // The packet was filled with control frames — offer the
                     // same tail again.
