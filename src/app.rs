@@ -390,6 +390,8 @@ pub struct EditorApp {
     team_create_session_running: bool,
     /// Which 0xA7 the next join flow sends: 0 = real capture, 1 = empty, 2 = omit.
     a7_mode_choice: u8,
+    /// Application byte for the control stream header: 0, 1 or 4.
+    ctrl_app_choice: u8,
     /// QUIC/TLS handshake milestone only; not BaseClient-connected or Team Create-accepted.
     team_create_session_quic_handshake_complete: bool,
     team_create_session_status: String,
@@ -554,6 +556,7 @@ impl Default for EditorApp {
             team_create_session_cancel: None,
             team_create_session_running: false,
             a7_mode_choice: 0,
+            ctrl_app_choice: 0,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
             prop_num_buf: HashMap::new(),
@@ -2212,6 +2215,21 @@ ui.label("Place ID:");
                             2 => crate::appflow::A7Mode::Skip,
                             _ => crate::appflow::A7Mode::Real,
                         });
+                        // The application byte in the control stream header. Every
+                        // session that stayed up 3-7s used 0; every session since it
+                        // was changed to 4 has been closed at ~160 ms with the same
+                        // application error. 1 is what 0.741's BaseClient::
+                        // openSendChannel uses.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("ctrl app byte:");
+                            ui.radio_value(&mut self.ctrl_app_choice, 0u8, "0")
+                                .on_hover_text("What every multi-second session used");
+                            ui.radio_value(&mut self.ctrl_app_choice, 1u8, "1")
+                                .on_hover_text("0.741 BaseClient::openSendChannel application");
+                            ui.radio_value(&mut self.ctrl_app_choice, 4u8, "4")
+                                .on_hover_text("Reference client's openStream(APP, CTRL)");
+                        });
+                        crate::appflow::set_ctrl_app(self.ctrl_app_choice);
                         let can_probe = can_start
                             && self
                                 .team_create_join_config

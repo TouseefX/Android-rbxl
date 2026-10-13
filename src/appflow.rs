@@ -24,22 +24,6 @@ pub const CTRL_CHANNEL: u32 = 0x6374_726C;
 
 /// App id written into the ctrl stream header.
 ///
-/// This is a live question, not a settled one. Boblox uses [`APP`] (4) and joins
-/// game servers, so 4 is right there. But the Studio decompile shows the
-/// RbxTransport *base* connection opening ctrl with app 0 at two independent
-/// call sites - `RtcIoBaseConnection::updateTransportConnReadyState` and
-/// `RtcIoServerConnection::start` both call `initializeAppContext(this, 0)`
-/// followed by `initializeChannelContext(this, 0, 0x6374726C, 0, 1, 0, 1)`.
-/// If the header byte for ctrl is 0 rather than 4, a server that routes on it
-/// would ignore our ctrl stream entirely - which matches a session that gets
-/// transport ACKs and no challenge. Kept as one constant so the two are easy to
-/// swap between.
-///
-/// Set to 0 to match the decompile. chan1 stays at [`APP`] because nothing yet
-/// says otherwise for it - the open question is whether ctrl is transport-owned
-/// (app 0) while application channels sit on a higher app id.
-pub const CTRL_APP: u32 = 0;
-
 /// Native 0x90 message template (10 432 B capture). The JSON region is
 /// patched with this session's values; the leading bytes and the final 20
 /// bytes are preserved verbatim.
@@ -99,6 +83,39 @@ pub fn a7_mode_label(mode: A7Mode) -> &'static str {
         A7Mode::Empty => "empty a7 00 00",
         A7Mode::Skip => "omitted",
     }
+}
+
+/// Which application byte the control stream header carries.
+///
+/// Every session that stayed up 3-7 seconds sent app 0 here. Since it was
+/// changed to 4 - to match the reference client's `openStream(APP, CTRL)` -
+/// every session has been closed by the peer at ~160 ms with application error
+/// 0x10000000110 and no reason phrase. Nothing on the wire said 0 was wrong:
+/// the server itself opens control streams under *both* app 0 and app 4, which
+/// is why app 0 parsed fine and hid the difference. The reference client is also
+/// not 0.741, whose `BaseClient::openSendChannel` uses application 1.
+///
+/// The correlation is forward - the byte changed, then the behaviour changed -
+/// but it is still only a correlation, so all three values are reachable from
+/// one build rather than guessing between them.
+///
+/// The 0.741 decompile is the strongest evidence for 0, and it was the reason
+/// for the original value: `RtcIoBaseConnection::updateTransportConnReadyState`
+/// and `RtcIoServerConnection::start` both call `initializeAppContext(this, 0)`
+/// followed by `initializeChannelContext(this, 0, 0x6374726C, 0, 1, 0, 1)`.
+/// chan1 stays at [`APP`] because nothing says otherwise for it; the open
+/// question is whether ctrl is transport-owned (app 0) while application
+/// channels sit on a higher app id.
+static CTRL_APP_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Choose the control stream's application byte for subsequent join flows.
+pub fn set_ctrl_app(app: u8) {
+    CTRL_APP_OVERRIDE.store(app, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The control stream's application byte. Defaults to 0.
+pub fn ctrl_app() -> u32 {
+    CTRL_APP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) as u32
 }
 
 /// Decoded early-auth material (the base64 fields 2 and 3 of the
@@ -688,7 +705,8 @@ impl AppFlow {
         // not on app 0: `openStream(APP, CTRL)`. The server itself opens control
         // streams under both ids, so app 0 parsed fine and hid the difference -
         // but the bytes on the wire were not the ones a working client sends.
-        let mut ctrl = stream_header(APP, CTRL_CHANNEL).to_vec();
+        let ctrl_app = ctrl_app();
+        let mut ctrl = stream_header(ctrl_app, CTRL_CHANNEL).to_vec();
         ctrl.extend_from_slice(&frame(&[0x00, 0x00]));
         for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
             ctrl.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
@@ -697,15 +715,16 @@ impl AppFlow {
         // is unresolved, and the only way to compare against a capture is to
         // see the exact seven bytes we put on the wire.
         self.events.push(FlowEvent::Log(format!(
-            "ctrl stream header: {}",
-            stream_header(APP, CTRL_CHANNEL)
+            "ctrl stream header: {} (application {})",
+            stream_header(ctrl_app, CTRL_CHANNEL)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join(" "),
+            ctrl_app
         )));
         actions.push(Action::OpenStream {
-            app: APP,
+            app: ctrl_app,
             chan: CTRL_CHANNEL,
             data: ctrl,
         });
@@ -1021,6 +1040,18 @@ impl AppFlow {
     }
 
     /// Which 0x90 fields came from this session and which are still captured.
+    /// Which 0xA7 and control application byte this session sent.
+    ///
+    /// Both are user-selectable, so a pass/fail result cannot be attributed
+    /// without them, and a log line the operator never sees is not a result.
+    pub fn flow_config_summary(&self) -> String {
+        format!(
+            "0xA7 = {}, control stream application = {}",
+            a7_mode_label(self.cfg.a7_mode),
+            ctrl_app()
+        )
+    }
+
     pub fn join90_report(&self) -> &str {
         if self.join90_report.is_empty() {
             "0x90 was not built"
@@ -1548,6 +1579,14 @@ mod tests {
 
     #[test]
     fn a7_real_template_starts_with_a7() {
+        // The control application byte defaults to 0, which is the value every
+        // multi-second session used.
+        assert_eq!(ctrl_app(), 0, "default ctrl app must stay 0");
+        for app in [0u8, 1, 4] {
+            set_ctrl_app(app);
+            assert_eq!(ctrl_app(), app as u32);
+        }
+        set_ctrl_app(0);
         // The UI selector must round-trip, or the three-way test it exists for
         // silently sends the same frame every time.
         for (mode, expect) in [
