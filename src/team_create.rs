@@ -2039,18 +2039,157 @@ fn build_join_flow_config(
     })
 }
 
+/// `RBX::ConnectionError`, read out of the 0.741 client.
+///
+/// Extracted from the enum's registration routine, where each item is a
+/// `mov r9d, <value>` / `lea rdx, [<name>]` pair passed to the item constructor
+/// - 109 items, in the order the client registers them. The server reports these
+/// in the QUIC application error code of its `CONNECTION_CLOSE`, ORed with
+/// `1 << 40`, which is why the raw value reads as `0x10000000110` rather than 272.
+const RBX_CONNECTION_ERRORS: &[(u64, &str)] = &[
+    (0, "OK"),
+    (1, "Unknown"),
+    (2, "ConnectErrors"),
+    (3, "AlreadyConnected"),
+    (4, "NoFreeIncomingConnections"),
+    (5, "ConnectionBanned"),
+    (6, "InvalidPassword"),
+    (7, "IncompatibleProtocolVersion"),
+    (8, "IPRecentlyConnected"),
+    (9, "OurSystemRequiresSecurity"),
+    (10, "SecurityKeyMismatch"),
+    (256, "DisconnectErrors"),
+    (257, "DisconnectBadhash"),
+    (258, "DisconnectSecurityKeyMismatch"),
+    (259, "DisconnectProtocolMismatch"),
+    (260, "DisconnectReceivePacketError"),
+    (261, "DisconnectReceivePacketStreamError"),
+    (262, "DisconnectSendPacketError"),
+    (263, "DisconnectIllegalTeleport"),
+    (264, "DisconnectDuplicatePlayer"),
+    (265, "DisconnectDuplicateTicket"),
+    (266, "DisconnectTimeout"),
+    (267, "DisconnectLuaKick"),
+    (268, "DisconnectOnRemoteSysStats"),
+    (269, "DisconnectHashTimeout"),
+    (270, "DisconnectCloudEditKick"),
+    (271, "DisconnectPlayerless"),
+    (272, "DisconnectNewSecurityKeyMismatch"),
+    (273, "DisconnectEvicted"),
+    (274, "DisconnectDevMaintenance"),
+    (275, "DisconnectRobloxMaintenance"),
+    (276, "DisconnectRejoin"),
+    (277, "DisconnectConnectionLost"),
+    (278, "DisconnectIdle"),
+    (279, "DisconnectRaknetErrors"),
+    (281, "DisconnectBySecurityPolicy"),
+    (282, "DisconnectBlockedIP"),
+    (284, "DisconnectClientFailure"),
+    (285, "DisconnectClientRequest"),
+    (286, "DisconnectPrivateServerKickout"),
+    (287, "DisconnectModeratedGame"),
+    (288, "ServerShutdown"),
+    (290, "ReplicatorTimeout"),
+    (291, "PlayerRemoved"),
+    (292, "DisconnectOutOfMemoryKeepPlayingLeave"),
+    (293, "DisconnectRomarkEndOfTest"),
+    (295, "DisconnectCollaboratorUnderage"),
+    (296, "NetworkInternal"),
+    (297, "NetworkSend"),
+    (298, "NetworkTimeout"),
+    (299, "NetworkMisbehavior"),
+    (301, "ReplacementReady"),
+    (302, "ServerEmpty"),
+    (303, "PhantomFreeze"),
+    (304, "AndroidAnticheatKick"),
+    (305, "AndroidEmulatorKick"),
+    (306, "AndroidRootedKick"),
+    (307, "ScreentimeLockoutKick"),
+    (308, "DisconnectionNotification"),
+    (309, "DisconnectVerboselyModeratedGame"),
+    (310, "DisconnectCollaboratorNotAgeVerified"),
+    (311, "DisconnectCollaboratorTrustedConnectionsRequired"),
+    (312, "DisconnectCollaboratorOwnerActionRequired"),
+    (313, "DisconnectCollaboratorTooManyCollaborators"),
+    (314, "DisconnectCollaboratorUnknownError"),
+    (315, "DisconnectCollaboratorRequestedEviction"),
+    (316, "DisconnectCollaboratorTrustedConnectionsRequiredPC"),
+    (317, "DisconnectRemoteAttestationUnsupported"),
+    (318, "DisconnectRemoteAttestationGeneralFailure"),
+    (319, "DisconnectRemoteAttestationTimeout"),
+    (320, "DisconnectRemoteAttestationOSOutOfDate"),
+    (321, "DisconnectRemoteAttestationBootValidationFailure"),
+    (512, "PlacelaunchErrors"),
+    (515, "PlacelaunchDisabled"),
+    (516, "PlacelaunchError"),
+    (517, "PlacelaunchGameEnded"),
+    (518, "PlacelaunchGameFull"),
+    (522, "PlacelaunchUserLeft"),
+    (523, "PlacelaunchRestricted"),
+    (524, "PlacelaunchUnauthorized"),
+    (525, "PlacelaunchFlooded"),
+    (526, "PlacelaunchHashExpired"),
+    (527, "PlacelaunchHashException"),
+    (528, "PlacelaunchPartyCannotFit"),
+    (529, "PlacelaunchHttpError"),
+    (533, "PlacelaunchUserPrivacyUnauthorized"),
+    (541, "PlacelaunchVipOwnerNotPresent"),
+    (542, "PlacelaunchAgeVerificationRequired"),
+    (543, "PlacelaunchParentalApprovalRequired"),
+    (544, "PlacelaunchCoreGated"),
+    (545, "PlacelaunchCollaborationCoreGated"),
+    (600, "PlacelaunchCreatorBan"),
+    (601, "PlacelaunchDeviceBlock"),
+    (611, "PlacelaunchOtherError"),
+    (768, "TeleportErrors"),
+    (769, "TeleportFailure"),
+    (770, "TeleportGameNotFound"),
+    (771, "TeleportGameEnded"),
+    (772, "TeleportGameFull"),
+    (773, "TeleportUnauthorized"),
+    (774, "TeleportFlooded"),
+    (775, "TeleportIsTeleporting"),
+    (1024, "TransportErrors"),
+    (1025, "DisconnectTransportIoError"),
+    (1026, "DisconnectTransportIoInternetError"),
+    (1027, "DisconnectTransportProtocolError"),
+    (1028, "DisconnectTransportNgtcp2Error"),
+    (1029, "DisconnectTransportQuicError"),
+    (1030, "DisconnectTransportRnaError"),
+];
+
+/// Name a Roblox connection-error code, if it is one.
+///
+/// The peer closed with `0x10000000110`. That is `(1 << 40) | 272`, and 272 is
+/// `DisconnectNewSecurityKeyMismatch` - the single most useful fact yet obtained
+/// about why the join fails, and invisible while it stayed a bare hex number.
+fn rbx_connection_error_name(code: u64) -> Option<(u64, &'static str)> {
+    let value = code & 0xFF_FFFF_FFFF;
+    RBX_CONNECTION_ERRORS
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map(|(v, name)| (*v, *name))
+}
+
 /// Why the connection ended, including the frame type that carried the close.
 ///
 /// The close error alone reports only the code. Which frame it arrived on says
 /// whether the peer rejected something specific we sent, which is the difference
 /// between an application that disliked our join and one that tripped over the
-/// transport.
+/// transport. The Roblox reason name says why.
 fn rbx_transport_close_detail(error: ngnet_quic::CloseError) -> String {
     let frame_type = error.frame_type();
-    if frame_type == 0 {
-        error.to_string()
-    } else {
-        format!("{error} (frame type 0x{frame_type:x})")
+    let base = error.to_string();
+    let named = match error.reason() {
+        ngnet_quic::CloseReason::Application(code) => rbx_connection_error_name(code.get())
+            .map(|(value, name)| format!(" = RBX::ConnectionError::{name} ({value})")),
+        _ => None,
+    };
+    match (named, frame_type) {
+        (Some(name), 0) => format!("{base}{name}"),
+        (Some(name), _) => format!("{base}{name} (frame type 0x{frame_type:x})"),
+        (None, 0) => base,
+        (None, _) => format!("{base} (frame type 0x{frame_type:x})"),
     }
 }
 
@@ -6011,6 +6150,30 @@ pub fn run_join_config_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connection_error_codes_are_named() {
+        // The two codes actually observed from the server.
+        assert_eq!(
+            rbx_connection_error_name(0x10000000110),
+            Some((272, "DisconnectNewSecurityKeyMismatch"))
+        );
+        assert_eq!(
+            rbx_connection_error_name(0x10000000120),
+            Some((288, "ServerShutdown"))
+        );
+        // The 1<<40 flag is stripped, not required.
+        assert_eq!(
+            rbx_connection_error_name(272),
+            Some((272, "DisconnectNewSecurityKeyMismatch"))
+        );
+        assert_eq!(rbx_connection_error_name(0x10000000999), None);
+        // No duplicate values: a duplicate would silently shadow a name.
+        let mut seen = std::collections::HashSet::new();
+        for (value, _) in RBX_CONNECTION_ERRORS {
+            assert!(seen.insert(*value), "duplicate ConnectionError value {value}");
+        }
+    }
+
     use super::*;
 
     fn hex_fixture(text: &str) -> Vec<u8> {
