@@ -1755,7 +1755,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1773,7 +1773,8 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.preauth_len,
             report.auth_len,
             report.early_auth_payload_len,
-            report.inbound_summary
+            report.inbound_summary,
+            report.flow_channel_opens
         ),
         Err(reason) => format!(
             "\nRbxTransport QUIC session attempt failed before inbound Team Create traffic was accepted: {reason}"
@@ -1818,6 +1819,10 @@ struct RbxTransportConnectionReport {
     /// missing. Distinct from `flow_burst_errors`: nothing errored, the frame
     /// simply was not built.
     flow_skipped: Vec<String>,
+    /// Channel assignments the peer announced on its control streams. These
+    /// were only ever emitted as Status events, which the session report does
+    /// not carry - so parsing them changed nothing that could be seen.
+    flow_channel_opens: String,
     inbound_summary: String,
 }
 
@@ -2746,6 +2751,24 @@ async fn attempt_rbx_transport_connection_async(
         flow_active: join_flow.is_some(),
         flow_burst_errors: burst_errors,
         flow_skipped: burst_skipped,
+        flow_channel_opens: join_flow
+            .as_ref()
+            .map(|flow| {
+                let opens = flow.channel_opens();
+                if opens.is_empty() {
+                    "none parsed".to_string()
+                } else {
+                    opens
+                        .iter()
+                        .map(|(app, chan, wire)| match wire {
+                            Some(wire) => format!("app={app} chan={chan} wire={wire}"),
+                            None => format!("app={app} chan={chan} (reliable)"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                }
+            })
+            .unwrap_or_else(|| "flow inactive".to_string()),
         flow_answered,
         inbound_summary,
     })
