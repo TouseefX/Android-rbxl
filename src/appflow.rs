@@ -547,6 +547,11 @@ pub struct AppFlow {
     chan1_reset: bool,
     challenge_seen: bool,
     answered: bool,
+    /// How far the marker walk has consumed `chan1_rx`.
+    marker_off: usize,
+    marker_seen: bool,
+    marker_id: u32,
+    markers_acked: u64,
     routes_at_ms: i64,
     post_answer_bytes: u64,
     post_answer_reported: bool,
@@ -582,6 +587,10 @@ impl AppFlow {
             chan1_rx: Vec::new(),
             chan1_reset: false,
             challenge_seen: false,
+            marker_off: 0,
+            marker_seen: false,
+            marker_id: 0,
+            markers_acked: 0,
             skipped: Vec::new(),
             pending: std::collections::VecDeque::new(),
             drain_summary: String::new(),
@@ -620,7 +629,11 @@ impl AppFlow {
         // ctrl stream: hello, then the four openU frames. They land on one
         // QUIC stream, so a single write is byte-identical to the native
         // per-frame sends.
-        let mut ctrl = stream_header(CTRL_APP, CTRL_CHANNEL).to_vec();
+        // The reference client opens the control stream on the *application* id,
+        // not on app 0: `openStream(APP, CTRL)`. The server itself opens control
+        // streams under both ids, so app 0 parsed fine and hid the difference -
+        // but the bytes on the wire were not the ones a working client sends.
+        let mut ctrl = stream_header(APP, CTRL_CHANNEL).to_vec();
         ctrl.extend_from_slice(&frame(&[0x00, 0x00]));
         for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
             ctrl.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
@@ -630,14 +643,14 @@ impl AppFlow {
         // see the exact seven bytes we put on the wire.
         self.events.push(FlowEvent::Log(format!(
             "ctrl stream header: {}",
-            stream_header(CTRL_APP, CTRL_CHANNEL)
+            stream_header(APP, CTRL_CHANNEL)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         )));
         actions.push(Action::OpenStream {
-            app: CTRL_APP,
+            app: APP,
             chan: CTRL_CHANNEL,
             data: ctrl,
         });
@@ -809,7 +822,9 @@ impl AppFlow {
                     });
                 }
             }
-            self.try_challenge()
+            let mut actions = self.try_marker();
+            actions.extend(self.try_challenge());
+            actions
         } else {
             self.feed_ctrl(stream, app, chan, data);
             Vec::new()
@@ -875,6 +890,56 @@ impl AppFlow {
             }
             (None, _) => {}
         }
+    }
+
+    /// Walk channel 1 for the server's snapshot-done marker and acknowledge it.
+    ///
+    /// `0x84` carries a little-endian id and the reply is `0x04` followed by the
+    /// same id. Every complete frame is stepped over whether or not it is a
+    /// marker, and each marker is acked exactly once.
+    fn try_marker(&mut self) -> Vec<Action> {
+        let Some(chan1) = self.chan1 else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        while self.marker_off < self.chan1_rx.len() {
+            let Some((len, used)) = compact_varint_decode(&self.chan1_rx[self.marker_off..])
+            else {
+                break;
+            };
+            let end = self.marker_off + used + len as usize;
+            if len == 0 || end > self.chan1_rx.len() {
+                break; // partial tail: wait for the rest
+            }
+            // Scoped so the borrow of `chan1_rx` ends before `self` is mutated.
+            let marker_id = {
+                let body = &self.chan1_rx[self.marker_off + used..end];
+                if body.len() == 5 && body[0] == 0x84 {
+                    Some(u32::from_le_bytes(body[1..5].try_into().unwrap()))
+                } else {
+                    None
+                }
+            };
+            self.marker_off = end;
+            if let Some(id) = marker_id {
+                self.marker_seen = true;
+                self.marker_id = id;
+                self.markers_acked += 1;
+                let mut ack = vec![0x04u8];
+                ack.extend_from_slice(&id.to_le_bytes());
+                self.log(format!("0x84 marker id={id} acknowledged"));
+                actions.push(Action::Write {
+                    stream: chan1,
+                    data: frame(&ack),
+                });
+            }
+        }
+        actions
+    }
+
+    /// How many snapshot-done markers were acknowledged.
+    pub fn markers_acked(&self) -> u64 {
+        self.markers_acked
     }
 
     /// Every complete framed record on channel 1, as (first body byte, body
@@ -972,10 +1037,16 @@ impl AppFlow {
             .map(|(tag, len)| format!("0x{tag:02x}/{len}B"))
             .collect();
         format!(
-            "chan1 {} bytes buffered, challenge_seen={}, answered={}; framed records [{}]; 0x9B tag at offsets [{}]; first bytes: {}",
+            "chan1 {} bytes buffered, challenge_seen={}, answered={}, markers_acked={}{}; framed records [{}]; 0x9B tag at offsets [{}]; first bytes: {}",
             self.chan1_rx.len(),
             self.challenge_seen,
             self.answered,
+            self.markers_acked,
+            if self.marker_seen {
+                format!(" (last id={})", self.marker_id)
+            } else {
+                String::new()
+            },
             frames.join(" "),
             tags.join(" "),
             head.join(" ")
@@ -1349,6 +1420,56 @@ mod tests {
         assert!(built.refreshed.iter().any(|k| k == "UserId"));
         assert!(built.frozen.iter().any(|k| k == "UserName"));
         assert!(!built.frozen.iter().any(|k| k == "UserId"));
+    }
+
+    /// The server's snapshot-done marker is `0x84` plus a little-endian id, and
+    /// the reply is `0x04` plus the same id on the same stream. Join progress is
+    /// gated on that ack, so the wire format has to be exact.
+    #[test]
+    fn marker_is_acknowledged_with_its_own_id() {
+        let cfg = JoinConfig {
+            user_id: 1,
+            user_name: None,
+            display_name: None,
+            domain_user_id: None,
+            client_ticket: "t;2".into(),
+            session_id: "s".into(),
+            random_seed1: None,
+            api_security_token: None,
+            serialized_client_fields: None,
+            encrypted_server_fields: None,
+            early_auth: None,
+            a7_mode: A7Mode::Skip,
+        };
+        let id: u32 = 0x0102_0304;
+        let mut body = vec![0x84u8];
+        body.extend_from_slice(&id.to_le_bytes());
+        let whole = frame(&body);
+
+        let mut flow = AppFlow::new(cfg.clone(), 0);
+        flow.note_opened(APP, 1, 7);
+        let actions = flow.on_stream_data(7, &whole);
+        assert_eq!(actions.len(), 1, "one marker, one ack");
+        match &actions[0] {
+            Action::Write { stream, data } => {
+                assert_eq!(*stream, 7, "the ack goes back on channel 1");
+                let (len, used) = compact_varint_decode(data).unwrap();
+                assert_eq!(len as usize, 5);
+                assert_eq!(&data[used..], &[0x04, 0x04, 0x03, 0x02, 0x01]);
+            }
+            other => panic!("expected a Write, got {other:?}"),
+        }
+        assert_eq!(flow.markers_acked(), 1);
+
+        // A marker split across two reads is acked once, after it completes -
+        // not twice, and not never.
+        let mut split_flow = AppFlow::new(cfg, 0);
+        split_flow.note_opened(APP, 1, 9);
+        let at = whole.len() / 2;
+        assert!(split_flow.on_stream_data(9, &whole[..at]).is_empty());
+        assert_eq!(split_flow.markers_acked(), 0, "a partial frame is not a marker");
+        assert_eq!(split_flow.on_stream_data(9, &whole[at..]).len(), 1);
+        assert_eq!(split_flow.markers_acked(), 1);
     }
 
     #[test]

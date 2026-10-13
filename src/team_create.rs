@@ -1774,7 +1774,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\n0x90 identity: {}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1796,7 +1796,8 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.flow_channel_opens,
             report.flow_challenge_state,
             report.flow_drain_summary,
-            report.flow_join90_report
+            report.flow_join90_report,
+            report.flow_markers_acked
         ),
         Err(reason) => format!(
             "\nRbxTransport QUIC session attempt failed before inbound Team Create traffic was accepted: {reason}"
@@ -1851,6 +1852,8 @@ struct RbxTransportConnectionReport {
     flow_drain_summary: String,
     /// Which 0x90 template fields were refreshed from this session.
     flow_join90_report: String,
+    /// Snapshot-done markers acknowledged on channel 1.
+    flow_markers_acked: u64,
     inbound_summary: String,
 }
 
@@ -2833,6 +2836,10 @@ async fn attempt_rbx_transport_connection_async(
             .as_ref()
             .map(|flow| flow.join90_report().to_owned())
             .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_markers_acked: join_flow
+            .as_ref()
+            .map(|flow| flow.markers_acked())
+            .unwrap_or(0),
         flow_answered,
         inbound_summary,
     })
@@ -5858,7 +5865,15 @@ pub fn run_join_config_session(
                         if connection_report.flow_burst_errors.is_empty()
                             && connection_report.flow_skipped.is_empty()
                         {
-                            "⚠️ app=4 join flow: burst sent, but the 0x9B challenge was not answered — connected stage NOT reached".into()
+                            // Across every run on this path the server has never
+                            // sent a 0x9B: channel 1 carries a single 0x93
+                            // settings dictionary. Reporting "challenge not
+                            // answered" reads as a failure we caused, when the
+                            // real question is whether the peer kept the session.
+                            format!(
+                                "⚠️ app=4 join flow: burst sent in full; no 0x9B challenge arrived on this path, and {} snapshot marker(s) acknowledged",
+                                connection_report.flow_markers_acked
+                            )
                         } else if connection_report.flow_burst_errors.is_empty() {
                             // Nothing errored, but the burst was incomplete: a
                             // frame was never built, so the server got a partial
@@ -5896,7 +5911,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\n0x90 identity: {}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -5914,7 +5929,8 @@ pub fn run_join_config_session(
                     connection_report.flow_channel_opens,
                     connection_report.flow_challenge_state,
                     connection_report.flow_drain_summary,
-                    connection_report.flow_join90_report
+                    connection_report.flow_join90_report,
+                    connection_report.flow_markers_acked
                 ));
             }
             Err(reason) => report.push_str(&format!(
