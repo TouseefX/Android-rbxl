@@ -508,6 +508,7 @@ fn generate_bindings(
             .allowlist_function("SSL_dane_enable")
             .allowlist_function("SSL_add_expected_rpk")
             .allowlist_function("SSL_set1_client_cert_type")
+            .allowlist_function("SSL_set1_server_cert_type")
             .allowlist_function("SSL_get_negotiated_server_cert_type")
             // Shaping the ClientHello. `SSL_CTX_set_min_proto_version`,
             // `SSL_CTX_set1_groups_list` and `SSL_OP_BIT` are macros bindgen does

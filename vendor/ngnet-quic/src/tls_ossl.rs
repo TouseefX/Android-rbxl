@@ -1191,6 +1191,7 @@ pub struct OsslBackendBuilder {
     ciphersuites: Option<Vec<u8>>,
     groups_list: Option<Vec<u8>>,
     no_certificate_compression: bool,
+    server_cert_type_rpk: bool,
 }
 
 impl OsslBackendBuilder {
@@ -1210,7 +1211,19 @@ impl OsslBackendBuilder {
             ciphersuites: None,
             groups_list: None,
             no_certificate_compression: false,
+            server_cert_type_rpk: false,
         }
+    }
+
+    /// Offers `server_certificate_type` asking for a raw public key.
+    ///
+    /// Without this the peer sends an X.509 chain, because that is the default
+    /// and the only kind it has been told we accept. RFC 7250 needs the client to
+    /// say so in the ClientHello; the extension is `server_certificate_type`
+    /// (0x0014) with RawPublicKey (2) as its body.
+    pub fn server_certificate_type_raw_public_key(mut self) -> Self {
+        self.server_cert_type_rpk = true;
+        self
     }
 
     /// Pins the handshake to exactly one TLS version, minimum and maximum.
@@ -1993,6 +2006,23 @@ impl OsslSession {
             verify: backend.verify,
             role,
         };
+
+        if backend.server_cert_type_rpk && role == Role::Client {
+            // 2 is RawPublicKey in RFC 7250's server_certificate_type extension;
+            // X.509 (0) is deliberately not offered.
+            let cert_type = [2u8];
+            // SAFETY: `ssl` is valid and the slice outlives the call.
+            if unsafe {
+                sys::SSL_set1_server_cert_type(
+                    session.ssl,
+                    cert_type.as_ptr(),
+                    cert_type.len(),
+                )
+            } != 1
+            {
+                return Err(tls_error("SSL_set1_server_cert_type failed"));
+            }
+        }
 
         if let Some(rpk) = &backend.expected_rpk {
             // DANE first: `SSL_add_expected_rpk` stores the pin as a DANE-EE

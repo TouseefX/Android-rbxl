@@ -1628,7 +1628,11 @@ fn decode_rbx_transport_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     Some((value, encoded_len))
 }
 
-const RBX_TRANSPORT_ALPN: &[u8] = b"RbxTransport";
+// The ALPN the UDMUX edge selects for a game connection. A session log showed
+// "negotiated unexpected ALPN None; expected RbxTransport" - the server was
+// offered "RbxTransport" and selected nothing, because that is not what it
+// advertises. The clients that complete the handshake offer "rbx-rtcio".
+const RBX_TRANSPORT_ALPN: &[u8] = b"rbx-rtcio";
 #[cfg(not(test))]
 const RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES: usize = 1 << 20;
 const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
@@ -2225,6 +2229,9 @@ async fn attempt_rbx_transport_connection_async(
             .ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
             .groups_list("X25519")
             .no_certificate_compression()
+            // server_certificate_type = RawPublicKey, so the edge sends its bare
+            // Ed25519 key rather than an X.509 chain.
+            .server_certificate_type_raw_public_key()
             // No verification, matching the reference client. The raw-public-key
             // pin below is stricter than anything the working client does, and a
             // pin that does not match the edge's actual key fails the handshake
