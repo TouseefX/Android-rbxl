@@ -700,7 +700,9 @@ impl AppFlow {
     /// announces its channel assignments here; dropping them is what left twelve
     /// opened channels unacknowledged.
     fn feed_ctrl(&mut self, stream: i64, app: u32, chan: u32, data: &[u8]) {
-        let buf = self.ctrl_rx.entry(stream).or_default();
+        // Taken out rather than borrowed through `entry`: `note_control_record`
+        // needs `&mut self`, which an outstanding borrow of `ctrl_rx` forbids.
+        let mut buf = self.ctrl_rx.remove(&stream).unwrap_or_default();
         buf.extend_from_slice(data);
         let mut off = 0usize;
         while off < buf.len() {
@@ -716,6 +718,9 @@ impl AppFlow {
             self.note_control_record(app, chan, &body);
         }
         buf.drain(..off);
+        if !buf.is_empty() {
+            self.ctrl_rx.insert(stream, buf);
+        }
     }
 
     fn note_control_record(&mut self, app: u32, chan: u32, body: &[u8]) {
