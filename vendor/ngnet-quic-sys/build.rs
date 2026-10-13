@@ -49,9 +49,25 @@ fn main() {
             println!("cargo::rustc-link-search=native={}", dir.display());
         }
         for lib in &openssl.libs {
-            // Dynamic: these are the system's OpenSSL, not something this crate
-            // built, so vendoring them into the rlib would be wrong.
-            println!("cargo::rustc-link-lib=dylib={lib}");
+            // Dynamic when a shared library is actually there, which is the case
+            // for a system OpenSSL: it belongs to the platform, and vendoring it
+            // into the rlib would be wrong.
+            //
+            // Android is the exception. It has no system OpenSSL at all, so
+            // `OPENSSL_DIR` points at a tree this build produced, configured
+            // `no-shared` - there is no `.so` to ask for, and the only thing that
+            // links is the archive. Decided by what is on disk rather than by
+            // target, so a platform that does ship a shared library keeps getting
+            // the dynamic link.
+            let shared = openssl.link_paths.iter().any(|dir| {
+                dir.join(format!("lib{lib}.so")).is_file()
+                    || dir.join(format!("lib{lib}.dylib")).is_file()
+            });
+            if shared {
+                println!("cargo::rustc-link-lib=dylib={lib}");
+            } else {
+                println!("cargo::rustc-link-lib=static={lib}");
+            }
         }
     }
 

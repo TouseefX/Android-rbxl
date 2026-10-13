@@ -48,11 +48,14 @@ env:
 jobs:
   build-android:
     name: Build Android APK
-    # Manual-only: the full NDK/Gradle/APK pipeline is expensive, so it is not
-    # run on every push. Dispatch it from the Actions tab (or `gh workflow run`)
-    # when an APK is actually wanted.
-    if: github.event_name == 'workflow_dispatch'
+    # Manual on master, and also on pushes to an `arena/**` working branch: the
+    # full NDK/Gradle/APK pipeline is expensive, so master does not pay for it on
+    # every push, but a working branch needs the APK to actually test a change -
+    # and `workflow_dispatch` is not always available to whoever is iterating.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/arena/')
     runs-on: ubuntu-latest
+    env:
+      OPENSSL_VERSION: "3.5.9"
 
     steps:
       - name: Checkout
@@ -77,6 +80,51 @@ jobs:
         with:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: false
+
+      - name: Restore a previously built OpenSSL
+        id: ossl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/ossl-android
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-pic-${{ env.NDK_VERSION }}
+
+      # Unlike the check job this has to produce a linkable archive: the cdylib
+      # takes libssl.a and libcrypto.a into librbxl_editor.so. Same cache key as
+      # check-openssl-android, so whichever job runs first saves the other the
+      # cross-compile.
+      - name: Cross-compile OpenSSL ${{ env.OPENSSL_VERSION }} for aarch64-linux-android
+        if: steps.ossl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          export ANDROID_NDK_ROOT="$NDK"
+          export ANDROID_NDK_HOME="$NDK"
+          export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          curl -fsSL "https://codeload.github.com/openssl/openssl/tar.gz/refs/tags/openssl-${OPENSSL_VERSION}" -o /tmp/ossl.tar.gz
+          mkdir -p /tmp/ossl-src
+          tar -xzf /tmp/ossl.tar.gz -C /tmp/ossl-src --strip-components=1
+          cd /tmp/ossl-src
+          ./Configure android-arm64 no-shared no-tests no-docs no-ui-console no-engine -fPIC \
+            --prefix="${{ github.workspace }}/ossl-android" --libdir=lib > /tmp/ossl-configure.log 2>&1 \
+            || {{ tail -n 40 /tmp/ossl-configure.log; exit 1; }}
+          make -j"$(nproc)" > /tmp/ossl-make.log 2>&1 \
+            || {{ tail -n 60 /tmp/ossl-make.log; exit 1; }}
+          make install_sw > /tmp/ossl-install.log 2>&1 \
+            || {{ tail -n 40 /tmp/ossl-install.log; exit 1; }}
+
+      - name: Keep the built OpenSSL
+        if: always() && steps.ossl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/ossl-android
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-pic-${{ env.NDK_VERSION }}
+
+      - name: Point the build at OpenSSL
+        run: |
+          set -euo pipefail
+          echo "OPENSSL_DIR=${{ github.workspace }}/ossl-android" >> "$GITHUB_ENV"
+          ls "${{ github.workspace }}/ossl-android/lib"/libssl.a \
+             "${{ github.workspace }}/ossl-android/lib"/libcrypto.a
 
       # xbuild always compiles against $XDG_CACHE_HOME/x/Android.ndk. By default
       # it downloads a 2022-era sysroot from its own GitHub release, which has
@@ -167,7 +215,7 @@ jobs:
           # --release: the debug profile produced a ~1 GB APK. [profile.release]
           # in Cargo.toml strips DWARF but keeps the symbol table, so logcat
           # backtraces still resolve to function names.
-          x build --release --platform android --arch arm64 --format apk --verbose
+          x build --release --platform android --arch arm64 --format apk --features ossl-tls --verbose
 
       - name: Zipalign + sign the APK
         run: |
@@ -517,7 +565,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/ossl-android
-          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-noeng-${{ env.NDK_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-pic-${{ env.NDK_VERSION }}
 
       # OpenSSL's android-arm64 target picks its toolchain up from
       # ANDROID_NDK_ROOT, so the NDK step above is all it needs. `no-shared`
@@ -540,7 +588,9 @@ jobs:
           # prompt or loads a legacy ENGINE, and removing them means the archive
           # links at any API level instead of depending on the NDK wrapper the
           # cmake crate happens to pick.
-          ./Configure android-arm64 no-shared no-tests no-docs no-ui-console no-engine \
+          # `-fPIC` because the archive ends up inside librbxl_editor.so, and
+          # the Android target does not imply it for a no-shared build.
+          ./Configure android-arm64 no-shared no-tests no-docs no-ui-console no-engine -fPIC \
             --prefix="${GITHUB_WORKSPACE}/ossl-android" --libdir=lib > /tmp/ossl-configure.log 2>&1 \
             || { tail -n 40 /tmp/ossl-configure.log; exit 1; }
           make -j"$(nproc)" > /tmp/ossl-make.log 2>&1 \
@@ -589,7 +639,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/ossl-android
-          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-noeng-${{ env.NDK_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-pic-${{ env.NDK_VERSION }}
 
       - name: Install Rust nightly and the Android target
         uses: dtolnay/rust-toolchain@nightly
