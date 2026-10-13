@@ -1755,7 +1755,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1775,7 +1775,8 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.early_auth_payload_len,
             report.inbound_summary,
             report.flow_channel_opens,
-            report.flow_challenge_state
+            report.flow_challenge_state,
+            report.flow_drain_summary
         ),
         Err(reason) => format!(
             "\nRbxTransport QUIC session attempt failed before inbound Team Create traffic was accepted: {reason}"
@@ -1826,6 +1827,8 @@ struct RbxTransportConnectionReport {
     flow_channel_opens: String,
     /// Whether a 0x9B arrived on chan1 and what it looked like.
     flow_challenge_state: String,
+    /// How the queued-writes drain went, which is whether the burst completed.
+    flow_drain_summary: String,
     inbound_summary: String,
 }
 
@@ -1954,10 +1957,16 @@ fn build_join_flow_config(
 }
 
 /// Worst-case time the drain loop will spend retrying before handing the
-/// remainder back to the next wake: 40 * 100us = 4ms, inside the few
-/// milliseconds the peer waits for the join burst.
+/// remainder back to the next wake.
+///
+/// Raised from 40 passes (4ms) after six runs split cleanly on how much of the
+/// burst got out: every session that sent ~18000 bytes was closed with
+/// application error 0x10000000110 within 190ms, while the two that sent 23679
+/// and 26022 bytes survived until the user stopped them. Completing the burst
+/// matters more than returning to the receive loop promptly, so the budget is
+/// now 40ms.
 #[cfg(not(test))]
-const RBX_TRANSPORT_DRAIN_MAX_PASSES: usize = 40;
+const RBX_TRANSPORT_DRAIN_MAX_PASSES: usize = 400;
 #[cfg(not(test))]
 const RBX_TRANSPORT_DRAIN_RETRY_DELAY: Duration = Duration::from_micros(100);
 
@@ -2775,6 +2784,10 @@ async fn attempt_rbx_transport_connection_async(
         flow_challenge_state: join_flow
             .as_ref()
             .map(|flow| flow.challenge_summary())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_drain_summary: join_flow
+            .as_ref()
+            .map(|flow| flow.drain_summary().to_owned())
             .unwrap_or_else(|| "flow inactive".to_string()),
         flow_answered,
         inbound_summary,
@@ -3630,11 +3643,16 @@ async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
         // How long the burst actually took to get out is the question this
         // answers: a couple of passes in microseconds means pacing, while many
         // passes over tens of milliseconds means something else is wrong.
-        emit(format!(
+        let summary = format!(
             "stream drain: {initial_bytes}B in {passes} pass(es) over {}us; {}B still queued",
             drain_started.elapsed().as_micros(),
             flow.pending_bytes()
-        ));
+        );
+        // Recorded as well as emitted: Status events do not reach the session
+        // report, and whether the burst completed is exactly what separates a
+        // session the peer keeps from one it closes.
+        flow.set_drain_summary(summary.clone());
+        emit(summary);
     }
 
     for event in flow.drain_events() {
@@ -5834,7 +5852,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -5850,7 +5868,8 @@ pub fn run_join_config_session(
                     flow_status,
                     connection_report.inbound_summary,
                     connection_report.flow_channel_opens,
-                    connection_report.flow_challenge_state
+                    connection_report.flow_challenge_state,
+                    connection_report.flow_drain_summary
                 ));
             }
             Err(reason) => report.push_str(&format!(

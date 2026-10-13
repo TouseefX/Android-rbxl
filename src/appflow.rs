@@ -446,6 +446,8 @@ pub struct AppFlow {
     post_answer_reported: bool,
     now_ms: u64,
     events: Vec<FlowEvent>,
+    /// Last drain-loop outcome, for the session report.
+    drain_summary: String,
     /// Partial control records per stream, since a record can straddle chunks.
     ctrl_rx: HashMap<i64, Vec<u8>>,
     /// Channel opens the peer announced: (app, channel, wire id if unreliable).
@@ -474,6 +476,7 @@ impl AppFlow {
             challenge_seen: false,
             skipped: Vec::new(),
             pending: std::collections::VecDeque::new(),
+            drain_summary: String::new(),
             ctrl_rx: HashMap::new(),
             channel_opens: Vec::new(),
             answered: false,
@@ -754,6 +757,20 @@ impl AppFlow {
                 ));
             }
             (None, _) => {}
+        }
+    }
+
+    /// Records how the queued-write drain went.
+    pub fn set_drain_summary(&mut self, summary: String) {
+        self.drain_summary = summary;
+    }
+
+    /// How the queued-write drain went.
+    pub fn drain_summary(&self) -> &str {
+        if self.drain_summary.is_empty() {
+            "nothing was queued"
+        } else {
+            &self.drain_summary
         }
     }
 
