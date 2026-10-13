@@ -1955,7 +1955,7 @@ async fn execute_join_flow_action<S: ngnet_quic::Session>(
     origin: Instant,
     flow: &mut crate::appflow::AppFlow,
     action: crate::appflow::Action,
-) -> Result<(), String> {
+) -> Result<Option<(i64, Vec<u8>)>, String> {
     match action {
         crate::appflow::Action::OpenStream { app, chan, data } => {
             let id = connection.open_bidi_stream().map_err(|error| {
@@ -1963,11 +1963,27 @@ async fn execute_join_flow_action<S: ngnet_quic::Session>(
             })?;
             let raw = id.get();
             flow.note_opened(app, chan, raw);
-            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, raw, &data).await
+            let accepted =
+                send_rbx_transport_stream_data(connection, socket, tx_buf, origin, raw, &data)
+                    .await?;
+            Ok(unwritten(raw, &data, accepted))
         }
         crate::appflow::Action::Write { stream, data } => {
-            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data).await
+            let accepted =
+                send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data)
+                    .await?;
+            Ok(unwritten(stream, &data, accepted))
         }
+    }
+}
+
+/// The tail of `data` that ngtcp2 did not take, to be offered again later.
+#[cfg(not(test))]
+fn unwritten(stream: i64, data: &[u8], accepted: usize) -> Option<(i64, Vec<u8>)> {
+    if accepted < data.len() {
+        Some((stream, data[accepted..].to_vec()))
+    } else {
+        None
     }
 }
 
@@ -2609,6 +2625,13 @@ async fn attempt_rbx_transport_connection_async(
                     action,
                 )
                 .await
+                .map(|leftover| {
+                    // Whatever ngtcp2 could not take is retried by the receive
+                    // loop rather than dropped.
+                    if let Some(entry) = leftover {
+                        flow.queue_pending(entry);
+                    }
+                })
                 {
                     burst_errors.push(error.clone());
                     if let Some(event_tx) = &event_tx {
@@ -3393,7 +3416,7 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
     origin: Instant,
     stream: i64,
     data: &[u8],
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let id = ngnet_quic::StreamId::new(stream)
         .map_err(|error| format!("invalid stream id {stream}: {error}"))?;
     let mut off = 0usize;
@@ -3418,22 +3441,14 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
                     // successful send - and the unaccepted tail was never handed
                     // to ngtcp2, so nothing downstream could recover it. The main
                     // loop's write_pending only flushes what ngtcp2 already has.
-                    return Err(format!(
-                        "stream {stream} stalled with a full window after {off} of {} bytes; \
-                         the remaining {} were NOT sent",
-                        data.len(),
-                        data.len() - off
-                    ));
+                    // Nothing usable this pass. Offer the tail again later
+                    // rather than treating it as terminal.
+                    return Ok(off);
                 } else if control_only >= 16 {
                     // Same failure, reached by a different route: sixteen packets
                     // in a row carried only control frames, so no stream data was
                     // accepted. Report it rather than claiming success.
-                    return Err(format!(
-                        "stream {stream} made no progress for 16 packets after {off} of {} bytes; \
-                         the remaining {} were NOT sent",
-                        data.len(),
-                        data.len() - off
-                    ));
+                    return Ok(off);
                 } else {
                     // The packet was filled with control frames — offer the
                     // same tail again.
@@ -3446,23 +3461,19 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
                 | ngnet_quic::StreamWrite::ConnectionBlocked
                 | ngnet_quic::StreamWrite::Blocked),
             ) => {
-                // This was a silent `break`, so a 10 KiB write that hit the
-                // peer's flow-control window returned Ok and the summary read
-                // "burst sent". The window only reopens on a MAX_STREAM_DATA
-                // from the peer, which is only processed by the receive loop -
-                // so retrying here cannot make progress. Report it; draining the
-                // tail from the receive loop is the actual fix.
-                return Err(format!(
-                    "stream {stream} blocked ({blocked:?}) after {off} of {} bytes; \
-                     the remaining {} were NOT sent",
-                    data.len(),
-                    data.len() - off
-                ));
+                // "ngtcp2 has something to send but cannot right now." The
+                // vendored contract is explicit that this is not the end of the
+                // send loop - treating it as one is the classic QUIC stall, and
+                // it is what stopped every stream write this client ever
+                // attempted, including a 54-byte ctrl header. Return how far we
+                // got and let the receive loop offer the rest.
+                let _ = blocked;
+                return Ok(off);
             }
             Err(error) => return Err(format!("ngtcp2 stream write failed: {error}")),
         }
     }
-    Ok(())
+    Ok(off)
 }
 
 /// Drain raw stream events into the app=4 flow, execute the resulting
@@ -3524,13 +3535,31 @@ async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
                 }
             }
             crate::appflow::Action::Write { stream, data } => {
-                if let Err(error) =
-                    send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data)
-                        .await
+                match send_rbx_transport_stream_data(
+                    connection, socket, tx_buf, origin, stream, &data,
+                )
+                .await
                 {
-                    emit(format!("stream {stream} write failed: {error}"));
+                    Ok(accepted) if accepted < data.len() => {
+                        flow.queue_pending((stream, data[accepted..].to_vec()));
+                    }
+                    Ok(_) => {}
+                    Err(error) => emit(format!("stream {stream} write failed: {error}")),
                 }
             }
+        }
+    }
+
+    // Offer again whatever an earlier pass could not write. ngtcp2's Blocked
+    // means "not now", and only this loop processes the peer frames that let it
+    // send - so this is the only place a retry can succeed.
+    for (sid, data) in flow.take_pending() {
+        match send_rbx_transport_stream_data(connection, socket, tx_buf, origin, sid, &data).await {
+            Ok(accepted) if accepted < data.len() => {
+                flow.queue_pending((sid, data[accepted..].to_vec()));
+            }
+            Ok(_) => {}
+            Err(error) => emit(format!("stream {sid} retry failed: {error}")),
         }
     }
 

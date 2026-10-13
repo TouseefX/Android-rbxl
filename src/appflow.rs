@@ -418,6 +418,11 @@ pub struct AppFlow {
     post_answer_reported: bool,
     now_ms: u64,
     events: Vec<FlowEvent>,
+    /// Stream writes ngtcp2 could not take yet, to be offered again from the
+    /// receive loop. `Blocked` means "try again later", not "finished", and the
+    /// window only reopens once the peer's frames have been processed - which
+    /// only happens there.
+    pending: std::collections::VecDeque<(i64, Vec<u8>)>,
     /// Pieces of the burst that were left out, and why. These used to reach
     /// only a Status event, so a session that silently dropped the 0x90 read
     /// exactly like one that sent it.
@@ -436,6 +441,7 @@ impl AppFlow {
             chan1_reset: false,
             challenge_seen: false,
             skipped: Vec::new(),
+            pending: std::collections::VecDeque::new(),
             answered: false,
             routes_at_ms: -1,
             post_answer_bytes: 0,
@@ -537,6 +543,23 @@ impl AppFlow {
             if m90.is_some() { "included" } else { "skipped" }
         ));
         actions
+    }
+
+    /// Queue stream bytes that could not be written yet.
+    pub fn queue_pending(&mut self, entry: (i64, Vec<u8>)) {
+        if !entry.1.is_empty() {
+            self.pending.push_back(entry);
+        }
+    }
+
+    /// Take everything queued for retry.
+    pub fn take_pending(&mut self) -> Vec<(i64, Vec<u8>)> {
+        self.pending.drain(..).collect()
+    }
+
+    /// Bytes still waiting to be written.
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.iter().map(|(_, data)| data.len()).sum()
     }
 
     /// Burst pieces that were left out, with reasons.
