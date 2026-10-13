@@ -677,6 +677,14 @@ struct RbxTransportConnectPlan {
     /// 0x9B challenge answer). All optional: the flow degrades to the
     /// passive receive loop when any of them is missing.
     join_user_id: Option<i64>,
+    /// The account's name and display name. The 0x90 template freezes the
+    /// captured account's, and unlike `UserId` these cannot be derived from
+    /// anything else we hold: they are absent from `SerializedClientFields`
+    /// and from the `APIsecurityToken` JWT, so the gamejoin response is the
+    /// only place they can come from.
+    join_user_name: Option<String>,
+    join_display_name: Option<String>,
+    join_domain_user_id: Option<i64>,
     join_client_ticket: Option<String>,
     join_session_id: Option<String>,
     join_random_seed1: Option<String>,
@@ -1117,6 +1125,17 @@ fn extract_rbx_transport_connect_plan(
         join_user_id: find_field_ci(config, "UserId", 0)
             .and_then(|v| v.as_i64())
             .or_else(|| find_field_ci(config, "UserId", 0).and_then(|v| v.as_u64()).map(|v| v as i64)),
+        join_user_name: find_field_ci(config, "UserName", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_display_name: find_field_ci(config, "DisplayName", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_domain_user_id: find_field_ci(config, "DomainUserId", 0)
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                find_field_ci(config, "DomainUserId", 0)
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as i64)
+            }),
         join_client_ticket: find_field_ci(config, "ClientTicket", 0)
             .and_then(|v| v.as_str().map(str::to_owned)),
         join_session_id: find_field_ci(config, "SessionId", 0)
@@ -1950,6 +1969,9 @@ fn build_join_flow_config(
         user_id,
         client_ticket,
         session_id,
+        user_name: plan.join_user_name.clone(),
+        display_name: plan.join_display_name.clone(),
+        domain_user_id: plan.join_domain_user_id,
         random_seed1: plan.join_random_seed1.clone(),
         api_security_token: plan.join_api_security_token.clone(),
         serialized_client_fields: plan.join_serialized_client_fields.clone(),

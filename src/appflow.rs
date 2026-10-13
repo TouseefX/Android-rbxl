@@ -80,6 +80,12 @@ pub struct EarlyAuth {
 #[derive(Clone, Debug)]
 pub struct JoinConfig {
     pub user_id: i64,
+    /// Account name / display name / domain id from the gamejoin response.
+    /// `None` when the response did not carry them, in which case the 0x90
+    /// keeps the captured template's value and says so in the report.
+    pub user_name: Option<String>,
+    pub display_name: Option<String>,
+    pub domain_user_id: Option<i64>,
     pub client_ticket: String,
     pub session_id: String,
     pub random_seed1: Option<String>,
@@ -433,6 +439,22 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
             serde_json::to_string(&ticket).map_err(|e| format!("0x90 ticket: {e}"))?,
         ),
     );
+
+    for (key, value) in [
+        ("UserName", cfg.user_name.as_ref().map(|v| serde_json::Value::from(v.clone()))),
+        (
+            "DisplayName",
+            cfg.display_name.as_ref().map(|v| serde_json::Value::from(v.clone())),
+        ),
+        (
+            "DomainUserId",
+            cfg.domain_user_id.map(serde_json::Value::from),
+        ),
+    ] {
+        if let Some(value) = value {
+            tmpl.insert(key.into(), value);
+        }
+    }
 
     // The template froze one account's identity. Rewrite the parts this
     // session can source, and say which parts it could not.
@@ -1150,6 +1172,9 @@ mod tests {
     fn build_8a_layout() {
         let cfg = JoinConfig {
             user_id: 2_655_886_518,
+            user_name: None,
+            display_name: None,
+            domain_user_id: None,
             client_ticket: "prefix;ignored;AAAA;BBBB;6".into(),
             session_id: "session-xyz".into(),
             random_seed1: None,
@@ -1223,6 +1248,9 @@ mod tests {
     fn build_90_patches_template() {
         let cfg = JoinConfig {
             user_id: 2_655_886_518,
+            user_name: None,
+            display_name: None,
+            domain_user_id: None,
             client_ticket: "t;2".into(),
             session_id: "s".into(),
             random_seed1: Some("SEED-XYZ".into()),
@@ -1265,6 +1293,9 @@ mod tests {
     fn build_90_replaces_the_captured_identity() {
         let cfg = JoinConfig {
             user_id: 777,
+            user_name: Some("live_name".into()),
+            display_name: Some("live display".into()),
+            domain_user_id: Some(424242),
             client_ticket: "t;2".into(),
             session_id: "s".into(),
             random_seed1: Some("SEED-XYZ".into()),
@@ -1291,6 +1322,13 @@ mod tests {
 
         assert_eq!(v["UserId"].as_i64(), Some(777));
         assert_eq!(v["CharacterAppearanceId"].as_i64(), Some(777));
+        // The remaining identity fields come from the gamejoin response when it
+        // carries them; the captured account's values must not survive.
+        assert_eq!(v["UserName"].as_str(), Some("live_name"));
+        assert_eq!(v["DisplayName"].as_str(), Some("live display"));
+        assert_eq!(v["DomainUserId"].as_i64(), Some(424242));
+        assert!(!built.frozen.iter().any(|k| k == "UserName"));
+        assert!(!built.frozen.iter().any(|k| k == "DomainUserId"));
         assert!(
             v["CharacterAppearance"].as_str().unwrap().contains("userId=777"),
             "the avatar URL names the user in a query parameter: {}",
