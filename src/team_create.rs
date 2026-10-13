@@ -1945,6 +1945,14 @@ fn build_join_flow_config(
     })
 }
 
+/// Worst-case time the drain loop will spend retrying before handing the
+/// remainder back to the next wake: 40 * 100us = 4ms, inside the few
+/// milliseconds the peer waits for the join burst.
+#[cfg(not(test))]
+const RBX_TRANSPORT_DRAIN_MAX_PASSES: usize = 40;
+#[cfg(not(test))]
+const RBX_TRANSPORT_DRAIN_RETRY_DELAY: Duration = Duration::from_micros(100);
+
 /// Execute one flow action: open a client stream (recording it in the flow)
 /// or write more bytes to an existing stream.
 #[cfg(not(test))]
@@ -3550,17 +3558,53 @@ async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
         }
     }
 
-    // Offer again whatever an earlier pass could not write. ngtcp2's Blocked
-    // means "not now", and only this loop processes the peer frames that let it
-    // send - so this is the only place a retry can succeed.
-    for (sid, data) in flow.take_pending() {
-        match send_rbx_transport_stream_data(connection, socket, tx_buf, origin, sid, &data).await {
-            Ok(accepted) if accepted < data.len() => {
-                flow.queue_pending((sid, data[accepted..].to_vec()));
+    // Offer again whatever an earlier pass could not write.
+    //
+    // This retries in a bounded tight loop rather than once per wake. The peer
+    // waits only a few milliseconds for the join burst, and waiting for the next
+    // inbound packet or ngtcp2's expiry is not guaranteed to happen inside that
+    // window. If the block is pacing - ngtcp2 sets the next permitted tx time
+    // after every packet - the deadline passes in microseconds, so a short sleep
+    // drains the burst almost immediately. The cap keeps the worst case inside
+    // the peer's patience, and anything still queued goes back for the next wake.
+    let queued = flow.take_pending();
+    if !queued.is_empty() {
+        let drain_started = std::time::Instant::now();
+        let initial_bytes: usize = queued.iter().map(|(_, data)| data.len()).sum();
+        let mut left = queued;
+        let mut passes = 0usize;
+        while !left.is_empty() && passes < RBX_TRANSPORT_DRAIN_MAX_PASSES {
+            passes += 1;
+            let mut next = Vec::new();
+            for (sid, data) in left {
+                match send_rbx_transport_stream_data(
+                    connection, socket, tx_buf, origin, sid, &data,
+                )
+                .await
+                {
+                    Ok(accepted) if accepted < data.len() => {
+                        next.push((sid, data[accepted..].to_vec()));
+                    }
+                    Ok(_) => {}
+                    Err(error) => emit(format!("stream {sid} retry failed: {error}")),
+                }
             }
-            Ok(_) => {}
-            Err(error) => emit(format!("stream {sid} retry failed: {error}")),
+            left = next;
+            if !left.is_empty() {
+                tokio::time::sleep(RBX_TRANSPORT_DRAIN_RETRY_DELAY).await;
+            }
         }
+        for entry in left {
+            flow.queue_pending(entry);
+        }
+        // How long the burst actually took to get out is the question this
+        // answers: a couple of passes in microseconds means pacing, while many
+        // passes over tens of milliseconds means something else is wrong.
+        emit(format!(
+            "stream drain: {initial_bytes}B in {passes} pass(es) over {}us; {}B still queued",
+            drain_started.elapsed().as_micros(),
+            flow.pending_bytes()
+        ));
     }
 
     for event in flow.drain_events() {
