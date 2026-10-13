@@ -683,6 +683,11 @@ struct RbxTransportConnectPlan {
     join_api_security_token: Option<String>,
     join_serialized_client_fields: Option<String>,
     join_encrypted_server_fields: Option<String>,
+    /// What the joinTicket lookup actually found. "0x90 needs
+    /// SerializedClientFields / EncryptedServerFields" is the same message
+    /// whether the ticket is absent or present without those keys, and those
+    /// mean very different things for a Team Create config.
+    join_ticket_note: String,
 }
 
 fn is_hex_field(text: &str, len: usize) -> bool {
@@ -1095,7 +1100,8 @@ fn extract_rbx_transport_connect_plan(
         .or_else(|| find_field_ci(config, "DebugRbxTransportQdmuxVip", 0))
         .and_then(|value| as_addr(&value))
         .filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok());
-    let (serialized_client_fields, encrypted_server_fields) = extract_join_ticket_fields(config);
+    let (serialized_client_fields, encrypted_server_fields, join_ticket_note) =
+        extract_join_ticket_fields(config);
     Ok(RbxTransportConnectPlan {
         public_endpoint,
         rcc_endpoint,
@@ -1121,6 +1127,7 @@ fn extract_rbx_transport_connect_plan(
             .and_then(|v| v.as_str().map(str::to_owned)),
         join_serialized_client_fields: serialized_client_fields,
         join_encrypted_server_fields: encrypted_server_fields,
+        join_ticket_note,
     })
 }
 
@@ -1129,10 +1136,11 @@ fn extract_rbx_transport_connect_plan(
 /// object with `SerializedClientFields` / `EncryptedServerFields`.
 fn extract_join_ticket_fields(
     config: &serde_json::Value,
-) -> (Option<String>, Option<String>) {
-    let ticket = match find_field_ci(config, "joinTicket", 0) {
+) -> (Option<String>, Option<String>, String) {
+    let found = find_field_ci(config, "joinTicket", 0);
+    let ticket = match &found {
         Some(serde_json::Value::String(text)) => {
-            match serde_json::from_str::<serde_json::Value>(&text) {
+            match serde_json::from_str::<serde_json::Value>(text) {
                 Ok(value) => Some(value),
                 Err(_) => None,
             }
@@ -1141,13 +1149,58 @@ fn extract_join_ticket_fields(
         None => None,
     };
     let Some(ticket) = ticket else {
-        return (None, None);
+        // Distinguish "no such field" from "present but not parseable JSON",
+        // because a Team Create config may simply not carry a joinTicket.
+        let note = match &found {
+            None => "joinTicket is absent from this config".to_string(),
+            Some(serde_json::Value::String(text)) => format!(
+                "joinTicket is a {}-char string that is not JSON",
+                text.len()
+            ),
+            Some(other) => format!("joinTicket is present but is a {}", json_kind(other)),
+        };
+        return (None, None, note);
     };
     let scf = find_field_ci(&ticket, "SerializedClientFields", 0)
         .and_then(|v| v.as_str().map(str::to_owned));
     let esf = find_field_ci(&ticket, "EncryptedServerFields", 0)
         .and_then(|v| v.as_str().map(str::to_owned));
-    (scf, esf)
+    let note = if scf.is_some() && esf.is_some() {
+        String::new()
+    } else {
+        // Name the keys the ticket does carry, so the right field can be found
+        // rather than guessed at.
+        let keys: Vec<String> = ticket
+            .as_object()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default();
+        format!(
+            "joinTicket is present but lacks {} (its keys: {})",
+            match (scf.is_some(), esf.is_some()) {
+                (false, false) => "both SerializedClientFields and EncryptedServerFields",
+                (true, false) => "EncryptedServerFields",
+                (false, true) => "SerializedClientFields",
+                (true, true) => "nothing",
+            },
+            if keys.is_empty() {
+                "not an object".to_string()
+            } else {
+                keys.join(", ")
+            }
+        )
+    };
+    (scf, esf, note)
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 fn extract_rupp_probe_material(config: &serde_json::Value) -> Result<RuppProbeMaterial, String> {
@@ -2576,6 +2629,9 @@ async fn attempt_rbx_transport_connection_async(
                 }
             }
             burst_skipped.extend(flow.skipped().iter().cloned());
+            if !plan.join_ticket_note.is_empty() {
+                burst_skipped.push(plan.join_ticket_note.clone());
+            }
             join_flow = Some(flow);
         }
         None => {
