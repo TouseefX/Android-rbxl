@@ -1136,7 +1136,7 @@ fn extract_rbx_transport_connect_plan(
 /// object with `SerializedClientFields` / `EncryptedServerFields`.
 fn extract_join_ticket_fields(
     config: &serde_json::Value,
-) -> (Option<String>, Option<String>, String) {
+) -> (Option<serde_json::Value>, Option<serde_json::Value>, String) {
     let found = find_field_ci(config, "joinTicket", 0);
     let ticket = match &found {
         Some(serde_json::Value::String(text)) => {
@@ -1164,8 +1164,8 @@ fn extract_join_ticket_fields(
     // Take the value whatever its JSON type. Requiring a string here is what
     // dropped EncryptedServerFields from a real Team Create config: the key was
     // present, the value just was not a string.
-    let scf = find_field_ci(&ticket, "SerializedClientFields", 0).cloned();
-    let esf = find_field_ci(&ticket, "EncryptedServerFields", 0).cloned();
+    let scf = find_field_ci(&ticket, "SerializedClientFields", 0);
+    let esf = find_field_ci(&ticket, "EncryptedServerFields", 0);
     let note = if scf.is_some() && esf.is_some() {
         String::new()
     } else {
