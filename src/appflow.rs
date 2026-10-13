@@ -769,9 +769,29 @@ impl AppFlow {
         let head: Vec<String> = self
             .chan1_rx
             .iter()
-            .take(48)
+            .take(256)
             .map(|byte| format!("{byte:02x}"))
             .collect();
+        // Every printable run of four or more bytes, in order. Team Create
+        // carries collaborative state - scripting sync, cursors, viewports -
+        // alongside instance replication, and the names are the fastest way to
+        // tell which kind of frame this is without knowing its layout yet.
+        let mut strings: Vec<String> = Vec::new();
+        let mut run: Vec<u8> = Vec::new();
+        for byte in self.chan1_rx.iter().chain(std::iter::once(&0u8)) {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                run.push(*byte);
+            } else {
+                if run.len() >= 4 {
+                    if let Ok(text) = std::str::from_utf8(&run) {
+                        if strings.len() < 60 {
+                            strings.push(text.to_owned());
+                        }
+                    }
+                }
+                run.clear();
+            }
+        }
         let tags: Vec<String> = self
             .chan1_rx
             .iter()
@@ -787,7 +807,7 @@ impl AppFlow {
             self.answered,
             tags.join(" "),
             head.join(" ")
-        )
+        ) + &format!("; printable runs ({}): {}", strings.len(), strings.join(" | "))
     }
 
     fn streams_key(&self, stream: i64) -> (u32, u32) {
