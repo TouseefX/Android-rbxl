@@ -22,6 +22,20 @@ pub const APP_DUMMY: u32 = 6;
 /// Control channel: the ASCII "ctrl" as a big-endian u32.
 pub const CTRL_CHANNEL: u32 = 0x6374_726C;
 
+/// App id written into the ctrl stream header.
+///
+/// This is a live question, not a settled one. Boblox uses [`APP`] (4) and joins
+/// game servers, so 4 is right there. But the Studio decompile shows the
+/// RbxTransport *base* connection opening ctrl with app 0 at two independent
+/// call sites - `RtcIoBaseConnection::updateTransportConnReadyState` and
+/// `RtcIoServerConnection::start` both call `initializeAppContext(this, 0)`
+/// followed by `initializeChannelContext(this, 0, 0x6374726C, 0, 1, 0, 1)`.
+/// If the header byte for ctrl is 0 rather than 4, a server that routes on it
+/// would ignore our ctrl stream entirely - which matches a session that gets
+/// transport ACKs and no challenge. Kept as one constant so testing 0 is a
+/// one-line change.
+pub const CTRL_APP: u32 = APP;
+
 /// Native 0x90 message template (10 432 B capture). The JSON region is
 /// patched with this session's values; the leading bytes and the final 20
 /// bytes are preserved verbatim.
@@ -442,13 +456,24 @@ impl AppFlow {
         // ctrl stream: hello, then the four openU frames. They land on one
         // QUIC stream, so a single write is byte-identical to the native
         // per-frame sends.
-        let mut ctrl = stream_header(APP, CTRL_CHANNEL).to_vec();
+        let mut ctrl = stream_header(CTRL_APP, CTRL_CHANNEL).to_vec();
         ctrl.extend_from_slice(&frame(&[0x00, 0x00]));
         for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
             ctrl.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
         }
+        // Log the header verbatim: whether the server routes on app 0 or app 4
+        // is unresolved, and the only way to compare against a capture is to
+        // see the exact seven bytes we put on the wire.
+        self.events.push(FlowEvent::Log(format!(
+            "ctrl stream header: {}",
+            stream_header(CTRL_APP, CTRL_CHANNEL)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )));
         actions.push(Action::OpenStream {
-            app: APP,
+            app: CTRL_APP,
             chan: CTRL_CHANNEL,
             data: ctrl,
         });
