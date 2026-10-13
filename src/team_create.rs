@@ -681,8 +681,8 @@ struct RbxTransportConnectPlan {
     join_session_id: Option<String>,
     join_random_seed1: Option<String>,
     join_api_security_token: Option<String>,
-    join_serialized_client_fields: Option<String>,
-    join_encrypted_server_fields: Option<String>,
+    join_serialized_client_fields: Option<serde_json::Value>,
+    join_encrypted_server_fields: Option<serde_json::Value>,
     /// What the joinTicket lookup actually found. "0x90 needs
     /// SerializedClientFields / EncryptedServerFields" is the same message
     /// whether the ticket is absent or present without those keys, and those
@@ -1161,10 +1161,11 @@ fn extract_join_ticket_fields(
         };
         return (None, None, note);
     };
-    let scf = find_field_ci(&ticket, "SerializedClientFields", 0)
-        .and_then(|v| v.as_str().map(str::to_owned));
-    let esf = find_field_ci(&ticket, "EncryptedServerFields", 0)
-        .and_then(|v| v.as_str().map(str::to_owned));
+    // Take the value whatever its JSON type. Requiring a string here is what
+    // dropped EncryptedServerFields from a real Team Create config: the key was
+    // present, the value just was not a string.
+    let scf = find_field_ci(&ticket, "SerializedClientFields", 0).cloned();
+    let esf = find_field_ci(&ticket, "EncryptedServerFields", 0).cloned();
     let note = if scf.is_some() && esf.is_some() {
         String::new()
     } else {

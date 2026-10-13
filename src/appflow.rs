@@ -84,8 +84,11 @@ pub struct JoinConfig {
     pub session_id: String,
     pub random_seed1: Option<String>,
     pub api_security_token: Option<String>,
-    pub serialized_client_fields: Option<String>,
-    pub encrypted_server_fields: Option<String>,
+    /// Kept as parsed JSON rather than a string: a live Team Create config
+    /// carried `EncryptedServerFields` as a non-string value, and requiring
+    /// `as_str()` silently dropped it, which cost the whole 0x90.
+    pub serialized_client_fields: Option<serde_json::Value>,
+    pub encrypted_server_fields: Option<serde_json::Value>,
     pub early_auth: Option<EarlyAuth>,
     pub a7_mode: A7Mode,
 }
