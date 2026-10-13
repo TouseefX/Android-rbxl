@@ -1952,6 +1952,50 @@ async fn run_rbx_transport_connection_async(
     .await
 }
 
+/// Resolve the account's `username` / `displayName` from the public users
+/// endpoint.
+///
+/// The 0x90 carries both, and the 0.741 client writes them from
+/// `v8datamodel/src/Players.cpp`. They are in none of the material the gamejoin
+/// response hands us - not the response itself, not `SerializedClientFields`,
+/// not the `APIsecurityToken` JWT - so the only remaining source is the account
+/// record. That endpoint needs no auth, and a real client gets the same strings
+/// from its logged-in session.
+///
+/// Best effort: a failure returns nothing and the 0x90 keeps the captured
+/// template's values, which the report then names.
+fn resolve_account_names(user_id: i64) -> (Option<String>, Option<String>) {
+    if user_id <= 0 {
+        return (None, None);
+    }
+    let Ok(http) = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+    else {
+        return (None, None);
+    };
+    let url = format!("https://users.roblox.com/v1/users/{user_id}");
+    match http.get(&url).send().and_then(|response| response.json::<serde_json::Value>()) {
+        Ok(value) => {
+            let username = value.get("username").and_then(|v| v.as_str()).map(str::to_owned);
+            let display = value
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            log::info!(
+                "account lookup for {user_id}: username={}, displayName={}",
+                username.as_deref().unwrap_or("<none>"),
+                display.as_deref().unwrap_or("<none>")
+            );
+            (username, display)
+        }
+        Err(error) => {
+            log::warn!("account lookup for {user_id} failed: {error}");
+            (None, None)
+        }
+    }
+}
+
 /// Build the app=4 flow config from the connect plan. Returns None when
 /// required fields are missing; the session then stays in passive mode.
 #[cfg(not(test))]
@@ -1968,12 +2012,19 @@ fn build_join_flow_config(
             auth: auth.auth_blob.clone(),
         }
     });
+    // Only reach the network for what the config did not already supply.
+    let (resolved_name, resolved_display) =
+        if plan.join_user_name.is_none() || plan.join_display_name.is_none() {
+            resolve_account_names(user_id)
+        } else {
+            (None, None)
+        };
     Some(crate::appflow::JoinConfig {
         user_id,
         client_ticket,
         session_id,
-        user_name: plan.join_user_name.clone(),
-        display_name: plan.join_display_name.clone(),
+        user_name: plan.join_user_name.clone().or(resolved_name),
+        display_name: plan.join_display_name.clone().or(resolved_display),
         domain_user_id: plan.join_domain_user_id,
         random_seed1: plan.join_random_seed1.clone(),
         api_security_token: plan.join_api_security_token.clone(),
