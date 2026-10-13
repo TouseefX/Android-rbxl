@@ -190,6 +190,34 @@ pub fn compact_varint(v: u64) -> Vec<u8> {
     out
 }
 
+/// Inverse of [`compact_varint`]: returns the value and how many bytes it
+/// occupied, or `None` if the buffer does not hold a complete varint.
+pub fn compact_varint_decode(buf: &[u8]) -> Option<(u64, usize)> {
+    let &b0 = buf.first()?;
+    let extra = match b0 >> 6 {
+        0 => 0usize,
+        1 => 1,
+        2 => 3,
+        _ => 7,
+    };
+    if buf.len() < 1 + extra {
+        return None;
+    }
+    let mut value = u64::from(b0 & 0x3F);
+    for byte in &buf[1..1 + extra] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    Some((value, 1 + extra))
+}
+
+/// Big-endian u32 from a four-byte slice.
+fn be32(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0]) << 24
+        | u32::from(bytes[1]) << 16
+        | u32::from(bytes[2]) << 8
+        | u32::from(bytes[3])
+}
+
 /// Frame a payload: `compactVarint(len) + payload`.
 pub fn frame(payload: &[u8]) -> Vec<u8> {
     let mut out = compact_varint(payload.len() as u64);
@@ -418,6 +446,10 @@ pub struct AppFlow {
     post_answer_reported: bool,
     now_ms: u64,
     events: Vec<FlowEvent>,
+    /// Partial control records per stream, since a record can straddle chunks.
+    ctrl_rx: HashMap<i64, Vec<u8>>,
+    /// Channel opens the peer announced: (app, channel, wire id if unreliable).
+    channel_opens: Vec<(u32, u32, Option<u32>)>,
     /// Stream writes ngtcp2 could not take yet, to be offered again from the
     /// receive loop. `Blocked` means "try again later", not "finished", and the
     /// window only reopens once the peer's frames have been processed - which
@@ -442,6 +474,8 @@ impl AppFlow {
             challenge_seen: false,
             skipped: Vec::new(),
             pending: std::collections::VecDeque::new(),
+            ctrl_rx: HashMap::new(),
+            channel_opens: Vec::new(),
             answered: false,
             routes_at_ms: -1,
             post_answer_bytes: 0,
@@ -657,9 +691,70 @@ impl AppFlow {
             }
             self.try_challenge()
         } else {
-            self.log(format!("RX app={app} chan={chan} {}B", data.len()));
+            self.feed_ctrl(stream, app, chan, data);
             Vec::new()
         }
+    }
+
+    /// Walk a control stream's bytes as length-prefixed records. The peer
+    /// announces its channel assignments here; dropping them is what left twelve
+    /// opened channels unacknowledged.
+    fn feed_ctrl(&mut self, stream: i64, app: u32, chan: u32, data: &[u8]) {
+        let buf = self.ctrl_rx.entry(stream).or_default();
+        buf.extend_from_slice(data);
+        let mut off = 0usize;
+        while off < buf.len() {
+            let Some((len, used)) = compact_varint_decode(&buf[off..]) else {
+                break; // partial length prefix
+            };
+            let end = off + used + len as usize;
+            if len == 0 || end > buf.len() {
+                break; // partial body: wait for more
+            }
+            let body = buf[off + used..end].to_vec();
+            off = end;
+            self.note_control_record(app, chan, &body);
+        }
+        buf.drain(..off);
+    }
+
+    fn note_control_record(&mut self, app: u32, chan: u32, body: &[u8]) {
+        match (body.first().copied(), body.len()) {
+            // OpenReliable: type 1, app, channel - 6 bytes.
+            (Some(1), 6) => {
+                let peer_app = u32::from(body[1]);
+                let peer_chan = be32(&body[2..6]);
+                self.channel_opens.push((peer_app, peer_chan, None));
+                self.log(format!(
+                    "ctrl OpenReliable app={peer_app} chan={peer_chan} (on app={app} chan={chan})"
+                ));
+            }
+            // OpenUnreliable: type 2, app, channel, wire id - 10 bytes. This is
+            // the channel->wire mapping the BaseClient path could not resolve.
+            (Some(2), 10) => {
+                let peer_app = u32::from(body[1]);
+                let peer_chan = be32(&body[2..6]);
+                let wire = be32(&body[6..10]);
+                self.channel_opens.push((peer_app, peer_chan, Some(wire)));
+                self.log(format!(
+                    "ctrl OpenUnreliable app={peer_app} chan={peer_chan} wire={wire} (on app={app} chan={chan})"
+                ));
+            }
+            (Some(tag), len) => {
+                let head: Vec<String> =
+                    body.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                self.log(format!(
+                    "ctrl record tag 0x{tag:02x} ({len}B) not recognised: {}",
+                    head.join(" ")
+                ));
+            }
+            (None, _) => {}
+        }
+    }
+
+    /// Channel assignments the peer announced.
+    pub fn channel_opens(&self) -> &[(u32, u32, Option<u32>)] {
+        &self.channel_opens
     }
 
     fn streams_key(&self, stream: i64) -> (u32, u32) {
