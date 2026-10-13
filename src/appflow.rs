@@ -67,6 +67,40 @@ pub enum A7Mode {
     Skip,
 }
 
+/// Runtime override for which 0xA7 the join flow sends.
+///
+/// The captured A7 is a 99-byte replay from one session against one place, and
+/// the binary has a libsodium Ed25519 signing subsystem next to
+/// `ScriptRegistrationService`. If the frame attests that place's script hashes
+/// then a join against any other place is rejected while every other byte of
+/// the burst is correct - and the server sends no reason phrase. Selecting the
+/// mode from the UI turns that from an open question into three join attempts
+/// in one build.
+static A7_MODE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Choose which 0xA7 variant subsequent join flows send.
+pub fn set_a7_mode(mode: A7Mode) {
+    A7_MODE_OVERRIDE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The currently selected 0xA7 variant. Defaults to `Real`.
+pub fn a7_mode() -> A7Mode {
+    match A7_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => A7Mode::Empty,
+        2 => A7Mode::Skip,
+        _ => A7Mode::Real,
+    }
+}
+
+/// A one-line description of a mode, for the UI and the session log.
+pub fn a7_mode_label(mode: A7Mode) -> &'static str {
+    match mode {
+        A7Mode::Real => "real 99-byte capture",
+        A7Mode::Empty => "empty a7 00 00",
+        A7Mode::Skip => "omitted",
+    }
+}
+
 /// Decoded early-auth material (the base64 fields 2 and 3 of the
 /// `ClientTicket` split on semicolons, plus the trailing version).
 #[derive(Clone, Debug)]
@@ -1514,6 +1548,18 @@ mod tests {
 
     #[test]
     fn a7_real_template_starts_with_a7() {
+        // The UI selector must round-trip, or the three-way test it exists for
+        // silently sends the same frame every time.
+        for (mode, expect) in [
+            (A7Mode::Real, A7Mode::Real),
+            (A7Mode::Empty, A7Mode::Empty),
+            (A7Mode::Skip, A7Mode::Skip),
+        ] {
+            set_a7_mode(mode);
+            assert_eq!(a7_mode(), expect, "{mode:?} did not round-trip");
+        }
+        assert_eq!(a7_mode_label(A7Mode::Real), "real 99-byte capture");
+        set_a7_mode(A7Mode::Real);
         assert_eq!(A7_REAL[0], 0xA7);
         assert_eq!(A7_REAL.len(), 99);
     }

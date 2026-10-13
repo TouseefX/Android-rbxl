@@ -388,6 +388,8 @@ pub struct EditorApp {
     team_create_session_rx: Option<Receiver<crate::team_create::RbxTransportSessionEvent>>,
     team_create_session_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     team_create_session_running: bool,
+    /// Which 0xA7 the next join flow sends: 0 = real capture, 1 = empty, 2 = omit.
+    a7_mode_choice: u8,
     /// QUIC/TLS handshake milestone only; not BaseClient-connected or Team Create-accepted.
     team_create_session_quic_handshake_complete: bool,
     team_create_session_status: String,
@@ -551,6 +553,7 @@ impl Default for EditorApp {
             team_create_session_rx: None,
             team_create_session_cancel: None,
             team_create_session_running: false,
+            a7_mode_choice: 0,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
             prop_num_buf: HashMap::new(),
@@ -2190,6 +2193,25 @@ ui.label("Place ID:");
                         {
                             self.team_create_negotiate(false, true, true);
                         }
+                        // The captured 0xA7 is a replay from one session against one
+                        // place, and the binary has an Ed25519 signing subsystem
+                        // beside ScriptRegistrationService. Whether the server
+                        // accepts that replay elsewhere is the main open question on
+                        // the burst, so make it switchable without a rebuild.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("0xA7 attestation:");
+                            ui.radio_value(&mut self.a7_mode_choice, 0u8, "real capture")
+                                .on_hover_text("Sends the captured 99-byte frame verbatim");
+                            ui.radio_value(&mut self.a7_mode_choice, 1u8, "empty")
+                                .on_hover_text("Sends a7 00 00 - tests whether the server wants a frame at all");
+                            ui.radio_value(&mut self.a7_mode_choice, 2u8, "omit")
+                                .on_hover_text("Sends no 0xA7 - tests whether it is optional");
+                        });
+                        crate::appflow::set_a7_mode(match self.a7_mode_choice {
+                            1 => crate::appflow::A7Mode::Empty,
+                            2 => crate::appflow::A7Mode::Skip,
+                            _ => crate::appflow::A7Mode::Real,
+                        });
                         let can_probe = can_start
                             && self
                                 .team_create_join_config

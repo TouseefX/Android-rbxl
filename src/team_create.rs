@@ -2031,7 +2031,7 @@ fn build_join_flow_config(
         serialized_client_fields: plan.join_serialized_client_fields.clone(),
         encrypted_server_fields: plan.join_encrypted_server_fields.clone(),
         early_auth,
-        a7_mode: crate::appflow::A7Mode::Real,
+        a7_mode: crate::appflow::a7_mode(),
     })
 }
 
@@ -2732,7 +2732,8 @@ async fn attempt_rbx_transport_connection_async(
             let now_ms = started.elapsed().as_millis() as u64;
             let mut flow = crate::appflow::AppFlow::new(cfg, now_ms);
             log::info!(
-                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, A7, 0x90/0x92/0x8A, 0x8F)"
+                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, 0xA7 = {}, 0x90/0x92/0x8A, 0x8F)",
+                crate::appflow::a7_mode_label(cfg.a7_mode)
             );
             for action in flow.on_connected() {
                 if let Err(error) = execute_join_flow_action(
