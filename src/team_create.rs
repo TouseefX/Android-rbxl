@@ -1760,6 +1760,10 @@ struct RbxTransportConnectionReport {
     /// write had been abandoned partway - which made a truncated send
     /// indistinguishable from a complete one.
     flow_burst_errors: Vec<String>,
+    /// Burst pieces that were never staged, e.g. a 0x90 whose join fields were
+    /// missing. Distinct from `flow_burst_errors`: nothing errored, the frame
+    /// simply was not built.
+    flow_skipped: Vec<String>,
     inbound_summary: String,
 }
 
@@ -2533,6 +2537,7 @@ async fn attempt_rbx_transport_connection_async(
     // only partly written has to be visible in the summary, not just in the
     // per-action Status events.
     let mut burst_errors: Vec<String> = Vec::new();
+    let mut burst_skipped: Vec<String> = Vec::new();
     match build_join_flow_config(plan) {
         Some(cfg) => {
             let now_ms = started.elapsed().as_millis() as u64;
@@ -2570,6 +2575,7 @@ async fn attempt_rbx_transport_connection_async(
                     });
                 }
             }
+            burst_skipped.extend(flow.skipped().iter().cloned());
             join_flow = Some(flow);
         }
         None => {
@@ -2651,6 +2657,7 @@ async fn attempt_rbx_transport_connection_async(
         early_auth_payload_len,
         flow_active: join_flow.is_some(),
         flow_burst_errors: burst_errors,
+        flow_skipped: burst_skipped,
         flow_answered,
         inbound_summary,
     })
@@ -5613,16 +5620,34 @@ pub fn run_join_config_session(
                     if connection_report.flow_answered {
                         "🎯 app=4 join flow: burst sent, 0x9B challenge answered — BaseClient connected stage reached (post-answer world state on channel 1)".into()
                     } else {
-                        if connection_report.flow_burst_errors.is_empty() {
+                        if connection_report.flow_burst_errors.is_empty()
+                            && connection_report.flow_skipped.is_empty()
+                        {
                             "⚠️ app=4 join flow: burst sent, but the 0x9B challenge was not answered — connected stage NOT reached".into()
+                        } else if connection_report.flow_burst_errors.is_empty() {
+                            // Nothing errored, but the burst was incomplete: a
+                            // frame was never built, so the server got a partial
+                            // join sequence and had no reason to challenge us.
+                            format!(
+                                "⚠️ app=4 join flow: burst sent INCOMPLETE — the 0x9B challenge was not answered and the connected stage was NOT reached. Omitted: {}",
+                                connection_report.flow_skipped.join(" | ")
+                            )
                         } else {
                             // The burst did not complete. Saying "burst sent" here
                             // is what hid a truncated write behind a successful
                             // handshake for several runs.
                             format!(
-                                "⚠️ app=4 join flow: burst FAILED — the 0x9B challenge was not answered and the connected stage was NOT reached. {} action(s) errored: {}",
+                                "⚠️ app=4 join flow: burst FAILED — the 0x9B challenge was not answered and the connected stage was NOT reached. {} action(s) errored: {}{}",
                                 connection_report.flow_burst_errors.len(),
-                                connection_report.flow_burst_errors.join(" | ")
+                                connection_report.flow_burst_errors.join(" | "),
+                                if connection_report.flow_skipped.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " | omitted: {}",
+                                        connection_report.flow_skipped.join(" | ")
+                                    )
+                                }
                             )
                         }
                     }

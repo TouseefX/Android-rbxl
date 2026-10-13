@@ -415,6 +415,10 @@ pub struct AppFlow {
     post_answer_reported: bool,
     now_ms: u64,
     events: Vec<FlowEvent>,
+    /// Pieces of the burst that were left out, and why. These used to reach
+    /// only a Status event, so a session that silently dropped the 0x90 read
+    /// exactly like one that sent it.
+    skipped: Vec<String>,
 }
 
 impl AppFlow {
@@ -428,6 +432,7 @@ impl AppFlow {
             chan1_rx: Vec::new(),
             chan1_reset: false,
             challenge_seen: false,
+            skipped: Vec::new(),
             answered: false,
             routes_at_ms: -1,
             post_answer_bytes: 0,
@@ -488,7 +493,9 @@ impl AppFlow {
             one.extend_from_slice(&frame(&build_early_auth(early)));
             self.log(format!("early-auth staged ({}B payload)", early.pre.len() + early.auth.len()));
         } else {
-            self.log("early-auth material missing — skipping 0xA8".into());
+            let why = "early-auth material missing — 0xA8 not sent".to_string();
+            self.skipped.push(why.clone());
+            self.log(why);
         }
         match self.cfg.a7_mode {
             A7Mode::Real => one.extend_from_slice(&frame(A7_REAL)),
@@ -498,7 +505,9 @@ impl AppFlow {
         let m90 = match build_90(&self.cfg) {
             Ok(m) => Some(m),
             Err(e) => {
-                self.log(format!("0x90 skipped: {e}"));
+                let why = format!("0x90 not sent: {e}");
+                self.skipped.push(why.clone());
+                self.log(why);
                 None
             }
         };
@@ -525,6 +534,11 @@ impl AppFlow {
             if m90.is_some() { "included" } else { "skipped" }
         ));
         actions
+    }
+
+    /// Burst pieces that were left out, with reasons.
+    pub fn skipped(&self) -> &[String] {
+        &self.skipped
     }
 
     /// The session tells us which raw stream id an OpenStream action got.
