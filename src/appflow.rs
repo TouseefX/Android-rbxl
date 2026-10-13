@@ -762,6 +762,34 @@ impl AppFlow {
         &self.channel_opens
     }
 
+    /// Where the 0x9B challenge stands, for the session report. Every other
+    /// signal about it went to Status events, so a challenge that arrived but
+    /// did not parse was indistinguishable from one that never came.
+    pub fn challenge_summary(&self) -> String {
+        let head: Vec<String> = self
+            .chan1_rx
+            .iter()
+            .take(48)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let tags: Vec<String> = self
+            .chan1_rx
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == 0x9B)
+            .take(8)
+            .map(|(offset, _)| format!("@{offset}"))
+            .collect();
+        format!(
+            "chan1 {} bytes buffered, challenge_seen={}, answered={}; 0x9B tag at offsets [{}]; first bytes: {}",
+            self.chan1_rx.len(),
+            self.challenge_seen,
+            self.answered,
+            tags.join(" "),
+            head.join(" ")
+        )
+    }
+
     fn streams_key(&self, stream: i64) -> (u32, u32) {
         self.streams
             .iter()

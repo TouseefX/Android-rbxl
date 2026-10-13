@@ -1755,7 +1755,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1774,7 +1774,8 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.auth_len,
             report.early_auth_payload_len,
             report.inbound_summary,
-            report.flow_channel_opens
+            report.flow_channel_opens,
+            report.flow_challenge_state
         ),
         Err(reason) => format!(
             "\nRbxTransport QUIC session attempt failed before inbound Team Create traffic was accepted: {reason}"
@@ -1823,6 +1824,8 @@ struct RbxTransportConnectionReport {
     /// were only ever emitted as Status events, which the session report does
     /// not carry - so parsing them changed nothing that could be seen.
     flow_channel_opens: String,
+    /// Whether a 0x9B arrived on chan1 and what it looked like.
+    flow_challenge_state: String,
     inbound_summary: String,
 }
 
@@ -2768,6 +2771,10 @@ async fn attempt_rbx_transport_connection_async(
                         .join("; ")
                 }
             })
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_challenge_state: join_flow
+            .as_ref()
+            .map(|flow| flow.challenge_summary())
             .unwrap_or_else(|| "flow inactive".to_string()),
         flow_answered,
         inbound_summary,
@@ -5827,7 +5834,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -5842,7 +5849,8 @@ pub fn run_join_config_session(
                     connection_report.udp_summary,
                     flow_status,
                     connection_report.inbound_summary,
-                    connection_report.flow_channel_opens
+                    connection_report.flow_channel_opens,
+                    connection_report.flow_challenge_state
                 ));
             }
             Err(reason) => report.push_str(&format!(
