@@ -5827,7 +5827,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -5841,7 +5841,8 @@ pub fn run_join_config_session(
                     connection_report.handshake_completed_ms,
                     connection_report.udp_summary,
                     flow_status,
-                    connection_report.inbound_summary
+                    connection_report.inbound_summary,
+                    connection_report.flow_channel_opens
                 ));
             }
             Err(reason) => report.push_str(&format!(
