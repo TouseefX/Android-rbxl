@@ -1628,11 +1628,17 @@ fn decode_rbx_transport_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     Some((value, encoded_len))
 }
 
-// The ALPN the UDMUX edge selects for a game connection. A session log showed
-// "negotiated unexpected ALPN None; expected RbxTransport" - the server was
-// offered "RbxTransport" and selected nothing, because that is not what it
-// advertises. The clients that complete the handshake offer "rbx-rtcio".
-const RBX_TRANSPORT_ALPN: &[u8] = b"rbx-rtcio";
+// ALPNs offered to the UDMUX edge, in preference order.
+//
+// Which of these the edge selects for a game connection was in dispute: Studio is
+// believed to use "RbxTransport", while the reference clients hardcode
+// "rbx-rtcio" at every join call site. Offering only one and asserting the answer
+// meant a session failed with "negotiated unexpected ALPN None" and nothing more.
+// ALPN is a list, so both are offered and whichever the server picks is used;
+// the log line records which one won, so the question gets settled by the wire.
+const RBX_TRANSPORT_ALPN_PRIMARY: &[u8] = b"rbx-rtcio";
+const RBX_TRANSPORT_ALPN_ALT: &[u8] = b"RbxTransport";
+const RBX_TRANSPORT_ALPNS: [&[u8]; 2] = [RBX_TRANSPORT_ALPN_PRIMARY, RBX_TRANSPORT_ALPN_ALT];
 #[cfg(not(test))]
 const RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES: usize = 1 << 20;
 const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
@@ -2220,7 +2226,8 @@ async fn attempt_rbx_transport_connection_async(
     #[cfg(feature = "ossl-tls")]
     let tls_session = {
         let backend = ngnet_quic::OsslBackend::builder(ngnet_quic::Role::Client)
-            .alpn(RBX_TRANSPORT_ALPN.to_vec())
+            .alpn(RBX_TRANSPORT_ALPN_PRIMARY.to_vec())
+            .alpn(RBX_TRANSPORT_ALPN_ALT.to_vec())
             .custom_extension(RBX_TRANSPORT_CAPS_EXT_TYPE, RBX_TRANSPORT_CAPS_WIRE.to_vec())
             // TLS 1.3 only, two cipher suites in this order, x25519 only, and no
             // compress_certificate: the reference client's ClientHello carries
@@ -2301,6 +2308,8 @@ async fn attempt_rbx_transport_connection_async(
     let mut rx_buf = vec![0u8; 65_535];
     let mut zero_rx_grace_given = false;
     let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
+    // Which of the offered ALPNs the edge selected, kept for the report.
+    let mut selected_alpn: Option<String> = None;
     loop {
         write_pending_rbx_transport_packets(
             &mut connection,
@@ -2311,12 +2320,25 @@ async fn attempt_rbx_transport_connection_async(
         .await?;
         if connection.is_handshake_completed() {
             let alpn = connection.negotiated_alpn();
-            if alpn.as_deref() != Some(RBX_TRANSPORT_ALPN) {
+            let selected = alpn.as_deref().map(core::str::from_utf8).transpose().ok().flatten();
+            if !RBX_TRANSPORT_ALPNS
+                .iter()
+                .any(|candidate| alpn.as_deref() == Some(*candidate))
+            {
                 return Err(format!(
-                    "RbxTransport TLS handshake negotiated unexpected ALPN {:?}; expected {}",
+                    "RbxTransport TLS handshake negotiated unexpected ALPN {:?}; offered {}",
                     alpn.as_deref().map(String::from_utf8_lossy),
-                    String::from_utf8_lossy(RBX_TRANSPORT_ALPN)
+                    RBX_TRANSPORT_ALPNS
+                        .iter()
+                        .map(|candidate| String::from_utf8_lossy(candidate))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
+            }
+            // Recording which one the edge chose is the point of offering both.
+            if let Some(selected) = selected {
+                log::info!("RbxTransport ALPN selected by the edge: {selected}");
+                selected_alpn = Some(selected.to_owned());
             }
             break;
         }
@@ -2490,7 +2512,7 @@ async fn attempt_rbx_transport_connection_async(
                 route.route_label,
                 route.target_endpoint.label(),
                 local_addr,
-                String::from_utf8_lossy(RBX_TRANSPORT_ALPN)
+                selected_alpn.as_deref().unwrap_or("<none>")
             )));
         }
     }
@@ -2597,7 +2619,9 @@ async fn attempt_rbx_transport_connection_async(
         route_label: route.route_label,
         target: route.target_endpoint.label(),
         local_addr,
-        alpn: String::from_utf8_lossy(RBX_TRANSPORT_ALPN).into_owned(),
+        alpn: selected_alpn
+            .clone()
+            .unwrap_or_else(|| String::from_utf8_lossy(RBX_TRANSPORT_ALPN_PRIMARY).into_owned()),
         rupp_prefix_len: route.outgoing_prefix.len(),
         initial_dst_cid_len,
         native_quic_cid_trailer_len: if route.native_quic_packet_protection {
