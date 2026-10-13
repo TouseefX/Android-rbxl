@@ -2730,10 +2730,11 @@ async fn attempt_rbx_transport_connection_async(
     match build_join_flow_config(plan) {
         Some(cfg) => {
             let now_ms = started.elapsed().as_millis() as u64;
+            // Read before `cfg` moves into the flow.
+            let a7_label = crate::appflow::a7_mode_label(cfg.a7_mode);
             let mut flow = crate::appflow::AppFlow::new(cfg, now_ms);
             log::info!(
-                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, 0xA7 = {}, 0x90/0x92/0x8A, 0x8F)",
-                crate::appflow::a7_mode_label(cfg.a7_mode)
+                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, 0xA7 = {a7_label}, 0x90/0x92/0x8A, 0x8F)"
             );
             for action in flow.on_connected() {
                 if let Err(error) = execute_join_flow_action(
