@@ -1437,7 +1437,7 @@ impl OsslBackendBuilder {
             let ok = unsafe {
                 sys::SSL_CTX_ctrl(
                     ctx.0,
-                    sys::SSL_CTRL_SET_MIN_PROTO_VERSION as core::ffi::c_long,
+                    sys::SSL_CTRL_SET_MIN_PROTO_VERSION as c_int,
                     version as core::ffi::c_long,
                     ptr::null_mut(),
                 )
@@ -1448,7 +1448,7 @@ impl OsslBackendBuilder {
             let ok = unsafe {
                 sys::SSL_CTX_ctrl(
                     ctx.0,
-                    sys::SSL_CTRL_SET_MAX_PROTO_VERSION as core::ffi::c_long,
+                    sys::SSL_CTRL_SET_MAX_PROTO_VERSION as c_int,
                     version as core::ffi::c_long,
                     ptr::null_mut(),
                 )
@@ -1472,7 +1472,7 @@ impl OsslBackendBuilder {
             let ok = unsafe {
                 sys::SSL_CTX_ctrl(
                     ctx.0,
-                    sys::SSL_CTRL_SET_GROUPS_LIST as core::ffi::c_long,
+                    sys::SSL_CTRL_SET_GROUPS_LIST as c_int,
                     0,
                     list.as_ptr().cast_mut().cast::<c_void>(),
                 )
