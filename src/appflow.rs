@@ -384,6 +384,10 @@ pub struct Build90 {
     pub refreshed: Vec<String>,
     /// Template keys still carrying the captured account's values.
     pub frozen: Vec<String>,
+    /// Identity keys the gamejoin response did not carry at all, so nothing
+    /// could replace them. Distinct from `frozen`, which also covers keys whose
+    /// live value merely equalled the capture.
+    pub missing_identity: Vec<String>,
 }
 
 /// 0x90 join-config message: the native capture template with the JSON
@@ -420,6 +424,11 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
         std::str::from_utf8(&raw[i..raw.len() - 20]).map_err(|_| "0x90 template: bad JSON")?;
     let mut tmpl: serde_json::Map<String, serde_json::Value> = serde_json::from_str(template_json)
         .map_err(|e| format!("0x90 template: JSON parse failed: {e}"))?;
+    // Snapshotted before ANY substitution. Taking this later - which is what the
+    // first version did - folded RandomSeed1, APIsecurityToken and __joinTicket
+    // into the baseline, so three fields that were always replaced read as
+    // "still frozen from the capture".
+    let pristine: serde_json::Map<String, serde_json::Value> = tmpl.clone();
 
     tmpl.insert(
         "RandomSeed1".into(),
@@ -458,7 +467,6 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
 
     // The template froze one account's identity. Rewrite the parts this
     // session can source, and say which parts it could not.
-    let captured: serde_json::Map<String, serde_json::Value> = tmpl.clone();
     tmpl.insert("UserId".into(), serde_json::Value::from(cfg.user_id));
     tmpl.insert(
         "CharacterAppearanceId".into(),
@@ -506,16 +514,28 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
         }
     }
 
-    let refreshed: Vec<String> = captured
+    let refreshed: Vec<String> = pristine
         .keys()
-        .filter(|key| tmpl.get(*key) != captured.get(*key))
+        .filter(|key| tmpl.get(*key) != pristine.get(*key))
         .cloned()
         .collect();
-    let frozen: Vec<String> = captured
+    let frozen: Vec<String> = pristine
         .keys()
-        .filter(|key| tmpl.get(*key) == captured.get(*key))
+        .filter(|key| tmpl.get(*key) == pristine.get(*key))
         .cloned()
         .collect();
+    // A field can be untouched either because nothing could source it or because
+    // the live value happened to match the capture. Those need telling apart, so
+    // name the identity fields the gamejoin response did not carry.
+    let missing_identity: Vec<String> = [
+        ("UserName", cfg.user_name.is_some()),
+        ("DisplayName", cfg.display_name.is_some()),
+        ("DomainUserId", cfg.domain_user_id.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| !present)
+    .map(|(key, _)| key.to_owned())
+    .collect();
 
     let body = serde_json::to_string(&tmpl).map_err(|e| format!("0x90 serialize: {e}"))?;
     let mut out = raw[..start].to_vec();
@@ -526,6 +546,7 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
         bytes: out,
         refreshed,
         frozen,
+        missing_identity,
     })
 }
 
@@ -673,8 +694,9 @@ impl AppFlow {
         let m90 = match build_90(&self.cfg) {
             Ok(built) => {
                 self.join90_report = format!(
-                    "refreshed from this session [{}]; still frozen from the capture [{}]",
+                    "refreshed from this session [{}]; not carried by the gamejoin response [{}]; unchanged [{}]",
                     built.refreshed.join(", "),
+                    built.missing_identity.join(", "),
                     built.frozen.join(", ")
                 );
                 self.log(format!("0x90 {}", self.join90_report));
@@ -1332,6 +1354,15 @@ mod tests {
             a7_mode: A7Mode::Skip,
         };
         let built = build_90(&cfg).expect("build_90");
+        // No identity fields supplied, so all three are reported as unavailable
+        // rather than quietly leaving the captured account's in place.
+        assert_eq!(
+            built.missing_identity,
+            ["UserName", "DisplayName", "DomainUserId"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
         let m = built.bytes;
         // Prefix (everything before the JSON LEB) is byte-identical.
         let raw = TEMPLATE_90;
@@ -1418,6 +1449,15 @@ mod tests {
         // The report says what is still the captured account's, rather than
         // leaving it to be discovered on the server's side.
         assert!(built.refreshed.iter().any(|k| k == "UserId"));
+        // These are replaced on every build; the baseline must be the pristine
+        // template or they get reported as untouched.
+        for key in ["RandomSeed1", "APIsecurityToken", "__joinTicket"] {
+            assert!(
+                built.refreshed.iter().any(|k| k == key),
+                "{key} is always substituted and must read as refreshed"
+            );
+        }
+        assert!(built.missing_identity.is_empty(), "all three identity fields were supplied");
         assert!(built.frozen.iter().any(|k| k == "UserName"));
         assert!(!built.frozen.iter().any(|k| k == "UserId"));
     }
