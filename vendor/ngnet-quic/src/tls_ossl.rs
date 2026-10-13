@@ -1186,6 +1186,7 @@ pub struct OsslBackendBuilder {
     use_system_trust_store: bool,
     verify: Verify,
     custom_extensions: Vec<(u16, Vec<u8>)>,
+    expected_rpk_spki_der: Option<Vec<u8>>,
 }
 
 impl OsslBackendBuilder {
@@ -1200,7 +1201,23 @@ impl OsslBackendBuilder {
             use_system_trust_store: role == Role::Client,
             verify: Verify::Peer,
             custom_extensions: Vec::new(),
+            expected_rpk_spki_der: None,
         }
+    }
+
+    /// Pins the exact server key expected, given as a SubjectPublicKeyInfo DER
+    /// blob, and negotiates an RFC 7250 raw public key instead of a certificate.
+    ///
+    /// This is the counterpart of the rustls backend's `ServerCertVerifier`:
+    /// peers that authenticate with a bare Ed25519 key rather than an X.509
+    /// chain. Without it the handshake has nothing to compare the peer against.
+    ///
+    /// OpenSSL implements the pin through DANE: `SSL_add_expected_rpk` records a
+    /// DANE-EE / SPKI / Full match, and returns 0 unless DANE has been enabled
+    /// first, so both are done here rather than left to the caller.
+    pub fn expected_rpk_spki_der(mut self, der: impl Into<Vec<u8>>) -> Self {
+        self.expected_rpk_spki_der = Some(der.into());
+        self
     }
 
     /// Registers a TLS extension OpenSSL does not know about, to be written
@@ -1363,6 +1380,32 @@ impl OsslBackendBuilder {
             alpn_offers = Some(offers);
         }
 
+        let mut expected_rpk = None;
+        if let Some(der) = &self.expected_rpk_spki_der {
+            let mut cursor: *const c_uchar = der.as_ptr();
+            let mut raw: *mut sys::EVP_PKEY = ptr::null_mut();
+            // SAFETY: `cursor` and `raw` are valid out-parameters describing
+            // `der`, whose length is passed alongside; a null libctx and propq
+            // mean the default context and no property query.
+            let parsed = unsafe {
+                sys::d2i_PUBKEY_ex(
+                    &mut raw,
+                    &mut cursor,
+                    der.len() as core::ffi::c_long,
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            };
+            if parsed.is_null() {
+                return Err(tls_error("the expected raw public key is not valid SPKI DER"));
+            }
+            // SAFETY: `parsed` is a fresh reference we now own; `Pkey` frees it.
+            if unsafe { sys::SSL_CTX_dane_enable(ctx.0) } <= 0 {
+                return Err(tls_error("SSL_CTX_dane_enable failed"));
+            }
+            expected_rpk = Some(Pkey(parsed));
+        }
+
         let mut custom_ext_payloads: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
         for (ext_type, payload) in &self.custom_extensions {
             let shared = std::sync::Arc::new(payload.clone());
@@ -1398,6 +1441,7 @@ impl OsslBackendBuilder {
             verify: self.verify,
             alpn_offers,
             custom_ext_payloads,
+            expected_rpk,
         })
     }
 }
@@ -1763,6 +1807,13 @@ pub struct OsslBackend {
     /// from this backend keeps the `SSL_CTX` alive after the backend is dropped,
     /// and the callbacks go with the context.
     custom_ext_payloads: Vec<std::sync::Arc<Vec<u8>>>,
+    /// The pinned peer key, for sessions to install as an expected RPK.
+    ///
+    /// Owned here rather than per session because it is parsed once. Held by the
+    /// backend for the backend's lifetime, which is all that is needed:
+    /// `SSL_add_expected_rpk` serialises the key into a TLSA record rather than
+    /// keeping the pointer, so no session can outlive a use of it.
+    expected_rpk: Option<Pkey>,
 }
 
 impl OsslBackend {
@@ -1826,6 +1877,32 @@ impl OsslSession {
             verify: backend.verify,
             role,
         };
+
+        if let Some(rpk) = &backend.expected_rpk {
+            // DANE first: `SSL_add_expected_rpk` stores the pin as a DANE-EE
+            // TLSA record and returns 0 when DANE is off. A null basedomain is
+            // correct for a peer that is not identified by a DNS name.
+            // SAFETY: `ssl` is valid and was just created above.
+            if unsafe { sys::SSL_dane_enable(session.ssl, ptr::null()) } <= 0 {
+                return Err(tls_error("SSL_dane_enable failed"));
+            }
+            // 2 is RawPublicKey in RFC 7250's client_cert_type extension; 0 is
+            // X.509 and is deliberately not offered, so a peer that wants to
+            // present a certificate cannot.
+            let cert_type = [2u8];
+            // SAFETY: `ssl` is valid and the slice outlives the call.
+            if unsafe {
+                sys::SSL_set1_client_cert_type(session.ssl, cert_type.as_ptr(), cert_type.len())
+            } != 1
+            {
+                return Err(tls_error("SSL_set1_client_cert_type failed"));
+            }
+            // SAFETY: `ssl` is valid and the key is owned by the backend; OpenSSL
+            // copies it into a TLSA record rather than keeping the pointer.
+            if unsafe { sys::SSL_add_expected_rpk(session.ssl, rpk.0) } != 1 {
+                return Err(tls_error("SSL_add_expected_rpk failed"));
+            }
+        }
 
         let mut ossl_ctx: *mut sys::ngtcp2_crypto_ossl_ctx = ptr::null_mut();
         // SAFETY: `ossl_ctx` is a valid out-parameter and `ssl` is valid.

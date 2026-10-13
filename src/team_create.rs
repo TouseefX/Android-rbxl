@@ -2168,18 +2168,56 @@ async fn attempt_rbx_transport_connection_async(
         .ack_delay_exponent(3)
         .max_ack_delay(ngnet_quic::Duration::from_nanos(25_000_000))
         .max_datagram_frame_size(RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES as u64);
-    let backend = RbxTransportRustlsBackend::new(
-        plan.early_key.public_key,
-        &route.server_name,
-        route.enable_sni,
-    )
-    .map_err(|error| format!("failed to configure Rustls QUIC client: {error}"))?;
-    let tls_session = ngnet_quic::Backend::new_session(
-        &backend,
-        ngnet_quic::Role::Client,
-        Some(&route.server_name),
-    )
-    .map_err(|error| format!("failed to create Rustls QUIC session: {error}"))?;
+    // Two TLS backends, chosen at compile time.
+    //
+    // Rustls is the default and does raw-public-key verification through a
+    // `ServerCertVerifier`. The OpenSSL backend exists because it is the only
+    // way to get 0xFF00 into the ClientHello as a genuine first extension -
+    // OpenSSL writes custom extensions ahead of every built-in one
+    // (`ssl/statem/extensions.c:1188`) - instead of splicing them into the
+    // finished message afterwards. It authenticates the same Ed25519 raw key,
+    // pinned as a DANE-EE / SPKI / Full match, and offers RawPublicKey only, so
+    // switching backend does not weaken what the peer has to prove.
+    #[cfg(not(feature = "ossl-tls"))]
+    let tls_session = {
+        let backend = RbxTransportRustlsBackend::new(
+            plan.early_key.public_key,
+            &route.server_name,
+            route.enable_sni,
+        )
+        .map_err(|error| format!("failed to configure Rustls QUIC client: {error}"))?;
+        ngnet_quic::Backend::new_session(
+            &backend,
+            ngnet_quic::Role::Client,
+            Some(&route.server_name),
+        )
+        .map_err(|error| format!("failed to create Rustls QUIC session: {error}"))?
+    };
+    #[cfg(feature = "ossl-tls")]
+    let tls_session = {
+        // The Ed25519 SubjectPublicKeyInfo header, so the raw 32-byte key can be
+        // handed to OpenSSL as the DER it expects.
+        const ED25519_SPKI_PREFIX: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        let mut spki_der = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
+        spki_der.extend_from_slice(&ED25519_SPKI_PREFIX);
+        spki_der.extend_from_slice(&plan.early_key.public_key);
+
+        let backend = ngnet_quic::OsslBackend::builder(ngnet_quic::Role::Client)
+            .alpn(RBX_TRANSPORT_ALPN.to_vec())
+            .custom_extension(RBX_TRANSPORT_CAPS_EXT_TYPE, RBX_TRANSPORT_CAPS_WIRE.to_vec())
+            .expected_rpk_spki_der(spki_der)
+            .verify(ngnet_quic::Verify::Peer)
+            .build()
+            .map_err(|error| format!("failed to configure OpenSSL QUIC client: {error}"))?;
+        ngnet_quic::Backend::new_session(
+            &backend,
+            ngnet_quic::Role::Client,
+            Some(&route.server_name),
+        )
+        .map_err(|error| format!("failed to create OpenSSL QUIC session: {error}"))?
+    };
 
     let receive_stats = Arc::new(Mutex::new(RbxTransportReceiveStats::default()));
     let stream_receiver = Arc::new(Mutex::new(RbxTransportStreamReceiver::new(

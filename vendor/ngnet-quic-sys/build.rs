@@ -482,6 +482,17 @@ fn generate_bindings(
             // SSL_EXT_CLIENT_HELLO and friends select which handshake message a
             // custom extension is written into.
             .allowlist_var("SSL_EXT_.*")
+            // Raw public keys (RFC 7250). `SSL_add_expected_rpk` stores the pin
+            // as a DANE-EE / SPKI / Full TLSA record, so DANE has to be on first,
+            // and `SSL_set1_client_cert_type` is what asks the peer for an RPK
+            // instead of a certificate. `d2i_PUBKEY_ex` rather than `d2i_PUBKEY`
+            // because the latter only exists as a macro-generated symbol.
+            .allowlist_function("d2i_PUBKEY_ex")
+            .allowlist_function("SSL_CTX_dane_enable")
+            .allowlist_function("SSL_dane_enable")
+            .allowlist_function("SSL_add_expected_rpk")
+            .allowlist_function("SSL_set1_client_cert_type")
+            .allowlist_function("SSL_get_negotiated_server_cert_type")
             .allowlist_function("SSL_set_alpn_protos")
             .allowlist_function("SSL_CTX_set_alpn_select_cb")
             .allowlist_function("SSL_get0_alpn_selected")
