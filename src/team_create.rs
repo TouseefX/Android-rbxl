@@ -1755,6 +1755,11 @@ struct RbxTransportConnectionReport {
     /// the challenge was answered.
     flow_active: bool,
     flow_answered: bool,
+    /// Errors from the post-handshake burst. The summary line used to be chosen
+    /// purely on `flow_answered`, so it printed "burst sent" even when a stream
+    /// write had been abandoned partway - which made a truncated send
+    /// indistinguishable from a complete one.
+    flow_burst_errors: Vec<String>,
     inbound_summary: String,
 }
 
@@ -2524,6 +2529,10 @@ async fn attempt_rbx_transport_connection_async(
     // sessions): once the keys are up, the appflow burst goes out
     // immediately.
     let mut join_flow: Option<crate::appflow::AppFlow> = None;
+    // Declared outside the match so the report can carry it: a burst that was
+    // only partly written has to be visible in the summary, not just in the
+    // per-action Status events.
+    let mut burst_errors: Vec<String> = Vec::new();
     match build_join_flow_config(plan) {
         Some(cfg) => {
             let now_ms = started.elapsed().as_millis() as u64;
@@ -2542,6 +2551,7 @@ async fn attempt_rbx_transport_connection_async(
                 )
                 .await
                 {
+                    burst_errors.push(error.clone());
                     if let Some(event_tx) = &event_tx {
                         let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
                             "app=4 flow burst: {error}"
@@ -2640,6 +2650,7 @@ async fn attempt_rbx_transport_connection_async(
         auth_len: auth.auth_blob.len(),
         early_auth_payload_len,
         flow_active: join_flow.is_some(),
+        flow_burst_errors: burst_errors,
         flow_answered,
         inbound_summary,
     })
@@ -5602,7 +5613,18 @@ pub fn run_join_config_session(
                     if connection_report.flow_answered {
                         "🎯 app=4 join flow: burst sent, 0x9B challenge answered — BaseClient connected stage reached (post-answer world state on channel 1)".into()
                     } else {
-                        "⚠️ app=4 join flow: burst sent, but the 0x9B challenge was not answered — connected stage NOT reached".into()
+                        if connection_report.flow_burst_errors.is_empty() {
+                            "⚠️ app=4 join flow: burst sent, but the 0x9B challenge was not answered — connected stage NOT reached".into()
+                        } else {
+                            // The burst did not complete. Saying "burst sent" here
+                            // is what hid a truncated write behind a successful
+                            // handshake for several runs.
+                            format!(
+                                "⚠️ app=4 join flow: burst FAILED — the 0x9B challenge was not answered and the connected stage was NOT reached. {} action(s) errored: {}",
+                                connection_report.flow_burst_errors.len(),
+                                connection_report.flow_burst_errors.join(" | ")
+                            )
+                        }
                     }
                 } else {
                     format!(
