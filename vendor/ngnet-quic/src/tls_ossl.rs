@@ -1571,6 +1571,7 @@ impl OsslBackendBuilder {
             alpn_offers,
             custom_ext_payloads,
             expected_rpk,
+            server_cert_type_rpk: self.server_cert_type_rpk,
         })
     }
 }
@@ -1943,6 +1944,8 @@ pub struct OsslBackend {
     /// `SSL_add_expected_rpk` serialises the key into a TLSA record rather than
     /// keeping the pointer, so no session can outlive a use of it.
     expected_rpk: Option<Pkey>,
+    /// Whether sessions ask the peer for a raw public key.
+    server_cert_type_rpk: bool,
 }
 
 impl OsslBackend {
