@@ -366,12 +366,31 @@ pub fn build_8a(cfg: &JoinConfig) -> Vec<u8> {
     out
 }
 
+/// A built 0x90 plus an account of how much of it is this session's.
+///
+/// The 0x90 is a captured template, so every key this struct does not claim to
+/// have refreshed still holds the captured account's value. Reporting the split
+/// is what keeps a stale identity field from looking like a working join.
+pub struct Build90 {
+    /// The frame bytes.
+    pub bytes: Vec<u8>,
+    /// Template keys replaced with this session's values.
+    pub refreshed: Vec<String>,
+    /// Template keys still carrying the captured account's values.
+    pub frozen: Vec<String>,
+}
+
 /// 0x90 join-config message: the native capture template with the JSON
 /// region replaced by this session's `RandomSeed1` / `APIsecurityToken` /
 /// `__joinTicket` (a JSON string of the two joinTicket fields), the LEB
 /// length rewritten, and the final 20 bytes preserved. Port of
 /// session.cpp `build90`.
-pub fn build_90(cfg: &JoinConfig) -> Result<Vec<u8>, String> {
+///
+/// The template's own identity fields are rewritten too. They used to be left
+/// alone, which made the burst self-contradictory: 0x8A carries
+/// `cfg.user_id` while 0x90 carried the captured account's, so the two frames
+/// named different users.
+pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
     if cfg.random_seed1.is_none() || cfg.api_security_token.is_none() {
         return Err("0x90 needs joinScript.RandomSeed1 / APIsecurityToken".into());
     }
@@ -415,12 +434,77 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Vec<u8>, String> {
         ),
     );
 
+    // The template froze one account's identity. Rewrite the parts this
+    // session can source, and say which parts it could not.
+    let captured: serde_json::Map<String, serde_json::Value> = tmpl.clone();
+    tmpl.insert("UserId".into(), serde_json::Value::from(cfg.user_id));
+    tmpl.insert(
+        "CharacterAppearanceId".into(),
+        serde_json::Value::from(cfg.user_id),
+    );
+    // The avatar-fetch URL names the user in a query parameter, not a field.
+    if let Some(serde_json::Value::String(url)) = tmpl.get("CharacterAppearance") {
+        let url = url.clone();
+        if let Some(at) = url.find("userId=") {
+            let from = at + "userId=".len();
+            let to = url[from..]
+                .find(|c: char| !c.is_ascii_digit())
+                .map_or(url.len(), |i| from + i);
+            tmpl.insert(
+                "CharacterAppearance".into(),
+                serde_json::Value::String(format!("{}{}{}", &url[..from], cfg.user_id, &url[to..])),
+            );
+        }
+    }
+
+    // The live join ticket is base64-encoded JSON and carries the same account
+    // fields the template froze. It arrives either as that string or, on some
+    // configs, already decoded into an object.
+    let ticket_fields: Option<serde_json::Map<String, serde_json::Value>> =
+        match cfg.serialized_client_fields.as_ref() {
+            Some(serde_json::Value::String(text)) => {
+                serde_json::from_slice(&b64_decode(text)).ok()
+            }
+            Some(serde_json::Value::Object(map)) => Some(map.clone()),
+            _ => None,
+        };
+    if let Some(fields) = ticket_fields {
+        // (SerializedClientFields key, the 0x90 key it feeds)
+        for (src, dst) in [
+            ("AccountAge", "AccountAge"),
+            ("CountryCode", "CountryRegionCode"),
+            ("MembershipType", "MembershipType"),
+            ("HasVerifiedBadge", "HasVerifiedBadge"),
+            ("GameLocale", "LocaleId"),
+            ("GameLocale", "LocaleIdInternal"),
+        ] {
+            if let Some(value) = fields.get(src) {
+                tmpl.insert(dst.into(), value.clone());
+            }
+        }
+    }
+
+    let refreshed: Vec<String> = captured
+        .keys()
+        .filter(|key| tmpl.get(*key) != captured.get(*key))
+        .cloned()
+        .collect();
+    let frozen: Vec<String> = captured
+        .keys()
+        .filter(|key| tmpl.get(*key) == captured.get(*key))
+        .cloned()
+        .collect();
+
     let body = serde_json::to_string(&tmpl).map_err(|e| format!("0x90 serialize: {e}"))?;
     let mut out = raw[..start].to_vec();
     out.extend_from_slice(&leb128(body.len() as u64));
     out.extend_from_slice(body.as_bytes());
     out.extend_from_slice(&raw[raw.len() - 20..]);
-    Ok(out)
+    Ok(Build90 {
+        bytes: out,
+        refreshed,
+        frozen,
+    })
 }
 
 fn hex32(v: u32) -> String {
@@ -448,6 +532,8 @@ pub struct AppFlow {
     events: Vec<FlowEvent>,
     /// Last drain-loop outcome, for the session report.
     drain_summary: String,
+    /// Which 0x90 template fields were refreshed and which are still captured.
+    join90_report: String,
     /// Partial control records per stream, since a record can straddle chunks.
     ctrl_rx: HashMap<i64, Vec<u8>>,
     /// Channel opens the peer announced: (app, channel, wire id if unreliable).
@@ -477,6 +563,7 @@ impl AppFlow {
             skipped: Vec::new(),
             pending: std::collections::VecDeque::new(),
             drain_summary: String::new(),
+            join90_report: String::new(),
             ctrl_rx: HashMap::new(),
             channel_opens: Vec::new(),
             answered: false,
@@ -549,7 +636,15 @@ impl AppFlow {
             A7Mode::Skip => {}
         }
         let m90 = match build_90(&self.cfg) {
-            Ok(m) => Some(m),
+            Ok(built) => {
+                self.join90_report = format!(
+                    "refreshed from this session [{}]; still frozen from the capture [{}]",
+                    built.refreshed.join(", "),
+                    built.frozen.join(", ")
+                );
+                self.log(format!("0x90 {}", self.join90_report));
+                Some(built.bytes)
+            }
             Err(e) => {
                 let why = format!("0x90 not sent: {e}");
                 self.skipped.push(why.clone());
@@ -780,6 +875,15 @@ impl AppFlow {
             off = end;
         }
         out
+    }
+
+    /// Which 0x90 fields came from this session and which are still captured.
+    pub fn join90_report(&self) -> &str {
+        if self.join90_report.is_empty() {
+            "0x90 was not built"
+        } else {
+            &self.join90_report
+        }
     }
 
     /// Records how the queued-write drain went.
@@ -1128,7 +1232,8 @@ mod tests {
             early_auth: None,
             a7_mode: A7Mode::Skip,
         };
-        let m = build_90(&cfg).expect("build_90");
+        let built = build_90(&cfg).expect("build_90");
+        let m = built.bytes;
         // Prefix (everything before the JSON LEB) is byte-identical.
         let raw = TEMPLATE_90;
         let i = raw.windows(9).position(|w| w == b"{\"UserId\"").unwrap();
@@ -1149,8 +1254,63 @@ mod tests {
             serde_json::from_str(v["__joinTicket"].as_str().unwrap()).expect("ticket json");
         assert_eq!(jt["SerializedClientFields"].as_str(), Some("SCF"));
         assert_eq!(jt["EncryptedServerFields"].as_str(), Some("ESF"));
-        // Other template keys survive.
+        // UserId now follows cfg, which here happens to be the captured value.
         assert_eq!(v["UserId"].as_i64(), Some(2_655_886_518));
+    }
+
+    /// The 0x90 template froze one account. Every identity field this session
+    /// can source has to follow `cfg`, or the burst contradicts itself: 0x8A
+    /// carries `cfg.user_id` and 0x90 would carry somebody else's.
+    #[test]
+    fn build_90_replaces_the_captured_identity() {
+        let cfg = JoinConfig {
+            user_id: 777,
+            client_ticket: "t;2".into(),
+            session_id: "s".into(),
+            random_seed1: Some("SEED-XYZ".into()),
+            api_security_token: Some("TOKEN-ABC".into()),
+            // base64 JSON, as the live gamejoin response delivers it
+            serialized_client_fields: Some(
+                "eyJBY2NvdW50QWdlIjo0MiwiQ291bnRyeUNvZGUiOiJBRSIsIk1lbWJlcnNoaXBUeXBlIjoiUHJlbWl1bSIsIkhhc1ZlcmlmaWVkQmFkZ2UiOnRydWUsIkdhbWVMb2NhbGUiOiJlbl9nYiJ9"
+                    .into(),
+            ),
+            encrypted_server_fields: Some("ESF".into()),
+            early_auth: None,
+            a7_mode: A7Mode::Skip,
+        };
+        let built = build_90(&cfg).expect("build_90");
+        let raw = TEMPLATE_90;
+        let i = raw.windows(9).position(|w| w == b"{\"UserId\"").unwrap();
+        let mut start = i - 1;
+        while raw[start - 1] & 0x80 != 0 {
+            start -= 1;
+        }
+        let (json_len, k) = leb128_decode(&built.bytes[start..]).unwrap();
+        let body = &built.bytes[start + k..start + k + json_len as usize];
+        let v: serde_json::Value = serde_json::from_slice(body).expect("json");
+
+        assert_eq!(v["UserId"].as_i64(), Some(777));
+        assert_eq!(v["CharacterAppearanceId"].as_i64(), Some(777));
+        assert!(
+            v["CharacterAppearance"].as_str().unwrap().contains("userId=777"),
+            "the avatar URL names the user in a query parameter: {}",
+            v["CharacterAppearance"]
+        );
+        assert!(!v["CharacterAppearance"].as_str().unwrap().contains("2655886518"));
+
+        // The ticket's own account fields override the frozen ones.
+        assert_eq!(v["AccountAge"].as_i64(), Some(42));
+        assert_eq!(v["CountryRegionCode"].as_str(), Some("AE"));
+        assert_eq!(v["MembershipType"].as_str(), Some("Premium"));
+        assert_eq!(v["HasVerifiedBadge"].as_bool(), Some(true));
+        assert_eq!(v["LocaleId"].as_str(), Some("en_gb"));
+        assert_eq!(v["LocaleIdInternal"].as_str(), Some("en_gb"));
+
+        // The report says what is still the captured account's, rather than
+        // leaving it to be discovered on the server's side.
+        assert!(built.refreshed.iter().any(|k| k == "UserId"));
+        assert!(built.frozen.iter().any(|k| k == "UserName"));
+        assert!(!built.frozen.iter().any(|k| k == "UserId"));
     }
 
     #[test]

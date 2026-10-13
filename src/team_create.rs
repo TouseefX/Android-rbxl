@@ -1755,7 +1755,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\n0x90 identity: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1776,7 +1776,8 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.inbound_summary,
             report.flow_channel_opens,
             report.flow_challenge_state,
-            report.flow_drain_summary
+            report.flow_drain_summary,
+            report.flow_join90_report
         ),
         Err(reason) => format!(
             "\nRbxTransport QUIC session attempt failed before inbound Team Create traffic was accepted: {reason}"
@@ -1829,6 +1830,8 @@ struct RbxTransportConnectionReport {
     flow_challenge_state: String,
     /// How the queued-writes drain went, which is whether the burst completed.
     flow_drain_summary: String,
+    /// Which 0x90 template fields were refreshed from this session.
+    flow_join90_report: String,
     inbound_summary: String,
 }
 
@@ -2803,6 +2806,10 @@ async fn attempt_rbx_transport_connection_async(
         flow_drain_summary: join_flow
             .as_ref()
             .map(|flow| flow.drain_summary().to_owned())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_join90_report: join_flow
+            .as_ref()
+            .map(|flow| flow.join90_report().to_owned())
             .unwrap_or_else(|| "flow inactive".to_string()),
         flow_answered,
         inbound_summary,
@@ -5867,7 +5874,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\n0x90 identity: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -5884,7 +5891,8 @@ pub fn run_join_config_session(
                     connection_report.inbound_summary,
                     connection_report.flow_channel_opens,
                     connection_report.flow_challenge_state,
-                    connection_report.flow_drain_summary
+                    connection_report.flow_drain_summary,
+                    connection_report.flow_join90_report
                 ));
             }
             Err(reason) => report.push_str(&format!(
