@@ -1187,6 +1187,10 @@ pub struct OsslBackendBuilder {
     verify: Verify,
     custom_extensions: Vec<(u16, Vec<u8>)>,
     expected_rpk_spki_der: Option<Vec<u8>>,
+    proto_version: Option<u16>,
+    ciphersuites: Option<Vec<u8>>,
+    groups_list: Option<Vec<u8>>,
+    no_certificate_compression: bool,
 }
 
 impl OsslBackendBuilder {
@@ -1202,7 +1206,55 @@ impl OsslBackendBuilder {
             verify: Verify::Peer,
             custom_extensions: Vec::new(),
             expected_rpk_spki_der: None,
+            proto_version: None,
+            ciphersuites: None,
+            groups_list: None,
+            no_certificate_compression: false,
         }
+    }
+
+    /// Pins the handshake to exactly one TLS version, minimum and maximum.
+    ///
+    /// `SSL_CTX_set_min_proto_version` and its max counterpart are macros over
+    /// `SSL_CTX_ctrl`, which bindgen does not emit, so the control command is
+    /// issued directly.
+    pub fn proto_version(mut self, version: u16) -> Self {
+        self.proto_version = Some(version);
+        self
+    }
+
+    /// Restricts the TLS 1.3 cipher suites offered, colon separated.
+    ///
+    /// The list is sent verbatim in the ClientHello, so a peer that expects a
+    /// particular set - and only that set - needs this rather than the default
+    /// offer.
+    pub fn ciphersuites(mut self, list: &str) -> Self {
+        let mut bytes = list.as_bytes().to_vec();
+        bytes.push(0);
+        self.ciphersuites = Some(bytes);
+        self
+    }
+
+    /// Restricts the `supported_groups` offered, colon separated.
+    ///
+    /// `SSL_CTX_set1_groups_list` is a macro over `SSL_CTX_ctrl`, so again the
+    /// control command is issued directly.
+    pub fn groups_list(mut self, list: &str) -> Self {
+        let mut bytes = list.as_bytes().to_vec();
+        bytes.push(0);
+        self.groups_list = Some(bytes);
+        self
+    }
+
+    /// Keeps the `compress_certificate` extension out of the ClientHello.
+    ///
+    /// RFC 8879 certificate compression is offered by default, which puts an
+    /// extension in the ClientHello that a peer built before the RFC does not
+    /// send and may not tolerate. Disabling both directions removes it from what
+    /// we advertise and from what we would accept.
+    pub fn no_certificate_compression(mut self) -> Self {
+        self.no_certificate_compression = true;
+        self
     }
 
     /// Pins the exact server key expected, given as a SubjectPublicKeyInfo DER
@@ -1380,6 +1432,66 @@ impl OsslBackendBuilder {
             alpn_offers = Some(offers);
         }
 
+        if let Some(version) = self.proto_version {
+            // SAFETY: `ctx` is valid; both commands take the version as `larg`.
+            let ok = unsafe {
+                sys::SSL_CTX_ctrl(
+                    ctx.0,
+                    sys::SSL_CTRL_SET_MIN_PROTO_VERSION as core::ffi::c_long,
+                    version as core::ffi::c_long,
+                    ptr::null_mut(),
+                )
+            };
+            if ok != 1 {
+                return Err(tls_error("SSL_CTX_set_min_proto_version failed"));
+            }
+            let ok = unsafe {
+                sys::SSL_CTX_ctrl(
+                    ctx.0,
+                    sys::SSL_CTRL_SET_MAX_PROTO_VERSION as core::ffi::c_long,
+                    version as core::ffi::c_long,
+                    ptr::null_mut(),
+                )
+            };
+            if ok != 1 {
+                return Err(tls_error("SSL_CTX_set_max_proto_version failed"));
+            }
+        }
+
+        if let Some(list) = &self.ciphersuites {
+            // SAFETY: `ctx` is valid and the slice is NUL-terminated.
+            let ok =
+                unsafe { sys::SSL_CTX_set_ciphersuites(ctx.0, list.as_ptr().cast::<c_char>()) };
+            if ok != 1 {
+                return Err(tls_error("the cipher suite list was rejected"));
+            }
+        }
+
+        if let Some(list) = &self.groups_list {
+            // SAFETY: `ctx` is valid and the slice is NUL-terminated.
+            let ok = unsafe {
+                sys::SSL_CTX_ctrl(
+                    ctx.0,
+                    sys::SSL_CTRL_SET_GROUPS_LIST as core::ffi::c_long,
+                    0,
+                    list.as_ptr().cast_mut().cast::<c_void>(),
+                )
+            };
+            if ok != 1 {
+                return Err(tls_error("the supported groups list was rejected"));
+            }
+        }
+
+        if self.no_certificate_compression {
+            // SSL_OP_BIT(n) is a function-like macro bindgen cannot emit, so the
+            // two bits are written out: TX is 32, RX is 33.
+            let options = (1u64 << 32) | (1u64 << 33);
+            // SAFETY: `ctx` is valid.
+            unsafe {
+                sys::SSL_CTX_set_options(ctx.0, options);
+            }
+        }
+
         let mut expected_rpk = None;
         if let Some(der) = &self.expected_rpk_spki_der {
             let mut cursor: *const c_uchar = der.as_ptr();
@@ -1418,7 +1530,11 @@ impl OsslBackendBuilder {
                 sys::SSL_CTX_add_custom_ext(
                     ctx.0,
                     u32::from(*ext_type),
-                    sys::SSL_EXT_CLIENT_HELLO as u32,
+                    // 1152 on the wire: ClientHello plus TLS 1.3
+                    // EncryptedExtensions, matching what the native client
+                    // registers rather than the ClientHello alone.
+                    (sys::SSL_EXT_CLIENT_HELLO
+                        | sys::SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS) as u32,
                     Some(custom_ext_add),
                     // Nothing is allocated in the add callback, so there is
                     // nothing to free.

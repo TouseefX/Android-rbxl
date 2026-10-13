@@ -509,6 +509,15 @@ fn generate_bindings(
             .allowlist_function("SSL_add_expected_rpk")
             .allowlist_function("SSL_set1_client_cert_type")
             .allowlist_function("SSL_get_negotiated_server_cert_type")
+            // Shaping the ClientHello. `SSL_CTX_set_min_proto_version`,
+            // `SSL_CTX_set1_groups_list` and `SSL_OP_BIT` are macros bindgen does
+            // not emit, so the ctrl commands and option bits are reached directly.
+            .allowlist_function("SSL_CTX_ctrl")
+            .allowlist_function("SSL_CTX_set_ciphersuites")
+            .allowlist_function("SSL_CTX_set_options")
+            .allowlist_var("SSL_CTRL_SET_MIN_PROTO_VERSION")
+            .allowlist_var("SSL_CTRL_SET_MAX_PROTO_VERSION")
+            .allowlist_var("SSL_CTRL_SET_GROUPS_LIST")
             .allowlist_function("SSL_set_alpn_protos")
             .allowlist_function("SSL_CTX_set_alpn_select_cb")
             .allowlist_function("SSL_get0_alpn_selected")

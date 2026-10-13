@@ -2136,8 +2136,21 @@ async fn attempt_rbx_transport_connection_async(
     // server-side). ngtcp2 pads the Initial up to the clamp; the oversized
     // on-wire datagram (1231/1249) is then chopped into IP fragments by
     // the socket's chop MTU. Never shrink this below 1200.
+    // A random 31-bit starting packet number, matching the reference client.
+    // Starting at a predictable value is a fingerprint as much as a shortcut.
+    let mut pkt_num_bytes = [0u8; 4];
+    let initial_pkt_num = if getrandom::fill(&mut pkt_num_bytes).is_ok() {
+        u32::from_le_bytes(pkt_num_bytes) & 0x7fff_ffff
+    } else {
+        0
+    };
     let settings = ngnet_quic::Settings::new(initial_ts)
         .max_tx_udp_payload_size(max_udp_payload)
+        // 333ms, the reference client's initial RTT estimate. It sets the first
+        // probe timer, so a client that guesses an order of magnitude off behaves
+        // differently on the wire before it has heard back.
+        .initial_rtt(ngnet_quic::Duration::from_nanos(333_333_333))
+        .initial_pkt_num(initial_pkt_num)
         .handshake_timeout(ng_handshake_timeout);
     // Transport parameters, stated explicitly rather than inherited.
     //
@@ -2161,13 +2174,20 @@ async fn attempt_rbx_transport_connection_async(
         .initial_max_stream_data_bidi_remote(1_410_065_407)
         .initial_max_stream_data_uni(1_410_065_407)
         .initial_max_data(141_006_550_700)
+        // Zero, not the crate default of 100: the reference client advertises no
+        // bidirectional streams at all, and the transport-parameters extension is
+        // compared byte for byte by the peer.
+        .initial_max_streams_bidi(0)
         .initial_max_streams_uni(1024)
         .max_idle_timeout(ngnet_quic::Duration::from_nanos(20_000_000_000))
         .max_udp_payload_size(65527)
         .active_connection_id_limit(2)
         .ack_delay_exponent(3)
         .max_ack_delay(ngnet_quic::Duration::from_nanos(25_000_000))
-        .max_datagram_frame_size(RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES as u64);
+        // 65535, matching the reference client. This is what goes on the wire,
+        // and it is deliberately not `RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES`
+        // (1 MiB), which is only how big a buffer we keep locally.
+        .max_datagram_frame_size(65535);
     // Two TLS backends, chosen at compile time.
     //
     // Rustls is the default and does raw-public-key verification through a
@@ -2195,20 +2215,22 @@ async fn attempt_rbx_transport_connection_async(
     };
     #[cfg(feature = "ossl-tls")]
     let tls_session = {
-        // The Ed25519 SubjectPublicKeyInfo header, so the raw 32-byte key can be
-        // handed to OpenSSL as the DER it expects.
-        const ED25519_SPKI_PREFIX: [u8; 12] = [
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
-        let mut spki_der = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
-        spki_der.extend_from_slice(&ED25519_SPKI_PREFIX);
-        spki_der.extend_from_slice(&plan.early_key.public_key);
-
         let backend = ngnet_quic::OsslBackend::builder(ngnet_quic::Role::Client)
             .alpn(RBX_TRANSPORT_ALPN.to_vec())
             .custom_extension(RBX_TRANSPORT_CAPS_EXT_TYPE, RBX_TRANSPORT_CAPS_WIRE.to_vec())
-            .expected_rpk_spki_der(spki_der)
-            .verify(ngnet_quic::Verify::Peer)
+            // TLS 1.3 only, two cipher suites in this order, x25519 only, and no
+            // compress_certificate: the reference client's ClientHello carries
+            // exactly this and the edge is comparing against it.
+            .proto_version(0x0304)
+            .ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+            .groups_list("X25519")
+            .no_certificate_compression()
+            // No verification, matching the reference client. The raw-public-key
+            // pin below is stricter than anything the working client does, and a
+            // pin that does not match the edge's actual key fails the handshake
+            // outright. `expected_rpk_spki_der` stays available to re-enable once
+            // a join succeeds and the real key can be confirmed.
+            .verify(ngnet_quic::Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .map_err(|error| format!("failed to configure OpenSSL QUIC client: {error}"))?;
         ngnet_quic::Backend::new_session(
