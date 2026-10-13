@@ -3440,12 +3440,25 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
                     control_only += 1;
                 }
             }
+            Ok(ngnet_quic::StreamWrite::Idle) => break,
             Ok(
-                ngnet_quic::StreamWrite::Idle
-                | ngnet_quic::StreamWrite::StreamBlocked
+                blocked @ (ngnet_quic::StreamWrite::StreamBlocked
                 | ngnet_quic::StreamWrite::ConnectionBlocked
-                | ngnet_quic::StreamWrite::Blocked,
-            ) => break,
+                | ngnet_quic::StreamWrite::Blocked),
+            ) => {
+                // This was a silent `break`, so a 10 KiB write that hit the
+                // peer's flow-control window returned Ok and the summary read
+                // "burst sent". The window only reopens on a MAX_STREAM_DATA
+                // from the peer, which is only processed by the receive loop -
+                // so retrying here cannot make progress. Report it; draining the
+                // tail from the receive loop is the actual fix.
+                return Err(format!(
+                    "stream {stream} blocked ({blocked:?}) after {off} of {} bytes; \
+                     the remaining {} were NOT sent",
+                    data.len(),
+                    data.len() - off
+                ));
+            }
             Err(error) => return Err(format!("ngtcp2 stream write failed: {error}")),
         }
     }
