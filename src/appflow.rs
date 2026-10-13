@@ -32,9 +32,13 @@ pub const CTRL_CHANNEL: u32 = 0x6374_726C;
 /// followed by `initializeChannelContext(this, 0, 0x6374726C, 0, 1, 0, 1)`.
 /// If the header byte for ctrl is 0 rather than 4, a server that routes on it
 /// would ignore our ctrl stream entirely - which matches a session that gets
-/// transport ACKs and no challenge. Kept as one constant so testing 0 is a
-/// one-line change.
-pub const CTRL_APP: u32 = APP;
+/// transport ACKs and no challenge. Kept as one constant so the two are easy to
+/// swap between.
+///
+/// Set to 0 to match the decompile. chan1 stays at [`APP`] because nothing yet
+/// says otherwise for it - the open question is whether ctrl is transport-owned
+/// (app 0) while application channels sit on a higher app id.
+pub const CTRL_APP: u32 = 0;
 
 /// Native 0x90 message template (10 432 B capture). The JSON region is
 /// patched with this session's values; the leading bytes and the final 20
