@@ -373,6 +373,13 @@ jobs:
           # The vendored QUIC crate has its own unit tests; `cargo test --lib`
           # on the workspace root never reaches them.
           cargo test -p ngnet-quic --lib 2>&1 | tee -a /tmp/cargo.log
+          # The two filters above match `plugin_*` and the caps-splice tests
+          # only. Tests that guard bytes we actually put on the wire match
+          # neither, so they were compiling but never running - including the
+          # 0x92 layout and the close-code table. Name them explicitly.
+          cargo test --lib appflow::tests::build_92 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib team_create::tests::connection_error 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib appflow::tests::marker 2>&1 | tee -a /tmp/cargo.log
 
       - name: Full suite (informational)
         if: always()
