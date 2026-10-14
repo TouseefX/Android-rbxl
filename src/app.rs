@@ -312,6 +312,9 @@ pub struct EditorApp {
     command_history_idx: usize,
     /// Last system clipboard text we pushed into egui.
     last_clipboard: String,
+    /// Last text we pushed *out* to the Android clipboard, and when. A single
+    /// tap can surface as several clicks, so pushes are deduplicated.
+    last_clipboard_push: Option<(String, std::time::Instant)>,
     /// Last focused egui Id, used to show/hide the IME.
     command_output: Vec<lua_runtime::OutputLine>,
     command_run_target_studio: bool,
@@ -523,6 +526,7 @@ impl Default for EditorApp {
             command_history: Vec::new(),
             command_history_idx: 0,
             last_clipboard: String::new(),
+            last_clipboard_push: None,
             command_output: Vec::new(),
             command_run_target_studio: false,
             plugin_index: plugins::load_index(),
@@ -693,6 +697,20 @@ impl EditorApp {
         roblox_api::fetch_viewport_asset_batch_async(viewport_assets, cookie);
         // Completion events debounce scene rebuilds in drain_events; no fixed
         // timer is needed (and a timer cannot predict mobile download speed).
+    }
+
+    /// Push text to the Android clipboard, ignoring repeats of the same text
+    /// inside a short window. `ui.button().clicked()` can fire more than once for
+    /// one tap on a touch device, which is why the Copy Output button was pushing
+    /// the same text two or three times.
+    fn copy_to_clipboard(&mut self, text: &str) {
+        if let Some((prev, at)) = &self.last_clipboard_push {
+            if prev == text && at.elapsed() < std::time::Duration::from_millis(500) {
+                return;
+            }
+        }
+        self.last_clipboard_push = Some((text.to_string(), std::time::Instant::now()));
+        jni_bridge::trigger_copy_to_clipboard(text);
     }
 
     fn log_info(&mut self, msg: impl Into<String>) {
@@ -1261,13 +1279,27 @@ impl EditorApp {
         // copies text inside an egui widget (Ctrl+C / selection), egui
         // emits OutputCommand::CopyText; forward it to the Android
         // clipboard so the system paste menu actually has our text.
-        ctx.output(|out| {
-            for cmd in out.commands.iter() {
-                if let egui::OutputCommand::CopyText(text) = cmd {
-                    jni_bridge::trigger_copy_to_clipboard(text);
-                }
+        // output_mut so the commands are actually removed: reading them without
+        // draining left every CopyText in the list to be forwarded again on the
+        // next frame.
+        let pending = ctx.output_mut(|out| {
+            let texts: Vec<String> = out
+                .commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !texts.is_empty() {
+                out.commands
+                    .retain(|cmd| !matches!(cmd, egui::OutputCommand::CopyText(_)));
             }
+            texts
         });
+        for text in pending {
+            self.copy_to_clipboard(&text);
+        }
     }
 }
 
@@ -1890,11 +1922,12 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
 
                                 let delivery_url = RobloxApiClient::get_asset_delivery_url(item.id);
                                 if ui.button("📋 Copy Delivery URL").clicked() {
-                                    jni_bridge::trigger_copy_to_clipboard(&delivery_url);
+                                    self.copy_to_clipboard(&delivery_url);
                                 }
 
                                 if ui.button("🌐 Copy Asset ID").clicked() {
-                                    jni_bridge::trigger_copy_to_clipboard(&item.id.to_string());
+                                    let id = item.id.to_string();
+                                    self.copy_to_clipboard(&id);
                                 }
                             });
                         });
@@ -2290,7 +2323,8 @@ ui.label("Place ID:");
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Handshake Output").strong());
                             if ui.button("📋 Copy Output").clicked() {
-                                jni_bridge::trigger_copy_to_clipboard(&self.team_create_response);
+                                let text = self.team_create_response.clone();
+                                self.copy_to_clipboard(&text);
                                 self.status = "Copied Team Create output to Android clipboard".into();
                             }
                         });
