@@ -383,6 +383,11 @@ pub struct EditorApp {
     /// Last successful join config from gamejoin (has the server endpoints);
     /// enables the transport-resolution button.
     team_create_join_config: Option<serde_json::Value>,
+    /// When the one-use config was received. Reported against the moment the
+    /// transport session starts, because a security-key check that passes on
+    /// one device and fails on a slower one is a timing question, not a
+    /// format one.
+    team_create_join_config_at: Option<std::time::Instant>,
     /// App-owned transport worker channel; the QUIC runtime and persistent
     /// receive loop live on the worker, never on the egui frame thread.
     team_create_session_rx: Option<Receiver<crate::team_create::RbxTransportSessionEvent>>,
@@ -552,10 +557,15 @@ impl Default for EditorApp {
             game_cfg_response: String::new(),
             team_create_response: String::new(),
             team_create_join_config: None,
+            team_create_join_config_at: None,
             team_create_session_rx: None,
             team_create_session_cancel: None,
             team_create_session_running: false,
-            a7_mode_choice: 0,
+            // Two live runs - real 99-byte capture and omitted - closed
+            // identically at 161/157 ms with DisconnectNewSecurityKeyMismatch,
+            // so the frame is not what the server is checking. Default to
+            // omitting it and keep the knob for re-testing.
+            a7_mode_choice: 2,
             ctrl_app_choice: 0,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
@@ -6445,6 +6455,18 @@ ui.label("Place ID:");
         key_ring_revert: bool,
         report_prefix: Option<String>,
     ) {
+        // The join ticket and the security key derived from it are one-use and
+        // short lived. If a slower device loses more time between negotiation and
+        // connect, that shows up here rather than in the burst, which is the same
+        // size on every device.
+        let config_age_ms = self
+            .team_create_join_config_at
+            .map(|at| at.elapsed().as_millis() as u64);
+        self.team_create_join_config_at = None;
+        if let Some(age) = config_age_ms {
+            self.log_info(format!("Join config age at connect: {age} ms"));
+        }
+
         self.start_team_create_session_worker(
             "Starting Team Create transport session…".into(),
             move |event_tx, cancel| {
@@ -6632,6 +6654,7 @@ ui.label("Place ID:");
                     // the separate transport-session button. The parser handles
                     // settings, joinTicket, joinScript, and nested wrappers.
                     self.team_create_join_config = Some(v.clone());
+                    self.team_create_join_config_at = Some(std::time::Instant::now());
                     let mut text = if preemptive {
                         String::from("Server warm-up config received")
                     } else {
