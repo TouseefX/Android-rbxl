@@ -2359,6 +2359,9 @@ async fn attempt_rbx_transport_connection_async(
     persistent_session: bool,
     event_tx: Option<Sender<RbxTransportSessionEvent>>,
 ) -> Result<RbxTransportConnectionReport, String> {
+    // Per attempt, so the report describes this route's ClientHello traffic and
+    // not a previous one's.
+    reset_rbx_transport_caps_counters();
     let target_addr = resolve_endpoint(&route.target_endpoint)?;
     // socket2 (not std::net) so the options std does not expose can be set
     // before the socket leaves this function:
@@ -2994,7 +2997,7 @@ async fn attempt_rbx_transport_connection_async(
         requested_timeout_ms,
         handshake_timeout_ms,
         handshake_completed_ms,
-        udp_summary: udp_stats.summary(),
+        udp_summary: format!("{}, {}", udp_stats.summary(), rbx_transport_caps_summary()),
         auth_version: auth.auth_version,
         preauth_len: auth.preauth_blob.len(),
         auth_len: auth.auth_blob.len(),
@@ -3371,6 +3374,38 @@ const RBX_TRANSPORT_CAPS_WIRE: [u8; 8] = [0x92, 0x08, 0xB7, 0x50, 0xC7, 0xD3, 0x
 /// few outgoing datagrams get a log line (with a hex preview on layout
 /// mismatch) so a silently-skipped splice can never happen again.
 static RBX_TRANSPORT_CAPS_SPLICE_LOGGED: AtomicUsize = AtomicUsize::new(0);
+/// Splice outcomes per session. These were only ever written to `log::info!`,
+/// which on Android is logcat - so a session whose ClientHello never got
+/// 0xFF00 reported exactly the same "spliced into every outgoing Initial"
+/// sentence as one that did. The sentence is static prose, not a measurement.
+static RBX_TRANSPORT_CAPS_SPLICED: AtomicUsize = AtomicUsize::new(0);
+static RBX_TRANSPORT_CAPS_ALREADY: AtomicUsize = AtomicUsize::new(0);
+static RBX_TRANSPORT_CAPS_LAYOUT: AtomicUsize = AtomicUsize::new(0);
+static RBX_TRANSPORT_CAPS_NOT_INITIAL: AtomicUsize = AtomicUsize::new(0);
+
+#[allow(dead_code)]
+fn reset_rbx_transport_caps_counters() {
+    for counter in [
+        &RBX_TRANSPORT_CAPS_SPLICE_LOGGED,
+        &RBX_TRANSPORT_CAPS_SPLICED,
+        &RBX_TRANSPORT_CAPS_ALREADY,
+        &RBX_TRANSPORT_CAPS_LAYOUT,
+        &RBX_TRANSPORT_CAPS_NOT_INITIAL,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+#[allow(dead_code)]
+fn rbx_transport_caps_summary() -> String {
+    format!(
+        "0xFF00 splice spliced {}/already {}/layout-mismatch {}/not-initial {}",
+        RBX_TRANSPORT_CAPS_SPLICED.load(Ordering::Relaxed),
+        RBX_TRANSPORT_CAPS_ALREADY.load(Ordering::Relaxed),
+        RBX_TRANSPORT_CAPS_LAYOUT.load(Ordering::Relaxed),
+        RBX_TRANSPORT_CAPS_NOT_INITIAL.load(Ordering::Relaxed),
+    )
+}
 /// Bounded diagnostic-log counter for the first received datagrams (hex
 /// preview of the post-RUPP head) - the DCID in those first long headers
 /// is what settles whether ngtcp2 matches the server's replies.
@@ -3662,6 +3697,7 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
                     RBX_TRANSPORT_CAPS_SPLICE_LOGGED.fetch_add(1, Ordering::Relaxed);
                 match splice_outcome {
                     RbxCapsSpliceOutcome::Spliced => {
+                        RBX_TRANSPORT_CAPS_SPLICED.fetch_add(1, Ordering::Relaxed);
                         if splice_log_no < 2 {
                             log::info!(
                                 "spliced the 0xFF00 capabilities extension (raw-ClientHello CRYPTO layout, no TLS record layer) into the outgoing QUIC v1 Initial"
@@ -3669,6 +3705,7 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
                         }
                     }
                     RbxCapsSpliceOutcome::AlreadyPresent => {
+                        RBX_TRANSPORT_CAPS_ALREADY.fetch_add(1, Ordering::Relaxed);
                         if splice_log_no < 3 {
                             log::info!(
                                 "0xFF00 capabilities extension already present in the ClientHello; leaving the Initial untouched"
@@ -3676,6 +3713,7 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
                         }
                     }
                     RbxCapsSpliceOutcome::LayoutMismatch => {
+                        RBX_TRANSPORT_CAPS_LAYOUT.fetch_add(1, Ordering::Relaxed);
                         if splice_log_no < 4 {
                             let preview: String = tx_buf[..len.min(64)]
                                 .iter()
@@ -3687,6 +3725,7 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
                         }
                     }
                     RbxCapsSpliceOutcome::NotInitial => {
+                        RBX_TRANSPORT_CAPS_NOT_INITIAL.fetch_add(1, Ordering::Relaxed);
                         if splice_log_no < 3 {
                             log::info!(
                                 "0xFF00 splice: datagram is not a v1 Initial (first byte {:#04x}); nothing to splice",
