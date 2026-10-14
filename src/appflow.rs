@@ -1436,15 +1436,18 @@ mod tests {
             assert_eq!(zz, expect, "a={a} b={b}");
         }
 
-        // The property the single-value formula broke: `low ^ high` must equal
-        // `b`, so it varies per join instead of being pinned to one constant.
+        // The property the single-value formula broke: `low ^ high` reduces to
+        // `b`, independent of `a`, so it changes on every join instead of being
+        // pinned to one constant.
         let low_xor_high = |a: u32, b: u32| {
             let x = ((a as u64) << 32) | ((b ^ a) as u64);
             (x as u32) ^ ((x >> 32) as u32)
         };
+        // 0x63E2_5F26 - the old "constant" - is just a value of b.
         assert_eq!(low_xor_high(0xDEAD_BEEF, 0x63E2_5F26), 0x63E2_5F26);
+        // a does not affect it, b does.
+        assert_eq!(low_xor_high(1, 0x63E2_5F26), 0x63E2_5F26);
         assert_ne!(low_xor_high(1, 1), low_xor_high(1, 2));
-        assert_ne!(low_xor_high(7, 7), low_xor_high(9, 7));
     }
 
     #[test]
