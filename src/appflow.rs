@@ -212,12 +212,20 @@ pub fn leb128(mut v: u64) -> Vec<u8> {
 pub fn leb128_decode(data: &[u8]) -> Option<(u64, usize)> {
     let mut v: u64 = 0;
     for (i, &b) in data.iter().enumerate() {
-        v |= u64::from(b & 0x7F) << (7 * i);
+        // A u64 takes up to 10 bytes, and the tenth carries a single bit. The
+        // old bound of 8 rejected exactly the wide values a zigzagged 0x92
+        // nonce produces, which is why its layout test never passed.
+        if i >= 10 {
+            return None;
+        }
+        let shift = 7 * i;
+        let bits = u64::from(b & 0x7F);
+        if shift == 63 && bits > 1 {
+            return None;
+        }
+        v |= bits << shift;
         if b & 0x80 == 0 {
             return Some((v, i + 1));
-        }
-        if i >= 8 {
-            return None;
         }
     }
     None
