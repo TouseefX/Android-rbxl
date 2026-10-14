@@ -521,7 +521,13 @@ const RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_0: u8 = 0x06;
 const RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_1: u8 = 0x01;
 const RBX_TRANSPORT_STREAM_HEADER_BYTES: usize = 7;
 const RBX_TRANSPORT_CONTROL_APPLICATION: u8 = 0;
-const RBX_TRANSPORT_CONTROL_CHANNEL_ID: u32 = u32::MAX; // native signed -1
+/// The control channel id on the wire is the four ASCII bytes `ctrl`
+/// (0x6374_726C), which is what `appflow::CTRL_CHANNEL` sends and what the
+/// server's own control streams carry. This was `u32::MAX` ("native signed
+/// -1"), so `is_control_channel` never matched: every session reported
+/// control streams 0 / control records 0 and the 0x02 open / 0x03 close
+/// messages the server sends were never dispatched.
+const RBX_TRANSPORT_CONTROL_CHANNEL_ID: u32 = 0x6374_726C;
 
 // Exact Studio 0.741 channel-control serializers:
 // OpenReliableChannelControl `0x1436b1980` writes 6 bytes, and
@@ -1535,13 +1541,16 @@ impl RbxTransportStreamHeader {
     }
 
     fn is_control_channel(self) -> bool {
-        self.application == RBX_TRANSPORT_CONTROL_APPLICATION
-            && self.channel_id == RBX_TRANSPORT_CONTROL_CHANNEL_ID
+        // Channel id only. The server opens two control streams on the same
+        // channel with different application bytes - one with app=4 and one with
+        // app=0 - so requiring a specific application discarded one of them and,
+        // combined with the wrong channel id, discarded both.
+        self.channel_id == RBX_TRANSPORT_CONTROL_CHANNEL_ID
     }
 
     fn channel_id_label(self) -> String {
         if self.channel_id == RBX_TRANSPORT_CONTROL_CHANNEL_ID {
-            "-1".into()
+            "ctrl".into()
         } else {
             self.channel_id.to_string()
         }
@@ -6554,7 +6563,27 @@ mod tests {
             channel_id: RBX_TRANSPORT_CONTROL_CHANNEL_ID,
         };
         let encoded = control.encode();
-        assert_eq!(encoded, [0x06, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff]);
+        // "ctrl" as four ASCII bytes, big-endian - not the signed -1 this used
+        // to encode.
+        assert_eq!(encoded, [0x06, 0x01, 0x00, 0x63, 0x74, 0x72, 0x6c]);
+
+        // The two control streams a live server actually opened: same channel,
+        // different application bytes. Both must classify as control, which is
+        // what was silently failing and reporting control streams 0.
+        for app in [0u8, 4u8] {
+            let header = RbxTransportStreamHeader {
+                application: app,
+                channel_id: 0x6374_726C,
+            };
+            assert!(header.is_control_channel(), "app={app} on ctrl must be control");
+            assert_eq!(header.channel_id_label(), "ctrl");
+        }
+        // A real application channel must not.
+        assert!(!RbxTransportStreamHeader {
+            application: 4,
+            channel_id: 1,
+        }
+        .is_control_channel());
         assert_eq!(RbxTransportStreamHeader::parse(&encoded), Ok(control));
         assert!(control.is_control_channel());
         assert_eq!(control.channel_id_label(), "-1");
