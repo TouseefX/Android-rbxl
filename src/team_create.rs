@@ -2359,9 +2359,6 @@ async fn attempt_rbx_transport_connection_async(
     persistent_session: bool,
     event_tx: Option<Sender<RbxTransportSessionEvent>>,
 ) -> Result<RbxTransportConnectionReport, String> {
-    // Per attempt, so the report describes this route's ClientHello traffic and
-    // not a previous one's.
-    reset_rbx_transport_caps_counters();
     let target_addr = resolve_endpoint(&route.target_endpoint)?;
     // socket2 (not std::net) so the options std does not expose can be set
     // before the socket leaves this function:
@@ -3373,68 +3370,18 @@ const RBX_TRANSPORT_CAPS_WIRE: [u8; 8] = [0x92, 0x08, 0xB7, 0x50, 0xC7, 0xD3, 0x
 /// Bounded diagnostic-log counter for 0xFF00 splice outcomes: the first
 /// few outgoing datagrams get a log line (with a hex preview on layout
 /// mismatch) so a silently-skipped splice can never happen again.
-static RBX_TRANSPORT_CAPS_SPLICE_LOGGED: AtomicUsize = AtomicUsize::new(0);
-/// Splice outcomes per session. These were only ever written to `log::info!`,
-/// which on Android is logcat - so a session whose ClientHello never got
-/// 0xFF00 reported exactly the same "spliced into every outgoing Initial"
-/// sentence as one that did. The sentence is static prose, not a measurement.
-static RBX_TRANSPORT_CAPS_SPLICED: AtomicUsize = AtomicUsize::new(0);
-static RBX_TRANSPORT_CAPS_ALREADY: AtomicUsize = AtomicUsize::new(0);
-static RBX_TRANSPORT_CAPS_LAYOUT: AtomicUsize = AtomicUsize::new(0);
-static RBX_TRANSPORT_CAPS_NOT_INITIAL: AtomicUsize = AtomicUsize::new(0);
-
-#[allow(dead_code)]
-fn reset_rbx_transport_caps_counters() {
-    for counter in [
-        &RBX_TRANSPORT_CAPS_SPLICE_LOGGED,
-        &RBX_TRANSPORT_CAPS_SPLICED,
-        &RBX_TRANSPORT_CAPS_ALREADY,
-        &RBX_TRANSPORT_CAPS_LAYOUT,
-        &RBX_TRANSPORT_CAPS_NOT_INITIAL,
-    ] {
-        counter.store(0, Ordering::Relaxed);
-    }
-    if let Ok(mut guard) = RBX_TRANSPORT_CAPS_NOT_INITIAL_HEAD.lock() {
-        *guard = None;
-    }
+/// 0xFF00 is emitted natively: the OpenSSL backend registers it with
+/// `.custom_extension()`, so it is part of ClientHello generation. The
+/// post-hoc splice that used to rewrite finished Initial packets is retired -
+/// measured on a live session that stayed up 14353 ms it ran zero times
+/// (spliced 0 / not-initial 44), so no Initial ever reached it, while the
+/// natively emitted extension was accepted. `splice_rbx_transport_caps_extension`
+/// and its tests are kept because they document the raw-ClientHello CRYPTO
+/// layout, not because anything calls them on the wire path.
+fn rbx_transport_caps_summary() -> &'static str {
+    "0xFF00 emitted natively by OpenSSL custom_extension; post-hoc splice retired"
 }
 
-#[allow(dead_code)]
-/// First 5 bytes of the first datagram the splice rejected as "not a v1
-/// Initial". NotInitial covers two different things - a short-header 1-RTT
-/// packet, which is expected after the handshake, and a long-header packet on a
-/// version other than 1, which would mean the Initial itself was never
-/// spliced. The counts alone cannot tell those apart, so record the header.
-static RBX_TRANSPORT_CAPS_NOT_INITIAL_HEAD: Mutex<Option<String>> = Mutex::new(None);
-
-fn rbx_transport_caps_summary() -> String {
-    let head = RBX_TRANSPORT_CAPS_NOT_INITIAL_HEAD
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .unwrap_or_else(|| "no not-initial datagram seen".to_string());
-    format!(
-        "0xFF00 splice spliced {}/already {}/layout-mismatch {}/not-initial {} ({})",
-        RBX_TRANSPORT_CAPS_SPLICED.load(Ordering::Relaxed),
-        RBX_TRANSPORT_CAPS_ALREADY.load(Ordering::Relaxed),
-        RBX_TRANSPORT_CAPS_LAYOUT.load(Ordering::Relaxed),
-        RBX_TRANSPORT_CAPS_NOT_INITIAL.load(Ordering::Relaxed),
-        head,
-    )
-}
-
-fn note_rbx_transport_caps_not_initial(packet: &[u8]) {
-    if let Ok(mut guard) = RBX_TRANSPORT_CAPS_NOT_INITIAL_HEAD.lock() {
-        if guard.is_none() {
-            let head: String = packet[..packet.len().min(5)]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            *guard = Some(format!("first not-initial head {head}"));
-        }
-    }
-}
 /// Bounded diagnostic-log counter for the first received datagrams (hex
 /// preview of the post-RUPP head) - the DCID in those first long headers
 /// is what settles whether ngtcp2 matches the server's replies.
@@ -3551,6 +3498,7 @@ enum RbxCapsSpliceErr {
 /// rustls `read_hs`/`write_hs` consume and emit handshake messages
 /// directly). The ClientHello therefore starts at the first CRYPTO byte:
 /// `01 <u24 length> 03 03 <32-byte random> ...`.
+#[allow(dead_code)]
 fn splice_rbx_transport_caps_extension(packet: &mut [u8]) -> RbxCapsSpliceOutcome {
     match splice_rbx_transport_caps_inner(packet) {
         Ok(()) => RbxCapsSpliceOutcome::Spliced,
@@ -3721,49 +3669,13 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
             .map_err(|error| format!("ngtcp2 packet write failed: {error}"))?
         {
             ngnet_quic::WriteOutcome::Datagram { len } => {
-                let splice_outcome = splice_rbx_transport_caps_extension(&mut tx_buf[..len]);
-                let splice_log_no =
-                    RBX_TRANSPORT_CAPS_SPLICE_LOGGED.fetch_add(1, Ordering::Relaxed);
-                match splice_outcome {
-                    RbxCapsSpliceOutcome::Spliced => {
-                        RBX_TRANSPORT_CAPS_SPLICED.fetch_add(1, Ordering::Relaxed);
-                        if splice_log_no < 2 {
-                            log::info!(
-                                "spliced the 0xFF00 capabilities extension (raw-ClientHello CRYPTO layout, no TLS record layer) into the outgoing QUIC v1 Initial"
-                            );
-                        }
-                    }
-                    RbxCapsSpliceOutcome::AlreadyPresent => {
-                        RBX_TRANSPORT_CAPS_ALREADY.fetch_add(1, Ordering::Relaxed);
-                        if splice_log_no < 3 {
-                            log::info!(
-                                "0xFF00 capabilities extension already present in the ClientHello; leaving the Initial untouched"
-                            );
-                        }
-                    }
-                    RbxCapsSpliceOutcome::LayoutMismatch => {
-                        RBX_TRANSPORT_CAPS_LAYOUT.fetch_add(1, Ordering::Relaxed);
-                        if splice_log_no < 4 {
-                            let preview: String = tx_buf[..len.min(64)]
-                                .iter()
-                                .map(|byte| format!("{byte:02x} "))
-                                .collect();
-                            log::warn!(
-                                "0xFF00 splice: v1 Initial with CRYPTO-offset-0 data but unexpected layout (len={len}, head: {preview})"
-                            );
-                        }
-                    }
-                    RbxCapsSpliceOutcome::NotInitial => {
-                        RBX_TRANSPORT_CAPS_NOT_INITIAL.fetch_add(1, Ordering::Relaxed);
-                        note_rbx_transport_caps_not_initial(&tx_buf[..len]);
-                        if splice_log_no < 3 {
-                            log::info!(
-                                "0xFF00 splice: datagram is not a v1 Initial (first byte {:#04x}); nothing to splice",
-                                tx_buf[0]
-                            );
-                        }
-                    }
-                }
+                // 0xFF00 is registered natively on the OpenSSL backend via
+                // .custom_extension(), so it is part of ClientHello generation
+                // rather than a post-hoc mutation of a finished packet. The
+                // splice that used to run here is retired: measured on a live
+                // session that stayed up 14353 ms it ran zero times (spliced 0,
+                // not-initial 44) - no Initial ever reached it - while the
+                // natively emitted extension was accepted.
                 socket
                     .send_to(&tx_buf[..len], connection.remote_addr())
                     .await
@@ -3797,7 +3709,7 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
         match connection.write_stream(tx_buf, id, &data[off..], false, now) {
             Ok(ngnet_quic::StreamWrite::Datagram { len, accepted }) => {
                 if len > 0 {
-                    let _ = splice_rbx_transport_caps_extension(&mut tx_buf[..len]);
+                    // Retired here as well - see write_pending_rbx_transport_packets.
                     socket
                         .send_to(&tx_buf[..len], connection.remote_addr())
                         .await
