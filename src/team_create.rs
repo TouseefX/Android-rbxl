@@ -3394,17 +3394,46 @@ fn reset_rbx_transport_caps_counters() {
     ] {
         counter.store(0, Ordering::Relaxed);
     }
+    if let Ok(mut guard) = RBX_TRANSPORT_CAPS_NOT_INITIAL_HEAD.lock() {
+        *guard = None;
+    }
 }
 
 #[allow(dead_code)]
+/// First 5 bytes of the first datagram the splice rejected as "not a v1
+/// Initial". NotInitial covers two different things - a short-header 1-RTT
+/// packet, which is expected after the handshake, and a long-header packet on a
+/// version other than 1, which would mean the Initial itself was never
+/// spliced. The counts alone cannot tell those apart, so record the header.
+static RBX_TRANSPORT_CAPS_NOT_INITIAL_HEAD: Mutex<Option<String>> = Mutex::new(None);
+
 fn rbx_transport_caps_summary() -> String {
+    let head = RBX_TRANSPORT_CAPS_NOT_INITIAL_HEAD
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| "no not-initial datagram seen".to_string());
     format!(
-        "0xFF00 splice spliced {}/already {}/layout-mismatch {}/not-initial {}",
+        "0xFF00 splice spliced {}/already {}/layout-mismatch {}/not-initial {} ({})",
         RBX_TRANSPORT_CAPS_SPLICED.load(Ordering::Relaxed),
         RBX_TRANSPORT_CAPS_ALREADY.load(Ordering::Relaxed),
         RBX_TRANSPORT_CAPS_LAYOUT.load(Ordering::Relaxed),
         RBX_TRANSPORT_CAPS_NOT_INITIAL.load(Ordering::Relaxed),
+        head,
     )
+}
+
+fn note_rbx_transport_caps_not_initial(packet: &[u8]) {
+    if let Ok(mut guard) = RBX_TRANSPORT_CAPS_NOT_INITIAL_HEAD.lock() {
+        if guard.is_none() {
+            let head: String = packet[..packet.len().min(5)]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            *guard = Some(format!("first not-initial head {head}"));
+        }
+    }
 }
 /// Bounded diagnostic-log counter for the first received datagrams (hex
 /// preview of the post-RUPP head) - the DCID in those first long headers
@@ -3726,6 +3755,7 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
                     }
                     RbxCapsSpliceOutcome::NotInitial => {
                         RBX_TRANSPORT_CAPS_NOT_INITIAL.fetch_add(1, Ordering::Relaxed);
+                        note_rbx_transport_caps_not_initial(&tx_buf[..len]);
                         if splice_log_no < 3 {
                             log::info!(
                                 "0xFF00 splice: datagram is not a v1 Initial (first byte {:#04x}); nothing to splice",
