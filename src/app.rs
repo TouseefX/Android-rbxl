@@ -2164,6 +2164,51 @@ ui.label("Place ID:");
                         }
                     });
 
+                    // Both knobs are reported in the session summary so a result
+                    // can be attributed to the run that produced it. They live in
+                    // their own group: nested inside the button row below they were
+                    // laid out past that row's right edge and clipped on narrow
+                    // layouts, so the toggles were never visible.
+                    ui.group(|ui| {
+                        ui.label(RichText::new("Join burst overrides").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("0xA7 attestation:");
+                            ui.radio_value(&mut self.a7_mode_choice, 0u8, "real capture")
+                                .on_hover_text("Sends the captured 99-byte frame verbatim");
+                            ui.radio_value(&mut self.a7_mode_choice, 1u8, "empty")
+                                .on_hover_text("Sends a7 00 00 - tests whether the server wants a frame at all");
+                            ui.radio_value(&mut self.a7_mode_choice, 2u8, "omit")
+                                .on_hover_text("Sends no 0xA7 - tests whether it is optional");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("ctrl app byte:");
+                            ui.radio_value(&mut self.ctrl_app_choice, 0u8, "0")
+                                .on_hover_text("What every multi-second session used");
+                            ui.radio_value(&mut self.ctrl_app_choice, 1u8, "1")
+                                .on_hover_text("0.741 BaseClient::openSendChannel application");
+                            ui.radio_value(&mut self.ctrl_app_choice, 4u8, "4")
+                                .on_hover_text("Reference client's openStream(APP, CTRL)");
+                        });
+                        // Applied after the radios, so changing one and starting a
+                        // session in the same frame cannot use the previous value.
+                        let a7_mode = match self.a7_mode_choice {
+                            1 => crate::appflow::A7Mode::Empty,
+                            2 => crate::appflow::A7Mode::Skip,
+                            _ => crate::appflow::A7Mode::Real,
+                        };
+                        crate::appflow::set_a7_mode(a7_mode);
+                        crate::appflow::set_ctrl_app(self.ctrl_app_choice);
+                        ui.label(
+                            RichText::new(format!(
+                                "active: 0xA7 = {}, ctrl app byte = {}",
+                                crate::appflow::a7_mode_label(a7_mode),
+                                self.ctrl_app_choice
+                            ))
+                            .weak(),
+                        );
+                    });
+                    ui.add_space(6.0);
+
                     ui.horizontal_wrapped(|ui| {
                         let can_start = !self.team_create_session_running;
                         if ui
@@ -2196,40 +2241,6 @@ ui.label("Place ID:");
                         {
                             self.team_create_negotiate(false, true, true);
                         }
-                        // The captured 0xA7 is a replay from one session against one
-                        // place, and the binary has an Ed25519 signing subsystem
-                        // beside ScriptRegistrationService. Whether the server
-                        // accepts that replay elsewhere is the main open question on
-                        // the burst, so make it switchable without a rebuild.
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("0xA7 attestation:");
-                            ui.radio_value(&mut self.a7_mode_choice, 0u8, "real capture")
-                                .on_hover_text("Sends the captured 99-byte frame verbatim");
-                            ui.radio_value(&mut self.a7_mode_choice, 1u8, "empty")
-                                .on_hover_text("Sends a7 00 00 - tests whether the server wants a frame at all");
-                            ui.radio_value(&mut self.a7_mode_choice, 2u8, "omit")
-                                .on_hover_text("Sends no 0xA7 - tests whether it is optional");
-                        });
-                        crate::appflow::set_a7_mode(match self.a7_mode_choice {
-                            1 => crate::appflow::A7Mode::Empty,
-                            2 => crate::appflow::A7Mode::Skip,
-                            _ => crate::appflow::A7Mode::Real,
-                        });
-                        // The application byte in the control stream header. Every
-                        // session that stayed up 3-7s used 0; every session since it
-                        // was changed to 4 has been closed at ~160 ms with the same
-                        // application error. 1 is what 0.741's BaseClient::
-                        // openSendChannel uses.
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("ctrl app byte:");
-                            ui.radio_value(&mut self.ctrl_app_choice, 0u8, "0")
-                                .on_hover_text("What every multi-second session used");
-                            ui.radio_value(&mut self.ctrl_app_choice, 1u8, "1")
-                                .on_hover_text("0.741 BaseClient::openSendChannel application");
-                            ui.radio_value(&mut self.ctrl_app_choice, 4u8, "4")
-                                .on_hover_text("Reference client's openStream(APP, CTRL)");
-                        });
-                        crate::appflow::set_ctrl_app(self.ctrl_app_choice);
                         let can_probe = can_start
                             && self
                                 .team_create_join_config
