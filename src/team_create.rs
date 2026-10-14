@@ -1600,58 +1600,62 @@ impl RbxTransportControlDecoder {
     fn decode_available(&mut self) -> Vec<RbxTransportControlMessage> {
         let mut messages = Vec::new();
         loop {
-            let Some(&tag) = self.pending.first() else {
+            // Every record is length-prefixed with a compact varint whose first
+            // byte carries the width in its top two bits (00=1, 01=2, 10=4,
+            // 11=8). This used to read the tag at pending[0], which mistook that
+            // prefix for a message type: the observed 0x80 was the 4-byte form
+            // encoding 1852 - the same length the chan1 record carries - and
+            // both control streams were abandoned as "unknown tag 0x80".
+            let Some((record_len, prefix_len)) = decode_rbx_transport_varint(&self.pending) else {
                 break;
             };
+            let Ok(record_len) = usize::try_from(record_len) else {
+                break;
+            };
+            let Some(total) = prefix_len.checked_add(record_len) else {
+                break;
+            };
+            if total > RBX_TRANSPORT_MAX_CONTROL_BUFFER_BYTES {
+                self.pending.clear();
+                self.desynchronized = true;
+                return messages;
+            }
+            if self.pending.len() < total {
+                break; // partial record; wait for more
+            }
+            self.pending.drain(..prefix_len);
+            let body: Vec<u8> = self.pending.drain(..record_len).collect();
+            if body.is_empty() {
+                continue;
+            }
+            let tag = body[0];
             let decoded = match tag {
                 RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE => {
-                    if self.pending.len() < RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES {
+                    if body.len() < RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES {
                         break;
                     }
-                    Some((
-                        RbxTransportControlMessage::OpenReliable {
-                            application: self.pending[1],
-                            channel_id: u32::from_be_bytes([
-                                self.pending[2],
-                                self.pending[3],
-                                self.pending[4],
-                                self.pending[5],
-                            ]),
-                        },
-                        RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES,
-                    ))
+                    Some(RbxTransportControlMessage::OpenReliable {
+                        application: body[1],
+                        channel_id: u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
+                    })
                 }
                 RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE => {
-                    if self.pending.len() < RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES {
+                    if body.len() < RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES {
                         break;
                     }
-                    Some((
-                        RbxTransportControlMessage::OpenUnreliable {
-                            application: self.pending[1],
-                            channel_id: u32::from_be_bytes([
-                                self.pending[2],
-                                self.pending[3],
-                                self.pending[4],
-                                self.pending[5],
-                            ]),
-                            wire_channel_id: u32::from_be_bytes([
-                                self.pending[6],
-                                self.pending[7],
-                                self.pending[8],
-                                self.pending[9],
-                            ]),
-                        },
-                        RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES,
-                    ))
+                    Some(RbxTransportControlMessage::OpenUnreliable {
+                        application: body[1],
+                        channel_id: u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
+                        wire_channel_id: u32::from_be_bytes([body[6], body[7], body[8], body[9]]),
+                    })
                 }
                 RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE => {
                     let mut fields = [0u64; 3];
                     let mut offset = 1usize;
                     let mut complete = true;
                     for field in &mut fields {
-                        let Some((value, encoded_len)) = decode_rbx_transport_varint(
-                            &self.pending[offset..],
-                        ) else {
+                        let Some((value, encoded_len)) = decode_rbx_transport_varint(&body[offset..])
+                        else {
                             complete = false;
                             break;
                         };
@@ -1661,26 +1665,19 @@ impl RbxTransportControlDecoder {
                     if !complete {
                         break;
                     }
-                    Some((
-                        RbxTransportControlMessage::CloseUnreliable { fields },
-                        offset,
-                    ))
+                    Some(RbxTransportControlMessage::CloseUnreliable { fields })
                 }
                 _ => {
-                    // Unknown control tags have no verified length. Stop
-                    // dispatching this stream rather than guessing where the
-                    // next frame begins after the unknown record.
-                    self.pending.clear();
-                    self.desynchronized = true;
+                    // Unknown tags have no verified inner layout, but the record
+                    // length is known, so the stream stays in sync and later
+                    // records are still readable.
                     messages.push(RbxTransportControlMessage::Unknown { tag });
-                    return messages;
+                    continue;
                 }
             };
-            let Some((message, consumed)) = decoded else {
-                break;
-            };
-            self.pending.drain(..consumed);
-            messages.push(message);
+            if let Some(message) = decoded {
+                messages.push(message);
+            }
         }
         messages
     }
@@ -6627,15 +6624,44 @@ mod tests {
 
     #[test]
     fn rbx_transport_control_decoder_handles_fragmented_and_coalesced_frames() {
-        let reliable = build_rbx_transport_open_reliable_channel_control(1, 0x0102_0304);
-        let unreliable = build_rbx_transport_open_unreliable_channel_control(
-            2,
-            0x0506_0708,
-            0x090a_0b0c,
+        // Every control record is <compact varint length><body>. Bodies under 64
+        // bytes take the 1-byte width, so the prefix is just the length.
+        fn framed(body: &[u8]) -> Vec<u8> {
+            assert!(body.len() < 64);
+            let mut out = vec![body.len() as u8];
+            out.extend_from_slice(body);
+            out
+        }
+
+        // The prefix that was being misread as a message tag: top two bits 10
+        // means the 4-byte width, and 80 00 07 3c is 1852 - the exact length of
+        // the chan1 record seen on every live session.
+        assert_eq!(
+            decode_rbx_transport_varint(&[0x80, 0x00, 0x07, 0x3c]),
+            Some((1852, 4))
         );
-        // Three QUIC-style varints: 37 (1 byte), 15293 (2 bytes), and
-        // 494878333 (4 bytes). Type-3 field semantics remain unconfirmed.
-        let close_unreliable = [
+
+        let reliable = framed(&[
+            RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE,
+            1,
+            0x01,
+            0x02,
+            0x03,
+            0x04,
+        ]);
+        let unreliable = framed(&[
+            RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE,
+            2,
+            0x05,
+            0x06,
+            0x07,
+            0x08,
+            0x09,
+            0x0a,
+            0x0b,
+            0x0c,
+        ]);
+        let close_unreliable = framed(&[
             RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE,
             0x25,
             0x7b,
@@ -6644,7 +6670,7 @@ mod tests {
             0x7f,
             0x3e,
             0x7d,
-        ];
+        ]);
 
         let mut decoder = RbxTransportControlDecoder::default();
         assert!(decoder.push(&unreliable[..5]).unwrap().is_empty());
@@ -6664,8 +6690,6 @@ mod tests {
             }]
         );
 
-        // Clone rather than move: `reliable` is asserted against again below,
-        // once the decoder has been driven into its desynchronized state.
         let mut coalesced = reliable.clone();
         coalesced.extend_from_slice(&unreliable);
         coalesced.extend_from_slice(&close_unreliable);
@@ -6688,13 +6712,22 @@ mod tests {
         );
         assert!(decoder.pending.is_empty());
 
+        // An unknown tag has no verified inner layout, but the record length is
+        // known, so the stream stays in sync instead of being abandoned - which
+        // is what "unknown control tag 0x80; dispatch stopped" used to mean.
         let mut unknown = RbxTransportControlDecoder::default();
         assert_eq!(
-            unknown.push(&[0xfe, 0x01, 0x02]).unwrap(),
+            unknown.push(&framed(&[0xfe, 0x01, 0x02])).unwrap(),
             vec![RbxTransportControlMessage::Unknown { tag: 0xfe }]
         );
-        assert!(unknown.desynchronized);
-        assert!(unknown.push(&reliable).unwrap().is_empty());
+        assert!(!unknown.desynchronized);
+        assert_eq!(
+            unknown.push(&reliable).unwrap(),
+            vec![RbxTransportControlMessage::OpenReliable {
+                application: 1,
+                channel_id: 0x0102_0304,
+            }]
+        );
     }
 
     #[test]
