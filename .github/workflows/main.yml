@@ -379,6 +379,9 @@ jobs:
           # 0x92 layout and the close-code table. Name them explicitly.
           cargo test --lib appflow::tests::build_92 2>&1 | tee -a /tmp/cargo.log
           cargo test --lib team_create::tests::connection_error 2>&1 | tee -a /tmp/cargo.log
+          # Guards the control-channel wire value: it silently never matched
+          # (u32::MAX vs 'ctrl'), which zeroed every control-record counter.
+          cargo test --lib team_create::tests::rbx_transport_stream_header 2>&1 | tee -a /tmp/cargo.log
           cargo test --lib appflow::tests::marker 2>&1 | tee -a /tmp/cargo.log
 
       - name: Full suite (informational)
