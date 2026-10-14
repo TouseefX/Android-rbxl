@@ -6586,7 +6586,7 @@ mod tests {
         .is_control_channel());
         assert_eq!(RbxTransportStreamHeader::parse(&encoded), Ok(control));
         assert!(control.is_control_channel());
-        assert_eq!(control.channel_id_label(), "-1");
+        assert_eq!(control.channel_id_label(), "ctrl");
 
         let application = RbxTransportStreamHeader {
             application: 1,
