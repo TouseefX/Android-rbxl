@@ -383,12 +383,24 @@ pub fn build_open_unreliable(app: u32, chan: u32, wire: u32) -> Vec<u8> {
     ]
 }
 
-/// 0x92 nonce message: `[92] LEB(((v8<<32)|(v8^0x63E25F26))<<1 [, sign])`.
-pub fn build_92(v8: u32) -> Vec<u8> {
-    const V9: u64 = 0x63E2_5F26;
-    let x = ((v8 as u64) << 32) | ((v8 as u64) ^ V9);
+/// 0x92 nonce message: `[92] LEB(zigzag((a << 32) | (b ^ a)))`.
+///
+/// Read out of 0.741's builder, which draws **two independent** 32-bit values and
+/// writes `CONCAT44(a, b ^ a)`: one from a PCG-style PRNG
+/// (`state * 0x5851_f42d_4c95_7f2d + 0x69`, output rotated by a byte of the
+/// state) and one from a GF(2) bit-mixer seeded off a global. The zigzag and
+/// LEB128 match too - the writer does `x * 2 ^ (x >> 63)`.
+///
+/// The port this replaces used a single value XORed with `0x63E2_5F26`. That
+/// constant appears nowhere in the 219 MB binary and was never a constant: it is
+/// the second value from one capture. The consequence is that `low ^ high` came
+/// out as the same 32 bits on every single join, where the real client's differs
+/// every time - the exact shape of thing an anti-replay or entropy check keys on,
+/// and the server's stated reason for closing is a security-key mismatch.
+pub fn build_92(a: u32, b: u32) -> Vec<u8> {
+    let x = ((a as u64) << 32) | ((b ^ a) as u64);
     let mut zz = x << 1;
-    if v8 & 0x8000_0000 != 0 {
+    if x >> 63 != 0 {
         zz = !zz;
     }
     let mut out = vec![0x92];
@@ -762,15 +774,22 @@ impl AppFlow {
                 None
             }
         };
-        let mut v8_seed =
+        // 0.741 draws two independent values for the 0x92. Sharing one seed is
+        // what pinned `low ^ high` to a constant.
+        let mut seed_a =
             (self.now_ms.wrapping_mul(0x9E37_79B1).wrapping_add(0x51_7C_C1_B7)) as u32;
-        if v8_seed == 0 {
-            v8_seed = 0x8000_0001;
+        let mut seed_b =
+            (self.now_ms.wrapping_mul(0x85EB_CA6B).wrapping_add(0x27D4_EB2F)) as u32;
+        if seed_a == 0 {
+            seed_a = 0x8000_0001;
+        }
+        if seed_b == 0 {
+            seed_b = 0x8000_0001;
         }
         if let Some(m90) = &m90 {
             one.extend_from_slice(&frame(m90));
         }
-        one.extend_from_slice(&frame(&build_92(v8_seed)));
+        one.extend_from_slice(&frame(&build_92(seed_a, seed_b)));
         one.extend_from_slice(&frame(&build_8a(&self.cfg)));
         one.extend_from_slice(&frame(&[0x8F, 0x00]));
         actions.push(Action::OpenStream {
@@ -1388,18 +1407,36 @@ mod tests {
 
     #[test]
     fn build_92_layout() {
-        for v8 in [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0x8000_0001, 0xFFFF_FFFF] {
-            let m = build_92(v8);
+        let pairs = [
+            (0u32, 0u32),
+            (1, 1),
+            (0x7FFF_FFFF, 0x8000_0000),
+            (0x8000_0000, 1),
+            (0x8000_0001, 0xFFFF_FFFF),
+            (0xFFFF_FFFF, 0x1234_5678),
+        ];
+        for (a, b) in pairs {
+            let m = build_92(a, b);
             assert_eq!(m[0], 0x92);
             let (zz, k) = leb128_decode(&m[1..]).unwrap();
             assert_eq!(m.len(), 1 + k);
-            let x = ((v8 as u64) << 32) | ((v8 as u64) ^ 0x63E2_5F26);
+            let x = ((a as u64) << 32) | ((b ^ a) as u64);
             let mut expect = x << 1;
-            if v8 & 0x8000_0000 != 0 {
+            if x >> 63 != 0 {
                 expect = !expect;
             }
-            assert_eq!(zz, expect, "v8={v8}");
+            assert_eq!(zz, expect, "a={a} b={b}");
         }
+
+        // The property the single-value formula broke: `low ^ high` must equal
+        // `b`, so it varies per join instead of being pinned to one constant.
+        let low_xor_high = |a: u32, b: u32| {
+            let x = ((a as u64) << 32) | ((b ^ a) as u64);
+            (x as u32) ^ ((x >> 32) as u32)
+        };
+        assert_eq!(low_xor_high(0xDEAD_BEEF, 0x63E2_5F26), 0x63E2_5F26);
+        assert_ne!(low_xor_high(1, 1), low_xor_high(1, 2));
+        assert_ne!(low_xor_high(7, 7), low_xor_high(9, 7));
     }
 
     #[test]
