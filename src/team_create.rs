@@ -2705,7 +2705,7 @@ async fn attempt_rbx_transport_connection_async(
                     Err(error) => {
                         let tls_reason = connection.tls().failure_reason();
                         return Err(format!(
-                            "ngtcp2/TLS handshake failed: {error}{}; target {}, local {}; {}",}
+                            "ngtcp2/TLS handshake failed: {error}{}; target {}, local {}; {}",
                             tls_reason
                                 .map(|reason| format!("; TLS detail: {reason}"))
                                 .unwrap_or_default(),
@@ -5971,7 +5971,7 @@ pub fn run_join_config_session(
                                     String::new()
                                 } else {
                                     format!(
-                                        " | flow/config notes: {}",}
+                                        " | flow/config notes: {}",
                                         connection_report.flow_skipped.join(" | ")
                                     )
                                 }
