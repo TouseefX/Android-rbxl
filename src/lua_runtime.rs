@@ -1,9 +1,8 @@
 //! A tiny embedded **Luau** runtime for testing scripts and running plugins.
 //!
-//! This is NOT a full Roblox engine — there's no physics simulation or live
-//! game server. It's a sandboxed Luau VM (the real, full-accuracy Luau
-//! interpreter from TouseefX/luaur, pure Rust + Android-ready) preloaded with
-//! the host surface that plugins and pure-logic ModuleScripts need:
+//! This is not a full Roblox engine: it does not provide physics simulation or
+//! a live game server. It embeds TouseefX/luaur, a pure-Rust Luau interpreter,
+//! with a small host surface for basic plugins and pure-logic ModuleScripts:
 //!
 //! * `print`/`warn`/`error`/`pcall`/`xpcall`, `typeof`, `tostring`
 //! * `task.wait/spawn/defer/delay` (synchronous stubs)
@@ -15,11 +14,11 @@
 //!   SetSetting`, and a `script` placeholder so plugin entry points load.
 //!
 //! Plugin GUI widgets created via `CreateDockWidgetPluginGui` are returned as
-//! `Instance`-like tables; the editor's plugin manager can walk their
-//! descendant tree for a GUI preview, but the widgets don't render inside the
-//! editor (that would need a full Roblox UI engine). For live DataModel access
-//! (real services, physics, rendering) you still need Roblox Studio; this VM
-//! is for running the *logic* of plugins and scripts offline.
+//! `Instance`-like tables, but are not rendered. Separately, the plugin manager
+//! lists summaries of static GUI-class instances found in the imported model;
+//! it does not include UI created dynamically at runtime. This VM runs scripts
+//! against the editor's local DataModel; it does not attach to a live Roblox
+//! place or implement engine services such as physics and rendering.
 
 use luaur::{
     Error as LuaError, Function, Lua, MultiValue, Result as LuaResult, Table, Value, Variadic,

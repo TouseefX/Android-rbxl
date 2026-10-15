@@ -1,10 +1,10 @@
 # ============================================================================
 # bevy_rbxl — standalone Bevy renderer for .rbxl / .rbxmx / .rbxm places
 # ----------------------------------------------------------------------------
-# A self-contained, desktop-runnable port of OpenRBLX's 3D viewport renderer
-# using the Bevy engine.  It is intentionally independent of the Android app
-# crate (which is a `cdylib` with an `android_main` entry that won't build on a
-# normal OS), so you can validate the Bevy rendering here first.
+# A standalone Bevy renderer sandbox for Roblox place/model files. It has its
+# own dependency versions and rendering code; it is not the root app's desktop
+# runner or an Android build target. Use the root desktop binary to exercise
+# the main application's renderer.
 #
 # Build & run (from the repo root):
 #   cargo run --release --manifest-path renderer/Cargo.toml -- place.rbxl

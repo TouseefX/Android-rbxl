@@ -1,6 +1,7 @@
 //! Roblox GUI preview rendered through egui over the Bevy viewport.
-//! This first stage covers StarterGui/ScreenGui layout, frames, text and input
-//! selection. Image and 3D BillboardGui rendering build on the same tree.
+//!
+//! The shared layout and paint pipeline handles ScreenGui, BillboardGui, and
+//! SurfaceGui trees, including common frame, text, image, and input controls.
 
 use bevy_egui::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use rbx_dom_weak::{types::{Ref, Variant}, WeakDom};

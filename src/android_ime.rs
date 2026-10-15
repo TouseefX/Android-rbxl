@@ -13,9 +13,9 @@
 //! * `Window::set_ime_allowed()` is an empty stub on Android, so nothing ever
 //!   asks the system to show the soft keyboard.
 //!
-//! Net effect: tapping an egui `TextEdit` focuses it (caret blinks) but no
-//! keyboard appears and no characters — or pasted text — ever reach egui.
-//! That's exactly the symptom we have.
+//! Without this bridge, egui text fields can focus without receiving the
+//! keyboard text and clipboard commits they need. The bridge below supplies
+//! those events from GameTextInput instead of relying on winit.
 //!
 //! # How this works
 //!

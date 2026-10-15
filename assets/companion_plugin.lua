@@ -1,11 +1,13 @@
 --!strict
 -- rbxl Editor Companion Plugin
 --
--- Install:  place this file (or the compiled .rbxm) in your Studio Plugins
--- folder (Studio → Plugins tab → "Plugins Folder" button). It connects a
--- WebSocket back to the rbxl Editor app running on the same machine so the
--- editor can run commands in the *real* engine, read selection, sync DOM
--- changes, etc. The protocol is plain JSON:
+-- Install this file in the Studio Plugins folder (Studio → Plugins tab →
+-- "Plugins Folder"). By default it connects to ws://127.0.0.1:41742. If the
+-- editor is running on Android, forward that port from the host with
+-- `adb forward tcp:41742 tcp:41742`; keep the UI and plugin ports in sync.
+-- The plugin provides Command Bar execution plus selection, undo/redo, and a
+-- shallow place-summary RPC. The editor currently uses command execution and
+-- does not synchronize the Studio DataModel. The protocol is plain JSON:
 --
 --   { "id": <n>, "method": "<name>", "params": { ... } }
 --
@@ -78,7 +80,7 @@ end
 
 handlers.run_command = function(params: any): any
 	local source = tostring(params and params.source or "")
-	-- Compile the expression; if it returns a value, surface it back.
+	-- Compile and run the submitted chunk; return its values or runtime error.
 	local chunk, compileErr = loadstring(source, "=rbxl-command")
 	if not chunk then
 		return { ok = false, error = tostring(compileErr) }
@@ -127,8 +129,8 @@ handlers.redo = function(_: any)
 end
 
 handlers.get_place = function(_: any): any
-	-- Return a minimal tree summary; the editor can ask for richer data
-	-- in later versions.
+	-- Return a shallow hierarchy summary. The editor does not currently
+	-- request this RPC or synchronize the returned tree into its local place.
 	local function walk(inst: Instance, depth: number): any
 		if depth > 4 then return nil end
 		local children = {}

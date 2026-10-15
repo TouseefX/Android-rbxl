@@ -265,7 +265,7 @@ impl Plugin for FlatMaterialPlugin {
 
 
 // ----------------------------------------------------------------------------
-// Math (S space, matches the Android software rasterizer)
+// Math in Roblox source coordinates
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]

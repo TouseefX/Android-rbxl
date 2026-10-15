@@ -5,8 +5,8 @@
 //! to spot when an endpoint moves and avoids scattering string literals
 //! across the codebase.
 
-/// All current Roblox subdomains (as of the last update). The ones most
-/// relevant to an editor are marked with the kind of traffic they carry.
+/// Roblox service hosts used by this client and its API references. This is a
+/// curated list, not an exhaustive list of every Roblox subdomain.
 pub const SUBDOMAINS: &[&str] = &[
     "apis.roblox.com",                // Open Cloud
     "accountinformation.roblox.com",

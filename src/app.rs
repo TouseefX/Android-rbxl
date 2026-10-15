@@ -19,9 +19,8 @@ use std::time::{Duration, Instant};
 
 /// One indentation level, as spaces.
 ///
-/// Spaces rather than '\t' so a level occupies the same visual width in the
-/// egui editor, the native Android EditText (whose tab stop is very wide and
-/// not adjustable), and exported files.
+/// Four-space indentation is shared by the egui editor, Android's Sora
+/// `CodeEditor`, and exported project files.
 pub const INDENT_WIDTH: usize = 4;
 pub const INDENT_UNIT: &str = "    ";
 
@@ -849,12 +848,8 @@ impl EditorApp {
         if self.editor_focus_mode && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.editor_focus_mode = false;
         }
-        // Keep egui's internal clipboard in sync with the Android system
-        // clipboard. arboard (egui's default backend) doesn't work on
-        // Android, and there's no native EditText long-press menu, so we
-        // copy the system text into egui each frame. egui handles its own
-        // copy internally (it sets system clipboard via our JNI when the
-        // user copies), so we only need to push here.
+        // Re-emit changed Android clipboard text through egui's clipboard
+        // output path. Paste input is injected separately by android_ime.
         self.sync_clipboard(ctx);
         // Pump any completed thumbnail downloads into GPU textures.
         crate::thumbnails::pump(ctx);
@@ -2130,13 +2125,13 @@ ui.label("Place ID:");
 
                 ui.add_space(8.0);
 
-                // Section 2c: Team Create (cloud edit) session control plane —
-                // the REST routes Studio's ApiTeamCreateUrlConstruction builds
-                // (see team-create-sessions-explained.md §1a/§1b). The live
-                // replication client (UDP/RakNet) is a future stage.
+                // Team Create REST controls are in roblox_api.rs; join
+                // configuration parsing and RakNet/RbxTransport sessions are
+                // implemented in team_create.rs and appflow.rs. This is not a
+                // live-place replication or editing client.
                 ui.group(|ui| {
                     ui.label(RichText::new("👥 Team Create Sessions").heading().color(Color32::from_rgb(120, 200, 255)));
-                    ui.label("Cookie-auth control plane: check/enable Team Create, view cloud-edit members, and negotiate a join. Start Transport Session runs on a background worker; after QUIC/TLS completes, a receive loop stays active until stopped or the peer closes. This is not the native BaseClient connected state or Team Create acceptance; early auth/channel-control data remains unsent.");
+                    ui.label("Cookie-auth Team Create controls and an experimental join client. Negotiate Join obtains a gamejoin config; Warm Up calls the preemptive route. Start Transport selects legacy RakNet probes or RbxTransport QUIC/TLS; the QUIC path sends an app=4 post-handshake flow when its required fields are present. Live-place replication/editing is not implemented, and handshake or flow observations do not prove native BaseClient connection or Team Create acceptance.");
 
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("🔄 Check Status").clicked() {
@@ -2225,22 +2220,22 @@ ui.label("Place ID:");
                     ui.group(|ui| {
                         ui.label(RichText::new("Join burst overrides").strong());
                         ui.horizontal_wrapped(|ui| {
-                            ui.label("0xA7 attestation:");
+                            ui.label("0xA7 frame:");
                             ui.radio_value(&mut self.a7_mode_choice, 0u8, "real capture")
                                 .on_hover_text("Sends the captured 99-byte frame verbatim");
                             ui.radio_value(&mut self.a7_mode_choice, 1u8, "empty")
-                                .on_hover_text("Sends a7 00 00 - tests whether the server wants a frame at all");
+                                .on_hover_text("Sends the three-byte frame a7 00 00");
                             ui.radio_value(&mut self.a7_mode_choice, 2u8, "omit")
-                                .on_hover_text("Sends no 0xA7 - tests whether it is optional");
+                                .on_hover_text("Sends no 0xA7 frame");
                         });
                         ui.horizontal_wrapped(|ui| {
                             ui.label("ctrl app byte:");
                             ui.radio_value(&mut self.ctrl_app_choice, 0u8, "0")
-                                .on_hover_text("What every multi-second session used");
+                                .on_hover_text("Writes application byte 0 in the control-stream header");
                             ui.radio_value(&mut self.ctrl_app_choice, 1u8, "1")
-                                .on_hover_text("0.741 BaseClient::openSendChannel application");
+                                .on_hover_text("Writes application byte 1 in the control-stream header");
                             ui.radio_value(&mut self.ctrl_app_choice, 4u8, "4")
-                                .on_hover_text("Reference client's openStream(APP, CTRL)");
+                                .on_hover_text("Writes application byte 4 in the control-stream header");
                         });
                         // Applied after the radios, so changing one and starting a
                         // session in the same frame cannot use the previous value.
@@ -2309,7 +2304,7 @@ ui.label("Place ID:");
                         let probe = ui
                             .add_enabled(can_probe, egui::Button::new("📡 Start Transport Session"))
                             .on_hover_text(if can_probe {
-                                "Consumes this one-use gamejoin config and keeps the selected transport's receive loop alive on a worker. A QUIC/TLS handshake alone does not mean BaseClient connected or Team Create accepted."
+                                "Consumes this one-use gamejoin config on a worker. RbxTransport keeps its QUIC receive loop active after handshake; legacy RakNet configs run bounded probes. A handshake alone does not establish BaseClient connection or Team Create acceptance."
                             } else {
                                 "Negotiate Join immediately before each transport session; the join ticket is one-use"
                             });
@@ -4993,27 +4988,9 @@ ui.label("Place ID:");
         })
     }
 
-    /// Wire the Android system clipboard into egui.
-    ///
-    /// On Android, arboard (egui's default clipboard backend) is a
-    /// no-op and NativeActivity has no native EditText, so paste does
-    /// not work out of the box. The fix (standard in eframe-on-android
-    /// projects) is to read the system clipboard via JNI and feed it to
-    /// egui each frame:
-    ///   * set egui's internal clipboard text with `ctx.copy_text`,
-    ///     which makes a hardware Ctrl+V deliver the right string once
-    ///     egui routes the Paste event,
-    ///   * detect a Ctrl+V / ⌘V key press ourselves and emit an
-    ///     explicit `Event::Paste` (egui's own Ctrl+V handling reads
-    ///     the arboard clipboard, which is empty on Android),
-    ///   * if the system clipboard changed *and* a text field currently
-    ///     has focus, emit an Event::Paste so the long-press / hardware
-    ///     paste reaches the focused widget.
-    /// Keep egui's internal clipboard in sync with the Android system
-    /// clipboard. winit's IME (enabled via `ime_enabled` on the Bevy
-    /// window) delivers Gboard typing/paste as egui Text/Paste events;
-    /// this just makes sure hardware Ctrl+V (which egui handles by
-    /// reading its internal clipboard) also has the system text.
+    /// When Android's clipboard changes, re-issue its current value through
+    /// egui's `CopyText` output. Paste input is separate: `android_ime::begin_frame`
+    /// reads the system clipboard and injects an `Event::Paste` on a paste request.
     fn sync_clipboard(&mut self, ctx: &egui::Context) {
         let system = jni_bridge::get_clipboard_text();
         if system != self.last_clipboard {
@@ -5138,7 +5115,7 @@ ui.label("Place ID:");
                         self.log_info(format!("✅ {summary}"));
                     } else {
                         self.log_info(format!(
-                            "{summary}. Roblox may not show InStudio until Team Create is fully connected."
+                            "{summary}. This presence response does not establish a Team Create transport or acceptance state."
                         ));
                     }
                 }
@@ -5793,9 +5770,9 @@ ui.label("Place ID:");
             "Plugins are .rbxm/.rbxmx files (the root is typically a Script or \
              ModuleScript). Install them from your device or by Creator Store asset \
              ID. Plugins run in the embedded luaur sandbox with a plugin:CreateToolbar \
-             /CreateDockWidgetPluginGui surface; their widgets show up in the GUI tree \
-             preview below. For full engine access, connect a Live Session to real \
-             Studio.",
+             /CreateDockWidgetPluginGui surface; the plugin list summarizes GUI objects \
+             found in each plugin. A Live Session can send Command Bar snippets to Studio; \
+             plugin scripts themselves still run in the local sandbox.",
         ).weak());
 
         ui.separator();
@@ -6018,10 +5995,7 @@ ui.label("Place ID:");
             });
             ui.label(
                 RichText::new(
-                    "Start the server, then install the companion plugin in Studio \
-                     (Plugins tab → Plugins Folder; paste the .lua there and restart \
-                     Studio). Connected Studio receives run_command / get_selection calls \
-                     from the Command Bar.",
+                    "The server listens on loopback. Run the desktop editor and Studio on the same computer; for Android, run `adb forward tcp:41742 tcp:41742` on the host before connecting (keep the UI/plugin port at 41742). Install the companion .lua in Studio's Plugins Folder and restart Studio. The Command Bar can send snippets as run_command; selection/history handlers are not wired into the editor UI.",
                 )
                 .weak(),
             );
@@ -6414,7 +6388,7 @@ ui.label("Place ID:");
                 crate::team_create::RbxTransportSessionEvent::QuicHandshakeComplete(status) => {
                     self.team_create_session_quic_handshake_complete = true;
                     self.team_create_session_status = status.clone();
-                    self.status = "RbxTransport QUIC/TLS handshake complete; app=4 join flow running (Team Create acceptance not confirmed)".into();
+                    self.status = "RbxTransport QUIC/TLS handshake complete; receive handling is starting (app=4 flow depends on join fields; Team Create acceptance not confirmed)".into();
                     self.log_info(status);
                 }
                 crate::team_create::RbxTransportSessionEvent::ChallengeReceived {
@@ -6432,16 +6406,16 @@ ui.label("Place ID:");
                     elapsed_ms,
                 } => {
                     self.status = format!(
-                        "0x9B challenge answered 0x{answer:08x} in {elapsed_ms}ms — waiting for connected stage (world state)…"
+                        "0x9B challenge solved locally (0x{answer:08x}, {elapsed_ms}ms); response action generated — write outcome and peer acceptance are not confirmed"
                     );
                     self.log_info(self.status.clone());
                 }
                 crate::team_create::RbxTransportSessionEvent::ChallengeFailed(reason) => {
-                    self.status = format!("0x9B challenge solve failed: {reason}");
+                    self.status = format!("0x9B frame processing failed: {reason}");
                     self.log_info(self.status.clone());
                 }
                 crate::team_create::RbxTransportSessionEvent::ConnectedStageReached(detail) => {
-                    self.status = format!("BaseClient connected stage reached — {detail}");
+                    self.status = format!("Channel-1 traffic observed after a 0x9B frame (local flow milestone, not native BaseClient confirmation) — {detail}");
                     self.log_info(self.status.clone());
                 }
                 crate::team_create::RbxTransportSessionEvent::Finished(report) => {
@@ -6742,7 +6716,7 @@ ui.label("Place ID:");
                         "Team Create {label} returned only null/empty values; negotiation failed and the transport resolver remains disabled"
                     )
                 } else if preemptive {
-                    self.status = "Team Create warm-up accepted — negotiate join next".into();
+                    self.status = "Team Create warm-up response received — negotiate join next".into();
                     String::from(
                         "Server warm-up response received, but it has no server endpoint yet; run Negotiate Join. The transport resolver remains disabled",
                     )
@@ -8136,8 +8110,8 @@ fn edit_color_sequence_field(
 }
 
 
-/// Android reports EditText selections in UTF-16 code units, while Luau
-/// intelligence indexes Unicode scalar values.
+/// The Android Sora editor reports cursor offsets in UTF-16 code units, while
+/// Luau intelligence indexes Unicode scalar values.
 fn utf16_to_char_index(text: &str, utf16_index: usize) -> usize {
     let mut units = 0;
     for (index, ch) in text.chars().enumerate() {

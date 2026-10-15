@@ -1,30 +1,17 @@
-//! Live Session bridge.
+//! Local WebSocket RPC bridge to the optional Roblox Studio companion plugin.
 //!
-//! Roblox Studio's Team Create / RCC replication protocol is proprietary and
-//! can't be spoken by a third-party client directly. Instead this module
-//! implements the **companion-plugin pattern** used by every serious external
-//! Studio tool (Rojo, the MCP server, etc.):
+//! The plugin connects to `ws://127.0.0.1:41742` by default and exchanges JSON
+//! messages shaped like `{ id, method, params }`. The listener is loopback-only:
+//! run the desktop app and Studio on the same machine, or, for an Android app,
+//! forward the port from the host with `adb forward tcp:41742 tcp:41742` (and use
+//! the same port in the UI and plugin). The app currently uses the bridge to
+//! send Command Bar snippets to Studio; editor plugin execution remains local.
+//! The plugin also defines selection, undo/redo, and shallow place-summary
+//! handlers, but the editor UI does not currently call those methods.
 //!
-//! 1. The user installs a small **Roblox plugin** (`rbxl_editor_bridge.rbxm`)
-//!    into their `Plugins` folder. The plugin opens a WebSocket to this app
-//!    (`ws://127.0.0.1:41742` by default).
-//! 2. This app runs a tiny WebSocket server that accepts that connection.
-//! 3. The plugin sends JSON-RPC style messages: `{ id, method, params }`, and
-//!    the app can call back into Studio the same way.
-//!
-//! We deliberately keep the wire protocol JSON (not msgpack) so it's easy to
-//! inspect and so the Luau side has no native dependencies.
-//!
-//! When a live session is connected the command bar and plugin runner can
-//! choose "Execute in Studio" instead of running locally in luaur, which
-//! means scripts get the *real* engine: `game`, `workspace`, `Selection`,
-//! `ChangeHistoryService`, rendering, physics — everything that the local
-//! sandbox can't provide.
-//!
-//! No actual WebSocket frames are parsed here beyond handshake + text framing
-//! because we pull in a minimal framing implementation rather than a heavy
-//! dependency. The server listens with a plain `std::net::TcpListener`; the
-//! Bevy UI polls `try_recv()` each frame so it never blocks the render loop.
+//! This bridge is separate from the Team Create transport code. It uses a small
+//! RFC 6455 handshake/text-frame implementation over `std::net::TcpListener`;
+//! the Bevy UI polls queued events so network reads do not block rendering.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -42,7 +29,7 @@ pub struct RpcMessage {
     /// Optional request id; omitted for notifications (no response expected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
-    /// Method name, e.g. "run_command", "get_selection", "push_dom".
+    /// Method name, e.g. `run_command`, `get_selection`, or `get_place`.
     pub method: String,
     /// JSON params payload.
     #[serde(default)]
@@ -187,7 +174,9 @@ impl LiveSessionState {
         id
     }
 
-    /// Ask the connected Studio to run a Luau snippet and return its result.
+    /// Send a Luau command to the connected Studio plugin. The plugin runs it
+    /// in Studio and sends a response asynchronously; this method does not wait
+    /// for or correlate that response.
     pub fn run_in_studio(&mut self, source: &str) {
         self.send(
             "run_command",
