@@ -73,6 +73,11 @@ fn catalog_thumbnail_channel() -> (&'static Sender<HashMap<u64, String>>, &'stat
     (tx, CATALOG_THUMBNAIL_RX.get().unwrap())
 }
 
+/// Consecutive automatic retries allowed for the intermittent
+/// DisconnectNewSecurityKeyMismatch close. Each retry needs a brand-new
+/// one-use join ticket, so this bounds how many negotiations one click costs.
+const RBX_TEAM_CREATE_AUTO_RETRIES: u8 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
     Explorer,
@@ -386,6 +391,10 @@ pub struct EditorApp {
     /// Last successful join config from gamejoin (has the server endpoints);
     /// enables the transport-resolution button.
     team_create_join_config: Option<serde_json::Value>,
+    /// Consecutive auto-retries left for the intermittent security-key
+    /// rejection. Refreshed whenever a session ends any other way, so only a
+    /// run of mismatches consumes it and it cannot loop forever.
+    team_create_auto_retries_left: u8,
     /// When the one-use config was received. Reported against the moment the
     /// transport session starts, because a security-key check that passes on
     /// one device and fails on a slower one is a timing question, not a
@@ -561,6 +570,7 @@ impl Default for EditorApp {
             game_cfg_response: String::new(),
             team_create_response: String::new(),
             team_create_join_config: None,
+            team_create_auto_retries_left: RBX_TEAM_CREATE_AUTO_RETRIES,
             team_create_join_config_at: None,
             team_create_session_rx: None,
             team_create_session_cancel: None,
@@ -2241,6 +2251,13 @@ ui.label("Place ID:");
                         };
                         crate::appflow::set_a7_mode(a7_mode);
                         crate::appflow::set_ctrl_app(self.ctrl_app_choice);
+                        ui.label(
+                            RichText::new(format!(
+                                "auto-retries left on security-key mismatch: {}",
+                                self.team_create_auto_retries_left
+                            ))
+                            .weak(),
+                        );
                         ui.label(
                             RichText::new(format!(
                                 "active: 0xA7 = {}, ctrl app byte = {}",
@@ -6437,6 +6454,25 @@ ui.label("Place ID:");
                     self.team_create_session_quic_handshake_complete = false;
                     self.team_create_session_cancel = None;
                     self.team_create_session_rx = None;
+                    // DisconnectNewSecurityKeyMismatch is intermittent: across
+                    // seven live runs the two that survived moved ~28.6 kB in
+                    // the handshake and the five that were rejected moved
+                    // ~17.8 kB, with an identical burst in both groups. Nothing
+                    // in what we send predicts it, so retrying with a fresh
+                    // one-use ticket is the only lever - and doing it here means
+                    // one manual test cycle can cover several attempts.
+                    if report.contains("DisconnectNewSecurityKeyMismatch")
+                        && self.team_create_auto_retries_left > 0
+                    {
+                        self.team_create_auto_retries_left -= 1;
+                        let left = self.team_create_auto_retries_left;
+                        self.log_info(format!(
+                            "Intermittent DisconnectNewSecurityKeyMismatch - renegotiating a fresh one-use ticket and retrying; {left} auto-retry attempt(s) left"
+                        ));
+                        self.team_create_negotiate(false, true, false);
+                    } else {
+                        self.team_create_auto_retries_left = RBX_TEAM_CREATE_AUTO_RETRIES;
+                    }
                 }
             }
         }
