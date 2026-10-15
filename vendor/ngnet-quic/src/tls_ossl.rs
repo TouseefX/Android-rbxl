@@ -1185,6 +1185,13 @@ pub struct OsslBackendBuilder {
     trust_anchors_pem: Vec<Vec<u8>>,
     use_system_trust_store: bool,
     verify: Verify,
+    custom_extensions: Vec<(u16, Vec<u8>)>,
+    expected_rpk_spki_der: Option<Vec<u8>>,
+    proto_version: Option<u16>,
+    ciphersuites: Option<Vec<u8>>,
+    groups_list: Option<Vec<u8>>,
+    no_certificate_compression: bool,
+    server_cert_type_rpk: bool,
 }
 
 impl OsslBackendBuilder {
@@ -1198,7 +1205,106 @@ impl OsslBackendBuilder {
             trust_anchors_pem: Vec::new(),
             use_system_trust_store: role == Role::Client,
             verify: Verify::Peer,
+            custom_extensions: Vec::new(),
+            expected_rpk_spki_der: None,
+            proto_version: None,
+            ciphersuites: None,
+            groups_list: None,
+            no_certificate_compression: false,
+            server_cert_type_rpk: false,
         }
+    }
+
+    /// Offers `server_certificate_type` asking for a raw public key.
+    ///
+    /// Without this the peer sends an X.509 chain, because that is the default
+    /// and the only kind it has been told we accept. RFC 7250 needs the client to
+    /// say so in the ClientHello; the extension is `server_certificate_type`
+    /// (0x0014) with RawPublicKey (2) as its body.
+    pub fn server_certificate_type_raw_public_key(mut self) -> Self {
+        self.server_cert_type_rpk = true;
+        self
+    }
+
+    /// Pins the handshake to exactly one TLS version, minimum and maximum.
+    ///
+    /// `SSL_CTX_set_min_proto_version` and its max counterpart are macros over
+    /// `SSL_CTX_ctrl`, which bindgen does not emit, so the control command is
+    /// issued directly.
+    pub fn proto_version(mut self, version: u16) -> Self {
+        self.proto_version = Some(version);
+        self
+    }
+
+    /// Restricts the TLS 1.3 cipher suites offered, colon separated.
+    ///
+    /// The list is sent verbatim in the ClientHello, so a peer that expects a
+    /// particular set - and only that set - needs this rather than the default
+    /// offer.
+    pub fn ciphersuites(mut self, list: &str) -> Self {
+        let mut bytes = list.as_bytes().to_vec();
+        bytes.push(0);
+        self.ciphersuites = Some(bytes);
+        self
+    }
+
+    /// Restricts the `supported_groups` offered, colon separated.
+    ///
+    /// `SSL_CTX_set1_groups_list` is a macro over `SSL_CTX_ctrl`, so again the
+    /// control command is issued directly.
+    pub fn groups_list(mut self, list: &str) -> Self {
+        let mut bytes = list.as_bytes().to_vec();
+        bytes.push(0);
+        self.groups_list = Some(bytes);
+        self
+    }
+
+    /// Keeps the `compress_certificate` extension out of the ClientHello.
+    ///
+    /// RFC 8879 certificate compression is offered by default, which puts an
+    /// extension in the ClientHello that a peer built before the RFC does not
+    /// send and may not tolerate. Disabling both directions removes it from what
+    /// we advertise and from what we would accept.
+    pub fn no_certificate_compression(mut self) -> Self {
+        self.no_certificate_compression = true;
+        self
+    }
+
+    /// Pins the exact server key expected, given as a SubjectPublicKeyInfo DER
+    /// blob, and negotiates an RFC 7250 raw public key instead of a certificate.
+    ///
+    /// This is the counterpart of the rustls backend's `ServerCertVerifier`:
+    /// peers that authenticate with a bare Ed25519 key rather than an X.509
+    /// chain. Without it the handshake has nothing to compare the peer against.
+    ///
+    /// OpenSSL implements the pin through DANE: `SSL_add_expected_rpk` records a
+    /// DANE-EE / SPKI / Full match, and returns 0 unless DANE has been enabled
+    /// first, so both are done here rather than left to the caller.
+    pub fn expected_rpk_spki_der(mut self, der: impl Into<Vec<u8>>) -> Self {
+        self.expected_rpk_spki_der = Some(der.into());
+        self
+    }
+
+    /// Registers a TLS extension OpenSSL does not know about, to be written
+    /// into the ClientHello.
+    ///
+    /// This is the only way to control where an extension sits in the list.
+    /// OpenSSL writes custom extensions before every built-in one --
+    /// `ssl/statem/extensions.c:1188`, "Add custom extensions first", inside the
+    /// same `WPACKET` sub-packet as the rest of the extensions -- so a peer that
+    /// expects a particular extension at the front can be matched exactly, and
+    /// without editing the ClientHello after it has been built.
+    ///
+    /// Extensions are written in the order they are registered, so with a single
+    /// registration this one is first overall.
+    ///
+    /// The payload is copied and reference counted, because OpenSSL keeps the
+    /// address and reads it from the add callback for as long as any `SSL` made
+    /// from the context lives -- which outlives the backend, so every session
+    /// holds a count. See `alpn_offers` for the same reasoning.
+    pub fn custom_extension(mut self, ext_type: u16, payload: impl Into<Vec<u8>>) -> Self {
+        self.custom_extensions.push((ext_type, payload.into()));
+        self
     }
 
     /// Adds an ALPN protocol, in preference order.
@@ -1339,12 +1445,133 @@ impl OsslBackendBuilder {
             alpn_offers = Some(offers);
         }
 
+        if let Some(version) = self.proto_version {
+            // SAFETY: `ctx` is valid; both commands take the version as `larg`.
+            let ok = unsafe {
+                sys::SSL_CTX_ctrl(
+                    ctx.0,
+                    sys::SSL_CTRL_SET_MIN_PROTO_VERSION as c_int,
+                    version as core::ffi::c_long,
+                    ptr::null_mut(),
+                )
+            };
+            if ok != 1 {
+                return Err(tls_error("SSL_CTX_set_min_proto_version failed"));
+            }
+            let ok = unsafe {
+                sys::SSL_CTX_ctrl(
+                    ctx.0,
+                    sys::SSL_CTRL_SET_MAX_PROTO_VERSION as c_int,
+                    version as core::ffi::c_long,
+                    ptr::null_mut(),
+                )
+            };
+            if ok != 1 {
+                return Err(tls_error("SSL_CTX_set_max_proto_version failed"));
+            }
+        }
+
+        if let Some(list) = &self.ciphersuites {
+            // SAFETY: `ctx` is valid and the slice is NUL-terminated.
+            let ok =
+                unsafe { sys::SSL_CTX_set_ciphersuites(ctx.0, list.as_ptr().cast::<c_char>()) };
+            if ok != 1 {
+                return Err(tls_error("the cipher suite list was rejected"));
+            }
+        }
+
+        if let Some(list) = &self.groups_list {
+            // SAFETY: `ctx` is valid and the slice is NUL-terminated.
+            let ok = unsafe {
+                sys::SSL_CTX_ctrl(
+                    ctx.0,
+                    sys::SSL_CTRL_SET_GROUPS_LIST as c_int,
+                    0,
+                    list.as_ptr().cast_mut().cast::<c_void>(),
+                )
+            };
+            if ok != 1 {
+                return Err(tls_error("the supported groups list was rejected"));
+            }
+        }
+
+        if self.no_certificate_compression {
+            // SSL_OP_BIT(n) is a function-like macro bindgen cannot emit, so the
+            // two bits are written out: TX is 32, RX is 33.
+            let options = (1u64 << 32) | (1u64 << 33);
+            // SAFETY: `ctx` is valid.
+            unsafe {
+                sys::SSL_CTX_set_options(ctx.0, options);
+            }
+        }
+
+        let mut expected_rpk = None;
+        if let Some(der) = &self.expected_rpk_spki_der {
+            let mut cursor: *const c_uchar = der.as_ptr();
+            let mut raw: *mut sys::EVP_PKEY = ptr::null_mut();
+            // SAFETY: `cursor` and `raw` are valid out-parameters describing
+            // `der`, whose length is passed alongside; a null libctx and propq
+            // mean the default context and no property query.
+            let parsed = unsafe {
+                sys::d2i_PUBKEY_ex(
+                    &mut raw,
+                    &mut cursor,
+                    der.len() as core::ffi::c_long,
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            };
+            if parsed.is_null() {
+                return Err(tls_error("the expected raw public key is not valid SPKI DER"));
+            }
+            // SAFETY: `parsed` is a fresh reference we now own; `Pkey` frees it.
+            if unsafe { sys::SSL_CTX_dane_enable(ctx.0) } <= 0 {
+                return Err(tls_error("SSL_CTX_dane_enable failed"));
+            }
+            expected_rpk = Some(Pkey(parsed));
+        }
+
+        let mut custom_ext_payloads: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
+        for (ext_type, payload) in &self.custom_extensions {
+            let shared = std::sync::Arc::new(payload.clone());
+            let arg = std::sync::Arc::as_ptr(&shared);
+            // SAFETY: `ctx` is valid. `arg` addresses a `Vec<u8>` owned by an
+            // `Arc` that is stored on the backend being returned and cloned into
+            // every session, so it outlives the context and the callback reading
+            // it. `SSL_EXT_CLIENT_HELLO` restricts it to the ClientHello.
+            let added = unsafe {
+                sys::SSL_CTX_add_custom_ext(
+                    ctx.0,
+                    u32::from(*ext_type),
+                    // 1152 on the wire: ClientHello plus TLS 1.3
+                    // EncryptedExtensions, matching what the native client
+                    // registers rather than the ClientHello alone.
+                    (sys::SSL_EXT_CLIENT_HELLO
+                        | sys::SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS) as u32,
+                    Some(custom_ext_add),
+                    // Nothing is allocated in the add callback, so there is
+                    // nothing to free.
+                    None,
+                    arg.cast_mut().cast::<c_void>(),
+                    Some(custom_ext_parse),
+                    arg.cast_mut().cast::<c_void>(),
+                )
+            };
+            if added != 1 {
+                return Err(tls_error("SSL_CTX_add_custom_ext failed"));
+            }
+            custom_ext_payloads.push(shared);
+        }
+
         Ok(OsslBackend {
             ctx,
             alpn_wire,
             role: self.role,
             verify: self.verify,
             alpn_offers,
+            custom_ext_payloads,
+            expected_rpk,
+            server_cert_type_rpk: self.server_cert_type_rpk,
         })
     }
 }
@@ -1455,6 +1682,57 @@ fn add_trust_anchor(ctx: *mut sys::SSL_CTX, pem: &[u8]) -> Result<()> {
 /// Runs inside OpenSSL during the handshake. Returning a fatal alert here is what turns "no
 /// protocol in common" into a handshake failure that names ALPN, rather than a connection
 /// that completes and then behaves strangely.
+/// Writes a registered custom extension into the handshake message.
+///
+/// The payload belongs to the backend and is shared with every session, so the
+/// pointer handed to OpenSSL stays valid for as long as the `SSL` does. Nothing
+/// is allocated here, which is why no free callback is registered.
+unsafe extern "C" fn custom_ext_add(
+    _ssl: *mut sys::SSL,
+    _ext_type: u32,
+    _context: u32,
+    out: *mut *const c_uchar,
+    outlen: *mut usize,
+    _x: *mut sys::X509,
+    _chainidx: usize,
+    _al: *mut c_int,
+    add_arg: *mut c_void,
+) -> c_int {
+    if add_arg.is_null() || out.is_null() || outlen.is_null() {
+        return 0;
+    }
+    // Edition 2024 does not treat an `unsafe fn` body as an implicit unsafe
+    // block, so the dereference is marked at the point it happens. `add_arg` is
+    // the address of the `Arc<Vec<u8>>` payload registered with
+    // `SSL_CTX_add_custom_ext`, which the backend and every session keep alive.
+    let payload = unsafe { &*add_arg.cast::<Vec<u8>>() };
+    unsafe {
+        *out = payload.as_ptr();
+        *outlen = payload.len();
+    }
+    1
+}
+
+/// Accepts the extension if a peer ever offers one back.
+///
+/// Registered with `SSL_EXT_CLIENT_HELLO` only, so the contexts a server would
+/// use are not in play and this is never reached. `SSL_CTX_add_custom_ext` wants
+/// a parse callback regardless, and rejecting an unexpected extension would fail
+/// the handshake for no gain.
+unsafe extern "C" fn custom_ext_parse(
+    _ssl: *mut sys::SSL,
+    _ext_type: u32,
+    _context: u32,
+    _in: *const c_uchar,
+    _inlen: usize,
+    _x: *mut sys::X509,
+    _chainidx: usize,
+    _al: *mut c_int,
+    _parse_arg: *mut c_void,
+) -> c_int {
+    1
+}
+
 unsafe extern "C" fn alpn_select_cb(
     _ssl: *mut sys::SSL,
     out: *mut *const c_uchar,
@@ -1652,6 +1930,22 @@ pub struct OsslBackend {
     /// with the context. Every session therefore holds a count.
     #[allow(clippy::box_collection)]
     alpn_offers: Option<std::sync::Arc<Vec<u8>>>,
+    /// Payloads for the registered custom extensions, each at a fixed address
+    /// for the add callback that reads it.
+    ///
+    /// Reference counted for the same reason as `alpn_offers`: a session made
+    /// from this backend keeps the `SSL_CTX` alive after the backend is dropped,
+    /// and the callbacks go with the context.
+    custom_ext_payloads: Vec<std::sync::Arc<Vec<u8>>>,
+    /// The pinned peer key, for sessions to install as an expected RPK.
+    ///
+    /// Owned here rather than per session because it is parsed once. Held by the
+    /// backend for the backend's lifetime, which is all that is needed:
+    /// `SSL_add_expected_rpk` serialises the key into a TLSA record rather than
+    /// keeping the pointer, so no session can outlive a use of it.
+    expected_rpk: Option<Pkey>,
+    /// Whether sessions ask the peer for a raw public key.
+    server_cert_type_rpk: bool,
 }
 
 impl OsslBackend {
@@ -1680,6 +1974,10 @@ pub struct OsslSession {
     /// A share of the backend's ALPN offer list, keeping it alive for the selection
     /// callback that reads it -- which outlives the backend whenever a session does.
     _alpn_offers: Option<std::sync::Arc<Vec<u8>>>,
+    /// Shares of the backend's custom-extension payloads, keeping them alive for
+    /// the add callbacks that read them -- which outlive the backend whenever a
+    /// session does.
+    _custom_ext_payloads: Vec<std::sync::Arc<Vec<u8>>>,
     /// The handshake state OpenSSL's callbacks reach through their argument.
     ///
     /// A raw pointer rather than a `Box` on purpose. OpenSSL holds this same address and
@@ -1706,10 +2004,54 @@ impl OsslSession {
             ossl_ctx: ptr::null_mut(),
             ssl,
             _alpn_offers: backend.alpn_offers.clone(),
+            _custom_ext_payloads: backend.custom_ext_payloads.clone(),
             engine: ptr::null_mut(),
             verify: backend.verify,
             role,
         };
+
+        if backend.server_cert_type_rpk && role == Role::Client {
+            // 2 is RawPublicKey in RFC 7250's server_certificate_type extension;
+            // X.509 (0) is deliberately not offered.
+            let cert_type = [2u8];
+            // SAFETY: `ssl` is valid and the slice outlives the call.
+            if unsafe {
+                sys::SSL_set1_server_cert_type(
+                    session.ssl,
+                    cert_type.as_ptr(),
+                    cert_type.len(),
+                )
+            } != 1
+            {
+                return Err(tls_error("SSL_set1_server_cert_type failed"));
+            }
+        }
+
+        if let Some(rpk) = &backend.expected_rpk {
+            // DANE first: `SSL_add_expected_rpk` stores the pin as a DANE-EE
+            // TLSA record and returns 0 when DANE is off. A null basedomain is
+            // correct for a peer that is not identified by a DNS name.
+            // SAFETY: `ssl` is valid and was just created above.
+            if unsafe { sys::SSL_dane_enable(session.ssl, ptr::null()) } <= 0 {
+                return Err(tls_error("SSL_dane_enable failed"));
+            }
+            // 2 is RawPublicKey in RFC 7250's client_cert_type extension; 0 is
+            // X.509 and is deliberately not offered, so a peer that wants to
+            // present a certificate cannot.
+            let cert_type = [2u8];
+            // SAFETY: `ssl` is valid and the slice outlives the call.
+            if unsafe {
+                sys::SSL_set1_client_cert_type(session.ssl, cert_type.as_ptr(), cert_type.len())
+            } != 1
+            {
+                return Err(tls_error("SSL_set1_client_cert_type failed"));
+            }
+            // SAFETY: `ssl` is valid and the key is owned by the backend; OpenSSL
+            // copies it into a TLSA record rather than keeping the pointer.
+            if unsafe { sys::SSL_add_expected_rpk(session.ssl, rpk.0) } != 1 {
+                return Err(tls_error("SSL_add_expected_rpk failed"));
+            }
+        }
 
         let mut ossl_ctx: *mut sys::ngtcp2_crypto_ossl_ctx = ptr::null_mut();
         // SAFETY: `ossl_ctx` is a valid out-parameter and `ssl` is valid.

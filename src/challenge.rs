@@ -1012,9 +1012,12 @@ mod tests {
                 rep.u2, v["u2"].as_u64().unwrap() as u32,
                 "{name}: u2 mismatch"
             );
+            // Rust format strings cannot do field access, so the assertion
+            // message needs the value in a local before it can be interpolated.
+            let answer = rep.answer;
             assert_eq!(
                 rep.answer, expected,
-                "{name}: answer 0x{rep.answer:08x} != native 0x{expected:08x} \
+                "{name}: answer 0x{answer:08x} != native 0x{expected:08x} \
                  (blob {}B wire {}B protos {} starts {} solve {}ms)",
                 rep.blob_bytes,
                 rep.wire_bytes,

@@ -73,6 +73,11 @@ fn catalog_thumbnail_channel() -> (&'static Sender<HashMap<u64, String>>, &'stat
     (tx, CATALOG_THUMBNAIL_RX.get().unwrap())
 }
 
+/// Consecutive automatic retries allowed for the intermittent
+/// DisconnectNewSecurityKeyMismatch close. Each retry needs a brand-new
+/// one-use join ticket, so this bounds how many negotiations one click costs.
+const RBX_TEAM_CREATE_AUTO_RETRIES: u8 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
     Explorer,
@@ -206,6 +211,9 @@ pub struct EditorApp {
     editor_word_wrap: bool,
     editor_focus_mode: bool,
     show_stats: bool,
+    /// View-menu skybox toggle. Persisted through `EditorSettings`; the renderer
+    /// does not read it yet, so flipping it currently only changes the label.
+    show_skybox: bool,
     /// Whether StarterGui/BillboardGui/SurfaceGui previews are drawn over the viewport.
     show_gui_preview: bool,
     /// Hide all editor chrome and dedicate the window to the 3D viewport.
@@ -309,6 +317,9 @@ pub struct EditorApp {
     command_history_idx: usize,
     /// Last system clipboard text we pushed into egui.
     last_clipboard: String,
+    /// Last text we pushed *out* to the Android clipboard, and when. A single
+    /// tap can surface as several clicks, so pushes are deduplicated.
+    last_clipboard_push: Option<(String, std::time::Instant)>,
     /// Last focused egui Id, used to show/hide the IME.
     command_output: Vec<lua_runtime::OutputLine>,
     command_run_target_studio: bool,
@@ -331,7 +342,10 @@ pub struct EditorApp {
     // mid-run (checked between scripts in the batch, and exposed to
     // long-running Luau via a hook if needed).
     running_plugin_id: Option<String>,
-    plugin_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Live Luau VM for the running plugin. Persistent, so `RunService`
+    /// connections and `task.defer` survive past the script body instead of
+    /// dying with a throwaway VM; ticked once per editor frame.
+    plugin_session: Option<lua_runtime::PluginSession>,
 
     // Live Session bridge state.
     live_session: live_session::LiveSessionState,
@@ -377,11 +391,24 @@ pub struct EditorApp {
     /// Last successful join config from gamejoin (has the server endpoints);
     /// enables the transport-resolution button.
     team_create_join_config: Option<serde_json::Value>,
+    /// Consecutive auto-retries left for the intermittent security-key
+    /// rejection. Refreshed whenever a session ends any other way, so only a
+    /// run of mismatches consumes it and it cannot loop forever.
+    team_create_auto_retries_left: u8,
+    /// When the one-use config was received. Reported against the moment the
+    /// transport session starts, because a security-key check that passes on
+    /// one device and fails on a slower one is a timing question, not a
+    /// format one.
+    team_create_join_config_at: Option<std::time::Instant>,
     /// App-owned transport worker channel; the QUIC runtime and persistent
     /// receive loop live on the worker, never on the egui frame thread.
     team_create_session_rx: Option<Receiver<crate::team_create::RbxTransportSessionEvent>>,
     team_create_session_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     team_create_session_running: bool,
+    /// Which 0xA7 the next join flow sends: 0 = real capture, 1 = empty, 2 = omit.
+    a7_mode_choice: u8,
+    /// Application byte for the control stream header: 0, 1 or 4.
+    ctrl_app_choice: u8,
     /// QUIC/TLS handshake milestone only; not BaseClient-connected or Team Create-accepted.
     team_create_session_quic_handshake_complete: bool,
     team_create_session_status: String,
@@ -448,6 +475,7 @@ impl Default for EditorApp {
             editor_word_wrap: saved_settings.editor_word_wrap,
             editor_focus_mode: false,
             show_stats: false,
+            show_skybox: saved_settings.show_skybox,
             show_gui_preview: true,
             viewport_fullscreen: false,
             roblox_fonts_installed: false,
@@ -507,6 +535,7 @@ impl Default for EditorApp {
             command_history: Vec::new(),
             command_history_idx: 0,
             last_clipboard: String::new(),
+            last_clipboard_push: None,
             command_output: Vec::new(),
             command_run_target_studio: false,
             plugin_index: plugins::load_index(),
@@ -518,7 +547,7 @@ impl Default for EditorApp {
             browse_places: Vec::new(),
             browse_status: String::new(),
             running_plugin_id: None,
-            plugin_stop_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            plugin_session: None,
             live_session: live_session::LiveSessionState::default(),
             anim_upload_name: "NewAnimation".into(),
             anim_id_input: "522635533".into(),
@@ -541,9 +570,17 @@ impl Default for EditorApp {
             game_cfg_response: String::new(),
             team_create_response: String::new(),
             team_create_join_config: None,
+            team_create_auto_retries_left: RBX_TEAM_CREATE_AUTO_RETRIES,
+            team_create_join_config_at: None,
             team_create_session_rx: None,
             team_create_session_cancel: None,
             team_create_session_running: false,
+            // Two live runs - real 99-byte capture and omitted - closed
+            // identically at 161/157 ms with DisconnectNewSecurityKeyMismatch,
+            // so the frame is not what the server is checking. Default to
+            // omitting it and keep the knob for re-testing.
+            a7_mode_choice: 2,
+            ctrl_app_choice: 0,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
             prop_num_buf: HashMap::new(),
@@ -672,6 +709,20 @@ impl EditorApp {
         // timer is needed (and a timer cannot predict mobile download speed).
     }
 
+    /// Push text to the Android clipboard, ignoring repeats of the same text
+    /// inside a short window. `ui.button().clicked()` can fire more than once for
+    /// one tap on a touch device, which is why the Copy Output button was pushing
+    /// the same text two or three times.
+    fn copy_to_clipboard(&mut self, text: &str) {
+        if let Some((prev, at)) = &self.last_clipboard_push {
+            if prev == text && at.elapsed() < std::time::Duration::from_millis(500) {
+                return;
+            }
+        }
+        self.last_clipboard_push = Some((text.to_string(), std::time::Instant::now()));
+        jni_bridge::trigger_copy_to_clipboard(text);
+    }
+
     fn log_info(&mut self, msg: impl Into<String>) {
         self.output_logs.push(OutputLog {
             level: "INFO",
@@ -749,15 +800,15 @@ impl EditorApp {
                 shortcut = Some(0);
             } else {
                 for (index, key) in [
-                    (1usize, egui::Key::Digit1),
-                    (2, egui::Key::Digit2),
-                    (3, egui::Key::Digit3),
-                    (4, egui::Key::Digit4),
-                    (5, egui::Key::Digit5),
-                    (6, egui::Key::Digit6),
-                    (7, egui::Key::Digit7),
-                    (8, egui::Key::Digit8),
-                    (9, egui::Key::Digit9),
+                    (1usize, egui::Key::Num1),
+                    (2, egui::Key::Num2),
+                    (3, egui::Key::Num3),
+                    (4, egui::Key::Num4),
+                    (5, egui::Key::Num5),
+                    (6, egui::Key::Num6),
+                    (7, egui::Key::Num7),
+                    (8, egui::Key::Num8),
+                    (9, egui::Key::Num9),
                 ] {
                     if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key)) {
                         shortcut = Some(index);
@@ -1238,13 +1289,27 @@ impl EditorApp {
         // copies text inside an egui widget (Ctrl+C / selection), egui
         // emits OutputCommand::CopyText; forward it to the Android
         // clipboard so the system paste menu actually has our text.
-        ctx.output(|out| {
-            for cmd in out.commands.iter() {
-                if let egui::OutputCommand::CopyText(text) = cmd {
-                    jni_bridge::trigger_copy_to_clipboard(text);
-                }
+        // output_mut so the commands are actually removed: reading them without
+        // draining left every CopyText in the list to be forwarded again on the
+        // next frame.
+        let pending = ctx.output_mut(|out| {
+            let texts: Vec<String> = out
+                .commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !texts.is_empty() {
+                out.commands
+                    .retain(|cmd| !matches!(cmd, egui::OutputCommand::CopyText(_)));
             }
+            texts
         });
+        for text in pending {
+            self.copy_to_clipboard(&text);
+        }
     }
 }
 
@@ -1571,6 +1636,10 @@ impl EditorApp {
             self.gui_hovered.clear(); self.gui_runtime_events.clear(); None
         };
         if let Some(session)=self.gui_play_session.as_mut() { if let Err(error)=session.tick(){log::error!("GUI tween tick: {error}");} }
+        // Drive the running plugin's RunService signals. Collect before
+        // pushing so the mutable borrow of the session has ended.
+        let plugin_lines=self.plugin_session.as_mut().map(|session|session.tick()).unwrap_or_default();
+        for line in plugin_lines { self.command_output.push(line); }
         let keyboard_events:Vec<(String,bool)>=ui.input(|input|input.events.iter().filter_map(|event|match event {egui::Event::Key{key,pressed,repeat,..} if !*repeat=>Some((format!("{key:?}"),*pressed)),_=>None}).collect());
         let keyboard_processed=ui.ctx().wants_keyboard_input();
         if let Some(session)=self.gui_play_session.as_ref() {
@@ -1863,11 +1932,12 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
 
                                 let delivery_url = RobloxApiClient::get_asset_delivery_url(item.id);
                                 if ui.button("📋 Copy Delivery URL").clicked() {
-                                    jni_bridge::trigger_copy_to_clipboard(&delivery_url);
+                                    self.copy_to_clipboard(&delivery_url);
                                 }
 
                                 if ui.button("🌐 Copy Asset ID").clicked() {
-                                    jni_bridge::trigger_copy_to_clipboard(&item.id.to_string());
+                                    let id = item.id.to_string();
+                                    self.copy_to_clipboard(&id);
                                 }
                             });
                         });
@@ -2147,6 +2217,58 @@ ui.label("Place ID:");
                         }
                     });
 
+                    // Both knobs are reported in the session summary so a result
+                    // can be attributed to the run that produced it. They live in
+                    // their own group: nested inside the button row below they were
+                    // laid out past that row's right edge and clipped on narrow
+                    // layouts, so the toggles were never visible.
+                    ui.group(|ui| {
+                        ui.label(RichText::new("Join burst overrides").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("0xA7 attestation:");
+                            ui.radio_value(&mut self.a7_mode_choice, 0u8, "real capture")
+                                .on_hover_text("Sends the captured 99-byte frame verbatim");
+                            ui.radio_value(&mut self.a7_mode_choice, 1u8, "empty")
+                                .on_hover_text("Sends a7 00 00 - tests whether the server wants a frame at all");
+                            ui.radio_value(&mut self.a7_mode_choice, 2u8, "omit")
+                                .on_hover_text("Sends no 0xA7 - tests whether it is optional");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("ctrl app byte:");
+                            ui.radio_value(&mut self.ctrl_app_choice, 0u8, "0")
+                                .on_hover_text("What every multi-second session used");
+                            ui.radio_value(&mut self.ctrl_app_choice, 1u8, "1")
+                                .on_hover_text("0.741 BaseClient::openSendChannel application");
+                            ui.radio_value(&mut self.ctrl_app_choice, 4u8, "4")
+                                .on_hover_text("Reference client's openStream(APP, CTRL)");
+                        });
+                        // Applied after the radios, so changing one and starting a
+                        // session in the same frame cannot use the previous value.
+                        let a7_mode = match self.a7_mode_choice {
+                            1 => crate::appflow::A7Mode::Empty,
+                            2 => crate::appflow::A7Mode::Skip,
+                            _ => crate::appflow::A7Mode::Real,
+                        };
+                        crate::appflow::set_a7_mode(a7_mode);
+                        crate::appflow::set_ctrl_app(self.ctrl_app_choice);
+                        ui.label(
+                            RichText::new(format!(
+                                "auto-retries left on security-key mismatch: {}",
+                                self.team_create_auto_retries_left
+                            ))
+                            .weak(),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "active: 0xA7 = {}, ctrl app byte = {}",
+                                crate::appflow::a7_mode_label(a7_mode),
+                                self.ctrl_app_choice
+                            ))
+                            .weak(),
+                        );
+                    });
+                    ui.add_space(6.0);
+
                     ui.horizontal_wrapped(|ui| {
                         let can_start = !self.team_create_session_running;
                         if ui
@@ -2218,7 +2340,8 @@ ui.label("Place ID:");
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Handshake Output").strong());
                             if ui.button("📋 Copy Output").clicked() {
-                                jni_bridge::trigger_copy_to_clipboard(&self.team_create_response);
+                                let text = self.team_create_response.clone();
+                                self.copy_to_clipboard(&text);
                                 self.status = "Copied Team Create output to Android clipboard".into();
                             }
                         });
@@ -5694,7 +5817,7 @@ ui.label("Place ID:");
             if ui.button("🔄 Reload list").clicked() {
                 self.plugin_index = plugins::load_index();
             }
-            // Stop a running sandbox plugin.
+            // Stop a running plugin.
             if self.running_plugin_id.is_some() {
                 if ui.button(RichText::new("⏹ Stop running plugin").color(Color32::from_rgb(255,120,120))).clicked() {
                     self.stop_running_plugin();
@@ -5704,6 +5827,9 @@ ui.label("Place ID:");
                 }
             }
         });
+
+        // Toolbars the running plugin created through plugin:CreateToolbar.
+        self.show_plugin_toolbars(ui);
 
         // Fetch thumbnails for all installed plugins that have an icon
         // asset id, in the background.
@@ -5962,7 +6088,6 @@ ui.label("Place ID:");
     }
 
     fn run_plugin(&mut self, id: &str) {
-        use std::sync::atomic::Ordering;
         let Some(rec) = self.plugin_index.get(id).cloned() else { return; };
         if !rec.enabled {
             self.status = "Enable the plugin before running it".into();
@@ -5972,47 +6097,114 @@ ui.label("Place ID:");
             self.status = "A plugin is already running; stop it first".into();
             return;
         }
-        // Reset stop flag and mark running.
-        self.plugin_stop_flag.store(false, Ordering::SeqCst);
-        self.running_plugin_id = Some(rec.id.clone());
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
-        let flag = self.plugin_stop_flag.clone();
-        let plugin_id = rec.id.clone();
-        std::thread::spawn(move || {
-            let dom = match plugins::load_plugin_dom(&rec) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = plugin_log_channel().0.send(PluginLogLine::Error(format!("load failed: {e}")));
-                    let _ = plugin_running_channel().0.send(plugin_id);
-                    return;
-                }
-            };
-            let mut ran = 0usize;
-            for &child in dom.root().children() {
-                if flag.load(Ordering::SeqCst) { break; }
-                if let Some(inst) = dom.get_by_ref(child) {
-                    if matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
-                        let src = rbxl::get_source(&dom, child).unwrap_or_default();
-                        let result = if inst.class == "ModuleScript" {
-                            lua_runtime::run_module(&src, &rec.name)
-                        } else {
-                            lua_runtime::run_source(&src, &rec.name)
-                        };
-                        for line in result.lines { let _ = plugin_log_channel().0.send(PluginLogLine::Output(line)); }
-                        ran += 1;
-                    }
-                }
+        // The session holds an Rc<RefCell<WeakDom>> for its whole lifetime, but
+        // EditorApp owns the place as Option<WeakDom> and dozens of sites read
+        // it that way. Hand the plugin a serialized snapshot instead: it gets a
+        // real, fully populated `game` to read and write, isolated from the
+        // editor. WeakDom is not Clone, so the round trip goes through bytes.
+        let Some(snapshot) = self
+            .dom
+            .as_ref()
+            .and_then(|dom| rbxl::save_place(dom).ok())
+            .and_then(|bytes| rbxl::load_place(bytes).ok())
+        else {
+            self.status = "Load a place before running a plugin".into();
+            return;
+        };
+
+        let mut session = match lua_runtime::PluginSession::new_for_plugin(
+            Rc::new(RefCell::new(snapshot)),
+            &rec.name,
+            plugins::settings_path(&rec.id),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.status = format!("Plugin VM failed: {error}");
+                return;
             }
-            let _ = plugin_log_channel().0.send(PluginLogLine::Done(ran));
-            let _ = plugin_running_channel().0.send(plugin_id);
-        });
+        };
+
+        let plugin_dom = match plugins::load_plugin_dom(&rec) {
+            Ok(dom) => dom,
+            Err(error) => {
+                self.status = format!("load failed: {error}");
+                return;
+            }
+        };
+
+        // Runs on the UI thread, like GuiPlaySession: Lua is not Send, so a
+        // session built on a worker thread could not be ticked from here. A
+        // slow plugin therefore blocks the editor while it runs.
+        let mut ran = 0usize;
+        for &child in plugin_dom.root().children() {
+            let Some(inst) = plugin_dom.get_by_ref(child) else { continue };
+            if !matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+                continue;
+            }
+            let src = rbxl::get_source(&plugin_dom, child).unwrap_or_default();
+            for line in session.exec(&src, &rec.name) {
+                self.command_output.push(line);
+            }
+            ran += 1;
+        }
+
+        self.plugin_session = Some(session);
+        self.running_plugin_id = Some(rec.id.clone());
+        self.log_info(format!("Plugin ran {ran} script(s) in a persistent VM"));
         self.active_tab = ActiveTab::Command;
     }
 
+    /// Draw the toolbars a running plugin created and dispatch clicks into its
+    /// real `Click` signals.
+    fn show_plugin_toolbars(&mut self, ui: &mut egui::Ui) {
+        let toolbars = match self.plugin_session.as_ref() {
+            Some(session) => session.plugin_toolbars(),
+            None => return,
+        };
+        if toolbars.is_empty() {
+            return;
+        }
+        ui.separator();
+        let mut clicked: Option<(usize, usize)> = None;
+        for (toolbar_index, toolbar) in toolbars.iter().enumerate() {
+            ui.label(RichText::new(format!("🧩 {}", toolbar.name)).weak());
+            ui.horizontal_wrapped(|ui| {
+                for (button_index, button) in toolbar.buttons.iter().enumerate() {
+                    let id = if button.id.is_empty() { "button" } else { button.id.as_str() };
+                    let label = if button.active { format!("▣ {id}") } else { id.to_string() };
+                    let mut response = ui.add_enabled(button.enabled, egui::Button::new(label));
+                    if !button.tooltip.is_empty() {
+                        response = response.on_hover_text(button.tooltip.as_str());
+                    }
+                    if response.clicked() {
+                        clicked = Some((toolbar_index, button_index));
+                    }
+                }
+            });
+        }
+        if let Some((toolbar_index, button_index)) = clicked {
+            let lines = self
+                .plugin_session
+                .as_mut()
+                .map(|session| session.click_button(toolbar_index, button_index))
+                .unwrap_or_default();
+            for line in lines {
+                self.command_output.push(line);
+            }
+        }
+    }
+
     fn stop_running_plugin(&mut self) {
-        use std::sync::atomic::Ordering;
-        self.plugin_stop_flag.store(true, Ordering::SeqCst);
-        self.status = "Stopping plugin...".into();
+        // Dropping the session tears down the VM and every connection in it.
+        let saved = self.plugin_session.take().map(|session| session.save_settings());
+        if let Some(Err(error)) = saved {
+            log::error!("Plugin settings save: {error}");
+        }
+        self.running_plugin_id = None;
+        self.status = "Plugin stopped".into();
     }
 
     fn pump_plugin_thumbnails(&mut self) {
@@ -6262,6 +6454,25 @@ ui.label("Place ID:");
                     self.team_create_session_quic_handshake_complete = false;
                     self.team_create_session_cancel = None;
                     self.team_create_session_rx = None;
+                    // DisconnectNewSecurityKeyMismatch is intermittent: across
+                    // seven live runs the two that survived moved ~28.6 kB in
+                    // the handshake and the five that were rejected moved
+                    // ~17.8 kB, with an identical burst in both groups. Nothing
+                    // in what we send predicts it, so retrying with a fresh
+                    // one-use ticket is the only lever - and doing it here means
+                    // one manual test cycle can cover several attempts.
+                    if report.contains("DisconnectNewSecurityKeyMismatch")
+                        && self.team_create_auto_retries_left > 0
+                    {
+                        self.team_create_auto_retries_left -= 1;
+                        let left = self.team_create_auto_retries_left;
+                        self.log_info(format!(
+                            "Intermittent DisconnectNewSecurityKeyMismatch - renegotiating a fresh one-use ticket and retrying; {left} auto-retry attempt(s) left"
+                        ));
+                        self.team_create_negotiate(false, true, false);
+                    } else {
+                        self.team_create_auto_retries_left = RBX_TEAM_CREATE_AUTO_RETRIES;
+                    }
                 }
             }
         }
@@ -6314,6 +6525,18 @@ ui.label("Place ID:");
         key_ring_revert: bool,
         report_prefix: Option<String>,
     ) {
+        // The join ticket and the security key derived from it are one-use and
+        // short lived. If a slower device loses more time between negotiation and
+        // connect, that shows up here rather than in the burst, which is the same
+        // size on every device.
+        let config_age_ms = self
+            .team_create_join_config_at
+            .map(|at| at.elapsed().as_millis() as u64);
+        self.team_create_join_config_at = None;
+        if let Some(age) = config_age_ms {
+            self.log_info(format!("Join config age at connect: {age} ms"));
+        }
+
         self.start_team_create_session_worker(
             "Starting Team Create transport session…".into(),
             move |event_tx, cancel| {
@@ -6501,6 +6724,7 @@ ui.label("Place ID:");
                     // the separate transport-session button. The parser handles
                     // settings, joinTicket, joinScript, and nested wrappers.
                     self.team_create_join_config = Some(v.clone());
+                    self.team_create_join_config_at = Some(std::time::Instant::now());
                     let mut text = if preemptive {
                         String::from("Server warm-up config received")
                     } else {
@@ -6856,7 +7080,7 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
                             open_cloud_place_id: self.open_cloud_place_id.clone(),
                             ui_mode: self.ui_mode.clone(),
                             auto_download_meshes: true,
-                            show_skybox: true,
+                            show_skybox: self.show_skybox,
                             editor_font_size: self.font_size,
                             compact_toolbar: self.compact_toolbar,
                             show_tablet_explorer: self.show_tablet_explorer,

@@ -144,6 +144,15 @@ default = []
 # Enable audio playback on desktop via rodio. Android uses MediaPlayer
 # via JNI regardless of this feature.
 desktop_audio = ["rodio"]
+# Drive TLS through OpenSSL instead of Rustls, which is what lets the ClientHello
+# carry 0xFF00 as a real extension rather than as a post-hoc splice: OpenSSL writes
+# custom extensions ahead of every built-in one (ssl/statem/extensions.c:1188).
+#
+# Off by default because ngnet-quic-sys requires OpenSSL >= 3.5.0 - the first
+# release carrying the QUIC TLS API ngtcp2's ossl helper is written against - and
+# neither the host runner nor the Android NDK ships one. Enabling it means pointing
+# OPENSSL_DIR at a build of 3.5.x, which the `check-openssl-android` job does.
+ossl-tls = ["ngnet-quic/tls-ossl"]
 
 [dependencies.rodio]
 version = "0.20"

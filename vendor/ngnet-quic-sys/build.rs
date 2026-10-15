@@ -49,9 +49,25 @@ fn main() {
             println!("cargo::rustc-link-search=native={}", dir.display());
         }
         for lib in &openssl.libs {
-            // Dynamic: these are the system's OpenSSL, not something this crate
-            // built, so vendoring them into the rlib would be wrong.
-            println!("cargo::rustc-link-lib=dylib={lib}");
+            // Dynamic when a shared library is actually there, which is the case
+            // for a system OpenSSL: it belongs to the platform, and vendoring it
+            // into the rlib would be wrong.
+            //
+            // Android is the exception. It has no system OpenSSL at all, so
+            // `OPENSSL_DIR` points at a tree this build produced, configured
+            // `no-shared` - there is no `.so` to ask for, and the only thing that
+            // links is the archive. Decided by what is on disk rather than by
+            // target, so a platform that does ship a shared library keeps getting
+            // the dynamic link.
+            let shared = openssl.link_paths.iter().any(|dir| {
+                dir.join(format!("lib{lib}.so")).is_file()
+                    || dir.join(format!("lib{lib}.dylib")).is_file()
+            });
+            if shared {
+                println!("cargo::rustc-link-lib=dylib={lib}");
+            } else {
+                println!("cargo::rustc-link-lib=static={lib}");
+            }
         }
     }
 
@@ -211,6 +227,23 @@ fn build_ngtcp2(source_dir: &Path, openssl: Option<&OpenSsl>) -> PathBuf {
             config.define("ENABLE_OPENSSL", "ON");
             if let Some(root) = &openssl.root {
                 config.define("OPENSSL_ROOT_DIR", root);
+                // Cross-compiling sets `CMAKE_SYSTEM_NAME`, which makes CMake
+                // re-root every `find_path` and `find_library` under
+                // `CMAKE_FIND_ROOT_PATH` (the target sysroot) and ignore
+                // absolute hints. `FindOpenSSL` then fails with "Could NOT find
+                // OpenSSL ... missing OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR"
+                // even though the tree is exactly where `OPENSSL_ROOT_DIR` says.
+                //
+                // `BOTH` lets the search consider the hint as written. The hints
+                // are absolute paths into the OpenSSL we were pointed at, so
+                // nothing from the host can be picked up by accident -- and
+                // `OPENSSL_ROOT_DIR` still pins which tree wins.
+                for mode in ["LIBRARY", "INCLUDE", "PACKAGE", "PROGRAM"] {
+                    config.define(
+                        format!("CMAKE_FIND_ROOT_PATH_MODE_{mode}"),
+                        "BOTH",
+                    );
+                }
             }
         }
         // Not merely "leave it default": ngtcp2 defaults ENABLE_OPENSSL to ON,
@@ -218,6 +251,43 @@ fn build_ngtcp2(source_dir: &Path, openssl: Option<&OpenSsl>) -> PathBuf {
         // link OpenSSL in through the crypto helper.
         None => {
             config.define("ENABLE_OPENSSL", "OFF");
+        }
+    }
+
+    // Android: hand CMake the NDK's own toolchain file.
+    //
+    // Without it, cmake-rs passes the target to the `cc` crate, which resolves a
+    // bare `aarch64-linux-android` to the NDK's **API 21** clang wrapper. Bionic
+    // does not export stdin, stdout or stderr before API 23, and libcrypto's
+    // cryptlib.c references stderr, so ngtcp2's `check_symbol_exists` probe for
+    // SSL_set_quic_tls_cbs fails to *link* -- and CMake then reports the OpenSSL
+    // as having no QUIC support, even though the symbol is in the archive.
+    //
+    // Defining `ANDROID_ABI` is what actually changes this: cmake-rs treats that
+    // as "the caller is driving the NDK", stops asking `cc` for a compiler, and
+    // lets the toolchain file choose one using ANDROID_PLATFORM.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
+            let toolchain = Path::new(&ndk).join("build/cmake/android.toolchain.cmake");
+            if toolchain.is_file() {
+                let abi = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+                    Ok("aarch64") => "arm64-v8a",
+                    Ok("arm") => "armeabi-v7a",
+                    Ok("x86_64") => "x86_64",
+                    _ => "x86",
+                };
+                config.define("CMAKE_TOOLCHAIN_FILE", &toolchain);
+                config.define("ANDROID_ABI", abi);
+                // manifest.yaml declares min_sdk_version 26; the check jobs
+                // export ANDROID_PLATFORM to match. Left to the NDK default
+                // when the caller has no opinion.
+                if let Ok(platform) = env::var("ANDROID_PLATFORM") {
+                    config.define("ANDROID_PLATFORM", &platform);
+                }
+                if let Ok(stl) = env::var("ANDROID_STL") {
+                    config.define("ANDROID_STL", &stl);
+                }
+            }
         }
     }
 
@@ -418,6 +488,37 @@ fn generate_bindings(
             .allowlist_function("SSL_set_ex_data")
             .allowlist_function("SSL_get_ex_data")
             // ALPN. Mandatory in QUIC rather than optional as it is over TCP.
+            // Custom extensions. The only way to put an extension OpenSSL does
+            // not know about into the ClientHello, and the only way to control
+            // where it sits in the list.
+            .allowlist_function("SSL_CTX_add_custom_ext")
+            .allowlist_type("SSL_custom_ext_add_cb_ex")
+            .allowlist_type("SSL_custom_ext_free_cb_ex")
+            .allowlist_type("SSL_custom_ext_parse_cb_ex")
+            // SSL_EXT_CLIENT_HELLO and friends select which handshake message a
+            // custom extension is written into.
+            .allowlist_var("SSL_EXT_.*")
+            // Raw public keys (RFC 7250). `SSL_add_expected_rpk` stores the pin
+            // as a DANE-EE / SPKI / Full TLSA record, so DANE has to be on first,
+            // and `SSL_set1_client_cert_type` is what asks the peer for an RPK
+            // instead of a certificate. `d2i_PUBKEY_ex` rather than `d2i_PUBKEY`
+            // because the latter only exists as a macro-generated symbol.
+            .allowlist_function("d2i_PUBKEY_ex")
+            .allowlist_function("SSL_CTX_dane_enable")
+            .allowlist_function("SSL_dane_enable")
+            .allowlist_function("SSL_add_expected_rpk")
+            .allowlist_function("SSL_set1_client_cert_type")
+            .allowlist_function("SSL_set1_server_cert_type")
+            .allowlist_function("SSL_get_negotiated_server_cert_type")
+            // Shaping the ClientHello. `SSL_CTX_set_min_proto_version`,
+            // `SSL_CTX_set1_groups_list` and `SSL_OP_BIT` are macros bindgen does
+            // not emit, so the ctrl commands and option bits are reached directly.
+            .allowlist_function("SSL_CTX_ctrl")
+            .allowlist_function("SSL_CTX_set_ciphersuites")
+            .allowlist_function("SSL_CTX_set_options")
+            .allowlist_var("SSL_CTRL_SET_MIN_PROTO_VERSION")
+            .allowlist_var("SSL_CTRL_SET_MAX_PROTO_VERSION")
+            .allowlist_var("SSL_CTRL_SET_GROUPS_LIST")
             .allowlist_function("SSL_set_alpn_protos")
             .allowlist_function("SSL_CTX_set_alpn_select_cb")
             .allowlist_function("SSL_get0_alpn_selected")

@@ -5857,7 +5857,9 @@ value:BetaMethod("#;
             .children()
             .iter()
             .find(|child| dom.get_by_ref(**child).expect("test child").name == name)
-            .map(|child| **child)
+            // `find` narrows the item to `&Ref`, so one deref is enough here;
+            // the `**` above is inside `find`, whose closure takes `&&Ref`.
+            .map(|child| *child)
             .expect("test child missing")
     }
 

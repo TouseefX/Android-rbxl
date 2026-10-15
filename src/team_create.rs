@@ -521,7 +521,13 @@ const RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_0: u8 = 0x06;
 const RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_1: u8 = 0x01;
 const RBX_TRANSPORT_STREAM_HEADER_BYTES: usize = 7;
 const RBX_TRANSPORT_CONTROL_APPLICATION: u8 = 0;
-const RBX_TRANSPORT_CONTROL_CHANNEL_ID: u32 = u32::MAX; // native signed -1
+/// The control channel id on the wire is the four ASCII bytes `ctrl`
+/// (0x6374_726C), which is what `appflow::CTRL_CHANNEL` sends and what the
+/// server's own control streams carry. This was `u32::MAX` ("native signed
+/// -1"), so `is_control_channel` never matched: every session reported
+/// control streams 0 / control records 0 and the 0x02 open / 0x03 close
+/// messages the server sends were never dispatched.
+const RBX_TRANSPORT_CONTROL_CHANNEL_ID: u32 = 0x6374_726C;
 
 // Exact Studio 0.741 channel-control serializers:
 // OpenReliableChannelControl `0x1436b1980` writes 6 bytes, and
@@ -677,12 +683,25 @@ struct RbxTransportConnectPlan {
     /// 0x9B challenge answer). All optional: the flow degrades to the
     /// passive receive loop when any of them is missing.
     join_user_id: Option<i64>,
+    /// The account's name and display name. The 0x90 template freezes the
+    /// captured account's, and unlike `UserId` these cannot be derived from
+    /// anything else we hold: they are absent from `SerializedClientFields`
+    /// and from the `APIsecurityToken` JWT, so the gamejoin response is the
+    /// only place they can come from.
+    join_user_name: Option<String>,
+    join_display_name: Option<String>,
+    join_domain_user_id: Option<i64>,
     join_client_ticket: Option<String>,
     join_session_id: Option<String>,
     join_random_seed1: Option<String>,
     join_api_security_token: Option<String>,
-    join_serialized_client_fields: Option<String>,
-    join_encrypted_server_fields: Option<String>,
+    join_serialized_client_fields: Option<serde_json::Value>,
+    join_encrypted_server_fields: Option<serde_json::Value>,
+    /// What the joinTicket lookup actually found. "0x90 needs
+    /// SerializedClientFields / EncryptedServerFields" is the same message
+    /// whether the ticket is absent or present without those keys, and those
+    /// mean very different things for a Team Create config.
+    join_ticket_note: String,
 }
 
 fn is_hex_field(text: &str, len: usize) -> bool {
@@ -1095,7 +1114,8 @@ fn extract_rbx_transport_connect_plan(
         .or_else(|| find_field_ci(config, "DebugRbxTransportQdmuxVip", 0))
         .and_then(|value| as_addr(&value))
         .filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok());
-    let (serialized_client_fields, encrypted_server_fields) = extract_join_ticket_fields(config);
+    let (serialized_client_fields, encrypted_server_fields, join_ticket_note) =
+        extract_join_ticket_fields(config);
     Ok(RbxTransportConnectPlan {
         public_endpoint,
         rcc_endpoint,
@@ -1111,6 +1131,17 @@ fn extract_rbx_transport_connect_plan(
         join_user_id: find_field_ci(config, "UserId", 0)
             .and_then(|v| v.as_i64())
             .or_else(|| find_field_ci(config, "UserId", 0).and_then(|v| v.as_u64()).map(|v| v as i64)),
+        join_user_name: find_field_ci(config, "UserName", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_display_name: find_field_ci(config, "DisplayName", 0)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        join_domain_user_id: find_field_ci(config, "DomainUserId", 0)
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                find_field_ci(config, "DomainUserId", 0)
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as i64)
+            }),
         join_client_ticket: find_field_ci(config, "ClientTicket", 0)
             .and_then(|v| v.as_str().map(str::to_owned)),
         join_session_id: find_field_ci(config, "SessionId", 0)
@@ -1121,6 +1152,7 @@ fn extract_rbx_transport_connect_plan(
             .and_then(|v| v.as_str().map(str::to_owned)),
         join_serialized_client_fields: serialized_client_fields,
         join_encrypted_server_fields: encrypted_server_fields,
+        join_ticket_note,
     })
 }
 
@@ -1129,10 +1161,11 @@ fn extract_rbx_transport_connect_plan(
 /// object with `SerializedClientFields` / `EncryptedServerFields`.
 fn extract_join_ticket_fields(
     config: &serde_json::Value,
-) -> (Option<String>, Option<String>) {
-    let ticket = match find_field_ci(config, "joinTicket", 0) {
+) -> (Option<serde_json::Value>, Option<serde_json::Value>, String) {
+    let found = find_field_ci(config, "joinTicket", 0);
+    let ticket = match &found {
         Some(serde_json::Value::String(text)) => {
-            match serde_json::from_str::<serde_json::Value>(&text) {
+            match serde_json::from_str::<serde_json::Value>(text) {
                 Ok(value) => Some(value),
                 Err(_) => None,
             }
@@ -1141,13 +1174,59 @@ fn extract_join_ticket_fields(
         None => None,
     };
     let Some(ticket) = ticket else {
-        return (None, None);
+        // Distinguish "no such field" from "present but not parseable JSON",
+        // because a Team Create config may simply not carry a joinTicket.
+        let note = match &found {
+            None => "joinTicket is absent from this config".to_string(),
+            Some(serde_json::Value::String(text)) => format!(
+                "joinTicket is a {}-char string that is not JSON",
+                text.len()
+            ),
+            Some(other) => format!("joinTicket is present but is a {}", json_kind(other)),
+        };
+        return (None, None, note);
     };
-    let scf = find_field_ci(&ticket, "SerializedClientFields", 0)
-        .and_then(|v| v.as_str().map(str::to_owned));
-    let esf = find_field_ci(&ticket, "EncryptedServerFields", 0)
-        .and_then(|v| v.as_str().map(str::to_owned));
-    (scf, esf)
+    // Take the value whatever its JSON type. Requiring a string here is what
+    // dropped EncryptedServerFields from a real Team Create config: the key was
+    // present, the value just was not a string.
+    let scf = find_field_ci(&ticket, "SerializedClientFields", 0);
+    let esf = find_field_ci(&ticket, "EncryptedServerFields", 0);
+    let note = if scf.is_some() && esf.is_some() {
+        String::new()
+    } else {
+        // Name the keys the ticket does carry, so the right field can be found
+        // rather than guessed at.
+        let keys: Vec<String> = ticket
+            .as_object()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default();
+        format!(
+            "joinTicket is present but lacks {} (its keys: {})",
+            match (scf.is_some(), esf.is_some()) {
+                (false, false) => "both SerializedClientFields and EncryptedServerFields",
+                (true, false) => "EncryptedServerFields",
+                (false, true) => "SerializedClientFields",
+                (true, true) => "nothing",
+            },
+            if keys.is_empty() {
+                "not an object".to_string()
+            } else {
+                keys.join(", ")
+            }
+        )
+    };
+    (scf, esf, note)
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 fn extract_rupp_probe_material(config: &serde_json::Value) -> Result<RuppProbeMaterial, String> {
@@ -1462,13 +1541,16 @@ impl RbxTransportStreamHeader {
     }
 
     fn is_control_channel(self) -> bool {
-        self.application == RBX_TRANSPORT_CONTROL_APPLICATION
-            && self.channel_id == RBX_TRANSPORT_CONTROL_CHANNEL_ID
+        // Channel id only. The server opens two control streams on the same
+        // channel with different application bytes - one with app=4 and one with
+        // app=0 - so requiring a specific application discarded one of them and,
+        // combined with the wrong channel id, discarded both.
+        self.channel_id == RBX_TRANSPORT_CONTROL_CHANNEL_ID
     }
 
     fn channel_id_label(self) -> String {
         if self.channel_id == RBX_TRANSPORT_CONTROL_CHANNEL_ID {
-            "-1".into()
+            "ctrl".into()
         } else {
             self.channel_id.to_string()
         }
@@ -1518,58 +1600,62 @@ impl RbxTransportControlDecoder {
     fn decode_available(&mut self) -> Vec<RbxTransportControlMessage> {
         let mut messages = Vec::new();
         loop {
-            let Some(&tag) = self.pending.first() else {
+            // Every record is length-prefixed with a compact varint whose first
+            // byte carries the width in its top two bits (00=1, 01=2, 10=4,
+            // 11=8). This used to read the tag at pending[0], which mistook that
+            // prefix for a message type: the observed 0x80 was the 4-byte form
+            // encoding 1852 - the same length the chan1 record carries - and
+            // both control streams were abandoned as "unknown tag 0x80".
+            let Some((record_len, prefix_len)) = decode_rbx_transport_varint(&self.pending) else {
                 break;
             };
+            let Ok(record_len) = usize::try_from(record_len) else {
+                break;
+            };
+            let Some(total) = prefix_len.checked_add(record_len) else {
+                break;
+            };
+            if total > RBX_TRANSPORT_MAX_CONTROL_BUFFER_BYTES {
+                self.pending.clear();
+                self.desynchronized = true;
+                return messages;
+            }
+            if self.pending.len() < total {
+                break; // partial record; wait for more
+            }
+            self.pending.drain(..prefix_len);
+            let body: Vec<u8> = self.pending.drain(..record_len).collect();
+            if body.is_empty() {
+                continue;
+            }
+            let tag = body[0];
             let decoded = match tag {
                 RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE => {
-                    if self.pending.len() < RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES {
+                    if body.len() < RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES {
                         break;
                     }
-                    Some((
-                        RbxTransportControlMessage::OpenReliable {
-                            application: self.pending[1],
-                            channel_id: u32::from_be_bytes([
-                                self.pending[2],
-                                self.pending[3],
-                                self.pending[4],
-                                self.pending[5],
-                            ]),
-                        },
-                        RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES,
-                    ))
+                    Some(RbxTransportControlMessage::OpenReliable {
+                        application: body[1],
+                        channel_id: u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
+                    })
                 }
                 RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE => {
-                    if self.pending.len() < RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES {
+                    if body.len() < RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES {
                         break;
                     }
-                    Some((
-                        RbxTransportControlMessage::OpenUnreliable {
-                            application: self.pending[1],
-                            channel_id: u32::from_be_bytes([
-                                self.pending[2],
-                                self.pending[3],
-                                self.pending[4],
-                                self.pending[5],
-                            ]),
-                            wire_channel_id: u32::from_be_bytes([
-                                self.pending[6],
-                                self.pending[7],
-                                self.pending[8],
-                                self.pending[9],
-                            ]),
-                        },
-                        RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES,
-                    ))
+                    Some(RbxTransportControlMessage::OpenUnreliable {
+                        application: body[1],
+                        channel_id: u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
+                        wire_channel_id: u32::from_be_bytes([body[6], body[7], body[8], body[9]]),
+                    })
                 }
                 RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE => {
                     let mut fields = [0u64; 3];
                     let mut offset = 1usize;
                     let mut complete = true;
                     for field in &mut fields {
-                        let Some((value, encoded_len)) = decode_rbx_transport_varint(
-                            &self.pending[offset..],
-                        ) else {
+                        let Some((value, encoded_len)) = decode_rbx_transport_varint(&body[offset..])
+                        else {
                             complete = false;
                             break;
                         };
@@ -1579,26 +1665,19 @@ impl RbxTransportControlDecoder {
                     if !complete {
                         break;
                     }
-                    Some((
-                        RbxTransportControlMessage::CloseUnreliable { fields },
-                        offset,
-                    ))
+                    Some(RbxTransportControlMessage::CloseUnreliable { fields })
                 }
                 _ => {
-                    // Unknown control tags have no verified length. Stop
-                    // dispatching this stream rather than guessing where the
-                    // next frame begins after the unknown record.
-                    self.pending.clear();
-                    self.desynchronized = true;
+                    // Unknown tags have no verified inner layout, but the record
+                    // length is known, so the stream stays in sync and later
+                    // records are still readable.
                     messages.push(RbxTransportControlMessage::Unknown { tag });
-                    return messages;
+                    continue;
                 }
             };
-            let Some((message, consumed)) = decoded else {
-                break;
-            };
-            self.pending.drain(..consumed);
-            messages.push(message);
+            if let Some(message) = decoded {
+                messages.push(message);
+            }
         }
         messages
     }
@@ -1628,7 +1707,17 @@ fn decode_rbx_transport_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     Some((value, encoded_len))
 }
 
-const RBX_TRANSPORT_ALPN: &[u8] = b"RbxTransport";
+// ALPNs offered to the UDMUX edge, in preference order.
+//
+// Which of these the edge selects for a game connection was in dispute: Studio is
+// believed to use "RbxTransport", while the reference clients hardcode
+// "rbx-rtcio" at every join call site. Offering only one and asserting the answer
+// meant a session failed with "negotiated unexpected ALPN None" and nothing more.
+// ALPN is a list, so both are offered and whichever the server picks is used;
+// the log line records which one won, so the question gets settled by the wire.
+const RBX_TRANSPORT_ALPN_PRIMARY: &[u8] = b"rbx-rtcio";
+const RBX_TRANSPORT_ALPN_ALT: &[u8] = b"RbxTransport";
+const RBX_TRANSPORT_ALPNS: [&[u8]; 2] = [RBX_TRANSPORT_ALPN_PRIMARY, RBX_TRANSPORT_ALPN_ALT];
 #[cfg(not(test))]
 const RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES: usize = 1 << 20;
 const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
@@ -1691,7 +1780,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1709,7 +1798,13 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.preauth_len,
             report.auth_len,
             report.early_auth_payload_len,
-            report.inbound_summary
+            report.inbound_summary,
+            report.flow_channel_opens,
+            report.flow_challenge_state,
+            report.flow_drain_summary,
+            report.flow_config,
+            report.flow_join90_report,
+            report.flow_markers_acked
         ),
         Err(reason) => format!(
             "\nRbxTransport QUIC session attempt failed before inbound Team Create traffic was accepted: {reason}"
@@ -1745,6 +1840,30 @@ struct RbxTransportConnectionReport {
     /// the challenge was answered.
     flow_active: bool,
     flow_answered: bool,
+    /// Errors from the post-handshake burst. The summary line used to be chosen
+    /// purely on `flow_answered`, so it printed "burst sent" even when a stream
+    /// write had been abandoned partway - which made a truncated send
+    /// indistinguishable from a complete one.
+    flow_burst_errors: Vec<String>,
+    /// Burst pieces that were never staged, e.g. a 0x90 whose join fields were
+    /// missing. Distinct from `flow_burst_errors`: nothing errored, the frame
+    /// simply was not built.
+    flow_skipped: Vec<String>,
+    /// Channel assignments the peer announced on its control streams. These
+    /// were only ever emitted as Status events, which the session report does
+    /// not carry - so parsing them changed nothing that could be seen.
+    flow_channel_opens: String,
+    /// Whether a 0x9B arrived on chan1 and what it looked like.
+    flow_challenge_state: String,
+    /// How the queued-writes drain went, which is whether the burst completed.
+    flow_drain_summary: String,
+    /// Which 0x90 template fields were refreshed from this session.
+    flow_join90_report: String,
+    /// Which 0xA7 and control application byte this session actually sent.
+    /// Both are selectable, so a result is meaningless without them.
+    flow_config: String,
+    /// Snapshot-done markers acknowledged on channel 1.
+    flow_markers_acked: u64,
     inbound_summary: String,
 }
 
@@ -1843,6 +1962,50 @@ async fn run_rbx_transport_connection_async(
     .await
 }
 
+/// Resolve the account's `username` / `displayName` from the public users
+/// endpoint.
+///
+/// The 0x90 carries both, and the 0.741 client writes them from
+/// `v8datamodel/src/Players.cpp`. They are in none of the material the gamejoin
+/// response hands us - not the response itself, not `SerializedClientFields`,
+/// not the `APIsecurityToken` JWT - so the only remaining source is the account
+/// record. That endpoint needs no auth, and a real client gets the same strings
+/// from its logged-in session.
+///
+/// Best effort: a failure returns nothing and the 0x90 keeps the captured
+/// template's values, which the report then names.
+fn resolve_account_names(user_id: i64) -> (Option<String>, Option<String>) {
+    if user_id <= 0 {
+        return (None, None);
+    }
+    let Ok(http) = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+    else {
+        return (None, None);
+    };
+    let url = format!("https://users.roblox.com/v1/users/{user_id}");
+    match http.get(&url).send().and_then(|response| response.json::<serde_json::Value>()) {
+        Ok(value) => {
+            let username = value.get("username").and_then(|v| v.as_str()).map(str::to_owned);
+            let display = value
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            log::info!(
+                "account lookup for {user_id}: username={}, displayName={}",
+                username.as_deref().unwrap_or("<none>"),
+                display.as_deref().unwrap_or("<none>")
+            );
+            (username, display)
+        }
+        Err(error) => {
+            log::warn!("account lookup for {user_id} failed: {error}");
+            (None, None)
+        }
+    }
+}
+
 /// Build the app=4 flow config from the connect plan. Returns None when
 /// required fields are missing; the session then stays in passive mode.
 #[cfg(not(test))]
@@ -1859,18 +2022,196 @@ fn build_join_flow_config(
             auth: auth.auth_blob.clone(),
         }
     });
+    // Only reach the network for what the config did not already supply.
+    let (resolved_name, resolved_display) =
+        if plan.join_user_name.is_none() || plan.join_display_name.is_none() {
+            resolve_account_names(user_id)
+        } else {
+            (None, None)
+        };
     Some(crate::appflow::JoinConfig {
         user_id,
         client_ticket,
         session_id,
+        user_name: plan.join_user_name.clone().or(resolved_name),
+        display_name: plan.join_display_name.clone().or(resolved_display),
+        domain_user_id: plan.join_domain_user_id,
         random_seed1: plan.join_random_seed1.clone(),
         api_security_token: plan.join_api_security_token.clone(),
         serialized_client_fields: plan.join_serialized_client_fields.clone(),
         encrypted_server_fields: plan.join_encrypted_server_fields.clone(),
         early_auth,
-        a7_mode: crate::appflow::A7Mode::Real,
+        a7_mode: crate::appflow::a7_mode(),
     })
 }
+
+/// `RBX::ConnectionError`, read out of the 0.741 client.
+///
+/// Extracted from the enum's registration routine, where each item is a
+/// `mov r9d, <value>` / `lea rdx, [<name>]` pair passed to the item constructor
+/// - 109 items, in the order the client registers them. The server reports these
+/// in the QUIC application error code of its `CONNECTION_CLOSE`, ORed with
+/// `1 << 40`, which is why the raw value reads as `0x10000000110` rather than 272.
+const RBX_CONNECTION_ERRORS: &[(u64, &str)] = &[
+    (0, "OK"),
+    (1, "Unknown"),
+    (2, "ConnectErrors"),
+    (3, "AlreadyConnected"),
+    (4, "NoFreeIncomingConnections"),
+    (5, "ConnectionBanned"),
+    (6, "InvalidPassword"),
+    (7, "IncompatibleProtocolVersion"),
+    (8, "IPRecentlyConnected"),
+    (9, "OurSystemRequiresSecurity"),
+    (10, "SecurityKeyMismatch"),
+    (256, "DisconnectErrors"),
+    (257, "DisconnectBadhash"),
+    (258, "DisconnectSecurityKeyMismatch"),
+    (259, "DisconnectProtocolMismatch"),
+    (260, "DisconnectReceivePacketError"),
+    (261, "DisconnectReceivePacketStreamError"),
+    (262, "DisconnectSendPacketError"),
+    (263, "DisconnectIllegalTeleport"),
+    (264, "DisconnectDuplicatePlayer"),
+    (265, "DisconnectDuplicateTicket"),
+    (266, "DisconnectTimeout"),
+    (267, "DisconnectLuaKick"),
+    (268, "DisconnectOnRemoteSysStats"),
+    (269, "DisconnectHashTimeout"),
+    (270, "DisconnectCloudEditKick"),
+    (271, "DisconnectPlayerless"),
+    (272, "DisconnectNewSecurityKeyMismatch"),
+    (273, "DisconnectEvicted"),
+    (274, "DisconnectDevMaintenance"),
+    (275, "DisconnectRobloxMaintenance"),
+    (276, "DisconnectRejoin"),
+    (277, "DisconnectConnectionLost"),
+    (278, "DisconnectIdle"),
+    (279, "DisconnectRaknetErrors"),
+    (281, "DisconnectBySecurityPolicy"),
+    (282, "DisconnectBlockedIP"),
+    (284, "DisconnectClientFailure"),
+    (285, "DisconnectClientRequest"),
+    (286, "DisconnectPrivateServerKickout"),
+    (287, "DisconnectModeratedGame"),
+    (288, "ServerShutdown"),
+    (290, "ReplicatorTimeout"),
+    (291, "PlayerRemoved"),
+    (292, "DisconnectOutOfMemoryKeepPlayingLeave"),
+    (293, "DisconnectRomarkEndOfTest"),
+    (295, "DisconnectCollaboratorUnderage"),
+    (296, "NetworkInternal"),
+    (297, "NetworkSend"),
+    (298, "NetworkTimeout"),
+    (299, "NetworkMisbehavior"),
+    (301, "ReplacementReady"),
+    (302, "ServerEmpty"),
+    (303, "PhantomFreeze"),
+    (304, "AndroidAnticheatKick"),
+    (305, "AndroidEmulatorKick"),
+    (306, "AndroidRootedKick"),
+    (307, "ScreentimeLockoutKick"),
+    (308, "DisconnectionNotification"),
+    (309, "DisconnectVerboselyModeratedGame"),
+    (310, "DisconnectCollaboratorNotAgeVerified"),
+    (311, "DisconnectCollaboratorTrustedConnectionsRequired"),
+    (312, "DisconnectCollaboratorOwnerActionRequired"),
+    (313, "DisconnectCollaboratorTooManyCollaborators"),
+    (314, "DisconnectCollaboratorUnknownError"),
+    (315, "DisconnectCollaboratorRequestedEviction"),
+    (316, "DisconnectCollaboratorTrustedConnectionsRequiredPC"),
+    (317, "DisconnectRemoteAttestationUnsupported"),
+    (318, "DisconnectRemoteAttestationGeneralFailure"),
+    (319, "DisconnectRemoteAttestationTimeout"),
+    (320, "DisconnectRemoteAttestationOSOutOfDate"),
+    (321, "DisconnectRemoteAttestationBootValidationFailure"),
+    (512, "PlacelaunchErrors"),
+    (515, "PlacelaunchDisabled"),
+    (516, "PlacelaunchError"),
+    (517, "PlacelaunchGameEnded"),
+    (518, "PlacelaunchGameFull"),
+    (522, "PlacelaunchUserLeft"),
+    (523, "PlacelaunchRestricted"),
+    (524, "PlacelaunchUnauthorized"),
+    (525, "PlacelaunchFlooded"),
+    (526, "PlacelaunchHashExpired"),
+    (527, "PlacelaunchHashException"),
+    (528, "PlacelaunchPartyCannotFit"),
+    (529, "PlacelaunchHttpError"),
+    (533, "PlacelaunchUserPrivacyUnauthorized"),
+    (541, "PlacelaunchVipOwnerNotPresent"),
+    (542, "PlacelaunchAgeVerificationRequired"),
+    (543, "PlacelaunchParentalApprovalRequired"),
+    (544, "PlacelaunchCoreGated"),
+    (545, "PlacelaunchCollaborationCoreGated"),
+    (600, "PlacelaunchCreatorBan"),
+    (601, "PlacelaunchDeviceBlock"),
+    (611, "PlacelaunchOtherError"),
+    (768, "TeleportErrors"),
+    (769, "TeleportFailure"),
+    (770, "TeleportGameNotFound"),
+    (771, "TeleportGameEnded"),
+    (772, "TeleportGameFull"),
+    (773, "TeleportUnauthorized"),
+    (774, "TeleportFlooded"),
+    (775, "TeleportIsTeleporting"),
+    (1024, "TransportErrors"),
+    (1025, "DisconnectTransportIoError"),
+    (1026, "DisconnectTransportIoInternetError"),
+    (1027, "DisconnectTransportProtocolError"),
+    (1028, "DisconnectTransportNgtcp2Error"),
+    (1029, "DisconnectTransportQuicError"),
+    (1030, "DisconnectTransportRnaError"),
+];
+
+/// Name a Roblox connection-error code, if it is one.
+///
+/// The peer closed with `0x10000000110`. That is `(1 << 40) | 272`, and 272 is
+/// `DisconnectNewSecurityKeyMismatch` - the single most useful fact yet obtained
+/// about why the join fails, and invisible while it stayed a bare hex number.
+fn rbx_connection_error_name(code: u64) -> Option<(u64, &'static str)> {
+    let value = code & 0xFF_FFFF_FFFF;
+    RBX_CONNECTION_ERRORS
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map(|(v, name)| (*v, *name))
+}
+
+/// Why the connection ended, including the frame type that carried the close.
+///
+/// The close error alone reports only the code. Which frame it arrived on says
+/// whether the peer rejected something specific we sent, which is the difference
+/// between an application that disliked our join and one that tripped over the
+/// transport. The Roblox reason name says why.
+fn rbx_transport_close_detail(error: ngnet_quic::CloseError) -> String {
+    let frame_type = error.frame_type();
+    let base = error.to_string();
+    let named = match error.reason() {
+        ngnet_quic::CloseReason::Application(code) => rbx_connection_error_name(code.get())
+            .map(|(value, name)| format!(" = RBX::ConnectionError::{name} ({value})")),
+        _ => None,
+    };
+    match (named, frame_type) {
+        (Some(name), 0) => format!("{base}{name}"),
+        (Some(name), _) => format!("{base}{name} (frame type 0x{frame_type:x})"),
+        (None, 0) => base,
+        (None, _) => format!("{base} (frame type 0x{frame_type:x})"),
+    }
+}
+
+/// Worst-case time the drain loop will spend retrying before handing the
+/// remainder back to the next wake.
+///
+/// Raised from 40 passes (4ms) after six runs split cleanly on how much of the
+/// burst got out: every session that sent ~18000 bytes was closed with
+/// application error 0x10000000110 within 190ms, while the two that sent 23679
+/// and 26022 bytes survived until the user stopped them. Completing the burst
+/// matters more than returning to the receive loop promptly, so the budget is
+/// now 40ms.
+#[cfg(not(test))]
+const RBX_TRANSPORT_DRAIN_MAX_PASSES: usize = 400;
+#[cfg(not(test))]
+const RBX_TRANSPORT_DRAIN_RETRY_DELAY: Duration = Duration::from_micros(100);
 
 /// Execute one flow action: open a client stream (recording it in the flow)
 /// or write more bytes to an existing stream.
@@ -1882,7 +2223,7 @@ async fn execute_join_flow_action<S: ngnet_quic::Session>(
     origin: Instant,
     flow: &mut crate::appflow::AppFlow,
     action: crate::appflow::Action,
-) -> Result<(), String> {
+) -> Result<Option<(i64, Vec<u8>)>, String> {
     match action {
         crate::appflow::Action::OpenStream { app, chan, data } => {
             let id = connection.open_bidi_stream().map_err(|error| {
@@ -1890,11 +2231,27 @@ async fn execute_join_flow_action<S: ngnet_quic::Session>(
             })?;
             let raw = id.get();
             flow.note_opened(app, chan, raw);
-            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, raw, &data).await
+            let accepted =
+                send_rbx_transport_stream_data(connection, socket, tx_buf, origin, raw, &data)
+                    .await?;
+            Ok(unwritten(raw, &data, accepted))
         }
         crate::appflow::Action::Write { stream, data } => {
-            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data).await
+            let accepted =
+                send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data)
+                    .await?;
+            Ok(unwritten(stream, &data, accepted))
         }
+    }
+}
+
+/// The tail of `data` that ngtcp2 did not take, to be offered again later.
+#[cfg(not(test))]
+fn unwritten(stream: i64, data: &[u8], accepted: usize) -> Option<(i64, Vec<u8>)> {
+    if accepted < data.len() {
+        Some((stream, data[accepted..].to_vec()))
+    } else {
+        None
     }
 }
 
@@ -2136,23 +2493,114 @@ async fn attempt_rbx_transport_connection_async(
     // server-side). ngtcp2 pads the Initial up to the clamp; the oversized
     // on-wire datagram (1231/1249) is then chopped into IP fragments by
     // the socket's chop MTU. Never shrink this below 1200.
+    // A random 31-bit starting packet number, matching the reference client.
+    // Starting at a predictable value is a fingerprint as much as a shortcut.
+    let mut pkt_num_bytes = [0u8; 4];
+    let initial_pkt_num = if getrandom::fill(&mut pkt_num_bytes).is_ok() {
+        u32::from_le_bytes(pkt_num_bytes) & 0x7fff_ffff
+    } else {
+        0
+    };
     let settings = ngnet_quic::Settings::new(initial_ts)
         .max_tx_udp_payload_size(max_udp_payload)
+        // 333ms, the reference client's initial RTT estimate. It sets the first
+        // probe timer, so a client that guesses an order of magnitude off behaves
+        // differently on the wire before it has heard back.
+        .initial_rtt(ngnet_quic::Duration::from_nanos(333_333_333))
+        .initial_pkt_num(initial_pkt_num)
         .handshake_timeout(ng_handshake_timeout);
+    // Transport parameters, stated explicitly rather than inherited.
+    //
+    // The first group has to match what a native client advertises: the UDMUX
+    // load balancer fronts a fleet whose flow-control windows are sized for a
+    // long-lived, high-throughput session, and the defaults in
+    // `ngnet_quic::TransportParams::new` (256 KiB per stream, 1 MiB for the
+    // connection, 100 streams) describe a short request instead.
+    //
+    // The second group is already what ngtcp2 defaults to, and is written out
+    // anyway so the code says what we put on the wire. ngtcp2 encodes a
+    // parameter only when it differs from its own default, so restating these
+    // four costs no bytes - but an ngtcp2 bump that moved a default would
+    // otherwise change what we advertise without anything here noticing.
+    //
+    // `initial_max_streams_bidi` is deliberately left at the crate default: it
+    // was not part of the set being matched, and lowering it to zero would
+    // refuse server-initiated bidirectional streams outright.
     let params = ngnet_quic::TransportParams::new()
-        .max_datagram_frame_size(RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES as u64);
-    let backend = RbxTransportRustlsBackend::new(
-        plan.early_key.public_key,
-        &route.server_name,
-        route.enable_sni,
-    )
-    .map_err(|error| format!("failed to configure Rustls QUIC client: {error}"))?;
-    let tls_session = ngnet_quic::Backend::new_session(
-        &backend,
-        ngnet_quic::Role::Client,
-        Some(&route.server_name),
-    )
-    .map_err(|error| format!("failed to create Rustls QUIC session: {error}"))?;
+        .initial_max_stream_data_bidi_local(1_410_065_407)
+        .initial_max_stream_data_bidi_remote(1_410_065_407)
+        .initial_max_stream_data_uni(1_410_065_407)
+        .initial_max_data(141_006_550_700)
+        // Zero, not the crate default of 100: the reference client advertises no
+        // bidirectional streams at all, and the transport-parameters extension is
+        // compared byte for byte by the peer.
+        .initial_max_streams_bidi(0)
+        .initial_max_streams_uni(1024)
+        .max_idle_timeout(ngnet_quic::Duration::from_nanos(20_000_000_000))
+        .max_udp_payload_size(65527)
+        .active_connection_id_limit(2)
+        .ack_delay_exponent(3)
+        .max_ack_delay(ngnet_quic::Duration::from_nanos(25_000_000))
+        // 65535, matching the reference client. This is what goes on the wire,
+        // and it is deliberately not `RBX_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_BYTES`
+        // (1 MiB), which is only how big a buffer we keep locally.
+        .max_datagram_frame_size(65535);
+    // Two TLS backends, chosen at compile time.
+    //
+    // Rustls is the default and does raw-public-key verification through a
+    // `ServerCertVerifier`. The OpenSSL backend exists because it is the only
+    // way to get 0xFF00 into the ClientHello as a genuine first extension -
+    // OpenSSL writes custom extensions ahead of every built-in one
+    // (`ssl/statem/extensions.c:1188`) - instead of splicing them into the
+    // finished message afterwards. It authenticates the same Ed25519 raw key,
+    // pinned as a DANE-EE / SPKI / Full match, and offers RawPublicKey only, so
+    // switching backend does not weaken what the peer has to prove.
+    #[cfg(not(feature = "ossl-tls"))]
+    let tls_session = {
+        let backend = RbxTransportRustlsBackend::new(
+            plan.early_key.public_key,
+            &route.server_name,
+            route.enable_sni,
+        )
+        .map_err(|error| format!("failed to configure Rustls QUIC client: {error}"))?;
+        ngnet_quic::Backend::new_session(
+            &backend,
+            ngnet_quic::Role::Client,
+            Some(&route.server_name),
+        )
+        .map_err(|error| format!("failed to create Rustls QUIC session: {error}"))?
+    };
+    #[cfg(feature = "ossl-tls")]
+    let tls_session = {
+        let backend = ngnet_quic::OsslBackend::builder(ngnet_quic::Role::Client)
+            .alpn(RBX_TRANSPORT_ALPN_PRIMARY.to_vec())
+            .alpn(RBX_TRANSPORT_ALPN_ALT.to_vec())
+            .custom_extension(RBX_TRANSPORT_CAPS_EXT_TYPE, RBX_TRANSPORT_CAPS_WIRE.to_vec())
+            // TLS 1.3 only, two cipher suites in this order, x25519 only, and no
+            // compress_certificate: the reference client's ClientHello carries
+            // exactly this and the edge is comparing against it.
+            .proto_version(0x0304)
+            .ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+            .groups_list("X25519")
+            .no_certificate_compression()
+            // server_certificate_type = RawPublicKey, so the edge sends its bare
+            // Ed25519 key rather than an X.509 chain.
+            .server_certificate_type_raw_public_key()
+            // No verification, matching the reference client. The raw-public-key
+            // pin below is stricter than anything the working client does, and a
+            // pin that does not match the edge's actual key fails the handshake
+            // outright. `expected_rpk_spki_der` stays available to re-enable once
+            // a join succeeds and the real key can be confirmed.
+            .verify(ngnet_quic::Verify::DangerouslyAcceptAnyCertificate)
+            .build()
+            .map_err(|error| format!("failed to configure OpenSSL QUIC client: {error}"))?;
+        ngnet_quic::Backend::new_session(
+            &backend,
+            ngnet_quic::Role::Client,
+            Some(&route.server_name),
+        )
+        .map_err(|error| format!("failed to create OpenSSL QUIC session: {error}"))?
+    };
 
     let receive_stats = Arc::new(Mutex::new(RbxTransportReceiveStats::default()));
     let stream_receiver = Arc::new(Mutex::new(RbxTransportStreamReceiver::new(
@@ -2207,6 +2655,8 @@ async fn attempt_rbx_transport_connection_async(
     let mut rx_buf = vec![0u8; 65_535];
     let mut zero_rx_grace_given = false;
     let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
+    // Which of the offered ALPNs the edge selected, kept for the report.
+    let mut selected_alpn: Option<String> = None;
     loop {
         write_pending_rbx_transport_packets(
             &mut connection,
@@ -2217,12 +2667,25 @@ async fn attempt_rbx_transport_connection_async(
         .await?;
         if connection.is_handshake_completed() {
             let alpn = connection.negotiated_alpn();
-            if alpn.as_deref() != Some(RBX_TRANSPORT_ALPN) {
+            let selected = alpn.as_deref().map(core::str::from_utf8).transpose().ok().flatten();
+            if !RBX_TRANSPORT_ALPNS
+                .iter()
+                .any(|candidate| alpn.as_deref() == Some(*candidate))
+            {
                 return Err(format!(
-                    "RbxTransport TLS handshake negotiated unexpected ALPN {:?}; expected {}",
+                    "RbxTransport TLS handshake negotiated unexpected ALPN {:?}; offered {}",
                     alpn.as_deref().map(String::from_utf8_lossy),
-                    String::from_utf8_lossy(RBX_TRANSPORT_ALPN)
+                    RBX_TRANSPORT_ALPNS
+                        .iter()
+                        .map(|candidate| String::from_utf8_lossy(candidate))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
+            }
+            // Recording which one the edge chose is the point of offering both.
+            if let Some(selected) = selected {
+                log::info!("RbxTransport ALPN selected by the edge: {selected}");
+                selected_alpn = Some(selected.to_owned());
             }
             break;
         }
@@ -2396,7 +2859,7 @@ async fn attempt_rbx_transport_connection_async(
                 route.route_label,
                 route.target_endpoint.label(),
                 local_addr,
-                String::from_utf8_lossy(RBX_TRANSPORT_ALPN)
+                selected_alpn.as_deref().unwrap_or("<none>")
             )));
         }
     }
@@ -2408,12 +2871,19 @@ async fn attempt_rbx_transport_connection_async(
     // sessions): once the keys are up, the appflow burst goes out
     // immediately.
     let mut join_flow: Option<crate::appflow::AppFlow> = None;
+    // Declared outside the match so the report can carry it: a burst that was
+    // only partly written has to be visible in the summary, not just in the
+    // per-action Status events.
+    let mut burst_errors: Vec<String> = Vec::new();
+    let mut burst_skipped: Vec<String> = Vec::new();
     match build_join_flow_config(plan) {
         Some(cfg) => {
             let now_ms = started.elapsed().as_millis() as u64;
+            // Read before `cfg` moves into the flow.
+            let a7_label = crate::appflow::a7_mode_label(cfg.a7_mode);
             let mut flow = crate::appflow::AppFlow::new(cfg, now_ms);
             log::info!(
-                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, A7, 0x90/0x92/0x8A, 0x8F)"
+                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, 0xA7 = {a7_label}, 0x90/0x92/0x8A, 0x8F)"
             );
             for action in flow.on_connected() {
                 if let Err(error) = execute_join_flow_action(
@@ -2425,7 +2895,15 @@ async fn attempt_rbx_transport_connection_async(
                     action,
                 )
                 .await
+                .map(|leftover| {
+                    // Whatever ngtcp2 could not take is retried by the receive
+                    // loop rather than dropped.
+                    if let Some(entry) = leftover {
+                        flow.queue_pending(entry);
+                    }
+                })
                 {
+                    burst_errors.push(error.clone());
                     if let Some(event_tx) = &event_tx {
                         let _ = event_tx.send(RbxTransportSessionEvent::Status(format!(
                             "app=4 flow burst: {error}"
@@ -2443,6 +2921,10 @@ async fn attempt_rbx_transport_connection_async(
                         other => RbxTransportSessionEvent::Status(format!("{other:?}")),
                     });
                 }
+            }
+            burst_skipped.extend(flow.skipped().iter().cloned());
+            if !plan.join_ticket_note.is_empty() {
+                burst_skipped.push(plan.join_ticket_note.clone());
             }
             join_flow = Some(flow);
         }
@@ -2503,7 +2985,9 @@ async fn attempt_rbx_transport_connection_async(
         route_label: route.route_label,
         target: route.target_endpoint.label(),
         local_addr,
-        alpn: String::from_utf8_lossy(RBX_TRANSPORT_ALPN).into_owned(),
+        alpn: selected_alpn
+            .clone()
+            .unwrap_or_else(|| String::from_utf8_lossy(RBX_TRANSPORT_ALPN_PRIMARY).into_owned()),
         rupp_prefix_len: route.outgoing_prefix.len(),
         initial_dst_cid_len,
         native_quic_cid_trailer_len: if route.native_quic_packet_protection {
@@ -2516,12 +3000,52 @@ async fn attempt_rbx_transport_connection_async(
         requested_timeout_ms,
         handshake_timeout_ms,
         handshake_completed_ms,
-        udp_summary: udp_stats.summary(),
+        udp_summary: format!("{}, {}", udp_stats.summary(), rbx_transport_caps_summary()),
         auth_version: auth.auth_version,
         preauth_len: auth.preauth_blob.len(),
         auth_len: auth.auth_blob.len(),
         early_auth_payload_len,
         flow_active: join_flow.is_some(),
+        flow_burst_errors: burst_errors,
+        flow_skipped: burst_skipped,
+        flow_channel_opens: join_flow
+            .as_ref()
+            .map(|flow| {
+                let opens = flow.channel_opens();
+                if opens.is_empty() {
+                    "none parsed".to_string()
+                } else {
+                    opens
+                        .iter()
+                        .map(|(app, chan, wire)| match wire {
+                            Some(wire) => format!("app={app} chan={chan} wire={wire}"),
+                            None => format!("app={app} chan={chan} (reliable)"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                }
+            })
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_challenge_state: join_flow
+            .as_ref()
+            .map(|flow| flow.challenge_summary())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_drain_summary: join_flow
+            .as_ref()
+            .map(|flow| flow.drain_summary().to_owned())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_config: join_flow
+            .as_ref()
+            .map(|flow| flow.flow_config_summary())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_join90_report: join_flow
+            .as_ref()
+            .map(|flow| flow.join90_report().to_owned())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_markers_acked: join_flow
+            .as_ref()
+            .map(|flow| flow.markers_acked())
+            .unwrap_or(0),
         flow_answered,
         inbound_summary,
     })
@@ -2832,7 +3356,9 @@ fn rbx_transport_expiry<S: ngnet_quic::Session>(
     })
 }
 
-#[cfg(not(test))]
+// Deliberately NOT `#[cfg(not(test))]`: `splice_rbx_transport_caps_inner` is
+// compiled in test builds and compares against this value, so gating the const
+// out left the splice function referencing a symbol that did not exist.
 /**
  * The 0xFF00 capabilities TLS extension the native RbxTransport
  * ClientHello carries: an 8-byte little-endian u64 capability bitmask.
@@ -2850,7 +3376,18 @@ const RBX_TRANSPORT_CAPS_WIRE: [u8; 8] = [0x92, 0x08, 0xB7, 0x50, 0xC7, 0xD3, 0x
 /// Bounded diagnostic-log counter for 0xFF00 splice outcomes: the first
 /// few outgoing datagrams get a log line (with a hex preview on layout
 /// mismatch) so a silently-skipped splice can never happen again.
-static RBX_TRANSPORT_CAPS_SPLICE_LOGGED: AtomicUsize = AtomicUsize::new(0);
+/// 0xFF00 is emitted natively: the OpenSSL backend registers it with
+/// `.custom_extension()`, so it is part of ClientHello generation. The
+/// post-hoc splice that used to rewrite finished Initial packets is retired -
+/// measured on a live session that stayed up 14353 ms it ran zero times
+/// (spliced 0 / not-initial 44), so no Initial ever reached it, while the
+/// natively emitted extension was accepted. `splice_rbx_transport_caps_extension`
+/// and its tests are kept because they document the raw-ClientHello CRYPTO
+/// layout, not because anything calls them on the wire path.
+fn rbx_transport_caps_summary() -> &'static str {
+    "0xFF00 emitted natively by OpenSSL custom_extension; post-hoc splice retired"
+}
+
 /// Bounded diagnostic-log counter for the first received datagrams (hex
 /// preview of the post-RUPP head) - the DCID in those first long headers
 /// is what settles whether ngtcp2 matches the server's replies.
@@ -2885,10 +3422,15 @@ fn rbx_transport_read_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
     let size = rbx_transport_varint_size(first);
     let end = pos.checked_add(size)?;
     let bytes = buf.get(pos..end)?;
-    let mut value = 0u64;
-    for (i, &raw) in bytes.iter().enumerate() {
-        let chunk = if i == 0 { raw & 0x3F } else { raw & 0x7F };
-        value = (value << 7) | u64::from(chunk);
+    // RFC 9000 section 16: the top two bits of the first byte select the
+    // length, the remaining six bits are the value's most significant bits, and
+    // every following byte contributes a full eight bits. The previous version
+    // shifted by seven and masked continuation bytes with 0x7F, which read 300
+    // as 172 and 15293 as 7613 - and because the writer was wrong the same way,
+    // a round-trip test passed while every real packet decoded wrong.
+    let mut value = u64::from(first & 0x3F);
+    for &raw in &bytes[1..] {
+        value = (value << 8) | u64::from(raw);
     }
     Some((value, end))
 }
@@ -2900,20 +3442,27 @@ fn rbx_transport_write_varint_same_size(buf: &mut [u8], pos: usize, value: u64) 
     let prefix = match size {
         1 => 0u8,
         2 => 0x40,
-        3 => 0x80,
+        4 => 0x80,
         _ => 0xC0,
     };
-    let mut out = [0u8; 4];
-    let mut v = value;
-    for i in (0..size).rev() {
-        let chunk = if i == 0 { v & 0x3F } else { v & 0x7F };
-        out[i] = chunk as u8;
-        v >>= 7;
-    }
-    if v != 0 {
+    // The value has to fit in the width the existing prefix already declares;
+    // this function never changes the encoding length.
+    let max = match size {
+        1 => (1u64 << 6) - 1,
+        2 => (1u64 << 14) - 1,
+        4 => (1u64 << 30) - 1,
+        _ => (1u64 << 62) - 1,
+    };
+    if value > max {
         return false;
     }
-    out[0] |= prefix;
+    let mut out = [0u8; 8];
+    let mut v = value;
+    for i in (0..size).rev() {
+        out[i] = (v & 0xFF) as u8;
+        v >>= 8;
+    }
+    out[0] = (out[0] & 0x3F) | prefix;
     buf[pos..pos + size].copy_from_slice(&out[..size]);
     true
 }
@@ -2955,6 +3504,7 @@ enum RbxCapsSpliceErr {
 /// rustls `read_hs`/`write_hs` consume and emit handshake messages
 /// directly). The ClientHello therefore starts at the first CRYPTO byte:
 /// `01 <u24 length> 03 03 <32-byte random> ...`.
+#[allow(dead_code)]
 fn splice_rbx_transport_caps_extension(packet: &mut [u8]) -> RbxCapsSpliceOutcome {
     match splice_rbx_transport_caps_inner(packet) {
         Ok(()) => RbxCapsSpliceOutcome::Spliced,
@@ -2984,12 +3534,22 @@ fn splice_rbx_transport_caps_inner(packet: &mut [u8]) -> Result<(), RbxCapsSplic
     // token
     let token_len = usize::from(*packet.get(p).ok_or(RbxCapsSpliceErr::NotInitial)?);
     p = p.checked_add(1 + token_len).ok_or(RbxCapsSpliceErr::NotInitial)?;
-    if p >= packet.len() || packet[p] != 0x40 {
-        // first frame must be CRYPTO
+    if p >= packet.len() {
         return Err(RbxCapsSpliceErr::NotInitial);
     }
-    p += 1;
-    let (offset, q) = rbx_transport_read_varint(packet, p).ok_or(RbxCapsSpliceErr::Layout)?;
+    // The first frame must be CRYPTO. Frame types are varints, so this has to
+    // be read as one: CRYPTO is 0x06, which ngtcp2 emits as the single byte
+    // 0x06. The old check compared one byte against 0x40 and then treated the
+    // next byte as the offset varint, so a real Initial always bailed - with
+    // NotInitial when the type was 0x06, or with Layout when it was the
+    // two-byte form 40 06 (offset then read as 6).
+    let (frame_type, after_type) =
+        rbx_transport_read_varint(packet, p).ok_or(RbxCapsSpliceErr::NotInitial)?;
+    if frame_type != 0x06 {
+        return Err(RbxCapsSpliceErr::NotInitial);
+    }
+    let (offset, q) =
+        rbx_transport_read_varint(packet, after_type).ok_or(RbxCapsSpliceErr::Layout)?;
     if offset != 0 {
         return Err(RbxCapsSpliceErr::Layout);
     }
@@ -3098,6 +3658,10 @@ fn splice_rbx_transport_caps_inner(packet: &mut [u8]) -> Result<(), RbxCapsSplic
     Ok(())
 }
 
+// Missed when the rest of this region was gated: the body takes a
+// `RuppUdpSocket`, which is `#[cfg(not(test))]`, so an ungated signature here
+// could not resolve the type in a test build.
+#[cfg(not(test))]
 async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
     connection: &mut ngnet_quic::Conn<'_, S>,
     socket: &RuppUdpSocket,
@@ -3111,44 +3675,13 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
             .map_err(|error| format!("ngtcp2 packet write failed: {error}"))?
         {
             ngnet_quic::WriteOutcome::Datagram { len } => {
-                let splice_outcome = splice_rbx_transport_caps_extension(&mut tx_buf[..len]);
-                let splice_log_no =
-                    RBX_TRANSPORT_CAPS_SPLICE_LOGGED.fetch_add(1, Ordering::Relaxed);
-                match splice_outcome {
-                    RbxCapsSpliceOutcome::Spliced => {
-                        if splice_log_no < 2 {
-                            log::info!(
-                                "spliced the 0xFF00 capabilities extension (raw-ClientHello CRYPTO layout, no TLS record layer) into the outgoing QUIC v1 Initial"
-                            );
-                        }
-                    }
-                    RbxCapsSpliceOutcome::AlreadyPresent => {
-                        if splice_log_no < 3 {
-                            log::info!(
-                                "0xFF00 capabilities extension already present in the ClientHello; leaving the Initial untouched"
-                            );
-                        }
-                    }
-                    RbxCapsSpliceOutcome::LayoutMismatch => {
-                        if splice_log_no < 4 {
-                            let preview: String = tx_buf[..len.min(64)]
-                                .iter()
-                                .map(|byte| format!("{byte:02x} "))
-                                .collect();
-                            log::warn!(
-                                "0xFF00 splice: v1 Initial with CRYPTO-offset-0 data but unexpected layout (len={len}, head: {preview})"
-                            );
-                        }
-                    }
-                    RbxCapsSpliceOutcome::NotInitial => {
-                        if splice_log_no < 3 {
-                            log::info!(
-                                "0xFF00 splice: datagram is not a v1 Initial (first byte {:#04x}); nothing to splice",
-                                tx_buf[0]
-                            );
-                        }
-                    }
-                }
+                // 0xFF00 is registered natively on the OpenSSL backend via
+                // .custom_extension(), so it is part of ClientHello generation
+                // rather than a post-hoc mutation of a finished packet. The
+                // splice that used to run here is retired: measured on a live
+                // session that stayed up 14353 ms it ran zero times (spliced 0,
+                // not-initial 44) - no Initial ever reached it - while the
+                // natively emitted extension was accepted.
                 socket
                     .send_to(&tx_buf[..len], connection.remote_addr())
                     .await
@@ -3172,7 +3705,7 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
     origin: Instant,
     stream: i64,
     data: &[u8],
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let id = ngnet_quic::StreamId::new(stream)
         .map_err(|error| format!("invalid stream id {stream}: {error}"))?;
     let mut off = 0usize;
@@ -3182,7 +3715,7 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
         match connection.write_stream(tx_buf, id, &data[off..], false, now) {
             Ok(ngnet_quic::StreamWrite::Datagram { len, accepted }) => {
                 if len > 0 {
-                    let _ = splice_rbx_transport_caps_extension(&mut tx_buf[..len]);
+                    // Retired here as well - see write_pending_rbx_transport_packets.
                     socket
                         .send_to(&tx_buf[..len], connection.remote_addr())
                         .await
@@ -3192,29 +3725,44 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
                     off += accepted;
                     control_only = 0;
                 } else if len == 0 {
-                    // Nothing usable this pass; the main loop retries on its
-                    // next wake (avoids a hot spin on a full window).
-                    break;
+                    // The peer's stream window is full. The old code broke out
+                    // and returned Ok, which reported a partial write as a
+                    // successful send - and the unaccepted tail was never handed
+                    // to ngtcp2, so nothing downstream could recover it. The main
+                    // loop's write_pending only flushes what ngtcp2 already has.
+                    // Nothing usable this pass. Offer the tail again later
+                    // rather than treating it as terminal.
+                    return Ok(off);
                 } else if control_only >= 16 {
-                    // Only control-frame datagrams in a row: stop and let
-                    // the main loop's write_pending pick it back up.
-                    break;
+                    // Same failure, reached by a different route: sixteen packets
+                    // in a row carried only control frames, so no stream data was
+                    // accepted. Report it rather than claiming success.
+                    return Ok(off);
                 } else {
                     // The packet was filled with control frames — offer the
                     // same tail again.
                     control_only += 1;
                 }
             }
+            Ok(ngnet_quic::StreamWrite::Idle) => break,
             Ok(
-                ngnet_quic::StreamWrite::Idle
-                | ngnet_quic::StreamWrite::StreamBlocked
+                blocked @ (ngnet_quic::StreamWrite::StreamBlocked
                 | ngnet_quic::StreamWrite::ConnectionBlocked
-                | ngnet_quic::StreamWrite::Blocked,
-            ) => break,
+                | ngnet_quic::StreamWrite::Blocked),
+            ) => {
+                // "ngtcp2 has something to send but cannot right now." The
+                // vendored contract is explicit that this is not the end of the
+                // send loop - treating it as one is the classic QUIC stall, and
+                // it is what stopped every stream write this client ever
+                // attempted, including a 54-byte ctrl header. Return how far we
+                // got and let the receive loop offer the rest.
+                let _ = blocked;
+                return Ok(off);
+            }
             Err(error) => return Err(format!("ngtcp2 stream write failed: {error}")),
         }
     }
-    Ok(())
+    Ok(off)
 }
 
 /// Drain raw stream events into the app=4 flow, execute the resulting
@@ -3276,14 +3824,73 @@ async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
                 }
             }
             crate::appflow::Action::Write { stream, data } => {
-                if let Err(error) =
-                    send_rbx_transport_stream_data(connection, socket, tx_buf, origin, stream, &data)
-                        .await
+                match send_rbx_transport_stream_data(
+                    connection, socket, tx_buf, origin, stream, &data,
+                )
+                .await
                 {
-                    emit(format!("stream {stream} write failed: {error}"));
+                    Ok(accepted) if accepted < data.len() => {
+                        flow.queue_pending((stream, data[accepted..].to_vec()));
+                    }
+                    Ok(_) => {}
+                    Err(error) => emit(format!("stream {stream} write failed: {error}")),
                 }
             }
         }
+    }
+
+    // Offer again whatever an earlier pass could not write.
+    //
+    // This retries in a bounded tight loop rather than once per wake. The peer
+    // waits only a few milliseconds for the join burst, and waiting for the next
+    // inbound packet or ngtcp2's expiry is not guaranteed to happen inside that
+    // window. If the block is pacing - ngtcp2 sets the next permitted tx time
+    // after every packet - the deadline passes in microseconds, so a short sleep
+    // drains the burst almost immediately. The cap keeps the worst case inside
+    // the peer's patience, and anything still queued goes back for the next wake.
+    let queued = flow.take_pending();
+    if !queued.is_empty() {
+        let drain_started = std::time::Instant::now();
+        let initial_bytes: usize = queued.iter().map(|(_, data)| data.len()).sum();
+        let mut left = queued;
+        let mut passes = 0usize;
+        while !left.is_empty() && passes < RBX_TRANSPORT_DRAIN_MAX_PASSES {
+            passes += 1;
+            let mut next = Vec::new();
+            for (sid, data) in left {
+                match send_rbx_transport_stream_data(
+                    connection, socket, tx_buf, origin, sid, &data,
+                )
+                .await
+                {
+                    Ok(accepted) if accepted < data.len() => {
+                        next.push((sid, data[accepted..].to_vec()));
+                    }
+                    Ok(_) => {}
+                    Err(error) => emit(format!("stream {sid} retry failed: {error}")),
+                }
+            }
+            left = next;
+            if !left.is_empty() {
+                tokio::time::sleep(RBX_TRANSPORT_DRAIN_RETRY_DELAY).await;
+            }
+        }
+        for entry in left {
+            flow.queue_pending(entry);
+        }
+        // How long the burst actually took to get out is the question this
+        // answers: a couple of passes in microseconds means pacing, while many
+        // passes over tens of milliseconds means something else is wrong.
+        let summary = format!(
+            "stream drain: {initial_bytes}B in {passes} pass(es) over {}us; {}B still queued",
+            drain_started.elapsed().as_micros(),
+            flow.pending_bytes()
+        );
+        // Recorded as well as emitted: Status events do not reach the session
+        // report, and whether the burst completed is exactly what separates a
+        // session the peer keeps from one it closes.
+        flow.set_drain_summary(summary.clone());
+        emit(summary);
     }
 
     for event in flow.drain_events() {
@@ -3413,7 +4020,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
                 }
                 match read_result {
                     Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
-                        connection_closed = Some(connection.close_error().to_string());
+                        connection_closed = Some(rbx_transport_close_detail(connection.close_error()));
                         break;
                     }
                     Ok(_) => {}
@@ -3433,7 +4040,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
                     .and_then(|timestamp| connection.handle_expiry(timestamp).map_err(|error| error.to_string()))
                 {
                     Ok(ngnet_quic::ExpiryOutcome::IdleClose | ngnet_quic::ExpiryOutcome::Terminal) => {
-                        connection_closed = Some(connection.close_error().to_string());
+                        connection_closed = Some(rbx_transport_close_detail(connection.close_error()));
                         break;
                     }
                     Ok(ngnet_quic::ExpiryOutcome::Handled) => {}
@@ -5442,7 +6049,44 @@ pub fn run_join_config_session(
                     if connection_report.flow_answered {
                         "🎯 app=4 join flow: burst sent, 0x9B challenge answered — BaseClient connected stage reached (post-answer world state on channel 1)".into()
                     } else {
-                        "⚠️ app=4 join flow: burst sent, but the 0x9B challenge was not answered — connected stage NOT reached".into()
+                        if connection_report.flow_burst_errors.is_empty()
+                            && connection_report.flow_skipped.is_empty()
+                        {
+                            // Across every run on this path the server has never
+                            // sent a 0x9B: channel 1 carries a single 0x93
+                            // settings dictionary. Reporting "challenge not
+                            // answered" reads as a failure we caused, when the
+                            // real question is whether the peer kept the session.
+                            format!(
+                                "⚠️ app=4 join flow: burst sent in full; no 0x9B challenge arrived on this path, and {} snapshot marker(s) acknowledged",
+                                connection_report.flow_markers_acked
+                            )
+                        } else if connection_report.flow_burst_errors.is_empty() {
+                            // Nothing errored, but the burst was incomplete: a
+                            // frame was never built, so the server got a partial
+                            // join sequence and had no reason to challenge us.
+                            format!(
+                                "⚠️ app=4 join flow: burst sent INCOMPLETE — the 0x9B challenge was not answered and the connected stage was NOT reached. Omitted: {}",
+                                connection_report.flow_skipped.join(" | ")
+                            )
+                        } else {
+                            // The burst did not complete. Saying "burst sent" here
+                            // is what hid a truncated write behind a successful
+                            // handshake for several runs.
+                            format!(
+                                "⚠️ app=4 join flow: burst FAILED — the 0x9B challenge was not answered and the connected stage was NOT reached. {} action(s) errored: {}{}",
+                                connection_report.flow_burst_errors.len(),
+                                connection_report.flow_burst_errors.join(" | "),
+                                if connection_report.flow_skipped.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " | omitted: {}",
+                                        connection_report.flow_skipped.join(" | ")
+                                    )
+                                }
+                            )
+                        }
                     }
                 } else {
                     format!(
@@ -5454,7 +6098,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -5468,7 +6112,13 @@ pub fn run_join_config_session(
                     connection_report.handshake_completed_ms,
                     connection_report.udp_summary,
                     flow_status,
-                    connection_report.inbound_summary
+                    connection_report.inbound_summary,
+                    connection_report.flow_channel_opens,
+                    connection_report.flow_challenge_state,
+                    connection_report.flow_drain_summary,
+                    connection_report.flow_config,
+                    connection_report.flow_join90_report,
+                    connection_report.flow_markers_acked
                 ));
             }
             Err(reason) => report.push_str(&format!(
@@ -5487,6 +6137,30 @@ pub fn run_join_config_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connection_error_codes_are_named() {
+        // The two codes actually observed from the server.
+        assert_eq!(
+            rbx_connection_error_name(0x10000000110),
+            Some((272, "DisconnectNewSecurityKeyMismatch"))
+        );
+        assert_eq!(
+            rbx_connection_error_name(0x10000000120),
+            Some((288, "ServerShutdown"))
+        );
+        // The 1<<40 flag is stripped, not required.
+        assert_eq!(
+            rbx_connection_error_name(272),
+            Some((272, "DisconnectNewSecurityKeyMismatch"))
+        );
+        assert_eq!(rbx_connection_error_name(0x10000000999), None);
+        // No duplicate values: a duplicate would silently shadow a name.
+        let mut seen = std::collections::HashSet::new();
+        for (value, _) in RBX_CONNECTION_ERRORS {
+            assert!(seen.insert(*value), "duplicate ConnectionError value {value}");
+        }
+    }
+
     use super::*;
 
     fn hex_fixture(text: &str) -> Vec<u8> {
@@ -5886,10 +6560,30 @@ mod tests {
             channel_id: RBX_TRANSPORT_CONTROL_CHANNEL_ID,
         };
         let encoded = control.encode();
-        assert_eq!(encoded, [0x06, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff]);
+        // "ctrl" as four ASCII bytes, big-endian - not the signed -1 this used
+        // to encode.
+        assert_eq!(encoded, [0x06, 0x01, 0x00, 0x63, 0x74, 0x72, 0x6c]);
+
+        // The two control streams a live server actually opened: same channel,
+        // different application bytes. Both must classify as control, which is
+        // what was silently failing and reporting control streams 0.
+        for app in [0u8, 4u8] {
+            let header = RbxTransportStreamHeader {
+                application: app,
+                channel_id: 0x6374_726C,
+            };
+            assert!(header.is_control_channel(), "app={app} on ctrl must be control");
+            assert_eq!(header.channel_id_label(), "ctrl");
+        }
+        // A real application channel must not.
+        assert!(!RbxTransportStreamHeader {
+            application: 4,
+            channel_id: 1,
+        }
+        .is_control_channel());
         assert_eq!(RbxTransportStreamHeader::parse(&encoded), Ok(control));
         assert!(control.is_control_channel());
-        assert_eq!(control.channel_id_label(), "-1");
+        assert_eq!(control.channel_id_label(), "ctrl");
 
         let application = RbxTransportStreamHeader {
             application: 1,
@@ -5930,15 +6624,44 @@ mod tests {
 
     #[test]
     fn rbx_transport_control_decoder_handles_fragmented_and_coalesced_frames() {
-        let reliable = build_rbx_transport_open_reliable_channel_control(1, 0x0102_0304);
-        let unreliable = build_rbx_transport_open_unreliable_channel_control(
-            2,
-            0x0506_0708,
-            0x090a_0b0c,
+        // Every control record is <compact varint length><body>. Bodies under 64
+        // bytes take the 1-byte width, so the prefix is just the length.
+        fn framed(body: &[u8]) -> Vec<u8> {
+            assert!(body.len() < 64);
+            let mut out = vec![body.len() as u8];
+            out.extend_from_slice(body);
+            out
+        }
+
+        // The prefix that was being misread as a message tag: top two bits 10
+        // means the 4-byte width, and 80 00 07 3c is 1852 - the exact length of
+        // the chan1 record seen on every live session.
+        assert_eq!(
+            decode_rbx_transport_varint(&[0x80, 0x00, 0x07, 0x3c]),
+            Some((1852, 4))
         );
-        // Three QUIC-style varints: 37 (1 byte), 15293 (2 bytes), and
-        // 494878333 (4 bytes). Type-3 field semantics remain unconfirmed.
-        let close_unreliable = [
+
+        let reliable = framed(&[
+            RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_TYPE,
+            1,
+            0x01,
+            0x02,
+            0x03,
+            0x04,
+        ]);
+        let unreliable = framed(&[
+            RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE,
+            2,
+            0x05,
+            0x06,
+            0x07,
+            0x08,
+            0x09,
+            0x0a,
+            0x0b,
+            0x0c,
+        ]);
+        let close_unreliable = framed(&[
             RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE,
             0x25,
             0x7b,
@@ -5947,7 +6670,7 @@ mod tests {
             0x7f,
             0x3e,
             0x7d,
-        ];
+        ]);
 
         let mut decoder = RbxTransportControlDecoder::default();
         assert!(decoder.push(&unreliable[..5]).unwrap().is_empty());
@@ -5967,7 +6690,7 @@ mod tests {
             }]
         );
 
-        let mut coalesced = reliable;
+        let mut coalesced = reliable.clone();
         coalesced.extend_from_slice(&unreliable);
         coalesced.extend_from_slice(&close_unreliable);
         assert_eq!(
@@ -5989,13 +6712,22 @@ mod tests {
         );
         assert!(decoder.pending.is_empty());
 
+        // An unknown tag has no verified inner layout, but the record length is
+        // known, so the stream stays in sync instead of being abandoned - which
+        // is what "unknown control tag 0x80; dispatch stopped" used to mean.
         let mut unknown = RbxTransportControlDecoder::default();
         assert_eq!(
-            unknown.push(&[0xfe, 0x01, 0x02]).unwrap(),
+            unknown.push(&framed(&[0xfe, 0x01, 0x02])).unwrap(),
             vec![RbxTransportControlMessage::Unknown { tag: 0xfe }]
         );
-        assert!(unknown.desynchronized);
-        assert!(unknown.push(&reliable).unwrap().is_empty());
+        assert!(!unknown.desynchronized);
+        assert_eq!(
+            unknown.push(&reliable).unwrap(),
+            vec![RbxTransportControlMessage::OpenReliable {
+                application: 1,
+                channel_id: 0x0102_0304,
+            }]
+        );
     }
 
     #[test]
@@ -6483,5 +7215,160 @@ mod tests {
         assert!(!join_response_is_all_null(&serde_json::json!({
             "message": "starting"
         })));
+    }
+}
+
+#[cfg(test)]
+mod rbx_caps_splice_tests {
+    use super::*;
+
+    /// RFC 9000 section 16 encoding, written independently of the code under
+    /// test so a shared mistake cannot hide.
+    fn rfc9000_encode(value: u64) -> Vec<u8> {
+        if value < 1 << 6 {
+            vec![value as u8]
+        } else if value < 1 << 14 {
+            vec![0x40 | (value >> 8) as u8, (value & 0xFF) as u8]
+        } else if value < 1 << 30 {
+            vec![
+                0x80 | (value >> 24) as u8,
+                (value >> 16) as u8,
+                (value >> 8) as u8,
+                (value & 0xFF) as u8,
+            ]
+        } else {
+            panic!("test value too large")
+        }
+    }
+
+    /// The old codec shifted by seven bits per byte instead of eight, so it
+    /// agreed with itself on a round trip and disagreed with every real
+    /// packet. These are wire vectors, not round trips.
+    #[test]
+    fn varint_matches_rfc9000_wire_vectors() {
+        for value in [0u64, 37, 63, 64, 127, 128, 255, 300, 373, 512, 1024, 4096, 15293, 16383] {
+            let wire = rfc9000_encode(value);
+            let (decoded, end) = rbx_transport_read_varint(&wire, 0)
+                .unwrap_or_else(|| panic!("failed to decode {value}"));
+            assert_eq!(decoded, value, "wire {} decoded wrong", hex(&wire));
+            assert_eq!(end, wire.len());
+        }
+    }
+
+    /// The writer feeds the splice's CRYPTO-length update, so it has to put
+    /// RFC bytes on the wire, not just bytes the reader happens to accept.
+    #[test]
+    fn varint_writer_emits_rfc9000_bytes() {
+        for value in [37u64, 128, 300, 373, 512, 1024, 15293] {
+            let wire = rfc9000_encode(value);
+            let mut buf = vec![0u8; wire.len()];
+            // Seed the prefix so the writer keeps the same width.
+            buf[0] = wire[0] & 0xC0;
+            assert!(
+                rbx_transport_write_varint_same_size(&mut buf, 0, value),
+                "writer refused {value}"
+            );
+            assert_eq!(buf, wire, "writer produced wrong bytes for {value}");
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Returns the ClientHello and the length of its extension list.
+    fn synthetic_client_hello() -> (Vec<u8>, usize) {
+        let mut extensions = Vec::new();
+        // supported_versions, so the extension list is not empty.
+        extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+        // A padding extension to bring the ClientHello to a realistic size.
+        // This matters: the splice grows the CRYPTO length by 12 and refuses
+        // to change the varint's width, so a ClientHello short enough to use a
+        // one-byte length (< 52 bytes of body) cannot be spliced at all. Real
+        // ones are 300-500 bytes.
+        let padding = 250u16;
+        extensions.extend_from_slice(&[0x00, 0x15]);
+        extensions.extend_from_slice(&padding.to_be_bytes());
+        extensions.extend_from_slice(&vec![0x00; padding as usize]);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0xAB; 32]); // random
+        body.push(0x00); // session id length
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
+        body.push(0x01); // compression methods length
+        body.push(0x00); // null compression
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut out = vec![0x01]; // ClientHello handshake type
+        let len = body.len();
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+        out.extend_from_slice(&body);
+        (out, extensions.len())
+    }
+
+    /// An Initial shaped the way ngtcp2 emits one: CRYPTO as the one-byte
+    /// varint 0x06, offset 0, then the ClientHello, then PADDING.
+    fn synthetic_initial(client_hello: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0xC3]; // long header with the fixed bit
+        packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // QUIC v1
+        packet.push(0x08);
+        packet.extend_from_slice(&[0x11; 8]); // destination CID
+        packet.push(0x04);
+        packet.extend_from_slice(&[0x22; 4]); // source CID
+        packet.push(0x00); // token length
+        packet.push(0x06); // CRYPTO frame type
+        packet.push(0x00); // offset
+        packet.extend_from_slice(&rfc9000_encode(client_hello.len() as u64));
+        packet.extend_from_slice(client_hello);
+        packet.extend_from_slice(&vec![0x00; 64]); // PADDING
+        packet
+    }
+
+    /// The splice never ran on a real Initial: it demanded the frame's first
+    /// byte be 0x40 and then read the CRYPTO length with a seven-bit varint,
+    /// so it always bailed before touching a byte. This pins that it now
+    /// splices, keeps the packet the same size, and puts 0xFF00 first.
+    #[test]
+    fn splices_0xff00_first_and_keeps_the_packet_size() {
+        let (client_hello, exts_len) = synthetic_client_hello();
+        let mut packet = synthetic_initial(&client_hello);
+        let original_len = packet.len();
+
+        let outcome = splice_rbx_transport_caps_extension(&mut packet);
+        assert!(
+            matches!(outcome, RbxCapsSpliceOutcome::Spliced),
+            "expected Spliced, got {outcome:?}"
+        );
+        assert_eq!(
+            packet.len(),
+            original_len,
+            "packet grew; the PADDING was supposed to absorb the insert"
+        );
+
+        let block: Vec<u8> = [[0xFF, 0x00, 0x00, 0x08].as_slice(), &RBX_TRANSPORT_CAPS_WIRE].concat();
+        let at = packet
+            .windows(block.len())
+            .position(|window| window == block.as_slice())
+            .expect("0xFF00 extension was not written into the packet");
+
+        // It must sit at the front of the extension list, matching the native
+        // ClientHello order, and the list length must have grown by 12.
+        let list_len = u16::from_be_bytes([packet[at - 2], packet[at - 1]]);
+        assert_eq!(
+            list_len as usize,
+            exts_len + 12,
+            "extension list length was not updated"
+        );
+
+        // Idempotence: a second pass must recognise it is already there.
+        let again = splice_rbx_transport_caps_extension(&mut packet);
+        assert!(
+            matches!(again, RbxCapsSpliceOutcome::AlreadyPresent),
+            "expected AlreadyPresent, got {again:?}"
+        );
     }
 }

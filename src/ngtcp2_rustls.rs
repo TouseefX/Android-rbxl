@@ -24,6 +24,10 @@ use rustls::{
 };
 
 const RBX_TRANSPORT_ALPN: &[u8] = b"RbxTransport";
+/// Kept in sync with `team_create::RBX_TRANSPORT_ALPNS`: the edge is offered both
+/// and picks one, because which of these it selects for a game connection is not
+/// settled. See the comment there for the evidence on each side.
+const RBX_TRANSPORT_ALPN_ALT: &[u8] = b"rbx-rtcio";
 const QUIC_IV_LEN: usize = 12;
 const TLS13_SHA256_SECRET_LEN: usize = 32;
 
@@ -47,7 +51,10 @@ impl RbxTransportRustlsBackend {
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
-        config.alpn_protocols = vec![RBX_TRANSPORT_ALPN.to_vec()];
+        config.alpn_protocols = vec![
+            RBX_TRANSPORT_ALPN.to_vec(),
+            RBX_TRANSPORT_ALPN_ALT.to_vec(),
+        ];
         // All RbxTransport routes use the literal UDMUX IP as SNI (native
         // ClientHello parity — the edge SNI-routes on it). enable_sni stays
         // per-route so a future pure-QUIC fallback can opt out.

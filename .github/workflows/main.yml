@@ -1,7 +1,14 @@
-name: Build Android APK
+name: Build and test
 
 on:
   workflow_dispatch:
+  # Every push to a working branch or master runs the host check-and-test job.
+  # The APK build stays manual-only (see the `if` on build-android below) so a
+  # push does not burn 10+ minutes cross-compiling and uploading artifacts.
+  push:
+    branches:
+      - master
+      - 'arena/**'
 
 # ---------------------------------------------------------------------------
 # Build pipeline: xbuild (https://github.com/rust-mobile/xbuild)
@@ -41,7 +48,18 @@ env:
 jobs:
   build-android:
     name: Build Android APK
+    # Manual on master, and also on pushes to an `arena/**` working branch: the
+    # full NDK/Gradle/APK pipeline is expensive, so master does not pay for it on
+    # every push, but a working branch needs the APK to actually test a change -
+    # and `workflow_dispatch` is not always available to whoever is iterating.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/arena/')
     runs-on: ubuntu-latest
+    env:
+      OPENSSL_VERSION: "3.5.9"
+      # Same floor as manifest.yaml's min_sdk_version, and the same value the
+      # check job uses - the two share a cache entry, so they have to agree.
+      ANDROID_PLATFORM: "android-26"
+      ANDROID_API_LEVEL: "26"
 
     steps:
       - name: Checkout
@@ -66,6 +84,69 @@ jobs:
         with:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: false
+
+      - name: Restore a previously built OpenSSL
+        id: ossl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/ossl-android
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-pic-${{ env.NDK_VERSION }}
+
+      # Unlike the check job this has to produce a linkable archive: the cdylib
+      # takes libssl.a and libcrypto.a into librbxl_editor.so. Same cache key as
+      # check-openssl-android, so whichever job runs first saves the other the
+      # cross-compile.
+      - name: Cross-compile OpenSSL ${{ env.OPENSSL_VERSION }} for aarch64-linux-android
+        if: steps.ossl-cache.outputs.cache-hit != 'true'
+        id: ossl-build
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          export ANDROID_NDK_ROOT="$NDK"
+          export ANDROID_NDK_HOME="$NDK"
+          export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          curl -fsSL "https://codeload.github.com/openssl/openssl/tar.gz/refs/tags/openssl-${OPENSSL_VERSION}" -o /tmp/ossl.tar.gz
+          mkdir -p /tmp/ossl-src
+          tar -xzf /tmp/ossl.tar.gz -C /tmp/ossl-src --strip-components=1
+          cd /tmp/ossl-src
+          ./Configure android-arm64 no-shared no-tests no-docs no-ui-console no-engine -fPIC \
+            --prefix="${{ github.workspace }}/ossl-android" --libdir=lib > /tmp/ossl-configure.log 2>&1 \
+            || { tail -n 40 /tmp/ossl-configure.log; exit 1; }
+          make -j"$(nproc)" > /tmp/ossl-make.log 2>&1 \
+            || { tail -n 60 /tmp/ossl-make.log; exit 1; }
+          make install_sw > /tmp/ossl-install.log 2>&1 \
+            || { tail -n 40 /tmp/ossl-install.log; exit 1; }
+
+      - name: Keep the built OpenSSL
+        if: always() && steps.ossl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/ossl-android
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-pic-${{ env.NDK_VERSION }}
+
+      # Runner log archives are not reachable from every environment, so the
+      # failure has to carry its own diagnostics.
+      - name: Surface OpenSSL build failures as annotations
+        if: failure() && steps.ossl-build.outcome == 'failure'
+        run: |
+          for f in /tmp/ossl-configure.log /tmp/ossl-make.log /tmp/ossl-install.log; do
+            [ -s "$f" ] || continue
+            tail -n 40 "$f" | awk -v t="$(basename "$f")" '
+              {
+                gsub(/%/, "%25")
+                gsub(/\r/, "%0D")
+                out = (out == "" ? $0 : out "%0A" $0)
+              }
+              END { print "::error title=" t "::" out }
+            '
+          done
+
+      - name: Point the build at OpenSSL
+        run: |
+          set -euo pipefail
+          echo "OPENSSL_DIR=${{ github.workspace }}/ossl-android" >> "$GITHUB_ENV"
+          ls "${{ github.workspace }}/ossl-android/lib"/libssl.a \
+             "${{ github.workspace }}/ossl-android/lib"/libcrypto.a
 
       # xbuild always compiles against $XDG_CACHE_HOME/x/Android.ndk. By default
       # it downloads a 2022-era sysroot from its own GitHub release, which has
@@ -156,7 +237,7 @@ jobs:
           # --release: the debug profile produced a ~1 GB APK. [profile.release]
           # in Cargo.toml strips DWARF but keeps the symbol table, so logcat
           # backtraces still resolve to function names.
-          x build --release --platform android --arch arm64 --format apk --verbose
+          x build --release --platform android --arch arm64 --format apk --features ossl-tls --verbose
 
       - name: Zipalign + sign the APK
         run: |
@@ -231,3 +312,439 @@ jobs:
           name: symbols
           path: dist-symbols/
           if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Host-side typecheck + unit tests.
+  #
+  # `x build` only ever cross-compiles the aarch64 cdylib, so the crate's ~128
+  # `#[test]`s never ran and a Rust type error could only be caught by a full
+  # 10-minute Android build. This job compiles and tests on the host target in
+  # a couple of minutes, and runs in parallel with the APK build rather than
+  # gating it.
+  # ---------------------------------------------------------------------------
+  check-and-test:
+    name: Check and test (host)
+    runs-on: ubuntu-latest
+    env:
+      # Cargo colourises even when stdout is not a TTY under Actions, which
+      # prefixed every diagnostic with escape codes and defeated the error
+      # extraction below.
+      CARGO_TERM_COLOR: never
+      # Bevy is wide; two parallel rustc invocations keeps the peak memory of a
+      # cold target/ build inside the runner's budget.
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # bevy_winit pulls in wayland-sys, whose build script shells out to
+      # pkg-config for wayland-client and hard-fails without it. The rest are
+      # needed at link time by winit/wgpu on Linux.
+      - name: Install native build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libudev-dev libasound2-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: host-test-${{ hashFiles('Cargo.toml') }}
+
+      # Gate on the plugin session. The full suite is reported separately below
+      # because it has pre-existing failures unrelated to this change:
+      # challenge::tests::find_challenge_frame_walks_framed_stream aborts the
+      # whole process (a Luau null-pointer deref panics non-unwinding from the
+      # extern "C" boundary in luaur-vm/src/functions/loadsafe.rs), and three
+      # appflow tests fail. Any of those would otherwise mask the signal here.
+      - name: cargo test (plugin runtime)
+        id: test
+        run: |
+          set -o pipefail
+          cargo test --lib plugin_ 2>&1 | tee /tmp/cargo.log
+          cargo test --lib rbx_caps_splice_tests 2>&1 | tee -a /tmp/cargo.log
+          # The vendored QUIC crate has its own unit tests; `cargo test --lib`
+          # on the workspace root never reaches them.
+          cargo test -p ngnet-quic --lib 2>&1 | tee -a /tmp/cargo.log
+          # The two filters above match `plugin_*` and the caps-splice tests
+          # only. Tests that guard bytes we actually put on the wire match
+          # neither, so they were compiling but never running - including the
+          # 0x92 layout and the close-code table. Name them explicitly.
+          cargo test --lib appflow::tests::build_92 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib team_create::tests::connection_error 2>&1 | tee -a /tmp/cargo.log
+          # Guards the control-channel wire value: it silently never matched
+          # (u32::MAX vs 'ctrl'), which zeroed every control-record counter.
+          cargo test --lib team_create::tests::rbx_transport_stream_header 2>&1 | tee -a /tmp/cargo.log
+          # Guards the control-record framing: <compact varint length><body>.
+          # Misreading the prefix as a tag looked like 'unknown control tag 0x80'.
+          cargo test --lib team_create::tests::rbx_transport_control_decoder 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib appflow::tests::marker 2>&1 | tee -a /tmp/cargo.log
+
+      - name: Full suite (informational)
+        if: always()
+        continue-on-error: true
+        run: |
+          cargo test --lib --no-fail-fast 2>&1 | tee /tmp/cargo-full.log || true
+
+      - name: Report full-suite result
+        if: always()
+        run: |
+          {
+            grep -E '^test result:' /tmp/cargo-full.log
+            grep -E '^test .* FAILED$' /tmp/cargo-full.log
+            grep -E 'non-unwinding panic|SIGABRT|signal: 6' /tmp/cargo-full.log
+          } 2>/dev/null | awk '
+            {
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END { if (out != "") print "::warning title=full suite::" out }
+          '
+
+      - name: Publish test summary
+        if: always() && steps.test.outcome == 'success'
+        run: |
+          grep -E '^(test result:|running [0-9]+ tests?|     Running)' /tmp/cargo.log | awk '
+            {
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END { print "::notice title=cargo test::" out }
+          '
+
+      # Runner log archives are served from results-receiver.actions.githubusercontent.com,
+      # which is not reachable from every environment. Republishing the failure
+      # as a check-run annotation keeps the compiler output readable through
+      # api.github.com alone.
+      - name: Surface failures as annotations
+        if: failure() && steps.test.outcome == 'failure'
+        run: |
+          # Report both the compiler diagnostics and the test harness block.
+          # Either alone misses a class of failure: a compile error prints no
+          # `running N tests` line, and a test failure or abort buries its
+          # output above the warnings that a plain tail picks up.
+          diag="$(
+            {
+              grep -A 10 '^error' /tmp/cargo.log | head -n 45
+              awk '/^(running [0-9]+ tests?|failures:)/{flag=1} flag' /tmp/cargo.log | tail -n 25
+            } 2>/dev/null
+          )"
+          if [ -z "$diag" ]; then
+            diag="$(tail -n 40 /tmp/cargo.log)"
+          fi
+          printf '%s\n' "$diag" | awk '
+            {
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END { print "::error title=cargo::" out }
+          '
+
+  # ---------------------------------------------------------------------------
+  # Type-check for the Android target.
+  #
+  # The host job compiles for x86_64-linux, so nothing behind
+  # `#[cfg(target_os = "android")]` is ever compiled there. That is how
+  # jni_bridge::is_chromeos shipped a call to a JValueGen method that does not
+  # exist - it is only reachable on Android, and the only job that builds for
+  # Android costs 10+ minutes of NDK, Gradle and APK packaging.
+  #
+  # `cargo check` type-checks without linking, so it covers the same cfg gate
+  # in a few minutes and needs no Gradle.
+  # ---------------------------------------------------------------------------
+  check-android:
+    name: Check Android target
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      # manifest.yaml sets min_sdk_version 26 and xbuild compiles the native
+      # lib against the target SDK. Without this the cmake crate defaults to
+      # API 21, so the check would build against a platform the app never
+      # ships on - which is exactly how an OpenSSL link against a 23-only
+      # libc symbol slipped through here.
+      ANDROID_PLATFORM: "android-26"
+      ANDROID_API_LEVEL: "26"
+      # ANDROID_PLATFORM does not reach the cc crate, and `--target
+      # aarch64-linux-android26` is not a target rustc has - it rejects it with
+      # "could not find specification for target". The API level is selected by
+      # naming the NDK's versioned clang wrapper through CC_<target>, which the
+      # cc and cmake crates do read. Set in the NDK step, where the path exists.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      # ngnet-quic-sys cross-compiles ngtcp2 in its build script, so the NDK's
+      # clang has to be on PATH and the NDK location exported, exactly as the
+      # APK job does.
+      - name: Point the NDK env vars at the real sysroot
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          # The API-26 clang wrappers, named for the check step to point CMake
+          # at. Scoped there rather than exported, because a plain CC would also
+          # be picked up by every other build script in the tree.
+          HOST="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "NDK_CLANG26=$HOST/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "NDK_CLANGXX26=$HOST/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
+
+      - name: Install Rust nightly and the Android target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: android-check-${{ hashFiles('Cargo.toml') }}
+
+      - name: cargo check (aarch64-linux-android)
+        id: check
+        run: |
+          set -o pipefail
+          cargo check --lib --target aarch64-linux-android 2>&1 | tee /tmp/android-check.log
+
+      - name: Surface failures as annotations
+        if: failure() && steps.check.outcome == 'failure'
+        run: |
+          diag="$(grep -A 10 '^error' /tmp/android-check.log | head -n 45)"
+          if [ -z "$diag" ]; then
+            diag="$(tail -n 40 /tmp/android-check.log)"
+          fi
+          printf '%s\n' "$diag" | awk '
+            {
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END { print "::error title=android check::" out }
+          '
+
+  # The OpenSSL path is the one that can put 0xFF00 into the ClientHello as a
+  # real extension, but ngnet-quic-sys refuses to build against anything older
+  # than OpenSSL 3.5.0 and neither the runner nor the NDK ships it. So this job
+  # builds one for aarch64-linux-android and type-checks the crate against it.
+  check-openssl-android:
+    name: Check Android with OpenSSL 3.5
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      OPENSSL_VERSION: "3.5.9"
+      # Same floor as the APK (manifest.yaml min_sdk_version 26). OpenSSL's
+      # android-arm64 target defaults to API 21, where Bionic does not export
+      # stdin/stderr, and libcrypto's ui_openssl.o references both - so a
+      # 21-level build cannot even be linked against by CMake's symbol probe.
+      ANDROID_PLATFORM: "android-26"
+      ANDROID_API_LEVEL: "26"
+      # ANDROID_PLATFORM does not reach the cc crate, and `--target
+      # aarch64-linux-android26` is not a target rustc has - it rejects it with
+      # "could not find specification for target". The API level is selected by
+      # naming the NDK's versioned clang wrapper through CC_<target>, which the
+      # cc and cmake crates do read. Set in the NDK step, where the path exists.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      - name: Point the NDK env vars at the real sysroot
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          # The API-26 clang wrappers, named for the check step to point CMake
+          # at. Scoped there rather than exported, because a plain CC would also
+          # be picked up by every other build script in the tree.
+          HOST="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "NDK_CLANG26=$HOST/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "NDK_CLANGXX26=$HOST/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
+
+      # restore/save rather than the combined action: the combined one saves in
+      # a post step that is skipped when the job fails, so every iteration that
+      # got past OpenSSL but failed later rebuilt it from scratch.
+      - name: Restore a previously built OpenSSL
+        id: ossl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/ossl-android
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-pic-${{ env.NDK_VERSION }}
+
+      # OpenSSL's android-arm64 target picks its toolchain up from
+      # ANDROID_NDK_ROOT, so the NDK step above is all it needs. `no-shared`
+      # because ngnet-quic-sys links static archives, and `install_sw` because
+      # the documentation is not part of the dependency.
+      - name: Cross-compile OpenSSL ${{ env.OPENSSL_VERSION }} for aarch64-linux-android
+        if: steps.ossl-cache.outputs.cache-hit != 'true'
+        id: ossl-build
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://codeload.github.com/openssl/openssl/tar.gz/refs/tags/openssl-${OPENSSL_VERSION}" -o /tmp/ossl.tar.gz
+          mkdir -p /tmp/ossl-src
+          # The archive's top-level directory is named after the repo *and* the
+          # ref, so it cannot be predicted from the version alone. Strip it.
+          tar -xzf /tmp/ossl.tar.gz -C /tmp/ossl-src --strip-components=1
+          cd /tmp/ossl-src
+          # `no-ui-console` and `no-engine` drop the two libcrypto objects that
+          # reference stdin/stderr - ui_openssl.c and eng_openssl.c - which
+          # Bionic does not export before API 23. Nothing here drives a console
+          # prompt or loads a legacy ENGINE, and removing them means the archive
+          # links at any API level instead of depending on the NDK wrapper the
+          # cmake crate happens to pick.
+          # `-fPIC` because the archive ends up inside librbxl_editor.so, and
+          # the Android target does not imply it for a no-shared build.
+          ./Configure android-arm64 no-shared no-tests no-docs no-ui-console no-engine -fPIC \
+            --prefix="${GITHUB_WORKSPACE}/ossl-android" --libdir=lib > /tmp/ossl-configure.log 2>&1 \
+            || { tail -n 40 /tmp/ossl-configure.log; exit 1; }
+          make -j"$(nproc)" > /tmp/ossl-make.log 2>&1 \
+            || { tail -n 60 /tmp/ossl-make.log; exit 1; }
+          make install_sw > /tmp/ossl-install.log 2>&1 \
+            || { tail -n 40 /tmp/ossl-install.log; exit 1; }
+
+      # Runner log archives are not reachable from every environment, so a
+      # failing build has to put its own diagnostics into the run summary.
+      - name: Surface OpenSSL build failures as annotations
+        if: failure() && steps.ossl-build.outcome == 'failure'
+        run: |
+          for f in /tmp/ossl-configure.log /tmp/ossl-make.log /tmp/ossl-install.log; do
+            [ -s "$f" ] || continue
+            tail -n 40 "$f" | awk -v t="$(basename "$f")" '
+              {
+                gsub(/%/, "%25")
+                gsub(/\r/, "%0D")
+                out = (out == "" ? $0 : out "%0A" $0)
+              }
+              END { print "::error title=" t "::" out }
+            '
+          done
+
+      - name: Report what was built
+        run: |
+          set -euo pipefail
+          export OPENSSL_DIR="${GITHUB_WORKSPACE}/ossl-android"
+          echo "OPENSSL_DIR=$OPENSSL_DIR" >> "$GITHUB_ENV"
+          ls "$OPENSSL_DIR/include/openssl/ssl.h"
+          ls "$OPENSSL_DIR/lib"/libssl.a "$OPENSSL_DIR/lib"/libcrypto.a
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" t "$OPENSSL_DIR/lib/libssl.a" | head -3
+          # ngtcp2 refuses to build its OpenSSL backend unless it can see this
+          # symbol, so confirm it is really in the archive we built.
+          # ngtcp2 refuses to build its OpenSSL backend unless it can see this
+          # symbol, so confirm it is really in the archive we built. Emitted as
+          # an annotation because runner log archives are not reachable from
+          # every environment.
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          hits="$("$NM" "$OPENSSL_DIR/lib/libssl.a" 2>/dev/null | grep "SSL_set_quic_tls_cbs" | head -3 | tr '\n' ';')"
+          echo "SSL_set_quic_tls_cbs in libssl.a: ${hits:-NONE}"
+          echo "::notice title=openssl symbols::${hits:-NONE}"
+
+      - name: Keep the built OpenSSL
+        if: always() && steps.ossl-cache.outputs.cache-hit != 'true' && steps.ossl-build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/ossl-android
+          key: openssl-${{ env.OPENSSL_VERSION }}-android-arm64-pic-${{ env.NDK_VERSION }}
+
+      - name: Install Rust nightly and the Android target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: android-ossl-check-${{ hashFiles('Cargo.toml') }}
+
+      # Swatinem/rust-cache restores target/, and with it the CMake build tree
+      # ngnet-quic-sys configured on an earlier run. CMake then reuses the
+      # CMAKE_C_COMPILER pinned in its cache and ignores CC_aarch64_linux_android
+      # entirely - which is why the compile line kept saying android21 after the
+      # toolchain env vars were added. Drop the configuration, not the objects.
+      - name: Drop any stale CMake configuration
+        run: |
+          rm -rf target/aarch64-linux-android/debug/build/ngnet-quic-sys*/out/build
+          touch vendor/ngnet-quic-sys/build.rs
+
+      - name: cargo check with the OpenSSL backend
+        id: check
+        run: |
+          set -o pipefail
+          cargo check --lib --target aarch64-linux-android --features ossl-tls 2>&1 | tee /tmp/ossl-check.log
+
+      - name: Surface failures as annotations
+        if: failure() && steps.check.outcome == 'failure'
+        run: |
+          # A build script's panic message lands in the "--- stderr" section,
+          # which a grep anchored on "^error" cuts off before reaching.
+          # The tail, not the head: CMake's Android platform modules print
+          # three deprecation warnings before anything interesting, which is
+          # enough to push the actual error out of a head-anchored capture.
+          diag="$(awk '/--- stderr/{f=1} f' /tmp/ossl-check.log | tail -n 45)"
+          if [ -z "$diag" ]; then
+            diag="$(grep -A 25 '^error' /tmp/ossl-check.log | head -n 45)"
+          fi
+          if [ -z "$diag" ]; then
+            diag="$(tail -n 40 /tmp/ossl-check.log)"
+          fi
+          printf '%s\n' "$diag" | awk '
+            {
+              gsub(/%/, "%25")
+              gsub(/\r/, "%0D")
+              out = (out == "" ? $0 : out "%0A" $0)
+            }
+            END { print "::error title=openssl android check::" out }
+          '
+          # `check_symbol_exists` reports only pass or fail; the compiler and
+          # linker output behind the decision lands here and nowhere else.
+          # CMake 3.26 replaced CMakeError.log with CMakeConfigureLog.yaml, so
+          # both are looked for. The probe's output is embedded in the YAML with
+          # escaped newlines, hence pulling the interesting lines rather than the
+          # tail.
+          for log in target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeConfigureLog.yaml \
+                     target/aarch64-linux-android/debug/build/ngnet-quic-sys/*/out/build/CMakeFiles/CMakeError.log; do
+            [ -s "$log" ] || continue
+            {
+              grep -oE "ld: error[^\\]*|undefined (reference to|symbol)[^\\]*|cannot find -l[a-z0-9_]*|error: [^\\]*" "$log" | sort -u | head -n 25
+              echo "--- last check event ---"
+              tail -n 30 "$log"
+            } | awk '
+              {
+                gsub(/%/, "%25")
+                gsub(/\r/, "%0D")
+                out = (out == "" ? $0 : out "%0A" $0)
+              }
+              END { print "::error title=configure log::" out }
+            '
+          done

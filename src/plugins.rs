@@ -124,6 +124,12 @@ fn index_path() -> Result<PathBuf> {
     Ok(plugins_dir()?.join("plugins_index.json"))
 }
 
+/// Where a plugin's `plugin:SetSetting` values are persisted, so settings
+/// survive a restart the way Studio's do.
+pub fn settings_path(id: &str) -> Option<PathBuf> {
+    plugins_dir().ok().map(|dir| dir.join(format!("{id}.settings.json")))
+}
+
 pub fn load_index() -> PluginIndex {
     match index_path() {
         Ok(path) if path.exists() => std::fs::read_to_string(&path)

@@ -411,7 +411,22 @@ pub fn trigger_finish_external_edit() {
     });
 }
 
+/// Copies repeat unless they are suppressed: `ui.button().clicked()` can fire
+/// more than once for a single tap on a touch device, and an undrained
+/// `OutputCommand::CopyText` is seen again on the next frame. Guarding here
+/// covers every call site rather than just the ones that remember to check.
 pub fn trigger_copy_to_clipboard(text: &str) {
+    use std::sync::OnceLock;
+    static LAST: OnceLock<std::sync::Mutex<Option<(String, std::time::Instant)>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = last.lock() {
+        if let Some((prev, at)) = guard.as_ref() {
+            if prev == text && at.elapsed() < std::time::Duration::from_millis(500) {
+                return;
+            }
+        }
+        *guard = Some((text.to_string(), std::time::Instant::now()));
+    }
     with_env(|env, class| {
         let jtext = env.new_string(text)?;
         let _ = env.call_static_method(
@@ -694,8 +709,9 @@ pub fn is_chromeos() -> bool {
     let mut detected = false;
     with_env(|env, class| {
         if let Ok(jval) = env.call_static_method(class, "isChromeOsStatic", "()Z", &[]) {
-            let value: jni::sys::jboolean = jval.get().unwrap_or(0);
-            detected = value != 0;
+            // JValueGen has no `get`; `z()` is the jboolean accessor and yields
+            // a bool, the same way is_ime_visible reads its "()Z" result.
+            detected = jval.z().unwrap_or(false);
         }
         Ok(())
     });

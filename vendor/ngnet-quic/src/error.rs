@@ -263,10 +263,18 @@ impl fmt::Display for CloseError {
             CloseReason::Dropped => f.write_str("closed: connection dropped")?,
             CloseReason::Retry => f.write_str("closed: superseded by a Retry")?,
         }
-        if !self.phrase.is_empty()
-            && let Ok(text) = core::str::from_utf8(&self.phrase)
-        {
-            write!(f, ": {text}")?;
+        if !self.phrase.is_empty() {
+            match core::str::from_utf8(&self.phrase) {
+                Ok(text) => write!(f, ": {text}")?,
+                // Not every protocol above QUIC sends text here. Dropping a
+                // binary phrase loses the one thing the peer volunteered about
+                // why it ended the connection, so render the bytes instead.
+                Err(_) => {
+                    let hex: Vec<String> =
+                        self.phrase.iter().map(|byte| format!("{byte:02x}")).collect();
+                    write!(f, ": reason bytes {}", hex.join(" "))?
+                }
+            }
         }
         Ok(())
     }
@@ -507,6 +515,35 @@ fn classify(native: NativeCode) -> ErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reason phrase that is not text still reaches the caller.
+    ///
+    /// Nothing above QUIC is obliged to send printable bytes here, and rendering only the
+    /// UTF-8 case silently dropped the one thing the peer volunteered about why it closed —
+    /// exactly the case where knowing is the point.
+    #[test]
+    fn a_binary_close_reason_is_shown_as_bytes() {
+        let error = CloseError {
+            reason: CloseReason::Application(ApplicationErrorCode::new(0x10000000110)),
+            frame_type: 0,
+            phrase: vec![0x01, 0xff, 0x80],
+        };
+        assert_eq!(
+            format!("{error}"),
+            "closed by application error 0x10000000110: reason bytes 01 ff 80"
+        );
+    }
+
+    /// A text reason phrase still reads as text, unchanged.
+    #[test]
+    fn a_text_close_reason_is_shown_as_text() {
+        let error = CloseError {
+            reason: CloseReason::Application(ApplicationErrorCode::new(0x110)),
+            frame_type: 0,
+            phrase: b"bad join".to_vec(),
+        };
+        assert_eq!(format!("{error}"), "closed by application error 0x110: bad join");
+    }
 
     /// A backend-reported failure carries no native code, and says so.
     ///

@@ -1219,6 +1219,465 @@ struct ActiveGuiTween {
     completed: Table,
 }
 
+/// The Luau half of the deferred scheduler (`task.spawn/defer/delay/wait/cancel`)
+/// plus the coroutine helpers layered on top of it.
+///
+/// Shared by every long-lived VM. It used to live inline in
+/// `GuiPlaySession::new`, which meant a `PluginSession` had no scheduler at all
+/// and `task.defer` silently never resumed. One chunk keeps the two identical.
+const TASK_SCHEDULER_LUA: &str = r#"
+            local waiting = {}
+            local function schedule(thread, delay, args, started)
+                table.insert(waiting, {thread=thread, remaining=math.max(tonumber(delay) or 0, 0), elapsed=0, args=args, started=started or false})
+                return thread
+            end
+            local function resumeTask(record)
+                if record.cancelled then return end
+                local ok, delay
+                if record.started then ok, delay = coroutine.resume(record.thread, record.elapsed)
+                else record.started=true; ok, delay = coroutine.resume(record.thread, table.unpack(record.args, 1, record.args.n)) end
+                if not ok then warn(delay); return end
+                if coroutine.status(record.thread) ~= "dead" then schedule(record.thread, delay, table.pack(), true) end
+            end
+            task = {}
+            function task.spawn(callback, ...)
+                local record={thread=coroutine.create(callback),remaining=0,elapsed=0,args=table.pack(...),started=false}
+                resumeTask(record); return record.thread
+            end
+            function task.defer(callback, ...) return schedule(coroutine.create(callback), 0, table.pack(...)) end
+            function task.delay(duration, callback, ...) return schedule(coroutine.create(callback), duration, table.pack(...)) end
+            function task.wait(duration) return coroutine.yield(math.max(tonumber(duration) or 0, 0)) end
+            function task.cancel(thread) for _,record in ipairs(waiting) do if record.thread==thread then record.cancelled=true end end end
+            function _arena_step_tasks(delta)
+                local ready = {}
+                local remove = {}
+                for index, record in ipairs(waiting) do
+                    record.remaining -= delta
+                    record.elapsed += delta
+                    if record.cancelled then table.insert(remove, index)
+                    elseif record.remaining <= 0 then table.insert(remove, index); table.insert(ready, record) end
+                end
+                for index=#remove,1,-1 do table.remove(waiting, remove[index]) end
+                -- Resume in insertion order. New waits created by these
+                -- callbacks remain queued until the next scheduler step.
+                for _, record in ipairs(ready) do resumeTask(record) end
+            end
+            function _arena_resume_task(thread, ...)
+                task.cancel(thread)
+                local ok, delay = coroutine.resume(thread, ...)
+                if not ok then warn(delay); return end
+                if coroutine.status(thread) ~= "dead" then schedule(thread, delay, table.pack(), true) end
+            end
+            function _arena_signal_wait(signal)
+                local thread = coroutine.running()
+                local connection
+                connection = signal:Connect(function(...)
+                    connection:Disconnect()
+                    _arena_resume_task(thread, ...)
+                end)
+                return coroutine.yield(math.huge)
+            end
+            function _arena_install_instance_wait(instance)
+                instance.WaitForChild = function(self, name, timeout)
+                    local child = rawget(self, name)
+                    if child ~= nil then return child end
+                    local elapsed = 0
+                    while timeout == nil or elapsed < timeout do
+                        elapsed += task.wait()
+                        child = rawget(self, name)
+                        if child ~= nil then return child end
+                    end
+                    return nil
+                end
+            end
+"#;
+
+fn install_task_scheduler(lua: &Lua) -> LuaResult<()> {
+    lua.load(TASK_SCHEDULER_LUA).set_name("task_scheduler").exec()
+}
+
+// --------------------------------------------------------------------------
+// Persistent plugin session.
+// --------------------------------------------------------------------------
+
+/// A long-lived Luau VM for one running plugin.
+///
+/// `run_source` builds a VM, executes the source, and drops the VM when it
+/// returns. A plugin calling `RunService.RenderStepped:Connect(f)` therefore
+/// registers `f` into a VM that no longer exists, so the callback can never
+/// fire and nothing happens once the plugin's top-level body finishes. That VM
+/// also never saw `game`, so `game:GetService(...)` was unavailable to plugins
+/// altogether.
+///
+/// This keeps the VM alive for the plugin's whole lifetime, wires it to the
+/// editor's live DOM through `install_command_globals` (the same `game`,
+/// `workspace`, Selection, ChangeHistoryService and RunService the command bar
+/// gets), and is ticked once per editor frame so step signals,
+/// `BindToRenderStep` and `task.defer` actually run.
+///
+/// As with `GuiPlaySession` the VM lives on the UI thread: `Lua` is not `Send`,
+/// so a session cannot be built on a worker thread and ticked from the UI
+/// thread. That makes a slow plugin block the editor for as long as it runs —
+/// accepted here in exchange for the session actually working, and the same
+/// tradeoff `GuiPlaySession` already makes.
+/// One button on a plugin toolbar.
+pub struct PluginButton {
+    pub id: String,
+    pub tooltip: String,
+    pub icon: String,
+    pub active: bool,
+    pub enabled: bool,
+    /// The Lua table backing this button, held so the editor toolbar can fire
+    /// the button's real `Click` signal instead of a noop.
+    table: Table,
+}
+
+pub struct PluginToolbar {
+    pub name: String,
+    pub buttons: Vec<PluginButton>,
+}
+
+/// Everything the editor needs to render and drive a running plugin's UI.
+#[derive(Default)]
+pub struct PluginHost {
+    pub toolbars: Vec<PluginToolbar>,
+    settings: std::collections::HashMap<String, String>,
+}
+
+/// Toolbar/button snapshots for the editor to render, so `app.rs` never has to
+/// touch the Lua tables behind them.
+#[derive(Clone)]
+pub struct PluginButtonView {
+    pub id: String,
+    pub tooltip: String,
+    pub icon: String,
+    pub active: bool,
+    pub enabled: bool,
+}
+
+#[derive(Clone)]
+pub struct PluginToolbarView {
+    pub name: String,
+    pub buttons: Vec<PluginButtonView>,
+}
+
+/// Replace the noop `plugin` stub that `build_vm` installs with a real one.
+///
+/// `install_plugin_stub` handed back one shared noop table for every
+/// `CreateButton` call, so buttons had no identity and `Click` could not fire.
+/// Here each button is its own table with its own `Click` signal, recorded in
+/// `PluginHost` so the editor can draw the toolbar and fire the right signal.
+fn install_plugin_host(
+    lua: &Lua,
+    host: Rc<RefCell<PluginHost>>,
+    plugin_name: &str,
+) -> LuaResult<()> {
+    let plugin = lua.create_table();
+    plugin.set("Name", plugin_name)?;
+
+    let settings_for_get = host.clone();
+    plugin.set(
+        "GetSetting",
+        lua.create_function(move |lua, (_self, key): (Table, String)| {
+            match settings_for_get.borrow().settings.get(&key) {
+                Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+                    Ok(value) => json_to_lua(lua, &value, 0),
+                    Err(_) => Ok(Value::Nil),
+                },
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+    let settings_for_set = host.clone();
+    plugin.set(
+        "SetSetting",
+        lua.create_function(move |lua, (_self, key, value): (Table, String, Value)| {
+            if value.is_nil() {
+                settings_for_set.borrow_mut().settings.remove(&key);
+            } else {
+                let json = lua_to_json(value, 0)?;
+                let text =
+                    serde_json::to_string(&json).map_err(|e| LuaError::runtime(e.to_string()))?;
+                settings_for_set.borrow_mut().settings.insert(key, text);
+            }
+            Ok(())
+        })?,
+    )?;
+
+    let host_for_toolbar = host.clone();
+    plugin.set(
+        "CreateToolbar",
+        lua.create_function(move |lua, (_self, name): (Table, String)| {
+            let toolbar_index = {
+                let mut borrowed = host_for_toolbar.borrow_mut();
+                borrowed.toolbars.push(PluginToolbar {
+                    name: name.clone(),
+                    buttons: Vec::new(),
+                });
+                borrowed.toolbars.len() - 1
+            };
+            let toolbar = lua.create_table();
+            toolbar.set("Name", name.as_str())?;
+
+            let host_for_button = host_for_toolbar.clone();
+            toolbar.set(
+                "CreateButton",
+                lua.create_function(move |lua, args: Variadic<Value>| {
+                    // `args` includes the receiver, and Roblox's signature is
+                    // CreateButton(buttonId, tooltip, icon).
+                    let field = |index: usize| match args.get(index) {
+                        Some(Value::String(text)) => text.to_str().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    let (id, tooltip, icon) = (field(1), field(2), field(3));
+
+                    let button = lua.create_table();
+                    button.set("Name", id.as_str())?;
+                    button.set("Tooltip", tooltip.as_str())?;
+                    button.set("Icon", icon.as_str())?;
+                    button.set("Enabled", true)?;
+                    button.set("Active", false)?;
+                    button.set("Click", make_signal(lua)?)?;
+
+                    let button_index = {
+                        let mut borrowed = host_for_button.borrow_mut();
+                        let Some(entry) = borrowed.toolbars.get_mut(toolbar_index) else {
+                            return Err(LuaError::runtime("toolbar no longer exists"));
+                        };
+                        entry.buttons.push(PluginButton {
+                            id: id.clone(),
+                            tooltip: tooltip.clone(),
+                            icon: icon.clone(),
+                            active: false,
+                            enabled: true,
+                            table: button.clone(),
+                        });
+                        entry.buttons.len() - 1
+                    };
+
+                    let host_for_active = host_for_button.clone();
+                    button.set(
+                        "SetActive",
+                        lua.create_function(move |_, (_button, active): (Table, bool)| {
+                            if let Some(entry) = host_for_active
+                                .borrow_mut()
+                                .toolbars
+                                .get_mut(toolbar_index)
+                                .and_then(|t| t.buttons.get_mut(button_index))
+                            {
+                                entry.active = active;
+                            }
+                            Ok(())
+                        })?,
+                    )?;
+                    let host_for_enabled = host_for_button.clone();
+                    button.set(
+                        "SetEnabled",
+                        lua.create_function(move |_, (_button, enabled): (Table, bool)| {
+                            if let Some(entry) = host_for_enabled
+                                .borrow_mut()
+                                .toolbars
+                                .get_mut(toolbar_index)
+                                .and_then(|t| t.buttons.get_mut(button_index))
+                            {
+                                entry.enabled = enabled;
+                            }
+                            Ok(())
+                        })?,
+                    )?;
+                    Ok(button)
+                })?,
+            )?;
+            Ok(toolbar)
+        })?,
+    )?;
+
+    lua.globals().set("plugin", plugin)?;
+    Ok(())
+}
+
+pub struct PluginSession {
+    lua: Lua,
+    run_service: Table,
+    scheduler_step: Function,
+    plugin_host: Rc<RefCell<PluginHost>>,
+    settings_path: Option<std::path::PathBuf>,
+    last_tick: std::time::Instant,
+}
+
+/// Studio's step-signal order: pre-render, render, pre/post simulation and
+/// animation, then Heartbeat last. Plugins that animate expect Heartbeat to
+/// observe state the simulation already updated this frame.
+const STEP_SIGNALS: [&str; 8] = [
+    "PreRender",
+    "RenderStepped",
+    "PreSimulation",
+    "PreAnimation",
+    "PostAnimation",
+    "PostSimulation",
+    "Stepped",
+    "Heartbeat",
+];
+
+impl PluginSession {
+    /// Build a plugin VM against a DOM. No plugin name and no persisted
+    /// settings; the `plugin` global still works, it just reports an empty
+    /// name and keeps settings in memory.
+    pub fn new(dom_rc: Rc<RefCell<WeakDom>>) -> LuaResult<Self> {
+        Self::new_for_plugin(dom_rc, "Plugin", None)
+    }
+
+    /// Build a plugin VM for a named plugin, with settings persisted to
+    /// `settings_path` (a JSON object) so `plugin:GetSetting` survives a
+    /// restart the way Studio's does.
+    pub fn new_for_plugin(
+        dom_rc: Rc<RefCell<WeakDom>>,
+        plugin_name: &str,
+        settings_path: Option<std::path::PathBuf>,
+    ) -> LuaResult<Self> {
+        let lua = build_vm()?;
+        LOG.with(|log| log.borrow_mut().clear());
+        // Real DOM access. Passing `None` for the script context leaves the
+        // global `script` nil; plugins are not parented into the place.
+        install_command_globals(&lua, dom_rc, None, None, None)?;
+        install_task_scheduler(&lua)?;
+        // RunService is a child of the DataModel, not a Luau global, in the
+        // command path — resolve it the way a plugin would.
+        let run_service: Table = lua
+            .load(r#"return game:GetService("RunService")"#)
+            .set_name("plugin_run_service")
+            .eval()?;
+        let scheduler_step: Function = lua.globals().get("_arena_step_tasks")?;
+        let plugin_host = Rc::new(RefCell::new(PluginHost {
+            toolbars: Vec::new(),
+            settings: settings_path
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|text| serde_json::from_str::<std::collections::HashMap<String, String>>(&text).ok())
+                .unwrap_or_default(),
+        }));
+        install_plugin_host(&lua, plugin_host.clone(), plugin_name)?;
+        Ok(Self {
+            lua,
+            run_service,
+            scheduler_step,
+            plugin_host,
+            settings_path,
+            last_tick: std::time::Instant::now(),
+        })
+    }
+
+    /// The toolbars a plugin has created, for the editor to render.
+    pub fn plugin_toolbars(&self) -> Vec<PluginToolbarView> {
+        self.plugin_host
+            .borrow()
+            .toolbars
+            .iter()
+            .map(|toolbar| PluginToolbarView {
+                name: toolbar.name.clone(),
+                buttons: toolbar
+                    .buttons
+                    .iter()
+                    .map(|button| PluginButtonView {
+                        id: button.id.clone(),
+                        tooltip: button.tooltip.clone(),
+                        icon: button.icon.clone(),
+                        active: button.active,
+                        enabled: button.enabled,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Fire a toolbar button's `Click` signal, as the editor's toolbar UI does
+    /// when the user presses it. Returns the output the handlers produced.
+    pub fn click_button(&mut self, toolbar: usize, button: usize) -> Vec<OutputLine> {
+        LOG.with(|log| log.borrow_mut().clear());
+        let target = self
+            .plugin_host
+            .borrow()
+            .toolbars
+            .get(toolbar)
+            .and_then(|t| t.buttons.get(button))
+            .map(|b| b.table.clone());
+        let Some(table) = target else { return take_log() };
+        if let Err(error) = fire_instance_signal(&table, "Click", Vec::new()) {
+            LOG.with(|log| {
+                log.borrow_mut().push(OutputLine {
+                    level: Level::Error,
+                    text: format!("plugin button Click: {error}"),
+                })
+            });
+        }
+        // Handlers commonly defer; let the scheduler run them in the same
+        // frame the click happened in.
+        let _ = self.scheduler_step.call::<()>(0.0f64);
+        take_log()
+    }
+
+    /// Write the plugin's settings back to disk.
+    pub fn save_settings(&self) -> Result<(), String> {
+        let Some(path) = self.settings_path.as_ref() else { return Ok(()) };
+        let settings = self.plugin_host.borrow().settings.clone();
+        let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+        std::fs::write(path, text).map_err(|e| e.to_string())
+    }
+
+    /// Run one plugin script in the persistent VM and return the output it
+    /// produced. A Luau error is reported as an output line rather than
+    /// propagated: one broken script must not kill the whole session, and the
+    /// remaining callbacks the session already holds are still valid.
+    pub fn exec(&mut self, source: &str, name: &str) -> Vec<OutputLine> {
+        LOG.with(|log| log.borrow_mut().clear());
+        match self.lua.load(source).set_name(name).exec() {
+            Ok(()) => take_log(),
+            Err(error) => {
+                let mut lines = take_log();
+                lines.push(OutputLine { level: Level::Error, text: error.to_string() });
+                lines
+            }
+        }
+    }
+
+    /// Advance one editor frame: fire the step signals in Studio order, then
+    /// resume whatever the deferred scheduler has queued.
+    pub fn tick(&mut self) -> Vec<OutputLine> {
+        LOG.with(|log| log.borrow_mut().clear());
+        let now = std::time::Instant::now();
+        // Clamp so a stalled frame cannot hand a plugin a huge delta, matching
+        // the clamp `GuiPlaySession::tick` uses.
+        let delta = (now - self.last_tick).as_secs_f32().min(0.1);
+        self.last_tick = now;
+        for event in STEP_SIGNALS {
+            let Ok(signal) = self.run_service.raw_get::<Table>(event) else { continue };
+            // Mirrors `GuiPlaySession::tick`: annotate the binding rather than
+            // turbofishing `get`, whose first type parameter is the key.
+            let fire: Function = match signal.get("Fire") {
+                Ok(fire) => fire,
+                Err(_) => continue,
+            };
+            if let Err(error) = fire.call::<()>((signal, delta as f64)) {
+                LOG.with(|log| {
+                    log.borrow_mut().push(OutputLine {
+                        level: Level::Error,
+                        text: format!("{event}: {error}"),
+                    })
+                });
+            }
+        }
+        if let Err(error) = self.scheduler_step.call::<()>(delta as f64) {
+            LOG.with(|log| {
+                log.borrow_mut().push(OutputLine {
+                    level: Level::Error,
+                    text: format!("task scheduler: {error}"),
+                })
+            });
+        }
+        take_log()
+    }
+}
+
 pub struct GuiPlaySession {
     lua: Lua,
     instances: std::collections::HashMap<DomRef, Table>,
@@ -1410,72 +1869,7 @@ impl GuiPlaySession {
             creation_queue.borrow_mut().push(table.clone()); Ok(table)
         })?)?;
         lua.globals().set("Instance",runtime_instance)?;
-        lua.load(r#"
-            local waiting = {}
-            local function schedule(thread, delay, args, started)
-                table.insert(waiting, {thread=thread, remaining=math.max(tonumber(delay) or 0, 0), elapsed=0, args=args, started=started or false})
-                return thread
-            end
-            local function resumeTask(record)
-                if record.cancelled then return end
-                local ok, delay
-                if record.started then ok, delay = coroutine.resume(record.thread, record.elapsed)
-                else record.started=true; ok, delay = coroutine.resume(record.thread, table.unpack(record.args, 1, record.args.n)) end
-                if not ok then warn(delay); return end
-                if coroutine.status(record.thread) ~= "dead" then schedule(record.thread, delay, table.pack(), true) end
-            end
-            task = {}
-            function task.spawn(callback, ...)
-                local record={thread=coroutine.create(callback),remaining=0,elapsed=0,args=table.pack(...),started=false}
-                resumeTask(record); return record.thread
-            end
-            function task.defer(callback, ...) return schedule(coroutine.create(callback), 0, table.pack(...)) end
-            function task.delay(duration, callback, ...) return schedule(coroutine.create(callback), duration, table.pack(...)) end
-            function task.wait(duration) return coroutine.yield(math.max(tonumber(duration) or 0, 0)) end
-            function task.cancel(thread) for _,record in ipairs(waiting) do if record.thread==thread then record.cancelled=true end end end
-            function _arena_step_tasks(delta)
-                local ready = {}
-                local remove = {}
-                for index, record in ipairs(waiting) do
-                    record.remaining -= delta
-                    record.elapsed += delta
-                    if record.cancelled then table.insert(remove, index)
-                    elseif record.remaining <= 0 then table.insert(remove, index); table.insert(ready, record) end
-                end
-                for index=#remove,1,-1 do table.remove(waiting, remove[index]) end
-                -- Resume in insertion order. New waits created by these
-                -- callbacks remain queued until the next scheduler step.
-                for _, record in ipairs(ready) do resumeTask(record) end
-            end
-            function _arena_resume_task(thread, ...)
-                task.cancel(thread)
-                local ok, delay = coroutine.resume(thread, ...)
-                if not ok then warn(delay); return end
-                if coroutine.status(thread) ~= "dead" then schedule(thread, delay, table.pack(), true) end
-            end
-            function _arena_signal_wait(signal)
-                local thread = coroutine.running()
-                local connection
-                connection = signal:Connect(function(...)
-                    connection:Disconnect()
-                    _arena_resume_task(thread, ...)
-                end)
-                return coroutine.yield(math.huge)
-            end
-            function _arena_install_instance_wait(instance)
-                instance.WaitForChild = function(self, name, timeout)
-                    local child = rawget(self, name)
-                    if child ~= nil then return child end
-                    local elapsed = 0
-                    while timeout == nil or elapsed < timeout do
-                        elapsed += task.wait()
-                        child = rawget(self, name)
-                        if child ~= nil then return child end
-                    end
-                    return nil
-                end
-            end
-        "#).exec()?;
+        install_task_scheduler(&lua)?;
         let install_wait:Function=lua.globals().get("_arena_install_instance_wait")?;
         for table in instances.values(){install_wait.call::<()>(table.clone())?;}
         let scheduler_step:Function=lua.globals().get("_arena_step_tasks")?;
@@ -3016,5 +3410,243 @@ mod command_api_tests {
             dom.get_by_ref(*child).is_some_and(|instance| instance.name == format!("Asset_{ASSET_ID}"))
         });
         assert!(loaded_model.is_some(), "loaded asset should be inserted into the DataModel");
+    }
+}
+
+#[cfg(test)]
+mod plugin_session_tests {
+    use super::*;
+
+    fn session() -> PluginSession {
+        let dom = Rc::new(RefCell::new(WeakDom::new(InstanceBuilder::new("DataModel"))));
+        PluginSession::new(dom).expect("plugin session builds")
+    }
+
+    /// `run_source` drops its VM on return, so a plugin connecting to
+    /// `RunService.RenderStepped` registered a callback into nothing and it
+    /// never fired. A `PluginSession` keeps the VM alive and `tick` drives it,
+    /// so the callbacks must actually run.
+    #[test]
+    fn tick_fires_run_service_step_signals() {
+        let mut session = session();
+        let setup = session.exec(
+            r#"
+                local runService = game:GetService("RunService")
+                renderFrames, heartbeats, steppeds = 0, 0, 0
+                runService.RenderStepped:Connect(function() renderFrames += 1 end)
+                runService.Heartbeat:Connect(function() heartbeats += 1 end)
+                runService.Stepped:Connect(function() steppeds += 1 end)
+            "#,
+            "=plugin",
+        );
+        assert!(
+            !setup.iter().any(|line| matches!(line.level, Level::Error)),
+            "plugin setup failed: {setup:?}"
+        );
+
+        // Nothing has ticked yet: connecting alone must not fire anything.
+        session.exec(
+            r#"assert(renderFrames == 0 and heartbeats == 0 and steppeds == 0,
+                   "signals fired before any tick")"#,
+            "=plugin",
+        );
+
+        for _ in 0..3 {
+            session.tick();
+        }
+
+        let lines = session.exec(
+            r#"assert(renderFrames == 3, "RenderStepped: " .. tostring(renderFrames))
+               assert(heartbeats == 3, "Heartbeat: " .. tostring(heartbeats))
+               assert(steppeds == 3, "Stepped: " .. tostring(steppeds))"#,
+            "=plugin",
+        );
+        let failures: Vec<String> = lines
+            .iter()
+            .filter(|line| matches!(line.level, Level::Error))
+            .map(|line| line.text.clone())
+            .collect();
+        assert!(failures.is_empty(), "step signals did not fire: {failures:?}");
+    }
+
+    /// The whole point of a persistent session: state set by one script is
+    /// still there when the next one runs. With `run_source` each script got a
+    /// fresh VM, so a plugin split across scripts could not share anything.
+    #[test]
+    fn state_persists_across_scripts_and_ticks() {
+        let mut session = session();
+        session.exec(r#"counter = 0"#, "=plugin_a");
+        session.exec(r#"counter += 1"#, "=plugin_b");
+        session.exec(
+            r#"
+                game:GetService("RunService").Heartbeat:Connect(function() counter += 1 end)
+            "#,
+            "=plugin_b",
+        );
+        for _ in 0..4 {
+            session.tick();
+        }
+        let lines = session.exec(
+            r#"assert(counter == 5, "counter = " .. tostring(counter))"#,
+            "=plugin_b",
+        );
+        assert!(
+            !lines.iter().any(|line| matches!(line.level, Level::Error)),
+            "state did not persist: {lines:?}"
+        );
+    }
+
+    /// `task.defer` needs a scheduler step to resume. The scheduler used to be
+    /// installed only inside `GuiPlaySession::new`, so a plugin's deferred work
+    /// was queued forever.
+    #[test]
+    fn tick_resumes_deferred_tasks() {
+        let mut session = session();
+        session.exec(
+            r#"
+                ran = false
+                task.defer(function() ran = true end)
+                assert(ran == false, "task.defer ran synchronously")
+            "#,
+            "=plugin",
+        );
+        session.tick();
+        let lines = session.exec(r#"assert(ran, "task.defer never resumed")"#, "=plugin");
+        assert!(
+            !lines.iter().any(|line| matches!(line.level, Level::Error)),
+            "deferred task did not resume: {lines:?}"
+        );
+    }
+
+    /// `BindToRenderStep` callbacks ride on `RenderStepped`; a plugin that
+    /// binds a named step must see it invoked each frame with a delta.
+    #[test]
+    fn bound_render_steps_are_invoked_with_delta() {
+        let mut session = session();
+        session.exec(
+            r#"
+                local runService = game:GetService("RunService")
+                seen = 0
+                lastDelta = 0
+                runService:BindToRenderStep("probe", 100, function(delta)
+                    seen += 1
+                    lastDelta = delta
+                end)
+            "#,
+            "=plugin",
+        );
+        for _ in 0..2 {
+            session.tick();
+        }
+        let lines = session.exec(
+            r#"assert(seen == 2, "BindToRenderStep ran " .. tostring(seen) .. " times")
+               assert(type(lastDelta) == "number" and lastDelta >= 0,
+                      "delta was " .. tostring(lastDelta))"#,
+            "=plugin",
+        );
+        assert!(
+            !lines.iter().any(|line| matches!(line.level, Level::Error)),
+            "BindToRenderStep did not run: {lines:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plugin_host_tests {
+    use super::*;
+
+    fn assert_clean(lines: &[OutputLine], what: &str) {
+        let failures: Vec<String> = lines
+            .iter()
+            .filter(|line| matches!(line.level, Level::Error))
+            .map(|line| line.text.clone())
+            .collect();
+        assert!(failures.is_empty(), "{what}: {failures:?}");
+    }
+
+    /// `install_plugin_stub` returned one shared noop table for every
+    /// `CreateButton`, so buttons had no identity and `Click` never fired.
+    #[test]
+    fn buttons_carry_identity_and_fire_their_own_click() {
+        let dom = Rc::new(RefCell::new(WeakDom::new(InstanceBuilder::new("DataModel"))));
+        let mut session = PluginSession::new(dom).expect("plugin session builds");
+        let setup = session.exec(
+            r#"
+                clicked = {}
+                local toolbar = plugin:CreateToolbar("Probe")
+                local alpha = toolbar:CreateButton("alpha", "Alpha tooltip", "rbxassetid://1")
+                local beta = toolbar:CreateButton("beta", "Beta tooltip", "rbxassetid://2")
+                alpha.Click:Connect(function() table.insert(clicked, "alpha") end)
+                beta.Click:Connect(function() table.insert(clicked, "beta") end)
+                beta:SetActive(true)
+                alpha:SetEnabled(false)
+            "#,
+            "=plugin",
+        );
+        assert_clean(&setup, "toolbar setup");
+
+        let toolbars = session.plugin_toolbars();
+        assert_eq!(toolbars.len(), 1, "expected one toolbar");
+        assert_eq!(toolbars[0].name, "Probe");
+        assert_eq!(toolbars[0].buttons.len(), 2, "expected two distinct buttons");
+        assert_eq!(toolbars[0].buttons[0].id, "alpha");
+        assert_eq!(toolbars[0].buttons[0].tooltip, "Alpha tooltip");
+        assert_eq!(toolbars[0].buttons[1].id, "beta");
+        assert!(toolbars[0].buttons[1].active, "SetActive(true) was not recorded");
+        assert!(!toolbars[0].buttons[0].enabled, "SetEnabled(false) was not recorded");
+
+        // Pressing the second button must run only the second handler.
+        let click = session.click_button(0, 1);
+        assert_clean(&click, "click_button");
+        let after = session.exec(
+            r#"assert(#clicked == 1, "handlers run: " .. tostring(#clicked))
+               assert(clicked[1] == "beta", "wrong handler ran: " .. tostring(clicked[1]))"#,
+            "=plugin",
+        );
+        assert_clean(&after, "click routing");
+    }
+
+    /// Settings must survive the session, the way Studio persists them.
+    #[test]
+    fn settings_round_trip_through_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-plugin-settings-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let dom = Rc::new(RefCell::new(WeakDom::new(InstanceBuilder::new("DataModel"))));
+
+        {
+            let mut session = PluginSession::new_for_plugin(
+                dom.clone(),
+                "SettingsProbe",
+                Some(path.clone()),
+            )
+            .expect("plugin session builds");
+            let write = session.exec(
+                r#"
+                    assert(plugin.Name == "SettingsProbe", "Name = " .. tostring(plugin.Name))
+                    plugin:SetSetting("count", 7)
+                    plugin:SetSetting("label", "hello")
+                    assert(plugin:GetSetting("count") == 7, "count read back wrong")
+                    assert(plugin:GetSetting("label") == "hello", "label read back wrong")
+                    assert(plugin:GetSetting("missing") == nil, "unknown key was not nil")
+                "#,
+                "=plugin",
+            );
+            assert_clean(&write, "settings write");
+            session.save_settings().expect("settings save");
+        }
+
+        let mut session =
+            PluginSession::new_for_plugin(dom, "SettingsProbe", Some(path.clone()))
+                .expect("plugin session rebuilds");
+        let read = session.exec(
+            r#"assert(plugin:GetSetting("count") == 7, "count did not persist")
+               assert(plugin:GetSetting("label") == "hello", "label did not persist")"#,
+            "=plugin",
+        );
+        assert_clean(&read, "settings persistence");
+        let _ = std::fs::remove_file(&path);
     }
 }
