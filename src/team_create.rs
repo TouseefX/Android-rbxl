@@ -1,24 +1,15 @@
-//! Team Create (cloud edit) client — Stage 1 groundwork.
+//! Experimental Team Create join-config and transport client.
 //!
-//! The REST control plane and join negotiation live in `roblox_api.rs`
-//! (see team-create-sessions-explained.md §1a/§1b). This module owns what
-//! comes AFTER a successful `POST gamejoin.roblox.com/v1/team-create`:
+//! REST controls and join-ticket negotiation live in `roblox_api.rs`. This
+//! module parses the returned join configuration, selects a transport, and
+//! implements legacy RakNet connection probes plus the RbxTransport QUIC/TLS
+//! path. The QUIC path also runs the app=4 post-handshake flow in `appflow.rs`
+//! when the join configuration has the required fields.
 //!
-//! - parsing the returned join config into concrete UDP endpoints
-//!   (`Address`/`Port`, `ServerPort` + `UdmuxEndpoints`, or the classic
-//!   joinScript `MachineAddress`/`ServerPort` shapes — the decompile's
-//!   `fillServerConnectionsArrayFromConfig` accepts several), and
-//! - transport selection after the join config is decoded. Legacy RakNet
-//!   configs still use Roblox's customized 2022 RUPP-routed
-//!   `RbxOpenRequest1`/`RbxOpenReply1` flow followed by encrypted
-//!   `RbxOpenRequest2`/`RbxOpenReply2`; configs that satisfy the current
-//!   0.741 RbxTransport selector are now mapped onto the QUIC-first
-//!   RbxTransport path instead of being forced through the RakNet probe.
-//!
-//! The legacy RakNet probe can continue through normal SessionCrypto,
-//! reliable `ID_CONNECTION_REQUEST`, encrypted ACK/NAK handling, and
-//! `ID_CONNECTION_REQUEST_ACCEPTED`. JoinData → live change-item application
-//! remains the next Stage 1 layer after the selected transport is live.
+//! A completed QUIC handshake or observed flow traffic is diagnostic progress,
+//! not proof that Roblox's native BaseClient accepted the Team Create join.
+//! Live place replication and applying incoming change items are not
+//! implemented here.
 
 use crate::connected_raknet::{
     establish_connected_session, initialize_raknet_time, ConnectedConfig,
@@ -81,12 +72,13 @@ pub enum RbxTransportSessionEvent {
     QuicHandshakeComplete(String),
     /// A complete 0x9B challenge frame arrived on channel 1.
     ChallengeReceived { u1: u32, u2: u32, blob_len: u32 },
-    /// The challenge was solved locally and the 9-byte answer sent.
+    /// The challenge was solved locally and a response action was generated.
+    /// This does not report write success, peer receipt, or acceptance.
     ChallengeAnswered { answer: u32, elapsed_ms: u64 },
-    /// Local solving of the challenge failed.
+    /// Parsing the received 0x9B frame or solving its challenge failed.
     ChallengeFailed(String),
-    /// Post-answer traffic on channel 1 (world state / peer assignment) —
-    /// the BaseClient "connected" milestone.
+    /// Channel-1 traffic arrived after a 0x9B frame was seen; this is a local
+    /// diagnostic milestone, not confirmation of native BaseClient connection.
     ConnectedStageReached(String),
     Finished(String),
 }
@@ -441,12 +433,10 @@ pub fn join_response_is_all_null(v: &serde_json::Value) -> bool {
     !has_value(v)
 }
 
-/// TCP-connect RTT probe used by the fresh-join endpoint preflight. The
-/// UDMUX answer port answers TCP handshakes on the same network path as its
-/// QUIC UDP, so a connect's round trip is an honest measurement of the path;
-/// a path that does not complete even a TCP handshake within the budget will
-/// also silently drop our QUIC Initials (observed: 0 bytes RX for the whole
-/// 10 s handshake budget). `None` = no route within `budget_ms`.
+/// TCP connect-duration probe used by the fresh-join endpoint preflight. It
+/// measures only the time for a TCP handshake to complete; it does not establish
+/// reachability or performance over QUIC/UDP. `None` means address resolution,
+/// runtime creation, connection, or the timeout failed.
 pub fn probe_endpoint_rtt_ms(address: &str, port: u16, budget_ms: u32) -> Option<u32> {
     let addr = (address, port).to_socket_addrs().ok()?.next()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -497,10 +487,9 @@ const RAKNET_EPHEMERAL_EARLY_KEY_VERSION: u16 = 5;
 pub const DEFAULT_PROBE_MTU: u16 = 1200;
 const IPV6_UDP_HEADER_BYTES: usize = 40;
 const EARLY_AEAD_OVERHEAD: usize = 28; // 12-byte nonce + 16-byte detached tag
-// Current 0.735 `buildCapabilitiesHelper(..., PeerType::Client)` always sets
-// these bits. Additional bits are runtime-flag gated; do not advertise those
-// until the corresponding behavior is implemented. The old 2022 constant
-// falsely negotiated server bits 19 and 25 in the latest live session.
+// This is the 0.735 client-side capability floor used by this RakNet path.
+// Additional runtime-flagged capabilities are not advertised unless this client
+// implements the corresponding behavior.
 const RAK_PEER_CAPABILITIES_0735_CLIENT_FLOOR: u64 = 0x0000_0203_58b7_eafa;
 
 // Exact Studio 0.741 BaseClient open-send constants from
@@ -521,12 +510,8 @@ const RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_0: u8 = 0x06;
 const RBX_TRANSPORT_STREAM_HEADER_PREFIX_BYTE_1: u8 = 0x01;
 const RBX_TRANSPORT_STREAM_HEADER_BYTES: usize = 7;
 const RBX_TRANSPORT_CONTROL_APPLICATION: u8 = 0;
-/// The control channel id on the wire is the four ASCII bytes `ctrl`
-/// (0x6374_726C), which is what `appflow::CTRL_CHANNEL` sends and what the
-/// server's own control streams carry. This was `u32::MAX` ("native signed
-/// -1"), so `is_control_channel` never matched: every session reported
-/// control streams 0 / control records 0 and the 0x02 open / 0x03 close
-/// messages the server sends were never dispatched.
+/// The control channel ID is the big-endian value of the ASCII bytes `ctrl`
+/// (0x6374_726C), matching `appflow::CTRL_CHANNEL`.
 const RBX_TRANSPORT_CONTROL_CHANNEL_ID: u32 = 0x6374_726C;
 
 // Exact Studio 0.741 channel-control serializers:
@@ -580,45 +565,27 @@ const RBX_TRANSPORT_NATIVE_QUIC_PROTECTION_KEY: [u8; 32] = [
 const RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES: usize = 18;
 const RBX_TRANSPORT_NATIVE_QUIC_CID_TAG_BYTES: usize = 16;
 /// Max UDP payload (QUIC packet before the RUPP prefix) per route attempt.
-/// Pinned at the RFC 9000 client-Initial floor of 1200: the US Google Cloud
-/// UDMUX load balancer enforces the anti-amplification rule and blackholes
-/// client Initials whose UDP payload is below 1200 bytes — verified live:
-/// the sub-1200 tiers (831-1131 on the wire) cleared the local carrier but
-/// got zero answers from the UDMUX endpoint. So the Initial is NOT shrunk
-/// (the old descending "MTU ladder" is dead); instead the kernel chops the
-/// oversized UDP datagram into IP fragments (RBX_TRANSPORT_UDP_CHOP_MTU +
-/// IP_PMTUDISC_DONT) — the "Initial-Chop" strategy — keeping the physical
-/// frames under the strict carrier's threshold while the reassembled UDP
-/// payload stays 1231/1249, exactly what the server's front door expects.
+/// It is fixed at 1200 bytes, the RFC 9000 minimum size for a client Initial.
+/// The socket also requests IP fragmentation via the per-socket options below;
+/// those OS-level settings are best-effort.
 const RBX_TRANSPORT_UDP_PAYLOAD_TIERS: [usize; 1] = [1200];
-/// Per-socket path-MTU cap (IP_MTU / IPV6_MTU) that forces the kernel to
-/// chop the 1231/1249-byte RUPP-wrapped Initial (1259/1277 with IP+UDP
-/// headers) into ~two IP fragments of <= 640 bytes each.
-/// IP_PMTUDISC_DONT (DF=0, no PMTUD) is what allows the fragments; the
-/// phone's 1500-byte interface MTU would otherwise ship the datagram whole
-/// and let the strict carrier drop it. 640 = the "two ~600-byte fragments"
-/// shape; drop it to 576 (three fragments) if the carrier still eats
-/// 640-byte frames.
+/// Requested per-socket MTU value. The code passes raw option values 14 for
+/// IPv4 and 20 for IPv6; on Linux, IPV6_MTU is 24, so the IPv6 cap request may
+/// be rejected. Errors are ignored, and neither cap nor fragmentation is
+/// guaranteed.
 const RBX_TRANSPORT_UDP_CHOP_MTU: u32 = 640;
-/// Kernel-ABI setsockopt numbers (stable across Linux/Android/bionic):
-/// IP_MTU=14 at IPPROTO_IP level, IPV6_MTU=20 at IPPROTO_IPV6 level.
+/// Raw option values passed to setsockopt for the per-socket MTU request.
 const RBX_TRANSPORT_SOCKOPT_IP_MTU: i32 = 14;
 const RBX_TRANSPORT_SOCKOPT_IPV6_MTU: i32 = 20;
-/// IP_TOS for the QUIC UDP socket: DSCP AF41 (101001), TOS byte 136.
-/// CS4 (0x80/128) was tried live first and Roblox/carrier did not take it
-/// — switched to AF41 on 2026-10-11. Flip to 0x80 (CS4), 0xB8 (EF) or
-/// 0x00 (CS0) if a specific carrier reacts differently.
+/// Requested IP_TOS marking for the QUIC UDP socket: DSCP AF41 (TOS byte
+/// 136). `set_tos` is best-effort; the route continues if the platform rejects it.
 const RBX_TRANSPORT_UDP_TOS: u8 = 0x88;
-/// Bail a route attempt when datagrams went out but the carrier returned
-/// nothing for this long (a healthy path answers the Initial well before
-/// it). This is what turns a 10 s deadlock per route/size into a ~2.5 s
-/// probe so the MTU ladder can move on. Two-stage: the first observation
-/// grants one grace window (`RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS`) because
-/// on this network the first response was observed at ~3 s — a hard bail
-/// at 2.5 s killed an otherwise-alive path. A second observation with
-/// still zero RX bails (~3.5 s worst case per dead size).
+/// First no-response threshold for a route attempt, capped by the requested
+/// probe timeout. Once at least one UDP datagram has been sent and none received,
+/// the first qualifying check arms a second check. The next check occurs on the
+/// next QUIC/socket wake; this code schedules no fixed grace delay and does not
+/// identify why packets went unanswered.
 const RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS: u64 = 2_500;
-const RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS: u64 = 1_000;
 const RBX_TRANSPORT_NATIVE_QUIC_NONCE_BYTES: usize = 12;
 const RBX_TRANSPORT_NATIVE_QUIC_COUNTER_INITIAL: u64 = u64::from_le_bytes(*b"UniqueNu");
 const RBX_TRANSPORT_NATIVE_QUIC_NONCE_SUFFIX: [u8; 10] = *b"iqueNumbeR";
@@ -679,9 +646,9 @@ struct RbxTransportConnectPlan {
     early_auth: Result<EarlyAuthData, String>,
     game_fqdn: Option<String>,
     qdmux_vip: Option<String>,
-    /// Post-handshake app-flow material (the BaseClient join burst and the
-    /// 0x9B challenge answer). All optional: the flow degrades to the
-    /// passive receive loop when any of them is missing.
+    /// Post-handshake app-flow material. These plan fields are optional; a
+    /// string ClientTicket and numeric UserId are required to start the flow,
+    /// while other missing values can leave individual burst pieces unavailable.
     join_user_id: Option<i64>,
     /// The account's name and display name. The 0x90 template freezes the
     /// captured account's, and unlike `UserId` these cannot be derived from
@@ -922,7 +889,7 @@ impl RbxTransportConnectPlan {
     fn summary(&self) -> String {
         let quic_endpoint = rbx_transport_quic_endpoint(self);
         let mut text = format!(
-            "\nRbxTransport/QUIC remap ready: runtime flags FFlagUseRbxTransport + FFlagStudioClientServerMDI2 are treated as enabled, so the 0.741 selector maps this Team Create config to selectedTransport=RbxTransport (NetStack port/address/pubkey all present).\nRbxTransport QUIC UDP target: {} (public UDMUX IP on the NetStackPort - the RbxTransport UDP port per the validated Boblox clients; RUPP TLV2 and 0xd1 qdmux CID carry the RCC IP with the same NetStackPort)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with separate NetStackPort metadata {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
+            "\nRbxTransport/QUIC path selected by this client: its current 0.741 selector assumptions treat FFlagUseRbxTransport and FFlagStudioClientServerMDI2 as enabled; this config contains the NetStack port/address/public-key fields required by the path.\nRbxTransport QUIC UDP target: {} (public UDMUX IP; this client uses the NetStackPort as the QUIC UDP destination and carries the RCC IP plus that port in RUPP TLV2 / the 0xd1 qdmux CID)\nRbxTransport advertised UDMUX endpoint: {}\nRbxTransport RCC/RUPP config: RCC {} with separate NetStackPort metadata {}, NetStackTokenValue {} ({} decoded bytes), token subtype {}, DSR {}\nRbxTransport early pubkey: {} version {}, {} bytes",
             quic_endpoint.label(),
             self.public_endpoint.label(),
             self.rcc_endpoint.label(),
@@ -936,16 +903,17 @@ impl RbxTransportConnectPlan {
             self.early_key.public_key.len(),
         );
         text.push_str(&format!(
-            "\nPort routing: NetStackPort {} is the RbxTransport UDP port - QUIC targets the public UDMUX IP on that port ({}), and the RUPP TLV2 / 0xd1 qdmux CID fields carry the RCC IP ({}) with the same NetStackPort (validated Boblox client parity; FINDINGS.md's 'separate metadata, not the UDP destination' sentence is contradicted by all three live-joining clients). The legacy connected NetStackTokenValue reverse-endpoint route is not used on this selected RbxTransport session.",
+            "\nPort routing: NetStackPort {} is the RbxTransport UDP port - QUIC targets the public UDMUX IP on that port ({}), while the RUPP TLV2 / 0xd1 qdmux CID fields carry the RCC IP ({}) and the same port. The legacy connected NetStackTokenValue reverse-endpoint route is not used on this selected RbxTransport session.",
             self.rbx_transport_port,
             quic_endpoint.port,
             self.rcc_endpoint.address
         ));
         text.push_str(&format!(
-            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC IP + NetStackPort, all routes are RUPP-wrapped (flag byte 0x00 per the native capture) with the literal UDMUX IP as SNI and the 0xFF00 capabilities TLS extension spliced into every outgoing Initial (native ClientHello parity; native CH extension order, 0xff00 first), the recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer Boblox-parity fallback route, UDP payload is pinned at the RFC 9000 client-Initial floor of 1200 bytes (server-side anti-amplification; sub-1200 Initials are blackholed by the UDMUX load balancer) and kernel-chopped into IP fragments under a 640-byte per-socket MTU for strict-carrier networks, with IP_TOS AF41 (136), 0-RX bail 2500 ms, handshake timeout floor {} ms.",
+            "\nRbxTransport native QUIC settings: RUPP token subtype forced to Studio NetStack TokenTlv type {}, endpoint TLVs use ClientRuppGenerator types {}/{} with the RCC IP + NetStackPort; all routes are RUPP-wrapped (flag byte 0x00 per the native capture) and pass the literal UDMUX IP as the TLS server name; actual SNI behavior depends on the TLS backend. TLS backend behavior: {}. The recovered {}-byte ChaCha20-Poly1305 RUPP/QUIC CID trailer is forced on the primary route (native +0x2d state) with a no-trailer secondary route, UDP payload is pinned at the RFC 9000 client-Initial minimum of 1200 bytes; the socket makes best-effort fragmentation-related requests, including a 640-byte per-socket MTU value. It also requests IP_TOS AF41 (136), uses a two-check zero-RX early bail, and applies a handshake timeout floor of {} ms.",
             RUPP_TOKEN_TYPE_GAME_SERVICE,
             RUPP_TLV_IPV4_ENDPOINT,
             RUPP_TLV_IPV6_ENDPOINT,
+            rbx_transport_tls_backend_summary(),
             RBX_TRANSPORT_NATIVE_QUIC_CID_TRAILER_BYTES,
             RBX_TRANSPORT_NATIVE_HANDSHAKE_TIMEOUT_MS
         ));
@@ -963,7 +931,7 @@ impl RbxTransportConnectPlan {
         ));
         match &self.early_auth {
             Ok(auth) => text.push_str(&format!(
-                "\nRbxTransport BaseClient early auth material: native sendEarlyAuthData uses active connection send slot argument 1, frame tag 0xA8; auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted). It is sent in the post-handshake burst on channel 1 (with A7, 0x90/0x92/0x8A, 0x8F) as soon as the QUIC handshake completes.",
+                "\nRbxTransport BaseClient early-auth material: sendEarlyAuthData uses active connection send slot argument 1 and frame tag 0xA8; auth version {}, pre-auth {} bytes, auth {} bytes, wire payload {} bytes (contents redacted). The app=4 flow includes this frame on channel 1 only when its required join fields are available; the QUIC handshake alone does not mean it was sent.",
                 auth.auth_version,
                 auth.preauth_blob.len(),
                 auth.auth_blob.len(),
@@ -975,12 +943,12 @@ impl RbxTransportConnectPlan {
         }
         if let Some(game_fqdn) = &self.game_fqdn {
             text.push_str(&format!(
-                "\nRbxTransport GameFqdn/SNI: {}",
+                "\nRbxTransport GameFqdn field: {}",
                 game_fqdn_report_label(game_fqdn)
             ));
         } else if derive_qdmux_game_fqdn(self).is_some() {
             text.push_str(
-                "\nRbxTransport SNI: every route now uses the literal UDMUX IP as SNI (byte-exact native ClientHello parity; the token-ip-port.vip.qdmux.roblox.com shape is retained only as a redacted report candidate) and ngtcp2 gets the recovered 20-byte native qdmux initial destination-CID shape (0xd1/RCC IPv4/RCC server port/inner-CID entropy or counter, bytes redacted); the 18-byte CID trailer is forced on the primary route, while the fallback route omits it (Boblox C++ parity).",
+                "\nRbxTransport TLS server name: both routes pass the literal public UDMUX IP to the selected backend; actual SNI behavior is summarized above. The derived token-ip-port.vip.qdmux.roblox.com hostname is report-only. The routes use a 20-byte qdmux initial destination CID (0xd1/RCC IPv4/RCC server port/inner-CID fields, bytes redacted); the primary route includes the 18-byte CID trailer and the secondary route omits it.",
             );
         }
         text.push_str(
@@ -1725,13 +1693,8 @@ const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
 ];
 
 fn rbx_transport_quic_endpoint(plan: &RbxTransportConnectPlan) -> Endpoint {
-    // NetStackPort is the RbxTransport UDP port: all three validated Boblox
-    // clients join on udmuxIp:NetStackPort (py/rbx_client.py header,
-    // py/probe10.py, C++ quic_client.cpp sin_port = cfg.port =
-    // NetStackPort; live runs landed on udmux 128.116.2.33:61269 =
-    // NetStackPort). FINDINGS.md's sentence calling it "separate metadata,
-    // not the UDP destination" is contradicted by the working
-    // implementations, so the validated wire shape wins.
+    // RbxTransport targets the public UDMUX address on NetStackPort. The RCC
+    // address and the same port are encoded separately in the RUPP/CID fields.
     Endpoint {
         address: plan.public_endpoint.address.clone(),
         port: plan.rbx_transport_port,
@@ -1750,18 +1713,15 @@ fn resolve_endpoint(endpoint: &Endpoint) -> Result<SocketAddr, String> {
 }
 
 fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec<u8>, String> {
-    // TLV2 = RCC IPv4 + NetStackPort: "TLV2: 02 06 <rccIp 4B><NetStackPort
-    // u16 BE>" (py/rbx_client.py), rupp_.rcc_port = cfg.port in the C++
-    // client - same NetStackPort as the UDP destination.
+    // TLV2 carries the RCC IPv4 address and NetStackPort; the QUIC UDP target
+    // is the public UDMUX address on that same port.
     let rupp_endpoint = Endpoint {
         address: plan.rcc_endpoint.address.clone(),
         port: plan.rbx_transport_port,
     };
-    // FINDINGS.md byte layout for the RbxTransport game path:
-    // [01][00][u16 BE total][TLV1][TLV2] - the flag byte is 0x00. Both
-    // validated Boblox clients hardcode it (C++ rupp.h and Python
-    // rbx_client.py), and the native capture (rupp_tx001) shows 0x00; the
-    // join config's DSR bit is metadata for this path, not a wire flag.
+    // The RbxTransport game-path header is [01][00][u16 BE total][TLV1][TLV2].
+    // The second byte is 0x00; this path does not serialize the join config's
+    // DirectServerReturn value as a wire flag.
     build_rupp_header_for(
         &plan.token,
         &rupp_endpoint,
@@ -1773,14 +1733,14 @@ fn build_rbx_transport_rupp_header(plan: &RbxTransportConnectPlan) -> Result<Vec
 
 #[cfg(test)]
 fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms: u64) -> String {
-    "\nRbxTransport QUIC session attempt: skipped under unit tests (the app build runs a cancellable QUIC/RPK/RUPP receive/dispatch session; early auth remains unsent until channel routing is verified).".into()
+    "\nRbxTransport QUIC session attempt: skipped under unit tests; app builds run the cancellable QUIC/RPK/RUPP receive/dispatch session and attempt the app=4 post-handshake flow when its required join fields are available.".into()
 }
 
 #[cfg(not(test))]
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial floor; datagram kernel-chopped into IP fragments for strict-carrier networks), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial minimum; socket fragmentation options are best-effort), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\nEarly-auth metadata: version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted). The app=4 flow results below show whether the post-handshake send was active; the separate BaseClient reliability-2 channel/WireChannelId mapping remains unverified. A handshake or observed flow traffic does not prove native BaseClient connected state or Team Create acceptance.\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1807,7 +1767,7 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.flow_markers_acked
         ),
         Err(reason) => format!(
-            "\nRbxTransport QUIC session attempt failed before inbound Team Create traffic was accepted: {reason}"
+            "\nRbxTransport QUIC session attempt failed: {reason}"
         ),
     }
 }
@@ -1822,10 +1782,9 @@ struct RbxTransportConnectionReport {
     rupp_prefix_len: usize,
     initial_dst_cid_len: usize,
     native_quic_cid_trailer_len: usize,
-    /// The max_tx_udp_payload_size (QUIC payload before RUPP) this
-    /// connection used — pinned at the RFC 9000 client-Initial floor of
-    /// 1200 (the datagram is kernel-chopped into IP fragments instead of
-    /// being shrunk).
+    /// The max_tx_udp_payload_size (QUIC payload before RUPP) used by this
+    /// route attempt. It is set to the RFC 9000 client-Initial minimum of
+    /// 1200 bytes; socket-level IP fragmentation options are best-effort.
     max_udp_payload_size: usize,
     rpk_version: u16,
     requested_timeout_ms: u64,
@@ -1836,31 +1795,30 @@ struct RbxTransportConnectionReport {
     preauth_len: usize,
     auth_len: usize,
     early_auth_payload_len: usize,
-    /// Whether the app=4 flow (post-handshake burst + 0x9B answer) ran and
-    /// the challenge was answered.
+    /// Whether the app=4 post-handshake flow could be started from this config.
     flow_active: bool,
+    /// Whether a valid 0x9B challenge was solved locally and a response action
+    /// was generated; this does not confirm transport delivery or peer acceptance.
     flow_answered: bool,
-    /// Errors from the post-handshake burst. The summary line used to be chosen
-    /// purely on `flow_answered`, so it printed "burst sent" even when a stream
-    /// write had been abandoned partway - which made a truncated send
-    /// indistinguishable from a complete one.
+    /// Errors returned while opening or writing the initial post-handshake
+    /// burst. Later receive-loop action errors are emitted as status events but
+    /// are not collected in this field.
     flow_burst_errors: Vec<String>,
-    /// Burst pieces that were never staged, e.g. a 0x90 whose join fields were
-    /// missing. Distinct from `flow_burst_errors`: nothing errored, the frame
-    /// simply was not built.
+    /// Notes about burst pieces that were not staged and related join-ticket
+    /// diagnostics. This can include information that is not itself a send error.
     flow_skipped: Vec<String>,
-    /// Channel assignments the peer announced on its control streams. These
-    /// were only ever emitted as Status events, which the session report does
-    /// not carry - so parsing them changed nothing that could be seen.
+    /// Channel assignments parsed from peer control streams and formatted for
+    /// the final report; these observations do not verify native channel mapping.
     flow_channel_opens: String,
     /// Whether a 0x9B arrived on chan1 and what it looked like.
     flow_challenge_state: String,
-    /// How the queued-writes drain went, which is whether the burst completed.
+    /// Local retry-drain status for the initial burst's queued write tails; not
+    /// confirmation that the peer received or accepted the data.
     flow_drain_summary: String,
     /// Which 0x90 template fields were refreshed from this session.
     flow_join90_report: String,
-    /// Which 0xA7 and control application byte this session actually sent.
-    /// Both are selectable, so a result is meaningless without them.
+    /// Selected 0xA7 mode and control application byte for this flow. These
+    /// settings are configurable and are included for interpreting the report.
     flow_config: String,
     /// Snapshot-done markers acknowledged on channel 1.
     flow_markers_acked: u64,
@@ -1884,30 +1842,19 @@ fn build_rbx_transport_quic_routes(
     plan: &RbxTransportConnectPlan,
 ) -> Result<Vec<RbxTransportQuicRoute>, String> {
     let target_endpoint = rbx_transport_quic_endpoint(plan);
-    // SNI: the byte-exact native game ClientHello (Boblox
-    // run/native_clienthello_tx001.bin) carries the *literal UDMUX IP* as
-    // SNI; the token-ip-port.vip.qdmux.roblox.com grammar only exists on
-    // debug/pure-QUIC paths and the qdmux zone has no DNS records yet. The
-    // production udmux edge SNI-routes on that literal IP and silently drops
-    // datagrams carrying a different (or no) SNI, so every route below uses
-    // it. pki-types validates an IP literal as a DNS name, so rustls emits
-    // it as the SNI extension instead of suppressing SNI.
+    // Both current routes pass the public UDMUX address as the TLS server name.
+    // SNI emission depends on the TLS backend; the derived qdmux hostname is
+    // retained for diagnostics but is not selected here.
     let server_name = target_endpoint.address.clone();
-    // RUPP: every native game UDP packet is RUPP-wrapped (Boblox FINDINGS:
-    // "the production edge (udmux) routes on RUPP and silently drops
-    // RUPP-less UDP"; raw-QUIC Initials were captured and verified dropped
-    // in October 2026). The 31-byte prefix built here (token TLV + RCC
-    // endpoint TLV2) is byte-identical to Boblox's rupp_wrap output.
+    // Each route prepends the RUPP header built below to outgoing QUIC
+    // datagrams. It carries the token and RCC endpoint metadata for this path.
     let rupp_prefix = build_rbx_transport_rupp_header(plan)?;
     // Recovered native 0xd1 qdmux initial destination-CID shape (20 bytes);
     // server_rupp_config_empty=false because both routes are RUPP-wrapped.
     let initial_dst_cid = derive_native_qdmux_initial_dcid(plan, false)?;
     let routes = vec![
-        // Method 1 (strict): force the native +0x2d packet-protection state
-        // so the recovered 18-byte ChaCha20-Poly1305 CID trailer rides on
-        // every datagram. The pinned US pool still verifies that trailer;
-        // the inbound side accepts it under both nonce suffixes (primary,
-        // then the fallback suffix).
+        // Primary route: include the configured 18-byte ChaCha20-Poly1305
+        // CID trailer on outgoing datagrams.
         RbxTransportQuicRoute {
             target_endpoint: target_endpoint.clone(),
             outgoing_prefix: rupp_prefix.clone(),
@@ -1916,11 +1863,10 @@ fn build_rbx_transport_quic_routes(
             initial_dst_cid: initial_dst_cid.clone(),
             native_quic_packet_protection: true,
             route_label:
-                "RUPP-wrapped QUIC, literal-UDMUX-IP SNI, forced 18-byte native +0x2d CID trailer (strict method), 0xd1 qdmux initial DCID".into(),
+                "RUPP-wrapped QUIC, UDMUX-IP TLS server name, with 18-byte CID trailer, 0xd1 qdmux initial DCID".into(),
         },
-        // Method 2 (non-fallback / Boblox C++ byte parity): RUPP-wrapped
-        // QUIC with no CID trailer — the exact shape the Boblox client
-        // completes live handshakes with on public udmux pools.
+        // Secondary route: retain the same target, SNI, RUPP prefix, and
+        // initial destination CID, but omit the additional CID trailer.
         RbxTransportQuicRoute {
             target_endpoint,
             outgoing_prefix: rupp_prefix,
@@ -1929,7 +1875,7 @@ fn build_rbx_transport_quic_routes(
             initial_dst_cid,
             native_quic_packet_protection: false,
             route_label:
-                "RUPP-wrapped QUIC, literal-UDMUX-IP SNI, no CID trailer (Boblox C++ parity method), 0xd1 qdmux initial DCID".into(),
+                "RUPP-wrapped QUIC, UDMUX-IP TLS server name, no CID trailer, 0xd1 qdmux initial DCID".into(),
         },
     ];
     Ok(routes)
@@ -2199,15 +2145,9 @@ fn rbx_transport_close_detail(error: ngnet_quic::CloseError) -> String {
     }
 }
 
-/// Worst-case time the drain loop will spend retrying before handing the
-/// remainder back to the next wake.
-///
-/// Raised from 40 passes (4ms) after six runs split cleanly on how much of the
-/// burst got out: every session that sent ~18000 bytes was closed with
-/// application error 0x10000000110 within 190ms, while the two that sent 23679
-/// and 26022 bytes survived until the user stopped them. Completing the burst
-/// matters more than returning to the receive loop promptly, so the budget is
-/// now 40ms.
+/// Maximum retry passes when an initial flow write is blocked. Each retry
+/// waits `RBX_TRANSPORT_DRAIN_RETRY_DELAY`; 400 such waits total 40 ms, in
+/// addition to write attempts and scheduler overhead.
 #[cfg(not(test))]
 const RBX_TRANSPORT_DRAIN_MAX_PASSES: usize = 400;
 #[cfg(not(test))]
@@ -2271,20 +2211,19 @@ async fn run_rbx_transport_connection_async_with_session(
         .early_auth
         .as_ref()
         .map_err(|reason| format!("early-auth material unavailable: {reason}"))?;
-    // Keep the exact native 0xA8 frame length for the report, but do not send
-    // it on a guessed QUIC stream. BaseClient opens reliability enum 2 and the
-    // assigned WireChannelId/data route is not yet verified.
+    // Keep the exact native 0xA8 frame length for diagnostics. When the join
+    // fields allow an app=4 flow, it includes early auth on the observed
+    // post-handshake channel-1 path. The separate BaseClient reliability-2
+    // WireChannelId mapping is still unverified, so no guessed control frame
+    // is emitted.
     let early_auth_payload_len = build_rbx_transport_early_auth_payload(auth)?.len();
     let routes = build_rbx_transport_quic_routes(plan)?;
     let mut failures = Vec::new();
 
-    // Route sweep at a fixed 1200-byte payload cap: the UDMUX load
-    // balancer blackholes sub-1200 client Initials (RFC 9000
-    // anti-amplification floor), so the strict-carrier problem is solved
-    // socket-side instead — the kernel chops the 1231/1249-byte datagram
-    // into ~two 640-byte IP fragments (RBX_TRANSPORT_UDP_CHOP_MTU +
-    // IP_PMTUDISC_DONT), the native engine's fragmentation fallback. The
-    // two-stage 0-RX bail keeps each route attempt to ~3.5 s.
+    // Route attempts use the fixed 1200-byte QUIC payload cap. The socket
+    // requests fragmentation-related PMTU and per-socket MTU options, but the
+    // OS may reject or ignore them. A two-check zero-RX condition can end a
+    // route attempt early.
     for &max_udp_payload in &RBX_TRANSPORT_UDP_PAYLOAD_TIERS {
         for route in &routes {
             if cancel.load(Ordering::Relaxed) {
@@ -2341,7 +2280,7 @@ fn rbx_transport_handshake_timeout_message(
     udp_stats: &RbxTransportUdpStats,
 ) -> String {
     format!(
-        "ngtcp2/Rustls handshake timed out after {} ms (native RbxTransport budget; requested probe timeout {} ms); target {}, local {}; {}",
+        "ngtcp2/TLS handshake timed out after {} ms (native RbxTransport budget; requested probe timeout {} ms); target {}, local {}; {}",
         handshake_timeout.as_millis(),
         requested_timeout_ms,
         route.target_endpoint.label(),
@@ -2366,20 +2305,12 @@ async fn attempt_rbx_transport_connection_async(
     event_tx: Option<Sender<RbxTransportSessionEvent>>,
 ) -> Result<RbxTransportConnectionReport, String> {
     let target_addr = resolve_endpoint(&route.target_endpoint)?;
-    // socket2 (not std::net) so the options std does not expose can be set
-    // before the socket leaves this function:
-    // - IP_TOS: mark the flow as DSCP AF41 (TOS byte 136) so carrier QoS
-    //   treats it as a named class instead of unmarked bulk UDP;
-    // - IP_PMTUDISC_DONT: let the kernel FRAGMENT an oversized datagram
-    //   instead of setting DF and failing silently when the carrier
-    //   swallows the ICMP feedback - the "fragmentation fallback" the
-    //   native engine relies on on strict networks;
-    // - IP_MTU: cap the per-socket path MTU at RBX_TRANSPORT_UDP_CHOP_MTU
-    //   so the DONT above actually triggers - without it the 1500-byte
-    //   interface MTU ships the 1277-byte Initial whole and the strict
-    //   carrier drops it. Together they are the "Initial-Chop": the
-    //   reassembled UDP payload stays >= 1200 (UDMUX requirement) while
-    //   each physical frame is a small, carrier-safe fragment.
+    // socket2 (not std::net) is used so socket options can be requested before
+    // the socket is wrapped by Tokio:
+    // - IP_TOS: request DSCP AF41 (TOS byte 136);
+    // - IP_PMTUDISC_DONT: request fragmentation rather than path-MTU discovery;
+    // - a raw per-socket MTU option: pass 14 for IPv4 and 20 for IPv6.
+    // The traffic-class and fragmentation-related requests are best-effort below.
     let domain = if target_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -2390,14 +2321,12 @@ async fn attempt_rbx_transport_connection_async(
     sock.set_nonblocking(true)
         .map_err(|error| format!("failed to set QUIC UDP socket nonblocking: {error}"))?;
     if let Err(error) = sock.set_tos(RBX_TRANSPORT_UDP_TOS as u32) {
-        // Non-fatal: some platforms/carriers ignore IP_TOS; the socket MTU
-        // chop is the primary mechanism.
+        // Non-fatal: some platforms reject the requested traffic-class mark.
         let _ = error;
     }
-    // IP_PMTUDISC_DONT / IPV6_PMTUDISC_DONT (both = 0): let the kernel
-    // fragment an oversized datagram instead of silently failing PMTUD
-    // when the carrier swallows the ICMP feedback. socket2 0.5 does not
-    // expose this option, so setsockopt goes through libc directly.
+    // Request IP_PMTUDISC_DONT / IPV6_PMTUDISC_DONT (value 0). socket2 0.5
+    // does not expose this option, so setsockopt goes through libc directly;
+    // failure is ignored and does not abort the connection.
     let (sockopt_level, sockopt_name) = if target_addr.is_ipv4() {
         (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
     } else {
@@ -2413,11 +2342,10 @@ async fn attempt_rbx_transport_connection_async(
             std::mem::size_of::<i32>() as libc::socklen_t,
         );
     }
-    // IP_MTU / IPV6_MTU: per-socket path-MTU cap (Linux >= 4.5). This is
-    // what makes the kernel chop the Initial into fragments; DONT alone
-    // only permits it. Best-effort: if the kernel rejects the option the
-    // datagram goes out whole (old behaviour) rather than failing the
-    // connection.
+    // Request an IP_MTU / IPV6_MTU per-socket cap. With IP_PMTUDISC_DONT,
+    // supported Linux kernels may use it to fragment oversized datagrams.
+    // Best-effort: if the kernel rejects the option, this code continues
+    // without the cap rather than failing the connection.
     let (chop_level, chop_name) = if target_addr.is_ipv4() {
         (libc::IPPROTO_IP, RBX_TRANSPORT_SOCKOPT_IP_MTU)
     } else {
@@ -2487,14 +2415,12 @@ async fn attempt_rbx_transport_connection_async(
         u64::try_from(handshake_timeout.as_nanos())
             .map_err(|_| "RbxTransport handshake timeout exceeds ngtcp2's clock range")?,
     );
-    // Pin the max UDP payload (QUIC packet before the RUPP prefix) to
-    // this tier - currently always 1200, the RFC 9000 client-Initial floor
-    // the UDMUX load balancer enforces (sub-1200 Initials are blackholed
-    // server-side). ngtcp2 pads the Initial up to the clamp; the oversized
-    // on-wire datagram (1231/1249) is then chopped into IP fragments by
-    // the socket's chop MTU. Never shrink this below 1200.
-    // A random 31-bit starting packet number, matching the reference client.
-    // Starting at a predictable value is a fingerprint as much as a shortcut.
+    // The QUIC UDP-payload cap is 1200 bytes, the RFC 9000 minimum size for a
+    // client Initial. The RUPP prefix makes the resulting UDP datagram larger.
+    // Socket options above request IP fragmentation, but the OS may reject or
+    // ignore those requests, so this code cannot guarantee how it is transmitted.
+    // Use a random 31-bit starting packet number when entropy is available;
+    // fall back to zero if `getrandom` fails.
     let mut pkt_num_bytes = [0u8; 4];
     let initial_pkt_num = if getrandom::fill(&mut pkt_num_bytes).is_ok() {
         u32::from_le_bytes(pkt_num_bytes) & 0x7fff_ffff
@@ -2503,9 +2429,8 @@ async fn attempt_rbx_transport_connection_async(
     };
     let settings = ngnet_quic::Settings::new(initial_ts)
         .max_tx_udp_payload_size(max_udp_payload)
-        // 333ms, the reference client's initial RTT estimate. It sets the first
-        // probe timer, so a client that guesses an order of magnitude off behaves
-        // differently on the wire before it has heard back.
+        // Initial RTT estimate used for QUIC loss/PTO timing before a measured
+        // round-trip time is available.
         .initial_rtt(ngnet_quic::Duration::from_nanos(333_333_333))
         .initial_pkt_num(initial_pkt_num)
         .handshake_timeout(ng_handshake_timeout);
@@ -2547,14 +2472,11 @@ async fn attempt_rbx_transport_connection_async(
         .max_datagram_frame_size(65535);
     // Two TLS backends, chosen at compile time.
     //
-    // Rustls is the default and does raw-public-key verification through a
-    // `ServerCertVerifier`. The OpenSSL backend exists because it is the only
-    // way to get 0xFF00 into the ClientHello as a genuine first extension -
-    // OpenSSL writes custom extensions ahead of every built-in one
-    // (`ssl/statem/extensions.c:1188`) - instead of splicing them into the
-    // finished message afterwards. It authenticates the same Ed25519 raw key,
-    // pinned as a DANE-EE / SPKI / Full match, and offers RawPublicKey only, so
-    // switching backend does not weaken what the peer has to prove.
+    // Rustls is the default and verifies the expected Ed25519 raw public key
+    // through a `ServerCertVerifier`. The OpenSSL feature is used to register
+    // 0xFF00 as a ClientHello extension instead of splicing a finished packet;
+    // its current configuration disables peer verification, so it does not
+    // provide the same authentication guarantee as the Rustls path.
     #[cfg(not(feature = "ossl-tls"))]
     let tls_session = {
         let backend = RbxTransportRustlsBackend::new(
@@ -2583,14 +2505,10 @@ async fn attempt_rbx_transport_connection_async(
             .ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
             .groups_list("X25519")
             .no_certificate_compression()
-            // server_certificate_type = RawPublicKey, so the edge sends its bare
-            // Ed25519 key rather than an X.509 chain.
+            // Request the raw-public-key certificate type. The current OpenSSL
+            // configuration accepts any presented peer key; unlike Rustls, it
+            // does not verify the expected Ed25519 key yet.
             .server_certificate_type_raw_public_key()
-            // No verification, matching the reference client. The raw-public-key
-            // pin below is stricter than anything the working client does, and a
-            // pin that does not match the edge's actual key fails the handshake
-            // outright. `expected_rpk_spki_der` stays available to re-enable once
-            // a join succeeds and the real key can be confirmed.
             .verify(ngnet_quic::Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .map_err(|error| format!("failed to configure OpenSSL QUIC client: {error}"))?;
@@ -2653,7 +2571,7 @@ async fn attempt_rbx_transport_connection_async(
 
     let mut tx_buf = vec![0u8; 65_535];
     let mut rx_buf = vec![0u8; 65_535];
-    let mut zero_rx_grace_given = false;
+    let mut zero_rx_second_check_armed = false;
     let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
     // Which of the offered ALPNs the edge selected, kept for the report.
     let mut selected_alpn: Option<String> = None;
@@ -2689,37 +2607,30 @@ async fn attempt_rbx_transport_connection_async(
             }
             break;
         }
-        // 0-RX early bail (two-stage): datagrams went out (Initial +
-        // retransmits) but the carrier returned nothing. On e&/du-class
-        // strict filtering that is a dropped-by-DPI signature, not a slow
-        // handshake. The first observation only arms the grace window —
-        // the first response on this network has been observed at ~3 s, so
-        // a hard bail at 2.5 s killed an otherwise-alive path. The next
-        // loop wake (at most ~1 s later, usually immediately if a packet
-        // arrives) re-checks, and only a confirmed still-0-RX bails, so
-        // the next route variant still gets its chance in ~3.5 s instead of
-        // the full 10 s native budget.
+        // If at least one datagram has been sent but none received by the
+        // threshold, the first qualifying loop iteration arms a second check.
+        // The next QUIC/socket wake determines when that check runs; the
+        // handshake deadline may end the attempt first. Zero RX alone does not
+        // identify whether the cause is filtering, routing, or server behavior.
         let zero_rx_bail_ms =
             RBX_TRANSPORT_UDP_ZERO_RX_BAIL_MS.min(requested_timeout_ms);
         if started.elapsed() >= Duration::from_millis(zero_rx_bail_ms)
             && udp_stats.incoming_datagrams.load(Ordering::Relaxed) == 0
             && udp_stats.outgoing_datagrams.load(Ordering::Relaxed) >= 1
         {
-            if zero_rx_grace_given {
+            if zero_rx_second_check_armed {
                 return Err(format!(
-                    "UDP 0-RX for {} ms + {} ms grace (payload cap {}): {} datagrams sent, none received - the path looks filtered or the Initial is blackholed; the next route variant will retry",
+                    "UDP 0-RX remained after the {} ms threshold and a second check (payload cap {}): {} datagrams sent, none received; trying the next configured route",
                     zero_rx_bail_ms,
-                    RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS,
                     max_udp_payload,
                     udp_stats.outgoing_datagrams.load(Ordering::Relaxed)
                 ));
             }
-            zero_rx_grace_given = true;
+            zero_rx_second_check_armed = true;
             log::warn!(
-                "0-RX at {} ms (payload cap {}), granting {} ms grace window before bailing this size",
+                "0-RX at {} ms (payload cap {}); deferring this route's bail until the next QUIC/socket wake",
                 zero_rx_bail_ms,
-                max_udp_payload,
-                RBX_TRANSPORT_UDP_ZERO_RX_GRACE_MS
+                max_udp_payload
             );
         }
         if tokio::time::Instant::now() >= handshake_deadline {
@@ -2794,7 +2705,7 @@ async fn attempt_rbx_transport_connection_async(
                     Err(error) => {
                         let tls_reason = connection.tls().failure_reason();
                         return Err(format!(
-                            "ngtcp2/Rustls handshake failed: {error}{}; target {}, local {}; {}",
+                            "ngtcp2/TLS handshake failed: {error}{}; target {}, local {}; {}",}
                             tls_reason
                                 .map(|reason| format!("; TLS detail: {reason}"))
                                 .unwrap_or_default(),
@@ -2842,7 +2753,7 @@ async fn attempt_rbx_transport_connection_async(
             }
             RbxTransportWake::Cancelled => {
                 return Err(format!(
-                    "cancelled during ngtcp2/Rustls handshake for target {} from local {}; {}",
+                    "cancelled during ngtcp2/TLS handshake for target {} from local {}; {}",
                     route.target_endpoint.label(),
                     local_addr,
                     udp_stats.summary()
@@ -2855,7 +2766,7 @@ async fn attempt_rbx_transport_connection_async(
     if persistent_session {
         if let Some(event_tx) = &event_tx {
             let _ = event_tx.send(RbxTransportSessionEvent::QuicHandshakeComplete(format!(
-                "RbxTransport QUIC/TLS handshake completed via {}; target {}, local {}, ALPN {}. The app=4 join flow is starting (early-auth, A7, 0x90/0x92/0x8A burst) and the receive/dispatch loop is active.",
+                "RbxTransport QUIC/TLS handshake completed via {}; target {}, local {}, ALPN {}. Receive handling is starting; the app=4 join flow will start if a string ClientTicket and numeric UserId are available.",
                 route.route_label,
                 route.target_endpoint.label(),
                 local_addr,
@@ -2864,12 +2775,10 @@ async fn attempt_rbx_transport_connection_async(
         }
     }
 
-    // App=4 join flow: the post-handshake burst (ctrl openU, early-auth, A7,
-    // 0x90, 0x92, 0x8A, 0x8F) plus the 0x9B challenge solve-and-answer and
-    // the ~60 ms route declarations — the Boblox session.cpp sequence.
-    // Forced for every completed handshake (not just persistent
-    // sessions): once the keys are up, the appflow burst goes out
-    // immediately.
+    // Start the app=4 post-handshake flow when the config contains its required
+    // ClientTicket and UserId. It stages the control/channel burst, handles a
+    // valid 0x9B challenge locally, and schedules route declarations. Missing
+    // required fields leave this session in passive receive mode.
     let mut join_flow: Option<crate::appflow::AppFlow> = None;
     // Declared outside the match so the report can carry it: a burst that was
     // only partly written has to be visible in the summary, not just in the
@@ -2883,7 +2792,7 @@ async fn attempt_rbx_transport_connection_async(
             let a7_label = crate::appflow::a7_mode_label(cfg.a7_mode);
             let mut flow = crate::appflow::AppFlow::new(cfg, now_ms);
             log::info!(
-                "app=4 join flow: starting the post-handshake burst (ctrl hello + 4x openU, early-auth 0xA8, 0xA7 = {a7_label}, 0x90/0x92/0x8A, 0x8F)"
+                "app=4 join flow: staging the post-handshake burst (ctrl hello + 4x openU; early-auth and 0x90 when available; 0xA7 = {a7_label}; 0x92/0x8A/0x8F)"
             );
             for action in flow.on_connected() {
                 if let Err(error) = execute_join_flow_action(
@@ -2930,11 +2839,11 @@ async fn attempt_rbx_transport_connection_async(
         }
         None => {
             log::warn!(
-                "app=4 join flow skipped: join config is missing required fields (ClientTicket/UserId/joinTicket)"
+                "app=4 join flow skipped: join config lacks a string ClientTicket or numeric UserId"
             );
             if let Some(event_tx) = &event_tx {
                 let _ = event_tx.send(RbxTransportSessionEvent::Status(
-                    "app=4 join flow skipped: join config is missing required fields (ClientTicket/UserId/joinTicket); staying in passive receive mode".into(),
+                    "app=4 join flow skipped: join config lacks a string ClientTicket or numeric UserId; staying in passive receive mode".into(),
                 ));
             }
         }
@@ -3000,7 +2909,7 @@ async fn attempt_rbx_transport_connection_async(
         requested_timeout_ms,
         handshake_timeout_ms,
         handshake_completed_ms,
-        udp_summary: format!("{}, {}", udp_stats.summary(), rbx_transport_caps_summary()),
+        udp_summary: format!("{}, {}", udp_stats.summary(), rbx_transport_tls_backend_summary()),
         auth_version: auth.auth_version,
         preauth_len: auth.preauth_blob.len(),
         auth_len: auth.auth_blob.len(),
@@ -3360,32 +3269,25 @@ fn rbx_transport_expiry<S: ngnet_quic::Session>(
 // compiled in test builds and compares against this value, so gating the const
 // out left the splice function referencing a symbol that did not exist.
 /**
- * The 0xFF00 capabilities TLS extension the native RbxTransport
- * ClientHello carries: an 8-byte little-endian u64 capability bitmask.
- * The UDMUX edge will not answer an Initial whose ClientHello lacks it
- * (Boblox FINDINGS: the byte-parity C++ client completes the live
- * handshake with the extension, native CH order has 0xff00 FIRST).
- * rustls exposes no custom-extension API, so the value is spliced into
- * the encoded ClientHello of every outgoing QUIC v1 Initial - including
- * PTO retransmissions, which ngtcp2 regenerates from its internal CRYPTO
- * copy without our patch. Native conn#0 value (byte-identical per
- * FINDINGS; zeros are also tolerated, proven by native conn#1).
+ * Type and fixed eight-byte payload for the 0xFF00 RbxTransport TLS
+ * extension. The OpenSSL backend registers it as a
+ * custom extension before ClientHello generation; the default Rustls backend
+ * does not provide this custom-extension hook. The packet-splice helper below
+ * remains for layout tests and is not used on the production send path.
  */
 const RBX_TRANSPORT_CAPS_EXT_TYPE: u16 = 0xFF00;
 const RBX_TRANSPORT_CAPS_WIRE: [u8; 8] = [0x92, 0x08, 0xB7, 0x50, 0xC7, 0xD3, 0x2D, 0x00];
-/// Bounded diagnostic-log counter for 0xFF00 splice outcomes: the first
-/// few outgoing datagrams get a log line (with a hex preview on layout
-/// mismatch) so a silently-skipped splice can never happen again.
-/// 0xFF00 is emitted natively: the OpenSSL backend registers it with
-/// `.custom_extension()`, so it is part of ClientHello generation. The
-/// post-hoc splice that used to rewrite finished Initial packets is retired -
-/// measured on a live session that stayed up 14353 ms it ran zero times
-/// (spliced 0 / not-initial 44), so no Initial ever reached it, while the
-/// natively emitted extension was accepted. `splice_rbx_transport_caps_extension`
-/// and its tests are kept because they document the raw-ClientHello CRYPTO
-/// layout, not because anything calls them on the wire path.
-fn rbx_transport_caps_summary() -> &'static str {
-    "0xFF00 emitted natively by OpenSSL custom_extension; post-hoc splice retired"
+/// Summarize the selected TLS backend's extension, SNI, and verification behavior.
+#[cfg(feature = "ossl-tls")]
+fn rbx_transport_tls_backend_summary() -> &'static str {
+    "OpenSSL registers 0xFF00, sets SNI to the configured server name, and disables peer verification"
+}
+
+/// The default Rustls path verifies the expected key, omits 0xFF00, and does not
+/// send SNI when the configured server name is an IP address.
+#[cfg(not(feature = "ossl-tls"))]
+fn rbx_transport_tls_backend_summary() -> &'static str {
+    "Rustls verifies the expected raw public key, omits 0xFF00, and does not send SNI for IP-address server names"
 }
 
 /// Bounded diagnostic-log counter for the first received datagrams (hex
@@ -3498,12 +3400,9 @@ enum RbxCapsSpliceErr {
 /// a CRYPTO-offset-0 ClientHello is left untouched (never breaks the
 /// packet).
 ///
-/// CRYPTO framing: in this stack (rustls QUIC API under ngtcp2) the
-/// CRYPTO frame payload is the RAW TLS handshake message stream - there
-/// is no TLS record layer inside CRYPTO data (no `16 03 01` header;
-/// rustls `read_hs`/`write_hs` consume and emit handshake messages
-/// directly). The ClientHello therefore starts at the first CRYPTO byte:
-/// `01 <u24 length> 03 03 <32-byte random> ...`.
+/// QUIC CRYPTO frames carry TLS handshake messages directly, without a TLS
+/// record-layer wrapper. The ClientHello therefore starts at the first CRYPTO
+/// byte: `01 <u24 length> 03 03 <32-byte random> ...`.
 #[allow(dead_code)]
 fn splice_rbx_transport_caps_extension(packet: &mut [u8]) -> RbxCapsSpliceOutcome {
     match splice_rbx_transport_caps_inner(packet) {
@@ -3675,13 +3574,10 @@ async fn write_pending_rbx_transport_packets<S: ngnet_quic::Session>(
             .map_err(|error| format!("ngtcp2 packet write failed: {error}"))?
         {
             ngnet_quic::WriteOutcome::Datagram { len } => {
-                // 0xFF00 is registered natively on the OpenSSL backend via
-                // .custom_extension(), so it is part of ClientHello generation
-                // rather than a post-hoc mutation of a finished packet. The
-                // splice that used to run here is retired: measured on a live
-                // session that stayed up 14353 ms it ran zero times (spliced 0,
-                // not-initial 44) - no Initial ever reached it - while the
-                // natively emitted extension was accepted.
+                // With `ossl-tls`, 0xFF00 is registered through OpenSSL's
+                // `.custom_extension()` before ClientHello generation. This
+                // writer sends the packet as produced by ngtcp2; the legacy
+                // ClientHello-splice helper is not applied on this path.
                 socket
                     .send_to(&tx_buf[..len], connection.remote_addr())
                     .await
@@ -3878,17 +3774,16 @@ async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
         for entry in left {
             flow.queue_pending(entry);
         }
-        // How long the burst actually took to get out is the question this
-        // answers: a couple of passes in microseconds means pacing, while many
-        // passes over tens of milliseconds means something else is wrong.
+        // Record how long local stream writes took to drain and how many bytes
+        // remain queued; this is not an acknowledgment from the peer.
         let summary = format!(
             "stream drain: {initial_bytes}B in {passes} pass(es) over {}us; {}B still queued",
             drain_started.elapsed().as_micros(),
             flow.pending_bytes()
         );
-        // Recorded as well as emitted: Status events do not reach the session
-        // report, and whether the burst completed is exactly what separates a
-        // session the peer keeps from one it closes.
+        // Record it as well as emitting a Status event so the final report can
+        // show local queue state; a drained write queue does not establish peer
+        // receipt or session acceptance.
         flow.set_drain_summary(summary.clone());
         emit(summary);
     }
@@ -4110,7 +4005,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
     );
     if let Some(flow) = flow {
         summary.push_str(&format!(
-            " App=4 flow: challenge-answered={} post-answer-chan1-bytes={}",
+            " App=4 flow: challenge-solved-locally={} channel-1-bytes-after-0x9B={}",
             flow.answered(),
             flow.post_answer_bytes()
         ));
@@ -6025,7 +5920,7 @@ pub fn run_join_config_session(
 
     report.push_str(&plan.summary());
     let _ = event_tx.send(RbxTransportSessionEvent::Status(
-        "RbxTransport selected; starting native QUIC route attempts. Early auth and channel-control data remain unsent.".into(),
+        "RbxTransport selected; starting native QUIC route attempts. After a successful handshake, the app attempts its app=4 post-handshake flow when the required join fields are available; handshake success alone does not establish Team Create acceptance.".into(),
     ));
 
     #[cfg(not(test))]
@@ -6047,41 +5942,36 @@ pub fn run_join_config_session(
             Ok(connection_report) => {
                 let flow_status: String = if connection_report.flow_active {
                     if connection_report.flow_answered {
-                        "🎯 app=4 join flow: burst sent, 0x9B challenge answered — BaseClient connected stage reached (post-answer world state on channel 1)".into()
+                        "🎯 app=4 join flow: a valid 0x9B challenge was solved locally and a response action was generated; this does not confirm write success, peer receipt, or native BaseClient/Team Create acceptance.".into()
                     } else {
                         if connection_report.flow_burst_errors.is_empty()
                             && connection_report.flow_skipped.is_empty()
                         {
-                            // Across every run on this path the server has never
-                            // sent a 0x9B: channel 1 carries a single 0x93
-                            // settings dictionary. Reporting "challenge not
-                            // answered" reads as a failure we caused, when the
-                            // real question is whether the peer kept the session.
+                            // No local write errors or omission notes were recorded;
+                            // that does not establish peer receipt or acceptance.
                             format!(
-                                "⚠️ app=4 join flow: burst sent in full; no 0x9B challenge arrived on this path, and {} snapshot marker(s) acknowledged",
+                                "⚠️ app=4 join flow: no initial-action write errors or omission notes were recorded; no valid 0x9B response was produced, and {} snapshot marker(s) acknowledged",
                                 connection_report.flow_markers_acked
                             )
                         } else if connection_report.flow_burst_errors.is_empty() {
-                            // Nothing errored, but the burst was incomplete: a
-                            // frame was never built, so the server got a partial
-                            // join sequence and had no reason to challenge us.
+                            // These notes can describe omitted burst pieces or
+                            // join-ticket metadata; do not label all of them as sends.
                             format!(
-                                "⚠️ app=4 join flow: burst sent INCOMPLETE — the 0x9B challenge was not answered and the connected stage was NOT reached. Omitted: {}",
+                                "⚠️ app=4 join flow: no initial-action write errors were recorded, but no valid 0x9B response was queued. Flow/config notes: {}",
                                 connection_report.flow_skipped.join(" | ")
                             )
                         } else {
-                            // The burst did not complete. Saying "burst sent" here
-                            // is what hid a truncated write behind a successful
-                            // handshake for several runs.
+                            // Report local action failures without describing the
+                            // handshake itself as a completed join.
                             format!(
-                                "⚠️ app=4 join flow: burst FAILED — the 0x9B challenge was not answered and the connected stage was NOT reached. {} action(s) errored: {}{}",
+                                "⚠️ app=4 join flow: initial action(s) failed locally; no valid 0x9B response was queued. {} error(s): {}{}",
                                 connection_report.flow_burst_errors.len(),
                                 connection_report.flow_burst_errors.join(" | "),
                                 if connection_report.flow_skipped.is_empty() {
                                     String::new()
                                 } else {
                                     format!(
-                                        " | omitted: {}",
+                                        " | flow/config notes: {}",}
                                         connection_report.flow_skipped.join(" | ")
                                     )
                                 }
@@ -6090,7 +5980,7 @@ pub fn run_join_config_session(
                     }
                 } else {
                     format!(
-                        "⚠️ BaseClient early-auth material staged but NOT sent — auth version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted); reliability-2 channel/wire-ID routing is not verified; native BaseClient connected/Team Create accepted state is not reached",
+                        "⚠️ app=4 join flow skipped: a string ClientTicket or numeric UserId is missing, so the early-auth payload was not sent (version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes; contents redacted). The separate BaseClient reliability-2 channel/WireChannelId mapping remains unverified, and handshake success does not prove BaseClient connection or Team Create acceptance.",
                         connection_report.auth_version,
                         connection_report.preauth_len,
                         connection_report.auth_len,
@@ -6098,7 +5988,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nBurst delivery: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -6122,7 +6012,7 @@ pub fn run_join_config_session(
                 ));
             }
             Err(reason) => report.push_str(&format!(
-                "\nRbxTransport session ended before inbound Team Create traffic was accepted: {reason}"
+                "\nRbxTransport transport session ended: {reason}"
             )),
         }
     }
@@ -6396,7 +6286,7 @@ mod tests {
         assert!(report.contains("selectedTransport=RbxTransport"));
         assert!(report.contains("RbxTransport QUIC UDP target: 128.116.54.33:50704"));
         assert!(report.contains("RbxTransport advertised UDMUX endpoint: 128.116.54.33:50704"));
-        assert!(report.contains("RbxTransport GameFqdn/SNI: gamejoin.roblox.test"));
+        assert!(report.contains("RbxTransport GameFqdn field: gamejoin.roblox.test"));
         assert!(report.contains("RUPP token subtype forced to Studio NetStack TokenTlv type 1"));
         assert!(report.contains("endpoint TLVs use ClientRuppGenerator types 2/3"));
         assert!(report.contains("handshake timeout floor 10000 ms"));

@@ -2,9 +2,8 @@ name: Build and test
 
 on:
   workflow_dispatch:
-  # Every push to a working branch or master runs the host check-and-test job.
-  # The APK build stays manual-only (see the `if` on build-android below) so a
-  # push does not burn 10+ minutes cross-compiling and uploading artifacts.
+  # Pushes to master and arena/** run the host checks; the APK job runs for a
+  # manual dispatch or an arena/** push. Ordinary master pushes skip APK packaging.
   push:
     branches:
       - master
@@ -17,14 +16,12 @@ on:
 #   1. cross-compiles the Rust cdylib (librbxl_editor.so) against the NDK,
 #   2. generates a real Gradle/AGP project under target/x/release/android/gradle,
 #   3. copies kotlin/*.kt into it and resolves the Maven deps declared in
-#      manifest.yaml (games-activity, appcompat, core) from Google's Maven,
+#      manifest.yaml (GameActivity, AppCompat, Core, and Sora editor) from Maven,
 #   4. runs `gradle assemble` to produce the APK.
 #
-# That last part is why we moved off cargo-apk2: cargo-apk2 calls `javac` with
-# nothing but android.jar on the classpath, so an Activity extending
-# GameActivity cannot compile (37 "cannot find symbol" errors).
-#
-# Two knobs are needed to make xbuild's generated project modern enough:
+# Gradle is required for the Kotlin GameActivity and its Maven AAR dependencies.
+# CI also supplies a recent NDK sysroot and overrides the older plugin versions
+# in xbuild's generated Gradle template:
 #   * ~/.cache/x/Android.ndk is symlinked to a real NDK sysroot instead of the
 #     ancient one xbuild downloads (that one has no API-34 stubs).
 #   * ~/.gradle/init.d/ pins AGP/Kotlin plugin versions, because xbuild's
@@ -38,7 +35,7 @@ env:
   GRADLE_VERSION: "8.11.1"
   AGP_VERSION: "8.7.3"
   KOTLIN_PLUGIN_VERSION: "2.1.21"
-  # Pinned xbuild revision (master @ 2025-08-15) so builds are reproducible.
+  # Pinned xbuild revision so builds are reproducible.
   XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
   CARGO_BUILD_JOBS: 2                 # Matches the 2-core runner hardware
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16 # Splits compilation into parallel chunks
@@ -658,10 +655,7 @@ jobs:
           ls "$OPENSSL_DIR/include/openssl/ssl.h"
           ls "$OPENSSL_DIR/lib"/libssl.a "$OPENSSL_DIR/lib"/libcrypto.a
           "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" t "$OPENSSL_DIR/lib/libssl.a" | head -3
-          # ngtcp2 refuses to build its OpenSSL backend unless it can see this
-          # symbol, so confirm it is really in the archive we built.
-          # ngtcp2 refuses to build its OpenSSL backend unless it can see this
-          # symbol, so confirm it is really in the archive we built. Emitted as
+          # ngtcp2's OpenSSL backend requires this symbol. Report the result as
           # an annotation because runner log archives are not reachable from
           # every environment.
           NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"

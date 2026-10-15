@@ -55,9 +55,8 @@ impl RbxTransportRustlsBackend {
             RBX_TRANSPORT_ALPN.to_vec(),
             RBX_TRANSPORT_ALPN_ALT.to_vec(),
         ];
-        // All RbxTransport routes use the literal UDMUX IP as SNI (native
-        // ClientHello parity — the edge SNI-routes on it). enable_sni stays
-        // per-route so a future pure-QUIC fallback can opt out.
+        // Current routes pass the literal UDMUX IP as the TLS server name.
+        // Rustls omits SNI for IP-address names; this flag cannot make an IP a DNS SNI name.
         config.enable_sni = enable_sni;
         Ok(Self {
             config: Arc::new(config),

@@ -3,19 +3,17 @@
 // ============================================================================
 // rbxl-editor — a Roblox place editor rendered as a single Bevy app
 // ----------------------------------------------------------------------------
-// Architecture: ONE app, owned by Bevy.
-//   - Bevy owns the window, so it gets a GPU context and renders the 3D
-//     viewport natively on Android (this is what makes the GPU viewport work,
-//     unlike embedding Bevy inside an eframe window).
-//   - The egui editor UI runs INSIDE Bevy via `bevy_egui`, drawn over the 3D.
+// Architecture: one app, owned by Bevy.
+//   - Bevy owns the window and renders the 3D viewport natively on Android.
+//   - The egui editor UI runs inside Bevy via `bevy_egui`, drawn over the 3D.
 //   - Opening a place rebuilds the Bevy meshes; the 3D tab shows them live.
 //
 // Android entry uses `#[bevy_main]`, which expands to the `android_main` entry
 // point of `android-activity`'s GameActivity backend (Bevy feature
-// `android-game-activity`). The APK is built by xbuild (`manifest.yaml`), which
-// drives a real Gradle project so `kotlin/MainActivity.kt` can extend
-// `com.google.androidgamesdk.GameActivity` from the games-activity AAR — that
-// is what gives us a proper InputConnection / soft keyboard (paste works).
+// `android-game-activity`). xbuild (`manifest.yaml`) drives a Gradle project so
+// `kotlin/MainActivity.kt` can extend `com.google.androidgamesdk.GameActivity`.
+// GameActivity supplies GameTextInput; `android_ime.rs` bridges that state into
+// egui, while Android clipboard access uses separate JNI calls.
 // ============================================================================
 
 mod android_ime;

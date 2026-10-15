@@ -25,19 +25,14 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /**
- * Luau support for the sora-editor widget.
+ * Luau language support for the Sora editor.
  *
- * This replaces the hand-rolled EditText machinery: sora already owns bracket
- * pairing, smart Enter, indentation, the gutter and the completion window, so
- * the only things worth writing here are the parts that are actually
- * Luau-specific -- the token colors, the block rules, and the bridge to the
- * Rust `luau_intelligence` index.
+ * Sora provides the editor widget, gutter, and completion UI. This class
+ * configures Luau syntax and block-editing rules and bridges completion requests
+ * to the Rust `luau_intelligence` index.
  *
- * Threading is the important detail. [requireAutoComplete] is called by sora on
- * a worker thread and is *allowed* to block, which is what makes it possible to
- * drop the old debounce timer and ListPopupWindow entirely: we ask Rust for
- * suggestions, park until the JNI callback answers, then hand the results
- * straight to the publisher.
+ * [requireAutoComplete] runs on Sora's worker thread and may wait for the JNI
+ * response. The result is passed back to Sora's own completion publisher.
  */
 class LuauLanguage(
     private val scriptId: Long,
@@ -105,7 +100,7 @@ class LuauLanguage(
     override fun useTab(): Boolean = false
 
     /**
-     * Bracket and quote pairing, replacing the old afterTextChanged handler.
+     * Luau bracket and quote pairs supplied to Sora's editor.
      *
      * Per instance, never shared: setEditorLanguage() calls setParent() on
      * whatever this returns, so a single static SymbolPairMatch handed to two
@@ -635,9 +630,9 @@ class LuauLanguage(
         }
 
         /**
-         * Smart Enter. Copies the previous line's indent, adds a level after a
-         * block opener, and lays down the matching `end` when the block is not
-         * already closed -- the behaviour verified for the EditText version.
+         * Smart Enter copies the current line's indentation, adds a level after
+         * a block opener, and inserts a matching `end` when one is not already
+         * present later in the document.
          */
         private val blockNewlineHandler = object : NewlineHandler {
             override fun matchesRequirement(
@@ -698,7 +693,7 @@ class LuauLanguage(
         }
 
 
-        /** Dark scheme approximating the previous editor's colors. */
+        /** Dark color scheme used by the Sora editor. */
         fun darkScheme(): EditorColorScheme = EditorColorScheme().apply {
             setColor(EditorColorScheme.WHOLE_BACKGROUND, android.graphics.Color.rgb(30, 30, 30))
             setColor(EditorColorScheme.LINE_NUMBER_PANEL, android.graphics.Color.rgb(36, 36, 38))

@@ -1,23 +1,23 @@
-//! Offline Roblox **plugin** library manager.
+//! Roblox **plugin** library manager.
 //!
-//! A Roblox Studio plugin is just a `.rbxm`/`.rbxmx` model whose root is a
-//! `Script`/`ModuleScript` (the entry point Studio runs). Plugins do NOT live
+//! Studio plugins are commonly packaged as `.rbxm`/`.rbxmx` models containing
+//! `Script` or `ModuleScript` entry points. Plugins do NOT live
 //! inside a place's DataModel under some `PluginServices`; instead Studio loads
 //! them from its `Plugins` folder and, at runtime, their dock-widget UIs are
 //! parented to **`PluginGuiService`** and any injected UI to **`CoreGui`**,
 //! while toolbars/buttons come from the global `plugin:CreateToolbar(...)`.
 //!
-//! This app has no Roblox engine to *execute* a plugin, so it cannot render a
-//! live dock widget. What it CAN do — and what this module provides — is
+//! Plugins do not run inside a live Roblox engine here, so the app cannot show
+//! their live dock widgets. Supported script logic can run in the separate
+//! embedded sandbox; this module provides the plugin-library operations:
 //! everything else:
 //!
 //! * store a persistent library of plugins in the app's internal files dir;
 //! * import a local `.rbxm`/`.rbxmx`, or download one from the Creator Store by
 //!   asset ID (both reuse `rbxl::decode_model_bytes`, so binary/XML/gzip work);
 //! * enable/disable/delete plugins;
-//! * inspect a plugin's instance hierarchy, locate any GUI objects a plugin
-//!   ships (ScreenGui / DockWidgetPluginGui / frames / buttons …) and list the
-//!   scripts;
+//! * list the scripts and show summary rows for static GUI-class instances in
+//!   the decoded plugin model (runtime-created plugin UI is not included);
 //! * open any script's source in the editor, and insert a plugin's contents
 //!   into the currently-open place.
 
@@ -49,8 +49,8 @@ pub struct PluginRecord {
     pub instances: usize,
     /// Scripts found anywhere in the plugin (name + class).
     pub scripts: Vec<(String, String)>,
-    /// GUI objects found anywhere in the plugin — these are what Studio would
-    /// show under PluginGuiService / CoreGui once the plugin runs.
+    /// Static GUI-class instances found in the decoded plugin model. This does
+    /// not include UI created dynamically when a plugin runs in Studio.
     pub guis: Vec<PluginGuiInfo>,
     /// Roblox asset id for the plugin's icon (Creator Store plugins usually
     /// have one; local plugins default to the toolbox/generic icon).
@@ -68,7 +68,7 @@ pub enum PluginSource {
 pub struct PluginGuiInfo {
     pub name: String,
     pub class: String,
-    /// How many descendant GUI elements it contains (rough widget complexity).
+    /// Number of descendant instances of any class (a rough size indicator).
     pub descendants: usize,
 }
 

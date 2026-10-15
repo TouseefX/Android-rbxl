@@ -1,13 +1,13 @@
 // ============================================================================
-// bevy_rbxl — standalone Bevy renderer for Roblox place/model files
+// bevy_rbxl — standalone Bevy renderer sandbox for Roblox place/model files
 // ----------------------------------------------------------------------------
-// A self-contained port of OpenRBLX's 3D viewport renderer to the Bevy engine.
-// Renders .rbxl / .rbxmx / .rbxm with GPU lighting, correct part shapes,
-// per-face decals and (if the mesh/asset files exist locally) MeshParts.
+// This package is independent of the root editor's renderer in src/bevy_render.rs.
+// It previews .rbxl / .rbxmx / .rbxm files with Bevy lighting, part geometry,
+// per-face decals, and MeshParts when their asset files are available locally.
 //
-// Coordinate handling matches the Android app: Roblox is left-handed, Bevy is
-// right-handed, so we flip the Z axis on every world vertex/normal and use
-// two-sided materials (cull_mode: None) to avoid winding/backface problems.
+// Roblox source coordinates are mapped into Bevy's world by flipping Z on
+// vertices and normals. This renderer also uses two-sided materials to avoid
+// winding/backface issues in its generated meshes.
 // ============================================================================
 
 use bevy::asset::RenderAssetUsages;
@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 // ----------------------------------------------------------------------------
-// Math (S space, matches the Android software rasterizer)
+// Math in Roblox source coordinates
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]

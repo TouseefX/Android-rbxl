@@ -1,20 +1,12 @@
 # ============================================================================
 # xbuild (https://github.com/rust-mobile/xbuild) project manifest
 # ----------------------------------------------------------------------------
-# This replaces the old `[package.metadata.android]` table that cargo-apk2 used.
-#
 # Build locally with:
 #   x build --release --platform android --arch arm64 --format apk
 #
-# Why xbuild instead of cargo-apk2:
-#   * cargo-apk2 shells out to `javac` with only `android.jar` on the classpath,
-#     so it cannot compile an Activity that extends `GameActivity` (the class
-#     lives in the `androidx.games:games-activity` AAR). That is exactly what
-#     broke the old build: 37 "cannot find symbol" errors for every method
-#     inherited from GameActivity.
-#   * xbuild's `gradle: true` mode generates a real Gradle/AGP project, so
-#     Maven/AAR dependencies (games-activity, appcompat, core) resolve and our
-#     Kotlin Activity compiles against them like any native Android app.
+# Gradle mode is required because the app includes a Kotlin GameActivity and
+# Maven AAR dependencies. Keep package/activity settings and those dependencies
+# in sync with `kotlin/MainActivity.kt` and `.github/workflows/main.yml`.
 # ============================================================================
 
 android:
@@ -31,8 +23,8 @@ android:
   # "You need to use a Theme.AppCompat theme (or descendant)".
   #
   # sora-editor (LGPL-2.1, Maven Central) is the code editor widget used by
-  # the native script editor. It is consumed as an unmodified binary AAR, which
-  # is what keeps LGPL linking permissible; its source is not vendored here.
+  # the Android script editor. It is resolved as an unmodified AAR; its source
+  # is not vendored here. Review the upstream license before redistributing builds.
   # Pinned to 0.23.6 deliberately:
   #   * 0.23.6 builds against kotlin-stdlib 2.1.21, matching the Kotlin plugin
   #     pinned in .github/workflows/main.yml.

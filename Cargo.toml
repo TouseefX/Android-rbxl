@@ -40,16 +40,16 @@ chacha20poly1305 = "0.10"
 aes-gcm = "0.10"
 getrandom = "0.3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-# RbxTransport Team Create uses QUIC/TLS 1.3 with RFC 7250 raw-public-key verification.
-# ngnet-quic provides the lower-level ngtcp2 transport; rustls drives TLS 1.3
-# directly so the app can retain RPK verification, custom CIDs and DATAGRAM hooks.
+# RbxTransport Team Create uses QUIC/TLS 1.3. The default Rustls backend
+# verifies the expected RFC 7250 raw public key; the optional OpenSSL backend is
+# used for the 0xFF00 ClientHello extension and currently disables peer verification.
+# ngnet-quic provides the lower-level ngtcp2 transport, custom CIDs and DATAGRAM hooks.
 ngnet-quic = { path = "vendor/ngnet-quic", default-features = false }
-# socket2 for the two socket options std::net does not expose on the QUIC UDP
-# socket: IP_TOS (traffic class) and IP_PMTUDISC_DONT (fragmentation
-# fallback for strict carriers). Same major version tokio already depends on.
+# socket2 for creating and configuring the QUIC UDP socket, including its
+# best-effort traffic-class setting. Same major version tokio already depends on.
 socket2 = "0.5"
-# libc for the raw setsockopt(IP_MTU_DISCOVER) call socket2 0.5 does not
-# expose (fragmentation fallback for strict carriers).
+# libc for raw PMTU-discovery and per-socket MTU options not exposed by socket2;
+# the code treats these fragmentation requests as best-effort.
 libc = "0.2"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
@@ -58,15 +58,15 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Roblox CDN textures are not guaranteed to be PNG/JPEG; modern assets often
 # arrive as WebP and older uploaded images can be GIF/BMP.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
-# Embedded Luau VM for the script runner / plugin host. Uses TouseefX/luaur — a
-# pure-Rust, full-accuracy Luau port with Android support. `default-features =
-# false` skips the CLI binary and static type checker; we only need the runtime.
+# Embedded Luau runtime for the script runner / plugin host. TouseefX/luaur is
+# a pure-Rust implementation that can be built for Android. `default-features =
+# false` skips its CLI and static type-checker features; this app uses the runtime.
 luaur = { git = "https://github.com/TouseefX/luaur", branch = "main", default-features = false, features = [] }
 
-# Bevy owns the whole window (so it gets a GPU context and can render the 3D
-# viewport natively on Android). egui runs INSIDE Bevy via bevy_egui.
-# android-game-activity provides a proper InputConnection / soft-keyboard
-# (GameActivity's GameTextInput), which makes Gboard/Samsung paste work.
+# Bevy owns the whole window and renders the 3D viewport natively on Android;
+# egui runs inside Bevy via bevy_egui. The android-game-activity feature selects
+# GameActivity glue, whose GameTextInput supplies Android's InputConnection.
+# src/android_ime.rs bridges that input into egui; clipboard access is separate.
 bevy = { version = "0.17", default-features = false, features = [
     "android-game-activity",
     "android_shared_stdcxx",
@@ -104,12 +104,10 @@ bevy_egui = { version = "0.38", default-features = false, features = ["render", 
 # ----------------------------------------------------------------------------
 # Android-only dependencies.
 #
-# `android-activity` is what actually implements the GameActivity glue that
-# Bevy's `android-game-activity` feature selects. We depend on it directly so
-# that the version is pinned and stays in lock-step with the AAR declared in
-# `manifest.yaml`: android-activity 0.6.x targets
-# `androidx.games:games-activity:4.4.0` (backwards compatible with 4.0.0).
-# If you bump one, bump the other.
+# `android-activity` implements the GameActivity glue selected by Bevy's
+# `android-game-activity` feature. Pin it directly alongside the
+# `androidx.games:games-activity` AAR declared in `manifest.yaml`; review both
+# versions together when upgrading.
 # ----------------------------------------------------------------------------
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6.1", features = ["game-activity"] }
@@ -144,9 +142,11 @@ default = []
 # Enable audio playback on desktop via rodio. Android uses MediaPlayer
 # via JNI regardless of this feature.
 desktop_audio = ["rodio"]
-# Drive TLS through OpenSSL instead of Rustls, which is what lets the ClientHello
-# carry 0xFF00 as a real extension rather than as a post-hoc splice: OpenSSL writes
-# custom extensions ahead of every built-in one (ssl/statem/extensions.c:1188).
+# Drive TLS through OpenSSL instead of Rustls so the ClientHello can register
+# 0xFF00 as a custom extension. The default Rustls path does not add this extension;
+# its legacy packet-splice helper is retained for layout tests only.
+# WARNING: the current OpenSSL builder requests the raw-public-key certificate
+# type but uses DangerouslyAcceptAnyCertificate, so it does not verify the peer.
 #
 # Off by default because ngnet-quic-sys requires OpenSSL >= 3.5.0 - the first
 # release carrying the QUIC TLS API ngtcp2's ossl helper is written against - and

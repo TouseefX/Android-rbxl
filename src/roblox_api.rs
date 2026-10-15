@@ -512,10 +512,10 @@ impl RobloxApiClient {
         )
     }
 
-    /// Cookie (`user-auth`) flavor of the Assets API upload — the same
-    /// endpoint shape as Open Cloud but authenticated with the account's
-    /// `.ROBLOSECURITY` cookie + X-CSRF-TOKEN (the path Rojo uses; see
-    /// roblox-cookie-upload-endpoints.md §2). No API key needed.
+    /// Cookie-authenticated Assets API upload using Roblox's
+    /// `assets/user-auth/v1` endpoint and the account's `.ROBLOSECURITY` cookie
+    /// plus `X-CSRF-TOKEN`. No Open Cloud API key is used; account permissions
+    /// still apply.
     fn upload_asset_user_auth(
         cookie: &str,
         creator_id: &str,
@@ -546,9 +546,8 @@ impl RobloxApiClient {
         )
     }
 
-    /// Standard CSRF handshake: POST auth.roblox.com/v2/logout with the
-    /// cookie, read the fresh token from the 403 response's x-csrf-token
-    /// header (roblox-cookie-upload-endpoints.md §0).
+    /// Fetch a CSRF token by posting to `auth.roblox.com/v2/logout` with the
+    /// account cookie and reading the `x-csrf-token` response header.
     fn fetch_csrf_token(cookie: &str) -> Result<String, String> {
         let cookie = normalize_roblosecurity_cookie(cookie)?;
         let http = reqwest::blocking::Client::builder()
@@ -569,10 +568,9 @@ impl RobloxApiClient {
             .ok_or_else(|| "No x-csrf-token header in handshake response".into())
     }
 
-    /// Shared Assets API upload used by BOTH auth flavors (see
-    /// roblox-cookie-upload-endpoints.md §2): create the asset, poll the
-    /// operation, return the new asset id. `asset_type` is the asset type
-    /// string ("Animation", "Model", …).
+    /// Shared Assets API upload for Open Cloud and cookie authentication:
+    /// create the asset, poll the operation, and return the new asset id.
+    /// `asset_type` is an API asset-type string such as `Animation` or `Model`.
     ///
     /// - Open Cloud:  base `assets/v1`,        auth = `x-api-key`
     /// - user-auth:   base `assets/user-auth/v1`, auth = cookie + X-CSRF-TOKEN
@@ -883,15 +881,12 @@ impl RobloxApiClient {
         ))
     }
 
-    /// Team Create join negotiation (team-create-sessions-explained.md §1b):
-    /// `POST gamejoin.roblox.com/v1/team-create` (or `…/team-create-preemptive`
-    /// to warm the cloud-edit server up early) with
-    /// `{placeId, gameJoinAttemptId}` — the same request Studio's
-    /// CloudEditConnectionModel::constructTeamCreateGameJoinRequest builds.
-    /// The response is the join CONFIG: either `Address`/`Port` or a
-    /// `ServerPort` + `UdmuxEndpoints` list — i.e. where the UDP replication
-    /// socket would connect. We return the raw JSON for inspection; actually
-    /// speaking the RakNet replication protocol is the (future) engine part.
+    /// Negotiate a cookie-authenticated Team Create join configuration by
+    /// posting `{placeId, gameJoinAttemptId}` to `gamejoin.roblox.com/v1/team-create`
+    /// (or `.../team-create-preemptive` to request a server warm-up). Returns
+    /// the raw response JSON; endpoint parsing and transport attempts live in
+    /// `team_create.rs`. A successful response is not proof of a connected
+    /// BaseClient or accepted Team Create session.
     pub fn team_create_join(
         cookie: &str,
         place_id: &str,
@@ -4162,10 +4157,10 @@ impl WebClient {
         Ok(())
     }
 
-    // ---- Team Create (cloud edit) REST control plane -------------------------
-    // These are the exact routes Studio's ApiTeamCreateUrlConstruction builds
-    // (team-create-sessions-explained.md §1a) — Stage 0 of a Team Create
-    // client: session status, membership, and the on/off switch.
+    // ---- Team Create (cloud edit) REST controls ------------------------------
+    // These cookie-authenticated account-management requests cover status,
+    // membership, enable/disable, and join-config negotiation. They are separate
+    // from the transport and live-place replication code in team_create.rs.
 
     /// Is Team Create enabled for this universe?
     /// `GET develop.roblox.com/v1/universes/{id}/teamcreate` → {"isEnabled":bool}

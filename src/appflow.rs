@@ -1,10 +1,12 @@
 //! App=4 RbxTransport join-session flow.
 //!
-//! A faithful port of the post-handshake message sequence from the Boblox
-//! client (`session.cpp`): the control hello + openU burst, the channel-1
-//! early-auth / A7 / 0x90 / 0x92 / 0x8A / 0x8F burst, the 0x9B challenge
-//! solve-and-answer (via [`crate::challenge`]), and the route declarations
-//! sent ~60 ms after the answer.
+//! This models the observed post-handshake sequence from the Boblox client
+//! (`session.cpp`): the control hello + openU burst, attempts at the channel-1
+//! early-auth / A7 / 0x90 / 0x92 / 0x8A / 0x8F burst, local 0x9B challenge solving (via
+//! [`crate::challenge`]), and route declarations scheduled about 60 ms after
+//! the local solve. These queued actions do not confirm peer receipt.
+//! It is a partial protocol implementation, not proof of native BaseClient
+//! connection or Team Create acceptance.
 //!
 //! This module is pure logic: it receives raw stream bytes and emits
 //! [`Action`]s. The QUIC session (`team_create.rs`) executes the actions
@@ -31,8 +33,8 @@ const TEMPLATE_90: &[u8] = include_bytes!("../data/appflow/rbx90_template.bin");
 /// The real 99-byte 0xA7 client-auth frame captured from a native client.
 const A7_REAL: &[u8] = include_bytes!("../data/appflow/rbxa7_real.bin");
 
-/// Route declarations sent on channel 11 ~60 ms after the 0x9B answer
-/// (sessioncap s0019-s0022).
+/// Route declarations scheduled on channel 11 about 60 ms after local
+/// challenge solving; this client-side timer does not imply peer receipt.
 const ROUTES: &[&str] = &[
     "a60101000114000000140000000000",
     "a60201000118000000180000000000040400",
@@ -53,13 +55,9 @@ pub enum A7Mode {
 
 /// Runtime override for which 0xA7 the join flow sends.
 ///
-/// The captured A7 is a 99-byte replay from one session against one place, and
-/// the binary has a libsodium Ed25519 signing subsystem next to
-/// `ScriptRegistrationService`. If the frame attests that place's script hashes
-/// then a join against any other place is rejected while every other byte of
-/// the burst is correct - and the server sends no reason phrase. Selecting the
-/// mode from the UI turns that from an open question into three join attempts
-/// in one build.
+/// The real mode replays the captured 99-byte frame; the other modes send the
+/// empty frame or omit it. This enum describes client behavior only; it does not
+/// establish server requirements or interpret the frame's semantics.
 static A7_MODE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Choose which 0xA7 variant subsequent join flows send.
@@ -85,27 +83,9 @@ pub fn a7_mode_label(mode: A7Mode) -> &'static str {
     }
 }
 
-/// Which application byte the control stream header carries.
-///
-/// Every session that stayed up 3-7 seconds sent app 0 here. Since it was
-/// changed to 4 - to match the reference client's `openStream(APP, CTRL)` -
-/// every session has been closed by the peer at ~160 ms with application error
-/// 0x10000000110 and no reason phrase. Nothing on the wire said 0 was wrong:
-/// the server itself opens control streams under *both* app 0 and app 4, which
-/// is why app 0 parsed fine and hid the difference. The reference client is also
-/// not 0.741, whose `BaseClient::openSendChannel` uses application 1.
-///
-/// The correlation is forward - the byte changed, then the behaviour changed -
-/// but it is still only a correlation, so all three values are reachable from
-/// one build rather than guessing between them.
-///
-/// The 0.741 decompile is the strongest evidence for 0, and it was the reason
-/// for the original value: `RtcIoBaseConnection::updateTransportConnReadyState`
-/// and `RtcIoServerConnection::start` both call `initializeAppContext(this, 0)`
-/// followed by `initializeChannelContext(this, 0, 0x6374726C, 0, 1, 0, 1)`.
-/// chan1 stays at [`APP`] because nothing says otherwise for it; the open
-/// question is whether ctrl is transport-owned (app 0) while application
-/// channels sit on a higher app id.
+/// Application byte configured for the control-stream header. The default is
+/// zero; the UI can select 0, 1, or 4 for a flow attempt. This setting is
+/// independent of [`APP`], which identifies the join-data application streams.
 static CTRL_APP_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Choose the control stream's application byte for subsequent join flows.
@@ -167,12 +147,13 @@ pub enum FlowEvent {
     Log(String),
     /// A complete 0x9B challenge frame was received on channel 1.
     ChallengeReceived { u1: u32, u2: u32, blob_len: u32 },
-    /// The challenge was solved locally and the answer sent.
+    /// The challenge was solved locally and a response action was generated.
+    /// This event does not report write success, peer receipt, or acceptance.
     ChallengeAnswered { answer: u32, elapsed_ms: u64 },
-    /// Local solving failed; the session will not reach the connected stage.
+    /// Parsing the received 0x9B frame or solving its challenge failed.
     ChallengeFailed(String),
-    /// Post-answer traffic arrived on channel 1 (world state / peer
-    /// assignment) — the BaseClient "connected" milestone.
+    /// Channel-1 traffic arrived after a 0x9B frame was seen. This is a local
+    /// diagnostic milestone, not confirmation of native BaseClient connection.
     ConnectedStageReached { detail: String },
 }
 
@@ -645,6 +626,7 @@ pub struct AppFlow {
     marker_id: u32,
     markers_acked: u64,
     routes_at_ms: i64,
+    // Channel-1 bytes received after the flow has seen a 0x9B frame.
     post_answer_bytes: u64,
     post_answer_reported: bool,
     now_ms: u64,
@@ -698,10 +680,13 @@ impl AppFlow {
         }
     }
 
+    /// Whether a valid challenge was solved locally and a response action built.
+    /// This does not confirm that the peer received or accepted the response.
     pub fn answered(&self) -> bool {
         self.answered
     }
 
+    /// Channel-1 bytes received after a 0x9B frame was seen (legacy name).
     pub fn post_answer_bytes(&self) -> u64 {
         self.post_answer_bytes
     }
@@ -911,8 +896,8 @@ impl AppFlow {
         if (app, chan) == (APP, 1) {
             self.chan1_rx.extend_from_slice(data);
             if self.chan1_rx.len() > 16 << 20 {
-                // The challenge walk only needs a bounded tail; keep the
-                // buffer from growing for long replication sessions.
+                // Challenge/marker parsing needs only a bounded tail; cap
+                // receive-buffer growth in long-lived sessions.
                 self.chan1_rx.drain(..(self.chan1_rx.len() - (4 << 20)));
             }
             if self.challenge_seen {
@@ -920,7 +905,7 @@ impl AppFlow {
                 if !self.post_answer_reported {
                     self.post_answer_reported = true;
                     self.events.push(FlowEvent::ConnectedStageReached {
-                        detail: format!("post-answer channel-1 traffic: {}B (world state / peer assignment)", data.len()),
+                        detail: format!("channel-1 traffic after the 0x9B frame: {}B", data.len()),
                     });
                 }
             }
@@ -1066,11 +1051,8 @@ impl AppFlow {
         out
     }
 
-    /// Which 0x90 fields came from this session and which are still captured.
-    /// Which 0xA7 and control application byte this session sent.
-    ///
-    /// Both are user-selectable, so a pass/fail result cannot be attributed
-    /// without them, and a log line the operator never sees is not a result.
+    /// The selected 0xA7 mode and control-stream application byte.
+    /// These settings are user-selectable, so include them in the session report.
     pub fn flow_config_summary(&self) -> String {
         format!(
             "0xA7 = {}, control stream application = {}",
@@ -1079,6 +1061,7 @@ impl AppFlow {
         )
     }
 
+    /// Which 0x90 template fields were refreshed from this session versus kept.
     pub fn join90_report(&self) -> &str {
         if self.join90_report.is_empty() {
             "0x90 was not built"
@@ -1095,7 +1078,7 @@ impl AppFlow {
     /// How the queued-write drain went.
     pub fn drain_summary(&self) -> &str {
         if self.drain_summary.is_empty() {
-            "nothing was queued"
+            "no initial-burst bytes remained queued for retry"
         } else {
             &self.drain_summary
         }
@@ -1175,7 +1158,7 @@ impl AppFlow {
             .unwrap_or((0, 0))
     }
 
-    /// Walk chan1 for a complete 0x9B frame; solve and answer.
+    /// Find a complete 0x9B frame, solve it locally, and generate a response action.
     fn try_challenge(&mut self) -> Vec<Action> {
         if self.challenge_seen {
             return Vec::new();
@@ -1185,10 +1168,8 @@ impl AppFlow {
         };
         let msg = &self.chan1_rx[off..off + len];
         let Some((blob, u1, u2)) = challenge::extract_challenge(msg).ok() else {
-            // A frame with the 0x9B tag arrived but did not parse. Saying nothing
-            // here made that look identical to "no challenge was ever sent", which
-            // is the difference between a wrong reader and a protocol that does not
-            // use one - so report the bytes instead of going quiet.
+            // A frame with the 0x9B tag arrived but did not parse. Report its
+            // bytes so this is distinguishable from receiving no challenge frame.
             self.challenge_seen = true; // do not re-scan the same frame forever
             let head: Vec<String> = msg
                 .iter()
@@ -1245,7 +1226,7 @@ impl AppFlow {
             }
         }
         self.log(format!(
-            "answer 0x{} sent (u1=0x{} u2=0x{}, solved in {}ms)",
+            "response action generated for answer 0x{} (u1=0x{} u2=0x{}, solved in {}ms)",
             hex32(report.answer),
             hex32(report.u1),
             hex32(report.u2),
@@ -1267,7 +1248,7 @@ impl AppFlow {
         }
     }
 
-    /// Timer tick: fires the route declarations ~60 ms after the answer.
+    /// Fire route declarations about 60 ms after the local challenge solve.
     pub fn on_tick(&mut self, now_ms: u64) -> Vec<Action> {
         self.now_ms = now_ms;
         if self.routes_at_ms >= 0 && now_ms as i64 >= self.routes_at_ms {

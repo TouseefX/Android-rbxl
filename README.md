@@ -1,130 +1,177 @@
-# rbxl Editor (Android, Rust)
+# rbxl Editor
 
-A Roblox place (`.rbxl`) editor for Android, written in Rust: it parses/writes
-place files with `rbx_binary`/`rbx_dom_weak`, renders the 3D viewport with
-**Bevy**, and draws the editor UI with **egui** (via `bevy_egui`) on top of it.
-Scripts can be edited inline or handed off to an external editor app
-(QuickEdit, Acode, …) and synced back on return.
+An Android-first editor for Roblox place and model files, written in Rust. The
+main application uses Bevy for the 3D viewport and egui for the editor UI; a
+Kotlin `GameActivity` host supplies Android file, clipboard, keyboard, and native
+script-editor integration. It edits local files and selected Roblox web APIs;
+it is not Roblox Studio or a full Roblox game runtime.
 
-## Build system: xbuild + GameActivity
+## What it does
 
-The APK is built with [`xbuild`](https://github.com/rust-mobile/xbuild)
-(`x build`), **not** `cargo-apk2`.
+- Open, edit, and save binary or XML places (`.rbxl`, `.rbxlx`); import and
+  export models (`.rbxm`, `.rbxmx`).
+- Browse the DataModel, edit properties, insert instances, and inspect a 3D
+  viewport. Meshes and textures are fetched when needed and available.
+- Preview common `ScreenGui`, `BillboardGui`, and `SurfaceGui` content. This is
+  an editor preview, not Roblox's runtime UI engine.
+- Edit Luau in the egui editor or the Android Sora editor, with syntax
+  assistance and project-aware completion. Scripts can also be handed off to
+  an external Android editor and synchronized back into the open place.
+- Run Luau snippets and compatible plugins in the embedded sandbox. A separate
+  companion plugin can send Command Bar snippets to a connected Studio session.
+- Use selected Creator Store, Open Cloud, and cookie-authenticated Roblox API
+  operations. Features that access Roblox require network access and may require
+  an API key or a saved `.ROBLOSECURITY` cookie.
 
-* The app's Activity extends `com.google.androidgamesdk.GameActivity` from the
-  `androidx.games:games-activity` AAR. GameActivity is what provides a real
-  `InputConnection` (GameTextInput), so Gboard/Samsung keyboard input — and
-  paste — work in egui text fields. `NativeActivity` cannot do that.
-* `cargo-apk2` compiles Java by shelling out to `javac` with only `android.jar`
-  on the classpath. It has no notion of Maven/AAR dependencies, so the
-  GameActivity class was never on the classpath and the build failed with 37
-  `cannot find symbol` errors for every inherited method.
-* `xbuild` with `gradle: true` generates a real Gradle/AGP project, so AAR
-  dependencies resolve from Google's Maven repo and the Activity compiles like
-  in any native Android app.
+Team Create join and transport support is experimental. The app can negotiate a
+join and run legacy RakNet connection probes or an RbxTransport QUIC/TLS path
+(with an app=4 post-handshake flow when the required fields are available). It
+does not replicate a live place into the editor or provide Studio's full
+connected state. A successful handshake or observed flow traffic does not prove
+native BaseClient connection or Team Create acceptance.
 
-### Layout
+## Studio companion plugin
 
-| Path | What it is |
-| --- | --- |
-| `manifest.yaml` | xbuild project config: package id, SDK levels, permissions, activity, Maven deps. Replaces the old `[package.metadata.android]` tables. |
-| `kotlin/MainActivity.kt` | The `GameActivity` subclass + the JNI surface used by `src/jni_bridge.rs`. xbuild copies every file in `kotlin/` into the generated Gradle project (flat — no package sub-directories). |
-| `src/` | The Rust app (`cdylib` `librbxl_editor.so` + an rlib for the desktop runner). |
-| `.github/workflows/main.yml` | CI: cross-compiles, generates the Gradle project, builds, zipaligns and signs the APK. |
-
-### Building an APK locally
+The optional Live Session WebSocket listens on loopback port `41742` by default.
+Run the desktop editor and Studio on the same computer. If the editor is running
+on Android, create a port forward on the host before connecting:
 
 ```sh
-cargo install --locked --git https://github.com/rust-mobile/xbuild xbuild
-rustup target add aarch64-linux-android
-
-# xbuild compiles against ~/.cache/x/Android.ndk. Its bundled sysroot is from
-# 2022 and has no API-34 stubs, so point it at a real NDK (r27+) instead:
-ln -sfn "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" ~/.cache/x/Android.ndk
-export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-
-x doctor                       # checks clang/llvm, java, gradle, adb
-x build --release --platform android --arch arm64 --format apk
-# -> target/x/release/android/rbxl-editor.apk   (unsigned; see CI for signing)
+adb forward tcp:41742 tcp:41742
 ```
 
-Note that xbuild's Gradle template pins AGP 7.3.0 / Kotlin 1.7.20, which is too
-old for `compileSdk 34` and current AndroidX artifacts. CI overrides those
-plugin versions with a Gradle init script (see
-`.github/workflows/main.yml`); do the same locally if the Gradle step fails.
+Keep the app's port setting and the plugin's `PORT` value in sync. The editor
+currently uses the bridge to run Command Bar snippets in Studio; the plugin's
+selection, undo/redo, and shallow place-summary handlers are not wired into the
+editor UI, and the bridge does not synchronize the Studio DataModel.
 
-`x run --device adb:<id>` builds, installs and streams logcat to a connected
-phone.
+## Project layout
 
-### Desktop runner
+| Path | Purpose |
+| --- | --- |
+| `Cargo.toml` | Main Rust app. Builds the Android `cdylib` and the desktop runner. |
+| `src/` | Editor UI, file codecs, renderer, Luau tools, Roblox APIs, and transport code. |
+| `kotlin/MainActivity.kt` | Android `GameActivity`, file/clipboard bridges, and Sora script editor. |
+| `kotlin/LuauLanguage.kt` | Luau language support for the Sora editor. |
+| `src/android_ime.rs` | Android GameTextInput-to-egui keyboard and clipboard bridge. |
+| `manifest.yaml` | xbuild Android package, SDK, permission, and Maven dependency configuration. |
+| `assets/companion_plugin.lua` | Optional Roblox Studio companion plugin for the Live Session bridge. |
+| `renderer/` | Standalone renderer sandbox; separate from the main editor app. |
+| `.github/workflows/main.yml` | Host checks, Android target checks, and APK packaging. |
+
+## Run the desktop editor
 
 ```sh
 cargo run --bin rbxl-editor-desktop -- /path/to/place.rbxl
 ```
 
-### Version pinning
+The root crate's desktop runner uses the same Bevy/egui editor as Android. The
+separate `renderer/` package is an independent rendering sandbox, not a
+prerequisite for running the editor.
 
-`android-activity` (the GameActivity glue Bevy links through its
-`android-game-activity` feature) is pinned to `0.6.1` in `Cargo.toml`, and
-`manifest.yaml` requests `androidx.games:games-activity:4.4.0` — the AAR
-version that release expects. **Bump both together**, otherwise you get an
-`UnsatisfiedLinkError` for `GameActivity.initializeNativeCode` at startup.
+## Build an Android APK
 
-## Text input (soft keyboard, IME, paste)
+The checked-in CI configuration uses Rust nightly for the app build, Android
+NDK r27c, Java 17, Gradle 8.11.1, AGP 8.7.3, Kotlin Gradle plugin 2.1.21, and a
+pinned xbuild revision. Install those tools (including the Android SDK build
+tools) before building. On a Linux x86-64 host, set `ANDROID_NDK_HOME` to the
+installed NDK directory and install the pinned xbuild revision. Native
+Android dependency builds use API 26 (the app's `minSdk`); the generated Gradle
+project targets SDK level 34 from the manifest:
 
-GameActivity is necessary for text input but it is **not sufficient**: nothing
-in the Bevy stack consumes GameTextInput.
+```sh
+rustup toolchain install stable --profile minimal
+rustup toolchain install nightly --profile minimal
+rustup target add aarch64-linux-android --toolchain nightly
+# The pinned xbuild starts `cargo` by name and inherits this Rustup selection.
+export RUSTUP_TOOLCHAIN=nightly
 
-* `winit` 0.30's Android backend only translates `InputEvent::KeyEvent` /
-  `MotionEvent`; it ignores `MainEvent::TextInputEvent` and always sets
-  `KeyEvent::text = None`.
-* `Window::set_ime_allowed()` is an empty stub on Android, so nothing ever asks
-  the system to raise the soft keyboard.
+cargo +stable install --locked \
+  --git https://github.com/rust-mobile/xbuild \
+  --rev e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1 xbuild
 
-So a focused egui `TextEdit` would blink a caret and receive nothing.
-`src/android_ime.rs` closes that gap by talking to `android-activity` directly,
-bypassing winit:
+export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
+export ANDROID_HOME="$ANDROID_SDK_ROOT"
+export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+export ANDROID_PLATFORM=android-26
+export ANDROID_API_LEVEL=26
+NDK_HOST="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+mkdir -p "$HOME/.cache/x"
+# If Android.ndk exists as a real directory, inspect it and move it aside first.
+ln -sfnT "$NDK_HOST/sysroot" "$HOME/.cache/x/Android.ndk"
+export PATH="$NDK_HOST/bin:$PATH"
+```
 
-* **End of each egui pass** — if `ctx.wants_keyboard_input()` just became true,
-  configure the IME (`set_ime_editor_info`: multi-line, no autocorrect,
-  `IME_FLAG_NO_FULLSCREEN`), seed the GameTextInput buffer and call
-  `show_soft_input()`. When focus is lost, `hide_soft_input()`.
-* **Start of each egui pass** — poll `AndroidApp::text_input_state()` and diff
-  it against our mirror of the buffer. Inserted text becomes
-  `egui::Event::Text` (newlines become `Key::Enter`), removed characters become
-  `Key::Backspace`. Samsung Keyboard's replaceable composing regions are sent
-  as egui `ImeEvent::Preedit`/`Commit` events instead of destructive repeated
-  backspaces, supporting predictive, Korean, handwriting, and heavily modified
-  Samsung keyboard modes. Gboard's clipboard chip commits through the same
-  `InputConnection`, so **paste works through this path**.
-* egui's copy/cut (`OutputCommand::CopyText`) is forwarded to Android's
-  `ClipboardManager` via the existing JNI bridge, and Ctrl+V on a hardware
-  keyboard pushes `egui::Event::Paste` from the system clipboard.
+For another host OS, use the matching NDK `prebuilt/<host>` directory. xbuild's
+generated Gradle project needs the plugin versions used by CI. Create the
+`~/.gradle/init.d` directory if needed, then save the following as
+`~/.gradle/init.d/xbuild-overrides.gradle`:
 
-The buffer keeps a small run of leading spaces as padding so a Backspace
-pressed before anything has been typed still registers, and it is re-seeded
-when that padding is consumed.
+```groovy
+settingsEvaluated { settings ->
+    settings.pluginManagement.resolutionStrategy.eachPlugin { details ->
+        def id = details.requested.id.id
+        if (id == 'com.android.application' || id == 'com.android.library') {
+            details.useModule('com.android.tools.build:gradle:8.7.3')
+        } else if (id == 'org.jetbrains.kotlin.android') {
+            details.useModule('org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.21')
+        }
+    }
+}
+```
 
-Debugging: `adb logcat -s rbxl_editor` shows `android_ime: keyboard shown` /
-`hidden` on every focus change.
+Then check the local toolchain and build:
 
-**Known limitation:** the activity is fullscreen with the system bars hidden,
-so `windowSoftInputMode=adjustResize` cannot shrink the window — the keyboard
-overlays the bottom of the screen instead of pushing the UI up. If a field ends
-up underneath it, the fix is to read `AndroidApp::content_rect()` while the IME
-is up and reserve that much space at the bottom of the egui layout.
+```sh
+x doctor
+x build --release --platform android --arch arm64 --format apk
+```
 
-## Third-party licenses
+The local APK is written to
+`target/x/release/android/rbxl-editor.apk` and is unsigned. The command above
+uses Rustls by default: that backend verifies the expected raw public key but
+does not add the 0xFF00 extension and does not send SNI for the configured IP
+address. `ossl-tls` switches to OpenSSL, registers the RbxTransport 0xFF00
+ClientHello extension, and sets SNI to the configured IP literal; it requires
+an Android OpenSSL build at version 3.5.0 or later. The current OpenSSL configuration disables
+peer verification, so a successful handshake is not authenticated; do not use
+that feature for trusted sessions until verification is re-enabled. The CI
+workflow compiles OpenSSL 3.5.9, builds with `--features ossl-tls`, and signs its
+test artifact with a per-run key; use your own persistent signing key for an
+app you intend to distribute or update. To
+install and run on a connected device, use
+`x run --device adb:<device-id>`.
 
-The native script editor uses
-[sora-editor](https://github.com/Rosemoe/sora-editor) (`io.github.Rosemoe.sora-editor:editor`),
-copyright Rosemoe, licensed under the
-[GNU LGPL v2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt).
+### Android activity version pairing
 
-It is consumed as an **unmodified binary AAR** resolved from Maven Central at
-build time. No sora-editor source is vendored into or modified by this
-repository, so the library remains dynamically linked in the sense the LGPL
-requires, and only sora-editor itself stays under the LGPL — this project's own
-sources are unaffected. To use a different build of the library, replace the
-`io.github.Rosemoe.sora-editor:editor` coordinate in `manifest.yaml` and
-rebuild.
+`android-activity` is pinned to `0.6.1` in `Cargo.toml`, while
+`manifest.yaml` declares `androidx.games:games-activity:4.4.0`. Keep these
+versions in sync when upgrading: Bevy's GameActivity glue and the Android AAR
+must expose matching JNI entry points.
+
+## Android text input
+
+GameActivity provides the Android `InputConnection`, but Bevy/winit does not
+currently translate all GameTextInput state into egui events. `src/android_ime.rs`
+therefore polls GameTextInput directly: it forwards committed text, backspace,
+newlines, and composing text to egui, and routes copy/paste through Android's
+clipboard. `MainActivity` applies the keyboard's bottom inset to the content
+root; the manifest uses `adjustNothing` because resizing the native surface is
+not reliable on every device.
+
+## CI and tests
+
+The workflow runs host checks and selected regression tests, checks the Android
+target without packaging an APK, and reports the full library test suite
+separately. APK packaging runs on manual dispatch and on pushes to `arena/**`;
+it is skipped for ordinary pushes to `master`.
+
+## Third-party components
+
+The Android native script editor uses the Sora editor AAR declared in
+`manifest.yaml`, distributed under LGPL v2.1. The AAR is resolved at build time
+and bundled into the APK; this repository does not vendor its source. Anyone
+redistributing a built APK should review the upstream license and ensure the
+distribution meets its requirements. Roblox Builder fonts and their license
+notes are documented in `content/fonts/README.md`.

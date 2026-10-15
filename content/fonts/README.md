@@ -1,7 +1,9 @@
 # Roblox Builder fonts
 
-These font files are used only to render Roblox experience UI previews accurately.
-They were retrieved from the Roblox Builder font collection at:
+The app registers these files as named egui font families, then requests those
+families only while rendering Roblox experience UI previews. The ordinary editor
+UI continues to use egui's default font families. They were retrieved from the
+Roblox Builder font collection at:
 
 https://github.com/Shuiux/Roblox-Builder-Fonts
 

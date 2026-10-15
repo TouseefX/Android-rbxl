@@ -51,18 +51,17 @@ import org.json.JSONArray
 /**
  * Host Activity for the Rust/Bevy editor.
  *
- * It extends [GameActivity] (androidx.games:games-activity) rather than
- * `NativeActivity`, which is what gives us GameTextInput: a real
- * `InputConnection`, so Gboard / Samsung keyboard editing *and paste* work in
- * the egui text fields. The Rust side must be built with the
- * `android-game-activity` backend (see `Cargo.toml`) so that
- * `android-activity`'s GameActivity glue is linked in.
+ * It extends [GameActivity] (androidx.games:games-activity), which exposes
+ * GameTextInput through a real Android `InputConnection`. Rust's
+ * `android_ime.rs` polls that input state and forwards edits to egui; Android
+ * clipboard access is handled separately through JNI. The Rust side must use
+ * the `android-game-activity` backend (see `Cargo.toml`) so the matching
+ * `android-activity` GameActivity glue is linked in.
  *
- * Everything below the lifecycle methods is the JNI surface used by
- * `src/jni_bridge.rs`:
- *  - `*Static` helpers are called *from* Rust (`call_static_method`), so their
- *    names and JVM signatures must stay in sync with `jni_bridge.rs`.
- *  - `native*` methods are *implemented in* Rust
+ * The JNI surface shared with `src/jni_bridge.rs` consists of:
+ *  - `*Static` helpers called from Rust (`call_static_method`), whose names and
+ *    JVM signatures must stay in sync with the Rust bridge.
+ *  - `native*` methods implemented in Rust
  *    (`Java_com_yourname_rbxleditor_MainActivity_*`).
  */
 class MainActivity : GameActivity() {
@@ -98,9 +97,9 @@ class MainActivity : GameActivity() {
         // path — so saved settings never came back after a restart.
         sInstance = this
 
-        // Let Android resize the native surface above the Samsung/Gboard IME.
-        // Edge-to-edge (`false`) prevents adjustResize on several One UI builds
-        // and leaves the editor hidden behind the keyboard.
+        // Keep the content inside the decor view's normal inset layout. The
+        // GameActivity surface is adjusted separately using explicit IME insets
+        // below; relying on adjustResize is unreliable on some Samsung devices.
         WindowCompat.setDecorFitsSystemWindows(window, true)
         hideSystemUi()
         super.onCreate(savedInstanceState)
@@ -120,17 +119,17 @@ class MainActivity : GameActivity() {
     override fun onResume() {
         super.onResume()
         hideSystemUi()
-        // Whenever the user switches back to the app, auto-sync any script that
-        // was modified in an external editor.
+        // On return, import changes from the active external script and from
+        // any modified files in the exported project folder.
         checkExternalFileUpdate(false)
         syncExportedProject()
     }
 
     /**
-     * GameActivity owns a native SurfaceView, and on some Samsung One UI
-     * versions the normal adjustResize flag does not resize that surface.
-     * Apply the IME inset to the content FrameLayout explicitly so Bevy's
-     * drawable area ends above the keyboard instead of being covered by it.
+     * GameActivity owns a native SurfaceView, which is not reliably resized by
+     * adjustResize on some Samsung devices. Use adjustNothing and apply the
+     * visible IME bottom inset as padding on the content root so Bevy's
+     * drawable area remains above the keyboard.
      */
     private fun installImeResizeHandling() {
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
@@ -460,10 +459,10 @@ class MainActivity : GameActivity() {
     }
 
     /**
-     * Script editor built on sora-editor: the gutter, syntax highlighting,
-     * bracket pairing, smart Enter and the completion window all come from
-     * the library, so the only wiring left here is the toolbar, the symbol
-     * row and the Rust intelligence bridge.
+     * Build the Sora-based Luau editor. Sora supplies the native editing view,
+     * gutter, and completion UI; LuauLanguage configures syntax, pair/newline
+     * rules, and Rust-backed completion. This method wires those pieces to the
+     * toolbar, signature-help view, symbol row, and Rust callbacks.
      */
     private fun showSoraEditor(scriptId: Long, fileName: String, source: String, initialCursor: Int) {
         // Runs on the UI thread already: the caller wraps this in
@@ -531,12 +530,9 @@ class MainActivity : GameActivity() {
             setWordwrap(nativeEditorWordWrap)
             tabWidth = INDENT_WIDTH
             isHighlightCurrentLine = true
-            // Two completion requests closer together than this are dropped
-            // and the window is hidden. The 70ms default assumes a language
-            // that answers instantly; ours makes a round trip to the Rust
-            // index, so ordinary typing kept landing inside the window and
-            // the popup only appeared after a pause -- which is why typing a
-            // space and deleting it "fixed" it. Effectively disabled.
+            // Disable Sora's default 70ms completion-cancellation delay. These
+            // requests round-trip to the Rust index; LuauLanguage applies a
+            // bounded wait and discards replies for superseded requests.
             getProps().cancelCompletionNs = 0L
             // Backspace removes a whole indent level (tabWidth spaces) at
             // once when the caret sits in a line's leading whitespace, the
@@ -574,8 +570,8 @@ class MainActivity : GameActivity() {
             editor.post { requestNativeSignatureHelp() }
         }
 
-        // Position the caret by translating the Rust character index into
-        // the (line, column) pair sora addresses text with.
+        // `initialCursor` is a UTF-16 offset from Rust; use Sora's indexer to
+        // convert it into the line/column coordinates required by the editor.
         val caret = editor.text.getIndexer().getCharPosition(
             initialCursor.coerceIn(0, normalizedSource.length)
         )
