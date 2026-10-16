@@ -532,6 +532,11 @@ const RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES: usize = 6;
 const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE: u8 = 2;
 const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES: usize = 10;
 const RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE: u8 = 3;
+/// The tag this client writes to open a control stream: a two-byte record of
+/// `00 00`. A live 0.741 server sent the same two bytes back on both of its
+/// control streams, so the record is counted as a no-op instead of being reported
+/// as an unknown tag - its content is nothing, which is the whole finding.
+const RBX_TRANSPORT_CONTROL_NOOP_TYPE: u8 = 0;
 const RBX_TRANSPORT_MAX_CONTROL_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(not(test))]
 const RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS: usize = 24;
@@ -1545,6 +1550,8 @@ enum RbxTransportControlMessage {
     /// Native type 3 is three QUIC-style variable-length integers. Their
     /// exact semantic names are intentionally left unspecified here.
     CloseUnreliable { fields: [u64; 3] },
+    /// A `00`-tagged record: no fields, nothing to dispatch.
+    Noop,
     Unknown { tag: u8 },
 }
 
@@ -1626,6 +1633,7 @@ impl RbxTransportControlDecoder {
                         wire_channel_id: u32::from_be_bytes([body[6], body[7], body[8], body[9]]),
                     })
                 }
+                RBX_TRANSPORT_CONTROL_NOOP_TYPE => Some(RbxTransportControlMessage::Noop),
                 RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE => {
                     let mut fields = [0u64; 3];
                     let mut offset = 1usize;
@@ -2860,7 +2868,7 @@ async fn attempt_rbx_transport_connection_async(
                     }
                 }
             }
-            burst_skipped.extend(flow.skipped().iter().cloned());
+            burst_skipped.extend(flow.take_skipped());
             if !plan.join_ticket_note.is_empty() {
                 burst_skipped.push(plan.join_ticket_note.clone());
             }
@@ -2925,7 +2933,7 @@ async fn attempt_rbx_transport_connection_async(
     // the replication plane did. Nothing here implies the peer asked for it.
     if let Some(flow) = join_flow.as_mut() {
         flow.request_snapshot_apply();
-        burst_skipped.extend(flow.skipped().iter().cloned());
+        burst_skipped.extend(flow.take_skipped());
         for event in flow.drain_events() {
             if let (Some(tx), Some(event)) = (event_tx.as_ref(), rbx_transport_flow_event(event))
             {
@@ -4048,7 +4056,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         "persistent receive/dispatch loop"
     };
     let mut summary = format!(
-        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes, 1 MiB receive-buffer drops {}); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); app-body type-1/OpenReliable-shaped candidates {} (second-header semantics unresolved); body-read errors {}.",
+        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes, 1 MiB receive-buffer drops {}); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, type-0 no-ops {}, unknown tags {}); app-body type-1/OpenReliable-shaped candidates {} (second-header semantics unresolved); body-read errors {}.",
         started.elapsed().as_millis(),
         snapshot.accepted_uni_streams,
         snapshot.accepted_bi_streams,
@@ -4064,6 +4072,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         snapshot.reliable_open_on_control,
         snapshot.unreliable_opens,
         snapshot.unreliable_closes,
+        snapshot.control_noops,
         snapshot.unknown_control_tags,
         snapshot.application_body_open_reliable_candidates,
         snapshot.stream_read_errors,
@@ -4124,6 +4133,7 @@ struct RbxTransportReceiveStats {
     reliable_open_on_control: usize,
     unreliable_opens: usize,
     unreliable_closes: usize,
+    control_noops: usize,
     unknown_control_tags: usize,
     application_body_open_reliable_candidates: usize,
     stream_read_errors: usize,
@@ -4188,10 +4198,16 @@ fn dispatch_rbx_transport_control_message(
                     fields[0], fields[1], fields[2]
                 )
             }
+            RbxTransportControlMessage::Noop => {
+                stats.control_noops += 1;
+                format!(
+                    "stream {stream_id}: type-0 no-op record (the same two bytes this client sends to open a control stream), dispatch continued"
+                )
+            }
             RbxTransportControlMessage::Unknown { tag } => {
                 stats.unknown_control_tags += 1;
                 format!(
-                    "stream {stream_id}: unknown control tag 0x{tag:02x}; dispatch for this control stream stopped"
+                    "stream {stream_id}: unknown control tag 0x{tag:02x}; the record was skipped by length and the stream stays in sync"
                 )
             }
         };
@@ -6690,6 +6706,24 @@ mod tests {
             ]
         );
         assert!(decoder.pending.is_empty());
+
+        // A type-0 record is the peer's own control-stream hello: the same two
+        // bytes this client writes. It is named as a no-op, and the stream stays in
+        // sync so the records after it are still read.
+        let mut hello = RbxTransportControlDecoder::default();
+        assert_eq!(
+            hello.push(&framed(&[0x00, 0x00])).unwrap(),
+            vec![RbxTransportControlMessage::Noop]
+        );
+        assert!(!hello.desynchronized);
+        assert!(hello.pending.is_empty());
+        assert_eq!(
+            hello.push(&framed(&[1, 4, 0, 0, 0, 3])).unwrap(),
+            vec![RbxTransportControlMessage::OpenReliable {
+                application: 4,
+                channel_id: 3,
+            }]
+        );
 
         // An unknown tag has no verified inner layout, but the record length is
         // known, so the stream stays in sync instead of being abandoned - which

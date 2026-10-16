@@ -304,6 +304,11 @@ pub struct JoinChannel {
 /// keeps the per-channel byte accounting the session report shows.
 pub struct ChannelRouter {
     application: u32,
+    /// How many rows the profile contributed. This is not `channels.len()`:
+    /// byte accounting inserts a row for a channel that arrives outside the
+    /// profile, and the control channel does exactly that. A report that called
+    /// those entries "profile rows" was describing something else.
+    profile_rows: usize,
     local_parity: u8,
     allocator: LocalUnreliableIdAllocator,
     channels: BTreeMap<u32, JoinChannel>,
@@ -341,6 +346,7 @@ impl ChannelRouter {
         }
         Self {
             application,
+            profile_rows: profile.len(),
             local_parity,
             allocator: LocalUnreliableIdAllocator::new(local_parity),
             channels,
@@ -551,13 +557,22 @@ impl ChannelRouter {
         let mut gaps = Vec::new();
         let mut announced_unopened = Vec::new();
         let mut opened_unannounced = Vec::new();
+        let mut streamed_without_record = Vec::new();
         let mut unrouted = Vec::new();
         for (channel, entry) in &self.channels {
             if entry.peer_announced && !entry.self_opened {
                 announced_unopened.push(channel.to_string());
             }
             if entry.self_opened && !entry.peer_announced {
-                opened_unannounced.push(channel.to_string());
+                if entry.stream.is_some() {
+                    // A live 0.741 server opens the reliable channels as streams
+                    // and sends no open record for them at all. Not being able to
+                    // write those is real information, but it is not the same
+                    // failure as a channel nobody answered, so it is not a gap.
+                    streamed_without_record.push(channel.to_string());
+                } else {
+                    opened_unannounced.push(channel.to_string());
+                }
             }
             if entry.bytes == 0 && entry.channel != 0 {
                 unrouted.push(channel.to_string());
@@ -573,6 +588,12 @@ impl ChannelRouter {
             gaps.push(format!(
                 "opened here with no matching peer announcement: [{}]",
                 opened_unannounced.join(", ")
+            ));
+        }
+        if !streamed_without_record.is_empty() {
+            gaps.push(format!(
+                "peer opened a stream but sent no open record (read side only): [{}]",
+                streamed_without_record.join(", ")
             ));
         }
         if !unrouted.is_empty() {
@@ -615,9 +636,15 @@ impl ChannelRouter {
                     .map(|id| format!("chan{}=>{}", entry.channel, id))
             })
             .collect();
+        let outside = self.channels.len().saturating_sub(self.profile_rows);
+        let streamed_only = self
+            .channels
+            .values()
+            .filter(|entry| entry.self_opened && !entry.peer_announced && entry.stream.is_some())
+            .count();
         format!(
-            "{} profile rows ({} unreliable); staged {opened}, peer-announced {announced}, routed {routed} ({} frame(s), {bytes}B); local ids [{}]",
-            self.channels.len(),
+            "{} profile rows ({} unreliable), {outside} accounted outside the profile; staged {opened}, peer-announced {announced}, peer-streamed without a record {streamed_only}, routed {routed} ({} frame(s), {bytes}B); local ids [{}]",
+            self.profile_rows,
             unreliable,
             frames,
             ids.join(" ")
@@ -633,6 +660,40 @@ mod tests {
     fn profile_marks_the_four_known_unreliable_channels() {
         assert_eq!(unreliable_channels(&DEFAULT_CHANNEL_PROFILE), vec![3, 5, 6, 11]);
         assert_eq!(DEFAULT_CHANNEL_PROFILE.len(), CHANNEL_PROFILE_COUNT);
+    }
+
+    /// What a live 0.741 server does: it opens the reliable channels as streams
+    /// and sends no open record for any of them. The router has to report that as a
+    /// channel with one direction, not as a peer that ignored our open - and
+    /// accounting for the control stream must not inflate the row count the report
+    /// leads with.
+    #[test]
+    fn a_peer_stream_without_an_open_record_is_reported_as_one_direction_only() {
+        let mut router = ChannelRouter::new(crate::appflow::APP, &DEFAULT_CHANNEL_PROFILE);
+        router.stage_opens(ChannelOpenMode::FullProfile, 4);
+        router.note_stream(2, 99);
+        router.note_bytes(2, 10, 1);
+        // The control channel is not a profile row; bytes routed on it are still
+        // counted, but they belong to a fifteenth entry.
+        router.note_bytes(0x6374_726c, 68, 0);
+        let summary = router.summary();
+        assert!(summary.starts_with("14 profile rows"), "{summary}");
+        assert!(summary.contains("1 accounted outside the profile"), "{summary}");
+        assert!(summary.contains("peer-streamed without a record 1"), "{summary}");
+        let gaps = router.gaps();
+        assert!(
+            gaps.iter().any(|gap| {
+                gap.starts_with("peer opened a stream but sent no open record")
+                    && gap.contains(" 2")
+            }),
+            "{gaps:?}"
+        );
+        assert!(
+            !gaps
+                .iter()
+                .any(|gap| gap.contains("no matching peer announcement") && gap.contains(" 2")),
+            "channel 2 has a peer stream, so it is not an unanswered open: {gaps:?}"
+        );
     }
 
     /// The point where the recovered profile and the reference burst meet: the

@@ -1026,6 +1026,13 @@ impl AppFlow {
         &self.skipped
     }
 
+    /// The same notes, consumed. The session report collects them twice - once
+    /// after the initial actions and once after the receive loop - and reading the
+    /// list rather than draining it printed every skipped frame twice.
+    pub fn take_skipped(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.skipped)
+    }
+
     /// The session tells us which raw stream id an OpenStream action got.
     pub fn note_opened(&mut self, app: u32, chan: u32, stream: i64) {
         if (app, chan) == (APP, 1) {

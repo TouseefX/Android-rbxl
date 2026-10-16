@@ -53,6 +53,9 @@ pub const DELTA_CHAIN_TAG: u8 = 0x83;
 pub const JOIN_DATA_SUBCODE: u8 = 0x16;
 /// Compressed network schema / snapshot packet.
 pub const SNAPSHOT_TAG: u8 = 0x97;
+/// The peer's configuration table. A live 0.741 RbxTransport session sent this as
+/// the first and only frame of the join channel: 1869 bytes, 48 pairs.
+pub const CONFIG_TABLE_TAG: u8 = 0x93;
 /// Chain terminator.
 pub const CHAIN_END: u8 = 0x00;
 /// The implicit DataModel root every snapshot hangs from.
@@ -2131,6 +2134,109 @@ pub fn apply_join_snapshot(
     Ok(SnapshotApply { dom, stats, ids })
 }
 
+/// One entry of the peer's configuration table: two length-prefixed strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigPair {
+    pub key: String,
+    pub value: String,
+}
+
+/// A `0x93` frame: the table of configuration strings the peer sends on the join
+/// channel. The live capture this was written against pairs names like
+/// `UserAbilitiesUserInterfaceC` with values `true`/`false`, but nothing here
+/// interprets them: the entries are copied out verbatim, and a frame whose shape
+/// does not match is reported rather than read optimistically.
+#[derive(Clone, Debug, Default)]
+pub struct ConfigTable {
+    /// The single byte between the frame id and the entry count. Zero in the
+    /// capture; kept because it is there, not because it is understood.
+    pub header: u8,
+    /// The count the frame declares.
+    pub declared: usize,
+    /// The pairs actually readable.
+    pub pairs: Vec<ConfigPair>,
+    /// Bytes left in the frame after the last complete pair.
+    pub trailing: usize,
+}
+
+impl ConfigTable {
+    /// The value the peer gave for a key, if it named one.
+    pub fn value(&self, key: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find(|pair| pair.key == key)
+            .map(|pair| pair.value.as_str())
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "{} pair(s) of {} declared, {} byte(s) after the last pair",
+            self.pairs.len(),
+            self.declared,
+            self.trailing
+        )
+    }
+}
+
+/// One `<u16le length><bytes>` field of the table, advancing the cursor only when
+/// a complete field of valid text is there.
+fn read_config_text(cursor: &mut &[u8]) -> Option<String> {
+    let (low, rest) = cursor.split_first()?;
+    let high = *rest.first()?;
+    let len = usize::from(u16::from_le_bytes([*low, high]));
+    if len > rest.len() {
+        return None;
+    }
+    let (text, tail) = rest.split_at(len);
+    *cursor = tail;
+    String::from_utf8(text.to_vec()).ok()
+}
+
+pub fn parse_config_table(body: &[u8]) -> Result<ConfigTable, String> {
+    let context = "0x93 configuration table";
+    let Some((&id, rest)) = body.split_first() else {
+        return Err(format!("{context}: the frame is empty"));
+    };
+    if id != CONFIG_TABLE_TAG {
+        return Err(format!("{context}: the frame id is {id:#04x}"));
+    }
+    if rest.len() < 3 {
+        return Err(format!(
+            "{context}: {} byte(s) after the id, at least 3 of header needed",
+            rest.len()
+        ));
+    }
+    let header = rest[0];
+    let declared = usize::from(u16::from_le_bytes([rest[1], rest[2]]));
+    let mut cursor = &rest[3..];
+    let mut pairs = Vec::new();
+    while pairs.len() < declared {
+        let mark = *cursor;
+        let Some(key) = read_config_text(&mut cursor) else {
+            break;
+        };
+        let Some(value) = read_config_text(&mut cursor) else {
+            // A key without its value is not an entry: rewind so `trailing` counts
+            // every byte the table failed to deliver.
+            cursor = mark;
+            break;
+        };
+        pairs.push(ConfigPair { key, value });
+    }
+    let trailing = cursor.len();
+    if pairs.is_empty() {
+        return Err(format!(
+            "{context}: no readable pair in {trailing} byte(s) after the header ({declared} declared)"
+        ));
+    }
+    Ok(ConfigTable {
+        header,
+        declared,
+        pairs,
+        trailing,
+    })
+}
+
 /// Materialize one property value against the class's declared type. The raw
 /// extent came from [`skip_tagged_value`], so the length checks here are the
 /// second half of the same contract: a size that disagrees with the declared
@@ -2288,6 +2394,7 @@ fn varint_value(raw: &[u8]) -> Option<u64> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplicationNote {
     PeerInit(String),
+    Config(String),
     Schema(String),
     Batch(String),
     Applied(String),
@@ -2300,6 +2407,7 @@ impl ReplicationNote {
     pub fn text(&self) -> &str {
         match self {
             Self::PeerInit(text)
+            | Self::Config(text)
             | Self::Schema(text)
             | Self::Batch(text)
             | Self::Applied(text)
@@ -2323,6 +2431,8 @@ pub struct ReplicationStream {
     /// The built place, kept so the serialization, the applied id map and the
     /// diff baseline can all be asked for after the fact rather than rebuilt.
     snapshot: Option<SnapshotApply>,
+    /// The peer's configuration table, once a `0x93` frame has been read.
+    config: Option<ConfigTable>,
     notes: Vec<ReplicationNote>,
     pub frames: u64,
     pub bytes: u64,
@@ -2336,6 +2446,8 @@ pub struct ReplicationStream {
     pub clock_ticks: u64,
     pub stopped_chains: u64,
     pub unparsed: u64,
+    /// Entries recovered from the configuration table, whatever the frame count.
+    pub config_pairs: u64,
     /// Structural violations in the frame walk, kept apart from `unparsed`: a
     /// stream that dropped a bad length byte and resynchronized is a different
     /// failure from a stream that carried a message id nobody recognizes.
@@ -2355,6 +2467,7 @@ impl Default for ReplicationStream {
             apply_requested: false,
             applied: false,
             snapshot: None,
+            config: None,
             notes: Vec::new(),
             frames: 0,
             bytes: 0,
@@ -2368,6 +2481,7 @@ impl Default for ReplicationStream {
             clock_ticks: 0,
             stopped_chains: 0,
             unparsed: 0,
+            config_pairs: 0,
             walk_errors: 0,
             item_types: BTreeMap::new(),
         }
@@ -2441,6 +2555,21 @@ impl ReplicationStream {
                 };
                 self.notes.push(note);
             }
+            CONFIG_TABLE_TAG => match parse_config_table(&frame.body) {
+                Ok(table) => {
+                    self.config_pairs += table.pairs.len() as u64;
+                    let summary = table.summary();
+                    self.config = Some(table);
+                    self.notes.push(ReplicationNote::Config(format!(
+                        "0x93 configuration table: {summary}"
+                    )));
+                }
+                Err(error) => {
+                    self.unparsed += 1;
+                    self.notes
+                        .push(ReplicationNote::Warning(format!("{error} (frame left unread)")));
+                }
+            },
             SNAPSHOT_TAG => {
                 let note = match parse_snapshot_envelope(&frame.body) {
                     Ok(envelope) => match parse_join_schema(&envelope.inner) {
@@ -2710,6 +2839,17 @@ impl ReplicationStream {
         }
     }
 
+    /// The peer's configuration table, if a `0x93` frame arrived.
+    pub fn config(&self) -> Option<&ConfigTable> {
+        self.config.as_ref()
+    }
+
+    /// One value from the table by exact key. Keys and values are the peer's own
+    /// strings; nothing here decides what they mean.
+    pub fn config_value(&self, key: &str) -> Option<&str> {
+        self.config.as_ref().and_then(|table| table.value(key))
+    }
+
     pub fn snapshot_stats(&self) -> Option<&ApplyStats> {
         self.snapshot.as_ref().map(|applied| &applied.stats)
     }
@@ -2740,7 +2880,7 @@ impl ReplicationStream {
             .map(|(kind, count)| format!("0x{kind:02x} x{count}"))
             .collect();
         format!(
-            "{} frame(s) over {} byte(s); {} batch(es), {} record(s), {} shared string(s), {} skipped; {} chain(s): {} spawn(s), {} event(s), {} property update(s), {} clock tick(s), {} stopped; {} message(s) unrecognized, {} frame walk error(s); schema {}; snapshot {}; items [{}]",
+            "{} frame(s) over {} byte(s); {} batch(es), {} record(s), {} shared string(s), {} skipped; {} chain(s): {} spawn(s), {} event(s), {} property update(s), {} clock tick(s), {} stopped; {} message(s) unrecognized, {} frame walk error(s); schema {}; config {}; snapshot {}; items [{}]",
             self.frames,
             self.bytes,
             self.batches,
@@ -2756,6 +2896,10 @@ impl ReplicationStream {
             self.unparsed,
             self.walk_errors,
             if self.schema.is_some() { "received" } else { "not received" },
+            match &self.config {
+                Some(table) => table.summary(),
+                None => "not received".to_string(),
+            },
             if self.snapshot.is_some() {
                 "built"
             } else if self.apply_requested {
@@ -3427,6 +3571,68 @@ mod tests {
         assert_eq!(stream.frames, 2);
         assert!(stream.take_notes().is_empty(), "no note for an unknown id");
         assert!(stream.summary().contains("2 message(s) unrecognized"));
+    }
+
+    /// The opening bytes of a live join channel's first frame, from the session
+    /// report of 2026-10-16: a four-byte compact-varint length of 1869, the `0x93`
+    /// id, a zero header byte, a count of 48, then one complete pair. The rest of
+    /// that session's stream is not in this repository, so this is the fixture.
+    fn captured_config_frame() -> Vec<u8> {
+        let mut body = vec![CONFIG_TABLE_TAG, 0x00, 0x30, 0x00];
+        body.extend_from_slice(&27u16.to_le_bytes());
+        body.extend_from_slice(b"UserAbilitiesUserInterfaceC");
+        body.extend_from_slice(&5u16.to_le_bytes());
+        body.extend_from_slice(b"false");
+        body
+    }
+
+    #[test]
+    fn the_configuration_table_is_read_as_pairs_of_text() {
+        let body = captured_config_frame();
+        let table = parse_config_table(&body).expect("the captured prefix parses");
+        assert_eq!(table.header, 0);
+        assert_eq!(table.declared, 48);
+        assert_eq!(
+            table.pairs.len(),
+            1,
+            "one pair fits in the bytes we hold, and no more is invented"
+        );
+        assert_eq!(table.pairs[0].key, "UserAbilitiesUserInterfaceC");
+        assert_eq!(table.pairs[0].value, "false");
+        assert_eq!(table.trailing, 0, "the frame ended with the pair");
+        assert_eq!(table.value("UserAbilitiesUserInterfaceC"), Some("false"));
+        assert_eq!(table.value("not mentioned"), None);
+        assert!(table.summary().contains("1 pair(s) of 48 declared"));
+        // A key whose value is missing is not an entry, and a frame with no pair
+        // at all is an error rather than an empty table.
+        let truncated = vec![CONFIG_TABLE_TAG, 0x00, 0x02, 0x00, 0x03, 0x00, b'a', b'b', b'c'];
+        let error = parse_config_table(&truncated).unwrap_err();
+        assert!(error.contains("no readable pair"), "{error}");
+        assert!(parse_config_table(&[0x83, 0x00]).is_err(), "a wrong id is not a table");
+    }
+
+    #[test]
+    fn a_configuration_frame_is_named_by_the_stream_instead_of_counted_unrecognized() {
+        let mut stream = ReplicationStream::default();
+        assert_eq!(stream.push(&frame(captured_config_frame())), 1);
+        assert_eq!(stream.unparsed, 0, "0x93 is a message id this client knows");
+        assert_eq!(stream.config_pairs, 1);
+        assert_eq!(
+            stream.config_value("UserAbilitiesUserInterfaceC"),
+            Some("false")
+        );
+        let notes = stream.take_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| matches!(note, ReplicationNote::Config(_))),
+            "{notes:?}"
+        );
+        assert!(
+            stream.summary().contains("1 pair(s) of 48 declared"),
+            "{}",
+            stream.summary()
+        );
     }
 
     #[test]
