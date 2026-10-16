@@ -999,8 +999,9 @@ impl AppFlow {
         }
         let mut data = stream_header(APP, chan).to_vec();
         data.extend_from_slice(&payload);
+        let written = data.len();
         actions.push(Action::OpenStream { app: APP, chan, data });
-        self.log(format!("{what}: opening app={APP} chan={chan} ({}B)", data.len()));
+        self.log(format!("{what}: opening app={APP} chan={chan} ({written}B)"));
     }
 
     /// Queue stream bytes that could not be written yet.
@@ -1547,12 +1548,21 @@ impl AppFlow {
             return;
         }
         // `apply` builds the place once and keeps it, so a later tick can still
-        // pick up records that arrived after the marker.
-        let applied = self.replication.apply();
+        // pick up records that arrived after the marker. It hands back a borrow of
+        // the stream, so reduce it to an owned verdict right here: holding that
+        // borrow across the `&mut self` calls below is what the borrow checker
+        // refuses, and a clone of the place is the one thing this must not do.
+        const NOTHING: u8 = 0;
+        const BUILT: u8 = 1;
+        const REFUSED: u8 = 2;
+        let verdict = match self.replication.apply() {
+            None => NOTHING,
+            Some(Ok(_)) => BUILT,
+            Some(Err(_)) => REFUSED,
+        };
         self.pump_replication_notes();
-        // Bound before the match: a `match` scrutinee keeps its borrow of
-        // `self.replication` alive through every arm, and the arms need `&mut self`
-        // to record what happened.
+        // Bound before the match for the same reason: a `match` scrutinee keeps
+        // its borrow alive through every arm.
         let built = self.replication.snapshot_rbxlx();
         match built {
             Ok(Some(bytes)) => {
@@ -1565,13 +1575,13 @@ impl AppFlow {
                 self.events.push(FlowEvent::SnapshotReady { bytes, summary });
             }
             Ok(None) => {
-                // A failed apply has already said why, and will keep failing on
-                // the same bytes, so it stops being retried; an apply with
-                // nothing decoded is reported once and retried, because the
-                // schema and the batches may still be on their way.
-                if matches!(applied, Some(Err(_))) {
+                // A refused apply has already said why, and will keep refusing on
+                // the same bytes, so it stops being retried; nothing decoded yet
+                // is reported once and retried, because the schema and the
+                // batches may still be on their way.
+                if verdict == REFUSED {
                     self.snapshot_emitted = true;
-                } else if applied.is_none() && !self.snapshot_empty_reported {
+                } else if verdict == NOTHING && !self.snapshot_empty_reported {
                     self.snapshot_empty_reported = true;
                     let text = format!(
                         "{}: {}",
