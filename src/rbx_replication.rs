@@ -2181,9 +2181,11 @@ impl ConfigTable {
 /// One `<u16le length><bytes>` field of the table, advancing the cursor only when
 /// a complete field of valid text is there.
 fn read_config_text(cursor: &mut &[u8]) -> Option<String> {
-    let (low, rest) = cursor.split_first()?;
-    let high = *rest.first()?;
-    let len = usize::from(u16::from_le_bytes([*low, high]));
+    if cursor.len() < 2 {
+        return None;
+    }
+    let len = usize::from(u16::from_le_bytes([cursor[0], cursor[1]]));
+    let rest = &cursor[2..];
     if len > rest.len() {
         return None;
     }
@@ -2216,8 +2218,8 @@ pub fn parse_config_table(body: &[u8]) -> Result<ConfigTable, String> {
             break;
         };
         let Some(value) = read_config_text(&mut cursor) else {
-            // A key without its value is not an entry: rewind so `trailing` counts
-            // every byte the table failed to deliver.
+            // A key without its value is not an entry: rewind to before the key so
+            // `trailing` counts every byte the table failed to deliver.
             cursor = mark;
             break;
         };
@@ -2858,6 +2860,13 @@ impl ReplicationStream {
     /// that wants to diff local edits against what this client received.
     pub fn snapshot_ids(&self) -> Option<&BTreeMap<u32, rbx_dom_weak::types::Ref>> {
         self.snapshot.as_ref().map(|applied| &applied.ids)
+    }
+
+    /// The built place itself. A caller diffing local edits reads this DOM rather
+    /// than a copy: the snapshot that was serialized is the state the peer sent,
+    /// and a second copy would drift from it.
+    pub fn snapshot_dom(&self) -> Option<&WeakDom> {
+        self.snapshot.as_ref().map(|applied| &applied.dom)
     }
 
     pub fn snapshot_baseline(&self) -> Option<Baseline> {
