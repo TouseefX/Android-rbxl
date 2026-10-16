@@ -2366,9 +2366,11 @@ impl Default for ReplicationStream {
 
 impl ReplicationStream {
     /// Append received bytes and process every frame they close out.
-    pub fn push(&mut self, bytes: &[u8]) {
+    /// Returns how many complete frames this call consumed, so a caller routing
+    /// bytes for the channel report can count messages rather than guesses.
+    pub fn push(&mut self, bytes: &[u8]) -> usize {
         if bytes.is_empty() {
-            return;
+            return 0;
         }
         self.bytes += bytes.len() as u64;
         self.buffer.extend_from_slice(bytes);
@@ -2377,6 +2379,7 @@ impl ReplicationStream {
             self.frames += walk.frames.len() as u64;
         }
         let frames = walk.frames;
+        let completed = frames.len();
         let consumed = walk.consumed;
         let error = walk.error;
         for frame in frames {
@@ -2402,6 +2405,7 @@ impl ReplicationStream {
                 "replication buffer exceeded {MAX_STREAM_BUFFER_BYTES} byte(s) without closing a frame; {drop_to} byte(s) dropped"
             )));
         }
+        completed
     }
 
     fn handle_frame(&mut self, frame: ReplicationFrame) {
@@ -3269,9 +3273,9 @@ mod tests {
         let mut stream = ReplicationStream::default();
         let batch = frame(&join_data_batch(1, &shared_string_run()));
         let (head, tail) = batch.split_at(batch.len() / 2);
-        stream.push(head);
+        assert_eq!(stream.push(head), 0, "a partial frame completes nothing");
         assert_eq!(stream.frames, 0);
-        stream.push(tail);
+        assert_eq!(stream.push(tail), 1, "the second read closes the frame");
         assert_eq!(stream.frames, 1);
         let notes = stream.take_notes();
         assert!(
@@ -3408,7 +3412,7 @@ mod tests {
     fn a_broken_frame_resynchronizes_instead_of_stalling_the_stream() {
         let mut stream = ReplicationStream::default();
         // A zero-length frame cannot hold a message id, so it is structural.
-        stream.push(&[0x00]);
+        assert_eq!(stream.push(&[0x00]), 0);
         assert!(stream
             .take_notes()
             .iter()
@@ -3418,5 +3422,7 @@ mod tests {
         stream.push(&frame(&[0xC3]));
         assert_eq!(stream.frames, 1);
         assert_eq!(stream.unparsed, 1);
+        // The resynchronization is its own fact: it is not an unknown message id.
+        assert_eq!(stream.walk_errors, 1);
     }
 }

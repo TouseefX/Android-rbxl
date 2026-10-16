@@ -1099,12 +1099,16 @@ impl AppFlow {
         };
 
         if (app, chan) == (APP, 1) {
+            // The frame count comes from the replication walk, so the channel
+            // report counts messages that were actually delimited rather than
+            // assuming one frame per read.
+            let mut frames = 0usize;
+            if self.planes.replication {
+                frames = self.replication.push(data);
+            }
             if self.planes.channels {
                 self.channels.note_join_stream(stream);
-                self.channels.note_bytes(1, data.len(), 0);
-            }
-            if self.planes.replication {
-                self.replication.push(data);
+                self.channels.note_bytes(1, data.len(), frames);
             }
             self.chan1_rx.extend_from_slice(data);
             if self.chan1_rx.len() > 16 << 20 {
@@ -1125,15 +1129,16 @@ impl AppFlow {
             actions.extend(self.try_challenge());
             actions
         } else {
-            if self.planes.channels {
-                self.channels.note_stream(chan, stream);
-                self.channels.note_bytes(chan, data.len(), 0);
-            }
+            let mut frames = 0usize;
             if self.planes.replication && chan != CTRL_CHANNEL {
                 // A reliable channel the peer opened carries replication data
                 // too; the control channel carries channel announcements, and
                 // framing those as replication messages would be a false read.
-                self.replication.push(data);
+                frames = self.replication.push(data);
+            }
+            if self.planes.channels {
+                self.channels.note_stream(chan, stream);
+                self.channels.note_bytes(chan, data.len(), frames);
             }
             self.feed_ctrl(stream, app, chan, data);
             Vec::new()
