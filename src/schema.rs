@@ -338,7 +338,7 @@ pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<Stri
                 // is not, because a legacy property keeps the tag the binary format
                 // writes (`size` for `Size`). Returning the key here would put a
                 // wire name into the DOM, where both place writers reject it.
-                return Some(property.name.clone());
+                return Some(property.name.to_string());
             }
         }
         current_class = desc.superclass.as_deref();
