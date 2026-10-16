@@ -762,7 +762,7 @@ impl ChannelControlState {
             let _guard = self.mutex.lock().unwrap();
             self.local_ids[channel_index as usize]
         };
-        let id = id.ok_or_else(|| "Unreliable channel has no allocated local wire ID".into())?;
+        let id = id.ok_or_else(|| "Unreliable channel has no allocated local wire ID".to_string())?;
         let body = unreliable_open_body(application, channel_index, id)
             .ok_or_else(|| "unreliable open body not buildable".to_string())?;
         let mut out = [0u8; UNRELIABLE_OPEN_BODY_BYTES];
