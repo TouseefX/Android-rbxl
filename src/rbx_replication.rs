@@ -1496,6 +1496,7 @@ impl ChainItem {
             Self::Zigzag { .. } => 0x26,
             Self::Floats { .. } => 0x27,
             Self::RefList(_) => 0x29,
+            Self::GuidPair { .. } => 0x13,
         }
     }
 }
@@ -1988,7 +1989,10 @@ impl Baseline {
 impl SnapshotApply {
     /// Capture the applied state for an outbound diff.
     pub fn baseline(&self) -> Baseline {
-        let mut by_ref: BTreeMap<rbx_dom_weak::types::Ref, u32> = BTreeMap::new();
+        // `HashMap`, not `BTreeMap`: `Ref` is `Hash + Eq` but deliberately has no
+        // ordering, and this map is only ever probed by referent.
+        let mut by_ref: std::collections::HashMap<rbx_dom_weak::types::Ref, u32> =
+            std::collections::HashMap::new();
         for (id, reference) in &self.ids {
             by_ref.insert(*reference, *id);
         }
@@ -3300,7 +3304,7 @@ mod tests {
         let root = applied.dom.root_ref();
         let children = applied.dom.get_by_ref(root).expect("root").children().to_vec();
         let part = applied.dom.get_by_ref(children[0]).expect("part");
-        let Some(Variant::CFrame(frame)) = part.properties.get(&rbx_dom_weak::ustr("CFrame"))
+        let Some(Variant::CFrame(frame)) = part.properties.get(&rbx_dom_weak::Ustr::from("CFrame"))
         else {
             panic!("expected a CFrame property, got {:?}", part.properties);
         };
@@ -3327,7 +3331,7 @@ mod tests {
         assert_eq!(part.class, "Part");
         assert_eq!(part.name.to_string(), "Box");
         assert_eq!(
-            part.properties.get(&rbx_dom_weak::ustr("Anchored")),
+            part.properties.get(&rbx_dom_weak::Ustr::from("Anchored")),
             Some(&Variant::Bool(true))
         );
         let bytes = applied.to_rbxlx().expect("serializes");

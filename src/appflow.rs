@@ -1550,7 +1550,11 @@ impl AppFlow {
         // pick up records that arrived after the marker.
         let applied = self.replication.apply();
         self.pump_replication_notes();
-        match self.replication.snapshot_rbxlx() {
+        // Bound before the match: a `match` scrutinee keeps its borrow of
+        // `self.replication` alive through every arm, and the arms need `&mut self`
+        // to record what happened.
+        let built = self.replication.snapshot_rbxlx();
+        match built {
             Ok(Some(bytes)) => {
                 self.snapshot_emitted = true;
                 let summary = self.snapshot_summary();

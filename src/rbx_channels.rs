@@ -388,8 +388,9 @@ impl ChannelRouter {
             if mode == ChannelOpenMode::ReferenceUnreliable && !unreliable {
                 continue;
             }
+            let app_id = self.application;
             let entry = self.channels.entry(channel).or_insert_with(|| JoinChannel {
-                application: self.application,
+                application: app_id,
                 channel,
                 unreliable,
                 local_id: None,

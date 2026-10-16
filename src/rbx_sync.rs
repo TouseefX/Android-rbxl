@@ -434,10 +434,13 @@ pub fn encode_tagged(tag: u8, value: &Variant) -> Option<Vec<u8>> {
             out.extend_from_slice(&write_varint_leb(encoded));
         }
         (34, Variant::Int32(number)) => {
-            out.extend_from_slice(&write_varint_leb(u64::from(*number)))
+            // Sign-extended, because the reader widens to i64 before it
+            // re-narrows: `u64::from(i32)` does not exist and a plain `as u32`
+            // would drop the high half of a negative value's encoding.
+            out.extend_from_slice(&write_varint_leb(*number as u64))
         }
         (44, Variant::Int64(number)) => {
-            out.extend_from_slice(&write_varint_leb(u64::from(*number)))
+            out.extend_from_slice(&write_varint_leb(*number as u64))
         }
         (11, Variant::Float32(number)) | (16, Variant::Float32(number)) | (17, Variant::Float32(number)) => {
             out.extend_from_slice(&number.to_le_bytes());
@@ -575,7 +578,8 @@ pub fn plan_changes(
         None => format!("member indices only — {}", schema.prop_id_report()),
     };
     // Reverse map, so a reparent can be named by the wire id the peer uses.
-    let mut by_ref: BTreeMap<Ref, u32> = BTreeMap::new();
+    // `Ref` has no `Ord`, so the reverse index is a hash map.
+    let mut by_ref: std::collections::HashMap<Ref, u32> = std::collections::HashMap::new();
     for (wire_id, reference) in ids {
         by_ref.insert(*reference, *wire_id);
     }
@@ -1370,7 +1374,7 @@ mod tests {
         if let Some(instance) = dom.get_by_ref_mut(part) {
             instance
                 .properties
-                .insert(rbx_dom_weak::ustr("Size"), Variant::Vector3(Vector3::new(1.0, 2.0, 4.0)));
+                .insert(rbx_dom_weak::Ustr::from("Size"), Variant::Vector3(Vector3::new(1.0, 2.0, 4.0)));
             instance.name = "Long Box".to_owned();
         }
         let plan = plan_changes(&schema, &dom, &ids, &baseline, 32);
@@ -1419,7 +1423,7 @@ mod tests {
         if let Some(instance) = dom.get_by_ref_mut(part) {
             instance
                 .properties
-                .insert(rbx_dom_weak::ustr("Size"), Variant::Vector3(Vector3::new(9.0, 2.0, 3.0)));
+                .insert(rbx_dom_weak::Ustr::from("Size"), Variant::Vector3(Vector3::new(9.0, 2.0, 3.0)));
         }
         let plan = plan_changes(&schema, &dom, &ids, &baseline, 32);
         assert_eq!(plan.changes.len(), 1);
@@ -1437,11 +1441,22 @@ mod tests {
             InstanceBuilder::new("Part").with_property("Size", Vector3::new(1.0, 2.0, 3.0)),
         );
         let known: BTreeMap<u32, Ref> = [(7u32, part)].into_iter().collect();
-        let baseline = baseline_of(&dom, &known);
-        // An id whose instance is gone (deleted, or a referent that never
-        // existed here) is reported as gone; an instance the editor created is
-        // not in `ids`, so it cannot become a change either way.
-        let ids: BTreeMap<u32, Ref> = [(7u32, part), (8u32, Ref::null())].into_iter().collect();
+        let mut baseline = baseline_of(&dom, &known);
+        // The snapshot had applied a second instance that this DOM no longer
+        // holds. `Ref` has no null sentinel, so a referent from another DOM
+        // stands in for the dropped instance: only its absence matters.
+        let dropped = WeakDom::new(InstanceBuilder::new("DataModel"));
+        baseline.entries.insert(
+            8,
+            BaselineInstance {
+                class: "Part".to_owned(),
+                name: "Part".to_owned(),
+                properties: BTreeMap::new(),
+                parent: None,
+            },
+        );
+        let ids: BTreeMap<u32, Ref> =
+            [(7u32, part), (8u32, dropped.root_ref())].into_iter().collect();
         let plan = plan_changes(&schema, &dom, &ids, &baseline, 32);
         assert!(plan.changes.is_empty(), "{}", plan.summary());
         assert_eq!(plan.only_in_before, 1);
