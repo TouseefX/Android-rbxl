@@ -2,7 +2,7 @@ use rbx_dom_weak::{
     types::{Ref, Variant},
     InstanceBuilder, WeakDom,
 };
-use rbx_reflection::{DataType, PropertyKind};
+use rbx_reflection::{ClassDescriptor, DataType, PropertyDescriptor, PropertyKind};
 use rbx_reflection_database::get as get_reflection_database;
 use std::collections::BTreeMap;
 
@@ -336,21 +336,19 @@ pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<Stri
         let Some(desc) = db.classes.get(cls) else {
             break;
         };
+        // An exact hit first, because a capture's wire spelling is a key of this
+        // map for every legacy property and a snapshot repeats the lookup per
+        // instance: walking the map is the fallback, not the norm.
+        if let Some(property) = desc.properties.get(wire_name) {
+            return Some(canonical_name_for(desc, property));
+        }
         for (key, property) in &desc.properties {
-            // Bound through a `&str` rather than `key.as_str()`: the property map
-            // is keyed by an interned string type that only derefs to `str`, and
-            // `str::as_str` is not a stable method.
+            // Bound through a `&str`: the map key is a borrowed `str` already, and
+            // reading it through a local keeps the borrow of `desc` in one place.
             let key: &str = key;
             if key.eq_ignore_ascii_case(wire_name) || property.name.eq_ignore_ascii_case(wire_name)
             {
-                // A legacy spelling is not its own property: the database marks it
-                // `Alias { alias_for }` and points at the canonical descriptor. The
-                // DOM and both place writers key on that name, so returning the key
-                // here would store `size` where `Size` belongs.
-                if let PropertyKind::Alias { alias_for } = &property.kind {
-                    return Some((*alias_for).to_string());
-                }
-                return Some(property.name.to_string());
+                return Some(canonical_name_for(desc, property));
             }
         }
         current_class = desc.superclass.as_deref();
@@ -358,9 +356,43 @@ pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<Stri
     None
 }
 
+/// The name a property value should be stored under: an alias entry names the
+/// descriptor it stands for, and everything else names itself.
+fn canonical_name_for(desc: &ClassDescriptor<'_>, property: &PropertyDescriptor<'_>) -> String {
+    if let PropertyKind::Alias { alias_for } = &property.kind {
+        // Prefer the target's own spelling so a differently-cased alias cannot
+        // leak into the DOM; fall back to the name the alias points at.
+        if let Some(target) = desc.properties.get(*alias_for) {
+            return target.name.to_string();
+        }
+        return (*alias_for).to_string();
+    }
+    property.name.to_string()
+}
+
 #[cfg(test)]
 mod replication_helpers {
     use super::*;
+
+    /// What the reflection database actually holds for a class, so a disagreement
+    /// names itself instead of being guessed at from the outside.
+    fn describe_class(class: &str) -> String {
+        let db = database();
+        match db.classes.get(class) {
+            None => format!("{class}: absent from the reflection database"),
+            Some(desc) => {
+                let mut names: Vec<&str> = desc.properties.keys().copied().collect();
+                names.sort_unstable();
+                let shown = names.len().min(8);
+                format!(
+                    "{class}: superclass {:?}, {} propert(y/ies), first [{}, …]",
+                    desc.superclass,
+                    names.len(),
+                    names[..shown].join(", ")
+                )
+            }
+        }
+    }
 
     #[test]
     fn wire_names_resolve_to_canonical_properties() {
@@ -382,7 +414,10 @@ mod replication_helpers {
         ));
         assert_eq!(
             canonical_property_name("Part", "AnChArEd").as_deref(),
-            Some("Anchored")
+            Some("Anchored"),
+            "{}\n{}",
+            describe_class("Part"),
+            describe_class("BasePart")
         );
         // Inherited from BasePart, which is why the walk is needed.
         assert_eq!(
