@@ -1644,11 +1644,15 @@ impl AppFlow {
         if !self.planes.channels {
             return "channel plane off; opens are the four reference unreliable records".to_string();
         }
+        // The mode is part of the line, so a report can be read without the UI
+        // state that produced it.
+        let mode = rbx_channels::channel_open_mode_label(self.channels.effective_mode());
+        let base = self.channels.summary();
         let gaps = self.channels.gaps();
         if gaps.is_empty() {
-            self.channels.summary()
+            format!("mode {mode}; {base}")
         } else {
-            format!("{}; gaps: {}", self.channels.summary(), gaps.join("; "))
+            format!("mode {mode}; {base}; gaps: {}", gaps.join("; "))
         }
     }
 
@@ -2262,9 +2266,14 @@ mod tests {
         });
         assert!(!notes.is_empty(), "a frame must be accounted for");
         let text = notes.join("\n");
-        assert!(text.contains("0x83") || text.contains("131"), "{text}");
+        // The batch is reported as the sub-code it is, with its byte count, and
+        // not passed off as a decoded record run.
+        assert!(text.contains("JoinDataItemV2"), "{text}");
+        assert!(text.contains("no compressed frame"), "{text}");
         let report = flow.replication_report();
-        assert!(report.contains("frame"), "{report}");
+        assert!(report.contains("1 frame(s)"), "{report}");
+        assert!(report.contains("1 skipped"), "{report}");
+        assert!(report.contains("schema not received"), "{report}");
         // No schema arrived, so asking for the place must say so instead of
         // inventing a DataModel.
         flow.request_snapshot_apply();
