@@ -3070,6 +3070,8 @@ pub struct ParsedJoinDataItem {
 pub struct ParsedJoinReplicationMessage {
     pub ty: JoinReplicationMessageType,
     pub message_type: JoinReplicationMessageType,
+    pub r#type: JoinReplicationMessageType,
+    pub msg_type: JoinReplicationMessageType,
     pub raw_bytes: Vec<u8>,
     pub body: Vec<u8>,
     pub data_item: Option<ParsedJoinDataItem>,
@@ -3079,6 +3081,8 @@ pub fn parse_join_replication_message(data: &[u8]) -> Result<ParsedJoinReplicati
     let mut parsed = ParsedJoinReplicationMessage {
         ty: JoinReplicationMessageType::Other,
         message_type: JoinReplicationMessageType::Other,
+        r#type: JoinReplicationMessageType::Other,
+        msg_type: JoinReplicationMessageType::Other,
         raw_bytes: data.to_vec(),
         body: Vec::new(),
         data_item: None,
@@ -3089,6 +3093,8 @@ pub fn parse_join_replication_message(data: &[u8]) -> Result<ParsedJoinReplicati
     if data[0] == JOIN_START_TAG {
         parsed.ty = JoinReplicationMessageType::JoinStart;
         parsed.message_type = JoinReplicationMessageType::JoinStart;
+        parsed.r#type = JoinReplicationMessageType::JoinStart;
+        parsed.msg_type = JoinReplicationMessageType::JoinStart;
         parsed.body = data[1..].to_vec();
         return Ok(parsed);
     }
@@ -3115,6 +3121,8 @@ pub fn parse_join_replication_message(data: &[u8]) -> Result<ParsedJoinReplicati
     }
     parsed.ty = JoinReplicationMessageType::JoinDataItem;
     parsed.message_type = JoinReplicationMessageType::JoinDataItem;
+    parsed.r#type = JoinReplicationMessageType::JoinDataItem;
+    parsed.msg_type = JoinReplicationMessageType::JoinDataItem;
     parsed.body = opaque_payload;
     parsed.data_item = Some(item);
     Ok(parsed)
