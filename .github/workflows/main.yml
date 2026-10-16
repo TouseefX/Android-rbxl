@@ -461,8 +461,11 @@ jobs:
               # annotation is enough to locate a whole failed build; the raw
               # expansions follow for whoever reads the detail.
               awk '/^error/{m=$0} /^ +--> /{if (m != "") {print m " @ " $2; m=""}}' /tmp/cargo.log | head -n 60
-              grep -A 8 '^error' /tmp/cargo.log | head -n 200
-              awk '/^(running [0-9]+ tests?|failures:)/{flag=1} flag' /tmp/cargo.log | tail -n 40
+              # One line per filter command that ran, so a failure in an early
+              # filter is not hidden by the tail of the last one.
+              grep -E '^(test result:|error: test failed)' /tmp/cargo.log | head -n 40
+              grep -A 8 '^error' /tmp/cargo.log | head -n 160
+              grep -E '^(---- |thread .* panicked|assertion|  left:| right:)' /tmp/cargo.log | head -n 120
             } 2>/dev/null
           )"
           if [ -z "$diag" ]; then

@@ -569,6 +569,14 @@ impl JoinDataKind {
         }
     }
 
+    /// Whether this kind's payload is a `[u32][u32][zstd]` length pair, which is
+    /// the only case where a short tail means a truncated frame. The instance
+    /// categories are copied verbatim by the target, so their bytes are the whole
+    /// payload however small they are.
+    pub fn takes_length_pair(self) -> bool {
+        matches!(self, Self::SharedString | Self::Compressed)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::SharedString => "shared string",
@@ -640,7 +648,11 @@ pub fn parse_join_data_item(body: &[u8]) -> Option<JoinDataItem> {
         zero_trailer: false,
     };
     if rest.len() < 12 {
-        item.framing = JoinDataFraming::Truncated;
+        // Calling a short tail "truncated" is only honest for a kind that promises
+        // a length pair; for the copied categories the bytes are the payload.
+        if kind.takes_length_pair() {
+            item.framing = JoinDataFraming::Truncated;
+        }
         return Some(item);
     }
     for (framing, big_endian) in [
@@ -1363,6 +1375,10 @@ pub fn parse_join_record(data: &[u8], schema: &JoinSchema) -> Result<JoinRecord,
 /// Parse a chained record run of exactly `count` records, or until the buffer
 /// ends when `count` is `usize::MAX`. Returns the records and how many bytes the
 /// run consumed, so a caller with a counted run can keep the trailing bytes.
+/// The `count` value that means "no declared count": read records until the
+/// buffer is empty, and let the caller decide whether a leftover byte is an error.
+pub const RECORD_RUN_TO_END: usize = usize::MAX;
+
 pub fn parse_record_run(
     data: &[u8],
     schema: &JoinSchema,
@@ -1370,6 +1386,7 @@ pub fn parse_record_run(
 ) -> Result<(Vec<JoinRecord>, usize), String> {
     let mut records = Vec::new();
     let mut offset = 0usize;
+    let counted = count != RECORD_RUN_TO_END;
     while offset < data.len() && records.len() < count {
         let record = parse_join_record(&data[offset..], schema)
             .map_err(|error| format!("record {} at offset {offset}: {error}", records.len()))?;
@@ -1379,7 +1396,9 @@ pub fn parse_record_run(
         offset += record.consumed;
         records.push(record);
     }
-    if records.len() < count {
+    // A counted run has to be satisfied; an uncounted one stops at the end of the
+    // buffer and says nothing about a count it was never given.
+    if counted && records.len() < count {
         return Err(format!(
             "the run holds {} record(s) but {count} were declared",
             records.len()
@@ -1391,7 +1410,7 @@ pub fn parse_record_run(
 /// Parse a whole buffer as a record run. A batch inner is pure records, so a
 /// leftover byte is a parse failure rather than padding.
 pub fn parse_join_records(data: &[u8], schema: &JoinSchema) -> Result<Vec<JoinRecord>, String> {
-    let (records, consumed) = parse_record_run(data, schema, usize::MAX)?;
+    let (records, consumed) = parse_record_run(data, schema, RECORD_RUN_TO_END)?;
     if consumed != data.len() {
         return Err(format!(
             "{consumed} byte(s) of records left {} byte(s) over",
@@ -2307,6 +2326,10 @@ pub struct ReplicationStream {
     pub clock_ticks: u64,
     pub stopped_chains: u64,
     pub unparsed: u64,
+    /// Structural violations in the frame walk, kept apart from `unparsed`: a
+    /// stream that dropped a bad length byte and resynchronized is a different
+    /// failure from a stream that carried a message id nobody recognizes.
+    pub walk_errors: u64,
     /// Chain item types seen, for the histogram in the report.
     pub item_types: BTreeMap<u8, u64>,
 }
@@ -2335,6 +2358,7 @@ impl Default for ReplicationStream {
             clock_ticks: 0,
             stopped_chains: 0,
             unparsed: 0,
+            walk_errors: 0,
             item_types: BTreeMap::new(),
         }
     }
@@ -2364,7 +2388,7 @@ impl ReplicationStream {
         if let Some(error) = error {
             // A structural violation is not something more bytes can fix, so the
             // offending length byte is dropped and the stream resynchronizes.
-            self.unparsed += 1;
+            self.walk_errors += 1;
             if !self.buffer.is_empty() {
                 self.buffer.remove(0);
             }
@@ -2702,7 +2726,7 @@ impl ReplicationStream {
             .map(|(kind, count)| format!("0x{kind:02x} x{count}"))
             .collect();
         format!(
-            "{} frame(s) over {} byte(s); {} batch(es), {} record(s), {} shared string(s), {} skipped; {} chain(s): {} spawn(s), {} event(s), {} property update(s), {} clock tick(s), {} stopped; {} message(s) unrecognized; schema {}; snapshot {}; items [{}]",
+            "{} frame(s) over {} byte(s); {} batch(es), {} record(s), {} shared string(s), {} skipped; {} chain(s): {} spawn(s), {} event(s), {} property update(s), {} clock tick(s), {} stopped; {} message(s) unrecognized, {} frame walk error(s); schema {}; snapshot {}; items [{}]",
             self.frames,
             self.bytes,
             self.batches,
@@ -2716,6 +2740,7 @@ impl ReplicationStream {
             self.clock_ticks,
             self.stopped_chains,
             self.unparsed,
+            self.walk_errors,
             if self.schema.is_some() { "received" } else { "not received" },
             if self.snapshot.is_some() {
                 "built"
@@ -3022,13 +3047,14 @@ mod tests {
             data.push(0); // no events
             data.push(0); // no URL prefixes
             data.push(1); // one shared name
-            data.push(5);
+            data.push(7);
             data.extend_from_slice(b"Spawner");
             parse_join_schema(&data).expect("schema with a shared name table")
         };
         // Literal, shared-table index, then the extended form.
         assert_eq!(name_text(&schema, &[3, b'a', b'b', b'c']).as_deref(), Some("abc"));
-        assert_eq!(name_text(&schema, &[0x81]).as_deref(), Some("Spawner"));
+        // The high bit marks a shared-table index, so `0x80` is entry zero.
+        assert_eq!(name_text(&schema, &[0x80]).as_deref(), Some("Spawner"));
         assert_eq!(name_text(&schema, &[127, 2, b'x', b'y']).as_deref(), Some("xy"));
         // Index 127 is the escape hatch and the skip path refuses it.
         let mut reader = Reader::new(&[0xFF]);
