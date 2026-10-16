@@ -2134,7 +2134,10 @@ pub fn apply_join_snapshot(
 /// Materialize one property value against the class's declared type. The raw
 /// extent came from [`skip_tagged_value`], so the length checks here are the
 /// second half of the same contract: a size that disagrees with the declared
-/// type is reported, not forced into it.
+/// type is reported, not forced into it. Every fixed-size value type therefore
+/// demands its exact extent (the Color3uint8 prefix and the quantized CFrame
+/// forms being the documented exceptions), and the skip note carries the tag and
+/// the length so a report can show what was refused.
 fn decode_property(
     class: &str,
     property: &str,
@@ -2145,7 +2148,10 @@ fn decode_property(
 ) -> Option<Variant> {
     let data_type = crate::schema::resolve_property_type(class, property)?;
     let unsupported = |stats: &mut ApplyStats| {
-        stats.note_skip(format!("{class}.{property} (tag {tag})"));
+        stats.note_skip(format!(
+            "{class}.{property} (tag {tag}, {} byte(s))",
+            raw.len()
+        ));
         None
     };
     let value = match data_type {
@@ -2171,8 +2177,8 @@ fn decode_property(
             };
             Variant::String(text)
         }
-        DataType::Value(VariantType::Float32) => Variant::Float32(le_f32(raw, 0)?),
-        DataType::Value(VariantType::Float64) => Variant::Float64(le_f64(raw, 0)?),
+        DataType::Value(VariantType::Float32) if raw.len() == 4 => Variant::Float32(le_f32(raw, 0)?),
+        DataType::Value(VariantType::Float64) if raw.len() == 8 => Variant::Float64(le_f64(raw, 0)?),
         DataType::Value(VariantType::Int32) => Variant::Int32(varint_value(raw)? as i32),
         DataType::Value(VariantType::Int64) => {
             if raw.len() == 8 {
@@ -2181,33 +2187,36 @@ fn decode_property(
                 Variant::Int64(varint_value(raw)? as i64)
             }
         }
-        DataType::Value(VariantType::Vector3) if raw.len() >= 12 => Variant::Vector3(Vector3::new(
+        DataType::Value(VariantType::Vector3) if raw.len() == 12 => Variant::Vector3(Vector3::new(
             le_f32(raw, 0)?,
             le_f32(raw, 4)?,
             le_f32(raw, 8)?,
         )),
-        DataType::Value(VariantType::Vector2) if raw.len() >= 8 => {
+        DataType::Value(VariantType::Vector2) if raw.len() == 8 => {
             Variant::Vector2(Vector2::new(le_f32(raw, 0)?, le_f32(raw, 4)?))
         }
-        DataType::Value(VariantType::Color3) if raw.len() >= 12 => Variant::Color3(Color3::new(
+        DataType::Value(VariantType::Color3) if raw.len() == 12 => Variant::Color3(Color3::new(
             le_f32(raw, 0)?.clamp(0.0, 1.0),
             le_f32(raw, 4)?.clamp(0.0, 1.0),
             le_f32(raw, 8)?.clamp(0.0, 1.0),
         )),
+        // The exception to exact extents: a Color3uint8 can arrive behind a leading
+        // form byte, so three bytes or more are read as channels and only a shorter
+        // run is refused.
         DataType::Value(VariantType::Color3uint8) if raw.len() >= 3 => {
             Variant::Color3uint8(Color3uint8::new(raw[0], raw[1], raw[2]))
         }
-        DataType::Value(VariantType::UDim) if raw.len() >= 8 => {
+        DataType::Value(VariantType::UDim) if raw.len() == 8 => {
             Variant::UDim(UDim::new(le_f32(raw, 0)?, le_i32(raw, 4)?))
         }
-        DataType::Value(VariantType::UDim2) if raw.len() >= 16 => Variant::UDim2(UDim2::new(
+        DataType::Value(VariantType::UDim2) if raw.len() == 16 => Variant::UDim2(UDim2::new(
             UDim::new(le_f32(raw, 0)?, le_i32(raw, 4)?),
             UDim::new(le_f32(raw, 8)?, le_i32(raw, 12)?),
         )),
-        DataType::Value(VariantType::NumberRange) if raw.len() >= 8 => {
+        DataType::Value(VariantType::NumberRange) if raw.len() == 8 => {
             Variant::NumberRange(NumberRange::new(le_f32(raw, 0)?, le_f32(raw, 4)?))
         }
-        DataType::Value(VariantType::Rect) if raw.len() >= 16 => Variant::Rect(Rect::new(
+        DataType::Value(VariantType::Rect) if raw.len() == 16 => Variant::Rect(Rect::new(
             Vector2::new(le_f32(raw, 0)?, le_f32(raw, 4)?),
             Vector2::new(le_f32(raw, 8)?, le_f32(raw, 12)?),
         )),
@@ -3351,9 +3360,11 @@ mod tests {
         let applied = apply_join_snapshot(&schema, &records).expect("apply");
         assert_eq!(applied.stats.spawned, 1);
         assert_eq!(applied.stats.names_set, 1);
-        // Size is a Vec3 declared property, so the 24-byte payload is not it and
-        // gets counted instead of forced.
+        // Member one is `size`, which the reflection database types as a Vector3 -
+        // twelve bytes. The record carries a twenty-four-byte extent, so the value
+        // is counted as undecoded rather than read out of a longer payload.
         assert_eq!(applied.stats.properties_undecoded, 1);
+        assert_eq!(applied.stats.properties_set, 1, "only Anchored is typed here");
         assert_eq!(applied.stats.parents_grafted, 0, "parent 13 is the root");
         let root = applied.dom.root_ref();
         let children = applied.dom.get_by_ref(root).expect("root").children().to_vec();
@@ -3361,6 +3372,10 @@ mod tests {
         let part = applied.dom.get_by_ref(children[0]).expect("part");
         assert_eq!(part.class, "Part");
         assert_eq!(part.name.to_string(), "Box");
+        assert!(
+            !part.properties.contains_key(&rbx_dom_weak::Ustr::from("Size")),
+            "a refused extent leaves no value behind"
+        );
         assert_eq!(
             part.properties.get(&rbx_dom_weak::Ustr::from("Anchored")),
             Some(&Variant::Bool(true))
