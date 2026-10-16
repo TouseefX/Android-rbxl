@@ -2,7 +2,7 @@ use rbx_dom_weak::{
     types::{Ref, Variant},
     InstanceBuilder, WeakDom,
 };
-use rbx_reflection::DataType;
+use rbx_reflection::{DataType, PropertyKind};
 use rbx_reflection_database::get as get_reflection_database;
 use std::collections::BTreeMap;
 
@@ -177,10 +177,12 @@ pub fn resolve_property_type(class_name: &str, prop_name: &str) -> Option<DataTy
             if let Some(pd) = desc.properties.get(prop_name) {
                 return Some(pd.data_type.clone());
             }
-            // The database keys some properties by the spelling the binary format
-            // uses (`size`) while callers hold the canonical one (`Size`), so a
-            // miss is retried case-insensitively against both the key and the
-            // descriptor's own name before the walk moves to the superclass.
+            // The database carries an entry per spelling, with the legacy one
+            // (`size`) marked as an alias of the canonical property. A lookup by
+            // either name therefore has to land on the same descriptor, which the
+            // case-insensitive retry below arranges; following the alias keeps the
+            // type of an alias identical to its target even if the database ever
+            // records them differently.
             if let Some(pd) = desc
                 .properties
                 .iter()
@@ -191,6 +193,11 @@ pub fn resolve_property_type(class_name: &str, prop_name: &str) -> Option<DataTy
                 })
                 .map(|(_, property)| property)
             {
+                if let PropertyKind::Alias { alias_for } = &pd.kind {
+                    if let Some(target) = desc.properties.get(*alias_for) {
+                        return Some(target.data_type.clone());
+                    }
+                }
                 return Some(pd.data_type.clone());
             }
             current_class = desc.superclass.as_deref();
@@ -312,11 +319,13 @@ pub fn default_variant_for(dt: &DataType<'_>) -> Option<Variant> {
 /// walking the superclass chain exactly like [`resolve_property_type`] does.
 ///
 /// Snapshot records and delta property updates carry the *wire* spelling of a
-/// property (`size`, `anchored`, …), while the DOM and both place writers key on
-/// the canonical reflection name (`Size`, `Anchored`). A case-insensitive walk
-/// is the lookup that makes an applied snapshot round-trip through
-/// `rbx_xml`/`rbx_binary`; it also means a name the class does not declare is
-/// reported instead of being written as an invented property.
+/// property (`size`, `cframe`, …), while the DOM and both place writers key on the
+/// canonical reflection name (`Size`, `CFrame`). `rbx_reflection` keeps an entry
+/// per spelling and marks the legacy one `PropertyKind::Alias`, so this walk
+/// resolves either name to the canonical descriptor's name — which is what makes
+/// an applied snapshot round-trip through `rbx_xml`/`rbx_binary`. A name the class
+/// does not declare is reported as absent instead of being written as an invented
+/// property.
 pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<String> {
     if wire_name.is_empty() {
         return None;
@@ -334,10 +343,13 @@ pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<Stri
             let key: &str = key;
             if key.eq_ignore_ascii_case(wire_name) || property.name.eq_ignore_ascii_case(wire_name)
             {
-                // The descriptor's own name is the canonical spelling; the map key
-                // is not, because a legacy property keeps the tag the binary format
-                // writes (`size` for `Size`). Returning the key here would put a
-                // wire name into the DOM, where both place writers reject it.
+                // A legacy spelling is not its own property: the database marks it
+                // `Alias { alias_for }` and points at the canonical descriptor. The
+                // DOM and both place writers key on that name, so returning the key
+                // here would store `size` where `Size` belongs.
+                if let PropertyKind::Alias { alias_for } = &property.kind {
+                    return Some((*alias_for).to_string());
+                }
                 return Some(property.name.to_string());
             }
         }
