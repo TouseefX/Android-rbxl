@@ -291,3 +291,54 @@ pub fn default_variant_for(dt: &DataType<'_>) -> Option<Variant> {
         _ => None,
     }
 }
+
+/// Resolve a replication wire name to the class's canonical property name,
+/// walking the superclass chain exactly like [`resolve_property_type`] does.
+///
+/// Snapshot records and delta property updates carry the *wire* spelling of a
+/// property (`size`, `anchored`, …), while the DOM and both place writers key on
+/// the canonical reflection name (`Size`, `Anchored`). A case-insensitive walk
+/// is the lookup that makes an applied snapshot round-trip through
+/// `rbx_xml`/`rbx_binary`; it also means a name the class does not declare is
+/// reported instead of being written as an invented property.
+pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<String> {
+    if wire_name.is_empty() {
+        return None;
+    }
+    let db = database();
+    let mut current_class = Some(class_name);
+    while let Some(cls) = current_class {
+        let Some(desc) = db.classes.get(cls) else {
+            break;
+        };
+        for (key, _) in &desc.properties {
+            if key.as_str().eq_ignore_ascii_case(wire_name) {
+                return Some(key.as_str().to_owned());
+            }
+        }
+        current_class = desc.superclass.as_deref();
+    }
+    None
+}
+
+#[cfg(test)]
+mod replication_helpers {
+    use super::*;
+
+    #[test]
+    fn wire_names_resolve_to_canonical_properties() {
+        assert_eq!(canonical_property_name("Part", "size").as_deref(), Some("Size"));
+        assert_eq!(
+            canonical_property_name("Part", "AnChArEd").as_deref(),
+            Some("Anchored")
+        );
+        // Inherited from BasePart, which is why the walk is needed.
+        assert_eq!(
+            canonical_property_name("Part", "transparency").as_deref(),
+            Some("Transparency")
+        );
+        assert_eq!(canonical_property_name("Part", "definitely_not_a_property"), None);
+        assert_eq!(canonical_property_name("NoSuchClassAtAll", "size"), None);
+        assert_eq!(canonical_property_name("Part", ""), None);
+    }
+}

@@ -383,6 +383,29 @@ jobs:
           # Misreading the prefix as a tag looked like 'unknown control tag 0x80'.
           cargo test --lib team_create::tests::rbx_transport_control_decoder 2>&1 | tee -a /tmp/cargo.log
           cargo test --lib appflow::tests::marker 2>&1 | tee -a /tmp/cargo.log
+          # The three post-join planes. None of them runs on the default wire
+          # path (every switch is off unless the panel turns it on), so this
+          # suite is the only thing that exercises the framing, the decoding and
+          # the refusals; a broken encoder here would otherwise first show up as
+          # a live session that quietly sends nothing.
+          cargo test --lib rbx_channels::tests:: 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib rbx_replication::tests:: 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib rbx_sync::tests:: 2>&1 | tee -a /tmp/cargo.log
+          # The wire-name to canonical-property lookup every encoded change
+          # leans on, including the superclass walk.
+          cargo test --lib schema::replication_helpers 2>&1 | tee -a /tmp/cargo.log
+          # Flow integration: that the switches default off and move no bytes,
+          # that the reference channel mode reproduces the hard-coded burst
+          # exactly, and that a route payload really is unframed.
+          cargo test --lib appflow::tests::planes 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib appflow::tests::channel_plane 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib appflow::tests::replication_plane 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib appflow::tests::marker_asks 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib appflow::tests::sync_plane 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib appflow::tests::routes_are_unframed 2>&1 | tee -a /tmp/cargo.log
+          # Guards compact_varint's branch bounds, which mis-encoded 2^30..2^32
+          # and shifted the 8-byte form by one bit before both were fixed.
+          cargo test --lib appflow::tests::varint_round_trips 2>&1 | tee -a /tmp/cargo.log
 
       - name: Full suite (informational)
         if: always()
