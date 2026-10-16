@@ -2105,6 +2105,7 @@ pub fn apply_join_snapshot(
         }
         let created = dom.insert(root, builder);
         ids.insert(id, created);
+        stats.spawned += 1;
         if let Some(parent) = record.parent {
             parents.push((id, parent));
         } else if record.parent_lo == 0 {
