@@ -394,35 +394,44 @@ fn canonical_name_for(desc: &ClassDescriptor<'_>, property: &PropertyDescriptor<
 mod replication_helpers {
     use super::*;
 
-    /// What the reflection database actually holds for a class, so a disagreement
-    /// names itself instead of being guessed at from the outside.
-    fn describe_class(class: &str) -> String {
+    /// One line describing what the reflection database holds for a class and the
+    /// chain its inheritance walk crosses, so a failure names the disagreement
+    /// instead of leaving it to be inferred from one pair of values.
+    fn facts(class: &str) -> String {
         let db = database();
-        match db.classes.get(class) {
-            None => format!("{class}: absent from the reflection database"),
-            Some(desc) => {
-                let mut names: Vec<&str> = desc.properties.keys().copied().collect();
-                names.sort_unstable();
-                let shown = names.len().min(8);
-                format!(
-                    "{class}: superclass {:?}, {} propert(y/ies), first [{}, …]",
-                    desc.superclass,
-                    names.len(),
-                    names[..shown].join(", ")
-                )
-            }
+        let mut parts = vec![format!("chain [{})", class_chain(class).join(", "))];
+        for step in class_chain(class) {
+            parts.push(match db.classes.get(step) {
+                None => format!("{step}: undescribed"),
+                Some(desc) => {
+                    let mut names: Vec<&str> = desc.properties.keys().copied().collect();
+                    names.sort_unstable();
+                    let shown = names.len().min(6);
+                    format!(
+                        "{step}: {} propert(y/ies) [{}]",
+                        names.len(),
+                        names[..shown].join(", ")
+                    )
+                }
+            });
         }
+        parts.join(" | ")
     }
 
     #[test]
     fn wire_names_resolve_to_canonical_properties() {
+        // The database keeps one entry per spelling and marks the legacy one as an
+        // alias of the canonical property, so a snapshot's `size` has to come back
+        // as `Size` - the name the DOM and both place writers use.
         assert_eq!(canonical_property_name("Part", "size").as_deref(), Some("Size"));
-        // The canonical spelling resolves to itself, and the type lookup finds the
-        // same property under either spelling - the database keys `Part`'s size by
-        // the binary tag, so an exact `get("Size")` alone would miss.
+        assert_eq!(canonical_property_name("Part", "Size").as_deref(), Some("Size"));
+        // Case-insensitivity is asserted on a name this database is known to hold,
+        // which tests the walk rather than the dump's coverage.
         assert_eq!(
-            canonical_property_name("Part", "Size").as_deref(),
-            Some("Size")
+            canonical_property_name("Part", "SiZe").as_deref(),
+            Some("Size"),
+            "{}",
+            facts("Part")
         );
         assert!(matches!(
             resolve_property_type("Part", "Size"),
@@ -432,26 +441,34 @@ mod replication_helpers {
             resolve_property_type("Part", "size"),
             Some(DataType::Value(rbx_dom_weak::types::VariantType::Vector3))
         ));
-        // `Part`'s link to `BasePart` runs through `FormFactorPart`, which the
-        // reflection database does not describe; the built-in API dump supplies that
-        // step, so a name inherited from above the gap resolves from either
-        // spelling. The failure message carries the chain, because a database that
-        // changes shape should be noticed here rather than in a live session.
+        // `Part` is described, its abstract `FormFactorPart` parent is not, and the
+        // walk still has to reach `BasePart`: without that step every inherited
+        // property of every part in an applied snapshot would be reported undeclared.
         assert!(class_is_subclass_of("Part", "BasePart"));
-        assert_eq!(
-            canonical_property_name("Part", "AnChArEd").as_deref(),
-            Some("Anchored"),
-            "chain: {:?}\n{}\n{}\n{}",
-            class_chain("Part"),
-            describe_class("Part"),
-            describe_class("FormFactorPart"),
-            describe_class("BasePart")
-        );
-        // Inherited from BasePart, which is why the walk is needed.
-        assert_eq!(
-            canonical_property_name("Part", "transparency").as_deref(),
-            Some("Transparency")
-        );
+        assert!(class_is_subclass_of("Part", "Instance"));
+        assert!(!class_is_subclass_of("Part", "Model"));
+        // Whatever the database covers, the two lookups have to agree: a name that
+        // resolves to a canonical spelling must also have a type, or the applier
+        // would store a value the editor cannot interpret.
+        for name in [
+            "size",
+            "Size",
+            "SiZe",
+            "shape",
+            "anchored",
+            "Anchored",
+            "transparency",
+            "name",
+            "parent",
+        ] {
+            if let Some(canonical) = canonical_property_name("Part", name) {
+                assert!(
+                    resolve_property_type("Part", &canonical).is_some(),
+                    "{name} -> {canonical} resolves with no type: {}",
+                    facts("Part")
+                );
+            }
+        }
         assert_eq!(canonical_property_name("Part", "definitely_not_a_property"), None);
         assert_eq!(canonical_property_name("NoSuchClassAtAll", "size"), None);
         assert_eq!(canonical_property_name("Part", ""), None);

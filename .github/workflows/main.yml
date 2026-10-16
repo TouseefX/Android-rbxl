@@ -465,7 +465,10 @@ jobs:
               # filter is not hidden by the tail of the last one.
               grep -E '^(test result:|error: test failed)' /tmp/cargo.log | head -n 40
               grep -A 8 '^error' /tmp/cargo.log | head -n 160
-              grep -E '^(---- |thread .* panicked|assertion|  left:| right:)' /tmp/cargo.log | head -n 120
+              # The whole failure section: a panic message that continues on
+              # indented lines is the useful part, and filtering by line prefix
+              # dropped exactly that.
+              sed -n '/^failures:$/,$p' /tmp/cargo.log | head -n 120
             } 2>/dev/null
           )"
           if [ -z "$diag" ]; then
