@@ -652,6 +652,125 @@ impl ChannelRouter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-channel control state and callback dispatch (clean-room reconstruction).
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackDispatchPath {
+    NoCallback,
+    InvokedInline,
+    Submitted,
+}
+
+pub trait CallbackExecutor {
+    fn submit(&mut self, callback: Box<dyn FnOnce() + Send + 'static>);
+}
+
+pub fn dispatch_callback<F>(
+    current_thread_id: i32,
+    owner_thread_id: i32,
+    executor: &mut dyn CallbackExecutor,
+    callback: F,
+) -> CallbackDispatchPath
+where
+    F: FnOnce() + Send + 'static,
+{
+    // We can't easily detect a null callback in Rust; callers pass an Option
+    // when they need the NoCallback path. This helper assumes a callable.
+    if current_thread_id == owner_thread_id {
+        callback();
+        CallbackDispatchPath::InvokedInline
+    } else {
+        executor.submit(Box::new(callback));
+        CallbackDispatchPath::Submitted
+    }
+}
+
+// A convenience for callers that want the explicit no-callback case.
+pub fn dispatch_callback_option<F>(
+    current_thread_id: i32,
+    owner_thread_id: i32,
+    executor: &mut dyn CallbackExecutor,
+    callback: Option<F>,
+) -> CallbackDispatchPath
+where
+    F: FnOnce() + Send + 'static,
+{
+    match callback {
+        None => CallbackDispatchPath::NoCallback,
+        Some(callback) => dispatch_callback(current_thread_id, owner_thread_id, executor, callback),
+    }
+}
+
+pub struct ChannelControlState {
+    local_parity: u8,
+    allocator: LocalUnreliableIdAllocator,
+    local_ids: [Option<i32>; CHANNEL_PROFILE_COUNT],
+    mutex: Mutex<()>,
+}
+
+impl ChannelControlState {
+    pub fn new(local_parity: u8) -> Self {
+        Self {
+            local_parity: local_parity & 1,
+            allocator: LocalUnreliableIdAllocator::new(local_parity & 1),
+            local_ids: [None; CHANNEL_PROFILE_COUNT],
+            mutex: Mutex::new(()),
+        }
+    }
+
+    pub fn local_parity(&self) -> u8 {
+        self.local_parity
+    }
+
+    pub fn local_id(&self, channel_index: u32) -> Option<i32> {
+        if channel_index as usize >= CHANNEL_PROFILE_COUNT {
+            return None;
+        }
+        let _guard = self.mutex.lock().unwrap();
+        self.local_ids[channel_index as usize]
+    }
+
+    pub fn on_unreliable_open_callback(
+        &mut self,
+        channel_index: u32,
+    ) -> Result<i32, String> {
+        if channel_index as usize >= CHANNEL_PROFILE_COUNT {
+            return Err("Unreliable channel index is outside the 14-channel profile".into());
+        }
+        let _guard = self.mutex.lock().unwrap();
+        if self.local_ids[channel_index as usize].is_some() {
+            return Err("Unreliable channel already has a local wire ID".into());
+        }
+        let id = self.allocator.allocate().ok_or_else(|| "id space exhausted".to_string())?;
+        self.local_ids[channel_index as usize] = Some(id);
+        Ok(id)
+    }
+
+    pub fn make_unreliable_open_control(
+        &self,
+        application: u8,
+        channel_index: u32,
+    ) -> Result<[u8; UNRELIABLE_OPEN_BODY_BYTES], String> {
+        if channel_index as usize >= CHANNEL_PROFILE_COUNT {
+            return Err("Unreliable channel index is outside the 14-channel profile".into());
+        }
+        let id = {
+            let _guard = self.mutex.lock().unwrap();
+            self.local_ids[channel_index as usize]
+        };
+        let id = id.ok_or_else(|| "Unreliable channel has no allocated local wire ID".into())?;
+        let body = unreliable_open_body(application, channel_index, id)
+            .ok_or_else(|| "unreliable open body not buildable".to_string())?;
+        let mut out = [0u8; UNRELIABLE_OPEN_BODY_BYTES];
+        out.copy_from_slice(&body);
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
