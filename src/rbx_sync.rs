@@ -701,6 +701,80 @@ fn encode_member(
     Some(Ok(Change { entity, property, tag, raw }))
 }
 
+/// One property the editor asked to set, named the way the wire names it.
+///
+/// `entity` is a key of the applied snapshot's id map rather than a DOM `Ref`: a
+/// place the editor reloaded from serialized bytes has its own references, and two
+/// instances that look alike are not the same instance. Naming the wire id is what
+/// keeps an edit attached to what the peer assigned.
+#[derive(Clone, Debug)]
+pub struct SyncEdit {
+    pub entity: u32,
+    pub property: String,
+    pub value: Variant,
+}
+
+/// Turn explicit edits into a plan, without diffing anything.
+///
+/// [`plan_changes`] answers "what is different from what we received"; this answers
+/// "the caller said set this, can this client address it at all". An edit is refused
+/// and counted in [`ChangePlan::unmapped`] when the snapshot never assigned that
+/// wire id, when the instance's class is not in the peer's dictionary, or when the
+/// dictionary names no such member — the bytes are invented in none of those cases.
+/// `dom` is read, never written: the value the caller holds is the value that goes
+/// out, so an edit that was already applied locally is still sent.
+pub fn plan_edits(
+    schema: &crate::rbx_replication::JoinSchema,
+    dom: &WeakDom,
+    ids: &BTreeMap<u32, Ref>,
+    edits: &[SyncEdit],
+) -> ChangePlan {
+    let mut plan = ChangePlan::default();
+    let global = schema.global_prop_ids();
+    plan.addressing = match &global {
+        Some(table) => format!(
+            "runtime ids from the candidate global table ({} name(s))",
+            table.len()
+        ),
+        None => format!("member indices only — {}", schema.prop_id_report()),
+    };
+    plan.compared = edits.len();
+    for edit in edits {
+        let Some(reference) = ids.get(&edit.entity).copied() else {
+            plan.unmapped += 1;
+            continue;
+        };
+        let Some(instance) = dom.get_by_ref(reference) else {
+            plan.unmapped += 1;
+            continue;
+        };
+        let class = instance.class.to_string();
+        let Some(class_index) = schema
+            .classes
+            .iter()
+            .position(|defined| defined.name.eq_ignore_ascii_case(&class))
+            .map(|index| index as u16)
+        else {
+            plan.unmapped += 1;
+            continue;
+        };
+        match encode_member(
+            schema,
+            &global,
+            class_index,
+            edit.entity,
+            &class,
+            &edit.property,
+            &edit.value,
+        ) {
+            Some(Ok(change)) => plan.changes.push(change),
+            Some(Err(reason)) => plan.unencodable.push(reason),
+            None => plan.unmapped += 1,
+        }
+    }
+    plan
+}
+
 /// The property items of one delta chain:
 /// `[83] ( [03][ref selector][id u32 LE][prop id u16 LE][value] )* [00]`.
 ///
@@ -1350,6 +1424,61 @@ mod tests {
         assert_eq!(engine.next_flush_ms(), 510);
         assert_eq!(engine.pending(), 0);
         assert!(!engine.due(600), "the period has not elapsed");
+    }
+
+
+    /// An edit is addressed by the wire id the snapshot assigned. The id map, the
+    /// peer's class dictionary and the width that dictionary implies for the member
+    /// are the only things that can answer that, and an edit they do not cover is
+    /// counted rather than encoded from a guess.
+    #[test]
+    fn an_offered_edit_becomes_a_change_only_if_the_snapshot_can_name_it() {
+        let schema = test_schema(3);
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let part = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Part")
+                .with_name("Box")
+                .with_property("Size", Vector3::new(1.0, 2.0, 3.0)),
+        );
+        let ids: BTreeMap<u32, Ref> = [(7u32, part)].into_iter().collect();
+        let plan = plan_edits(
+            &schema,
+            &dom,
+            &ids,
+            &[
+                SyncEdit {
+                    entity: 7,
+                    property: "Size".to_string(),
+                    value: Variant::Vector3(Vector3::new(1.0, 2.0, 4.0)),
+                },
+                SyncEdit {
+                    entity: 7,
+                    property: "NotAMember".to_string(),
+                    value: Variant::Bool(true),
+                },
+                SyncEdit {
+                    entity: 99,
+                    property: "Size".to_string(),
+                    value: Variant::Vector3(Vector3::new(0.0, 0.0, 0.0)),
+                },
+            ],
+        );
+        assert_eq!(plan.compared, 3, "{}", plan.summary());
+        assert_eq!(plan.changes.len(), 1, "{}", plan.summary());
+        assert_eq!(plan.unmapped, 2, "one unknown member, one unknown instance");
+        let change = &plan.changes[0];
+        assert_eq!(change.entity, 7);
+        assert_eq!(change.tag, 19, "the dictionary's tag for size");
+        assert_eq!(change.raw.len(), 12);
+        assert_eq!(change.property, PropId::Runtime(0));
+
+        // A runtime-addressed change is exactly what the flush encoder accepts.
+        let mut engine = SyncEngine::new(0, 500);
+        engine.set_enabled(true, 0);
+        assert_eq!(engine.queue_plan(&plan), 1);
+        let payload = engine.flush(10).expect("a runtime-addressed item flushes");
+        assert_eq!(payload[0], DELTA_CHAIN_TAG);
     }
 
     #[test]

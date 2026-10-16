@@ -769,6 +769,14 @@ pub struct AppFlow {
     replication: ReplicationStream,
     liveness: LivenessTimers,
     sync: SyncEngine,
+    /// Editor edits waiting to be addressed. This is the seam between the place the
+    /// editor is showing and this session's outbound queue, held behind a lock so a
+    /// caller that is not the flow can offer one; the flow is the only thing that
+    /// takes them out.
+    edits: std::sync::Arc<std::sync::Mutex<Vec<crate::rbx_sync::SyncEdit>>>,
+    /// How many offered edits this flow has taken out of that outbox, whether or
+    /// not they could be addressed.
+    edits_offered: u64,
     /// A snapshot is emitted once, however many times the apply is attempted.
     snapshot_emitted: bool,
     /// Whether the "nothing decoded to apply" line has been said. It is said
@@ -811,6 +819,8 @@ impl AppFlow {
             replication: ReplicationStream::default(),
             liveness: LivenessTimers::new(now_ms),
             sync: SyncEngine::new(now_ms, 1000),
+            edits: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            edits_offered: 0,
             snapshot_emitted: false,
             snapshot_empty_reported: false,
             unbound_open: std::collections::BTreeSet::new(),
@@ -1521,6 +1531,7 @@ impl AppFlow {
             for tick in self.liveness.on_tick(now_ms) {
                 self.send_on_channel(tick.channel, tick.payload, &mut actions, tick.name);
             }
+            self.pump_edits();
             if let Some(payload) = self.sync.flush(now_ms) {
                 let framed = frame(&payload);
                 self.log(format!(
@@ -1677,17 +1688,96 @@ impl AppFlow {
     }
 
     /// Outbound accounting for the session report.
+    /// The outbox the editor writes into. Cloning this handle is how a caller that
+    /// is not this flow offers an edit; nothing about it implies the peer will
+    /// accept the edit, only that the flow will try to address it.
+    pub fn edits_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<crate::rbx_sync::SyncEdit>>> {
+        self.edits.clone()
+    }
+
+    /// Offer one edit directly, for a caller holding the flow.
+    pub fn offer_edit(&mut self, edit: crate::rbx_sync::SyncEdit) {
+        if let Ok(mut outbox) = self.edits.lock() {
+            outbox.push(edit);
+        }
+    }
+
+    /// Move whatever the editor offered into the sync engine's queue.
+    ///
+    /// An edit needs two numbers this client only owns once a place has been built:
+    /// the wire instance id the peer assigned and the property id from the peer's
+    /// dictionary. Without them the edit is dropped where the report can see it,
+    /// because an outbox that grows across a whole session would read as a backlog
+    /// rather than as a missing schema.
+    fn pump_edits(&mut self) {
+        let mut outbox = match self.edits.lock() {
+            Ok(outbox) => outbox,
+            Err(_) => return,
+        };
+        if outbox.is_empty() {
+            return;
+        }
+        let edits = std::mem::take(&mut *outbox);
+        drop(outbox);
+        self.edits_offered += edits.len() as u64;
+        let plan = {
+            let schema = self.replication.schema();
+            let ids = self.replication.snapshot_ids();
+            let dom = self.replication.snapshot_dom();
+            match (schema, ids, dom) {
+                (Some(schema), Some(ids), Some(dom)) => {
+                    Some(crate::rbx_sync::plan_edits(schema, dom, ids, &edits))
+                }
+                _ => None,
+            }
+        };
+        match plan {
+            Some(plan) => {
+                for reason in &plan.unencodable {
+                    self.skipped.push(format!("editor edit: {reason}"));
+                }
+                if plan.unmapped > 0 {
+                    self.skipped.push(format!(
+                        "{} editor edit(s) refused: no wire id for that instance, or the peer's dictionary names no such member",
+                        plan.unmapped
+                    ));
+                }
+                let accepted = self.sync.queue_plan(&plan);
+                self.log(format!(
+                    "editor edits: {} offered, {} queued; {}",
+                    edits.len(),
+                    accepted,
+                    plan.summary()
+                ));
+            }
+            None => {
+                let missing = if self.replication.schema().is_some() {
+                    "no applied snapshot to name an instance"
+                } else {
+                    "no snapshot schema to name a property"
+                };
+                self.skipped.push(format!(
+                    "{} editor edit(s) dropped: {missing}",
+                    edits.len()
+                ));
+            }
+        }
+    }
+
     pub fn sync_report(&self) -> String {
         if !self.planes.sync {
             return "outbound plane off; no flow control, liveness or property items were sent".to_string();
         }
         format!(
-            "liveness: {}; upstream: {}; queue: {} pending, {} dropped, {} coalesced",
+            "liveness: {}; upstream: {}; queue: {} pending, {} dropped, {} coalesced; editor edits {} offered",
             self.liveness.summary(),
             self.sync.summary(),
             self.sync.pending(),
             self.sync.dropped(),
-            self.sync.coalesced()
+            self.sync.coalesced(),
+            self.edits_offered
         )
     }
 
@@ -2409,9 +2499,9 @@ mod tests {
         let planes = JoinPlanes { sync: true, ..JoinPlanes::default() };
         let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
         let flow = flow_with(planes);
-        // Nothing is queued by construction: the editor's edits reach the
-        // session only if a caller hands a plan to `queue_plan`, and no caller
-        // does that on the current path. The report has to say so.
+        // Nothing is queued by construction: an editor edit reaches the session
+        // only through the flow's outbox, and the UI does not offer one on the
+        // current path. The report has to say so in the same terms.
         assert!(flow.sync_report().contains("0 pending"), "{}", flow.sync_report());
     }
 
@@ -2419,6 +2509,43 @@ mod tests {
     /// `on_tick` at send time. The assertion this replaces treated the leading
     /// `a6` as a compact-varint length, which it is not, so it failed against
     /// bytes that a live session sends unchanged.
+    /// The outbox is the editor's seam into a running session, and an edit this
+    /// client cannot address has to be dropped loudly rather than kept: a queue that
+    /// holds an edit forever reads as pending traffic, while the truth is that no
+    /// place has been built to point at.
+    #[test]
+    fn sync_plane_drops_an_editor_edit_it_cannot_address() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes { sync: true, ..JoinPlanes::default() };
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
+        let mut flow = flow_with(planes);
+        flow.offer_edit(crate::rbx_sync::SyncEdit {
+            entity: 7,
+            property: "Size".to_string(),
+            value: rbx_dom_weak::types::Variant::Vector3(rbx_dom_weak::types::Vector3::new(
+                1.0, 2.0, 4.0,
+            )),
+        });
+        flow.on_tick(10_000);
+        let report = flow.sync_report();
+        assert!(report.contains("0 pending"), "{report}");
+        assert!(report.contains("editor edits 1 offered"), "{report}");
+        assert!(
+            flow.skipped()
+                .iter()
+                .any(|note| note.contains("dropped: no snapshot schema")),
+            "{:?}",
+            flow.skipped()
+        );
+        // Taken out of the outbox, so a second tick cannot resurrect it.
+        flow.on_tick(20_000);
+        assert!(
+            flow.sync_report().contains("editor edits 1 offered"),
+            "the edit was consumed, not queued: {}",
+            flow.sync_report()
+        );
+    }
+
     #[test]
     fn routes_are_unframed_payloads_that_frame_to_exactly_one_message() {
         assert_eq!(ROUTES.len(), 4);
