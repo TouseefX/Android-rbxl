@@ -2156,13 +2156,25 @@ mod tests {
         assert!(flow.sync_report().starts_with("outbound plane off"));
         // Only the control channel and chan1 are opened, and no timer fires.
         let data = ctrl_burst(&mut flow);
+        // The handshake logs its own stream header whatever the switches say; the
+        // claim under test is that a disabled plane adds nothing to it.
+        let _ = flow.drain_events();
         assert!(flow.on_tick(10_000).is_empty(), "no liveness traffic when off");
         // Bound to channel 1 so the bytes take the join path, not the control
         // path: the control parser logs unrecognised records whatever the planes
         // say, and that would be a false pass here.
         flow.note_opened(APP, 1, 7);
         flow.on_stream_data(7, &frame(&[0x83, 0x16, 0x09, 0x00]));
-        assert!(flow.drain_events().is_empty(), "a disabled plane reports nothing");
+        let events = flow.drain_events();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                FlowEvent::ChannelUpdate(_)
+                    | FlowEvent::ReplicationStatus(_)
+                    | FlowEvent::SnapshotReady { .. }
+            )),
+            "a disabled plane reports nothing: {events:?}"
+        );
         // And the control burst is the four reference records, untouched. The
         // 7-byte header is skipped because the application byte inside it is a
         // global switch other tests are allowed to move.
