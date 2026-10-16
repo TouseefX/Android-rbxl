@@ -30,6 +30,28 @@ does not replicate a live place into the editor or provide Studio's full
 connected state. A successful handshake or observed flow traffic does not prove
 native BaseClient connection or Team Create acceptance.
 
+## Team Create post-join planes
+
+The RbxTransport path ends at "handshake plus one burst". Three switches extend
+it, and all three are off by default so that a run started without them sends
+byte-for-byte the session it sent before:
+
+| Switch | Module | What it does | What it does not claim |
+| --- | --- | --- | --- |
+| Join channels | `src/rbx_channels.rs` | Keeps the recovered fourteen-row `openSendChannel` profile, stages this client's open records on the control stream, decodes the peer's announcements (including the parity rule that separates a peer's unreliable id from this client's own), reports channels opened but never answered or answered but never opened, and calls a channel the peer opened as a bare stream one-direction rather than a gap. | That any channel carries usable traffic. In the default reference mode the staged records are byte-identical to the previous hard-coded burst, so this plane adds accounting rather than behaviour; `full profile` is the only mode that changes bytes. |
+| Replication | `src/rbx_replication.rs` | Walks the join channel's compact-varint frames into the `0x93` configuration table, `0x81` join start, `0x97` schema, `0x83`/`0x16` `JoinDataItemV2` batches, and the live delta chains of spawn, property, event and clock items; decodes the snapshot schema, shared strings and instance records, then builds a `WeakDom` and serializes it so the editor can open the place. | That the place is complete or current, or that this client joined. Messages whose inner layout the analysis does not pin down are counted and reported rather than guessed at, and a snapshot requested without a schema is refused instead of invented. |
+| Syncing | `src/rbx_sync.rs` | The outbound half: the `0xA6` flow-control block and route step counters, the reference client's 1 s ping and 5 s sync periods, and a coalescing queue of `0x83`/`0x03` property items fed two ways - a diff of the applied DOM against the snapshot baseline, or explicit edits named by the wire instance id the peer assigned. | That the peer wants any of it. The property id an update needs indexes the replicator's runtime table, which the snapshot never sends, so changes are encoded only against the candidate global id table the schema can validate and are otherwise refused and counted. An editor edit reaches a running session only through the flow's outbox (`AppFlow::offer_edit`, `AppFlow::edits_handle`), and an edit no applied snapshot can address is dropped into the session's skip notes instead of waiting there. The UI does not offer one yet, so on the current path the queue still stays empty and only the liveness frames are produced. |
+
+Each plane reports what it refused. The session output carries the channel gaps,
+the unparsable message ids, the liveness and sync counters, and the property-id
+binding decision, so "sent nothing" and "had nothing to send" stay distinguishable
+in a log. The live session of 2026-10-16 is what these rows rest on: the
+four-byte compact-varint frame this client writes was read back without an error
+from the server's own `0x93` table (1869 bytes, 48 declared pairs), the server
+opened streams for the ten reliable channels and sent no open record for any of
+them, and the flow stopped before any `0x9B` challenge reached the join channel. The reference material in `dump/` stops at verified framing on purpose;
+these modules stop at the same line.
+
 ## Studio companion plugin
 
 The optional Live Session WebSocket listens on loopback port `41742` by default.
@@ -54,6 +76,9 @@ editor UI, and the bridge does not synchronize the Studio DataModel.
 | `kotlin/MainActivity.kt` | Android `GameActivity`, file/clipboard bridges, and Sora script editor. |
 | `kotlin/LuauLanguage.kt` | Luau language support for the Sora editor. |
 | `src/android_ime.rs` | Android GameTextInput-to-egui keyboard and clipboard bridge. |
+| `src/team_create.rs` | Join-config parsing, legacy RakNet probes, and the RbxTransport QUIC/TLS session and its report. |
+| `src/appflow.rs` | The app=4 post-handshake flow: control hello and channel burst, 0x90/0x92/0x9B/0xA7, route declarations, snapshot markers. |
+| `src/rbx_channels.rs`, `src/rbx_replication.rs`, `src/rbx_sync.rs` | Opt-in join-channel, replication-decode and outbound-sync planes for that flow. |
 | `manifest.yaml` | xbuild Android package, SDK, permission, and Maven dependency configuration. |
 | `assets/companion_plugin.lua` | Optional Roblox Studio companion plugin for the Live Session bridge. |
 | `renderer/` | Standalone renderer sandbox; separate from the main editor app. |
@@ -164,7 +189,13 @@ not reliable on every device.
 
 The workflow runs host checks and selected regression tests, checks the Android
 target without packaging an APK, and reports the full library test suite
-separately. APK packaging runs on manual dispatch and on pushes to `arena/**`;
+separately. The selected tests are named in `.github/workflows/main.yml`, because
+the suite as a whole has pre-existing failures that would otherwise hide the
+signal: besides the plugin and caps-splice filters, the ones that guard bytes this
+app puts on the wire (the 0x92 layout, the marker ack, the control-record framing)
+and the three post-join plane modules are run by name. Those plane suites are the
+only thing that exercises the snapshot decoders and encoders, since no plane runs
+on the default wire path. APK packaging runs on manual dispatch and on pushes to `arena/**`;
 it is skipped for ordinary pushes to `master`.
 
 ## Third-party components

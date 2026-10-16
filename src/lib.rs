@@ -45,6 +45,9 @@ mod appflow;
 mod challenge;
 mod challenge_tables;
 mod team_create;
+mod rbx_channels;
+mod rbx_replication;
+mod rbx_sync;
 mod templates;
 mod thumbnails;
 

@@ -411,6 +411,22 @@ pub struct EditorApp {
     /// QUIC/TLS handshake milestone only; not BaseClient-connected or Team Create-accepted.
     team_create_session_quic_handshake_complete: bool,
     team_create_session_status: String,
+    /// Which of the three post-join planes the next flow runs. They are separate
+    /// switches because each one changes a different part of the wire: the
+    /// channel plane only stages control records, the replication plane only
+    /// reads, and the sync plane is the only one that sends on a timer. All three
+    /// default off, so a handshake experiment is not disturbed by them.
+    team_create_channels: bool,
+    team_create_replication: bool,
+    team_create_sync: bool,
+    /// Channel-open shape while the channel plane is on: 0 = the reference
+    /// unreliable rows (byte-identical to the current burst), 1 = every row of
+    /// the recovered profile, 2 = stage nothing but still track the peer.
+    team_create_channel_mode: u8,
+    /// A place materialized from the replicated snapshot, waiting for the user
+    /// to open it. Loading it replaces the editor's document; it is not a join.
+    team_create_snapshot: Option<Vec<u8>>,
+    team_create_snapshot_summary: String,
 
     // Per-property text buffers so number properties (float/int, and vector
     // components) can be TYPED exactly like Studio instead of only dragged.
@@ -582,6 +598,12 @@ impl Default for EditorApp {
             ctrl_app_choice: 0,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
+            team_create_channels: false,
+            team_create_replication: false,
+            team_create_sync: false,
+            team_create_channel_mode: 0,
+            team_create_snapshot: None,
+            team_create_snapshot_summary: String::new(),
             prop_num_buf: HashMap::new(),
             prop_num_sel: None,
             pending_play_audio: None,
@@ -2237,6 +2259,32 @@ ui.label("Place ID:");
                             ui.radio_value(&mut self.ctrl_app_choice, 4u8, "4")
                                 .on_hover_text("Writes application byte 4 in the control-stream header");
                         });
+                        ui.label(
+                            RichText::new("Post-join planes (off = handshake and burst only)")
+                                .weak(),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.team_create_channels, "join channels")
+                                .on_hover_text(
+                                    "Stage the profile's openSendChannel records on the control stream and reconcile them with the peer's announcements. In the reference mode this is byte-identical to the current burst, so the only thing it adds is the accounting.",
+                                );
+                            ui.radio_value(&mut self.team_create_channel_mode, 0u8, "reference openU")
+                                .on_hover_text("OpenUnreliable for channels 3, 5, 6 and 11 with wire ids 2, 4, 6, 8 — what the observed client sends");
+                            ui.radio_value(&mut self.team_create_channel_mode, 1u8, "full profile")
+                                .on_hover_text("One openSendChannel record per profile row, reliable ones included — a stronger claim on the wire than the reference burst");
+                            ui.radio_value(&mut self.team_create_channel_mode, 2u8, "no opens")
+                                .on_hover_text("Send no channel records; channel state is still tracked and reported");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.team_create_replication, "decode replication")
+                                .on_hover_text(
+                                    "Walk the join channel's frames into a snapshot: peer init, schema, JoinDataItemV2 batches, delta chains. When a schema and records are both present this builds an .rbxlx you can open below. Reading nothing back is deliberate: the snapshot plane sends no bytes.",
+                                );
+                            ui.checkbox(&mut self.team_create_sync, "send liveness + edits")
+                                .on_hover_text(
+                                    "The reference client's 1 s ping and 5 s sync templates, plus any outbound property items the sync engine can address. Note the limit: the editor does not yet feed its edits to a running session, so the queue stays empty and only the liveness templates go out. The diff planner and its refusals are exercised by tests, not by this panel.",
+                                );
+                        });
                         // Applied after the radios, so changing one and starting a
                         // session in the same frame cannot use the previous value.
                         let a7_mode = match self.a7_mode_choice {
@@ -2246,6 +2294,18 @@ ui.label("Place ID:");
                         };
                         crate::appflow::set_a7_mode(a7_mode);
                         crate::appflow::set_ctrl_app(self.ctrl_app_choice);
+                        crate::appflow::set_join_planes(crate::appflow::JoinPlanes {
+                            channels: self.team_create_channels,
+                            replication: self.team_create_replication,
+                            sync: self.team_create_sync,
+                        });
+                        crate::rbx_channels::set_channel_open_mode(
+                            match self.team_create_channel_mode {
+                                1 => crate::rbx_channels::ChannelOpenMode::FullProfile,
+                                2 => crate::rbx_channels::ChannelOpenMode::Off,
+                                _ => crate::rbx_channels::ChannelOpenMode::ReferenceUnreliable,
+                            },
+                        );
                         ui.label(
                             RichText::new(format!(
                                 "auto-retries left on security-key mismatch: {}",
@@ -2255,12 +2315,31 @@ ui.label("Place ID:");
                         );
                         ui.label(
                             RichText::new(format!(
-                                "active: 0xA7 = {}, ctrl app byte = {}",
+                                "active: 0xA7 = {}, ctrl app byte = {}, planes = {}",
                                 crate::appflow::a7_mode_label(a7_mode),
-                                self.ctrl_app_choice
+                                self.ctrl_app_choice,
+                                crate::appflow::join_planes().label()
                             ))
                             .weak(),
                         );
+                        if let Some(bytes) = self.team_create_snapshot.as_ref() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "replicated snapshot: {} B of rbxlx ready — opening it replaces the place in the editor",
+                                    bytes.len()
+                                ))
+                                .weak(),
+                            );
+                            ui.label(RichText::new(self.team_create_snapshot_summary.clone()).weak());
+                            if ui.button("📥 Open replicated snapshot").clicked() {
+                                if let Some(bytes) = self.team_create_snapshot.take() {
+                                    self.load_from_bytes(bytes);
+                                    self.status =
+                                        "Opened the place built from the replicated snapshot (local action; the Team Create session is unchanged)"
+                                            .into();
+                                }
+                            }
+                        }
                     });
                     ui.add_space(6.0);
 
@@ -6417,6 +6496,25 @@ ui.label("Place ID:");
                 crate::team_create::RbxTransportSessionEvent::ConnectedStageReached(detail) => {
                     self.status = format!("Channel-1 traffic observed after a 0x9B frame (local flow milestone, not native BaseClient confirmation) — {detail}");
                     self.log_info(self.status.clone());
+                }
+                crate::team_create::RbxTransportSessionEvent::ChannelUpdate(note) => {
+                    self.team_create_session_status = format!("Channel plane: {note}");
+                    self.log_info(format!("Channel plane: {note}"));
+                }
+                crate::team_create::RbxTransportSessionEvent::SnapshotReady {
+                    bytes,
+                    summary,
+                } => {
+                    let len = bytes.len();
+                    self.team_create_snapshot = Some(bytes);
+                    self.team_create_snapshot_summary = summary;
+                    self.status = format!(
+                        "Replicated snapshot ready ({len}B rbxlx) — open it from the Team Create panel; building a place locally is not acceptance by a Team Create session"
+                    );
+                    self.log_info(format!(
+                        "Replicated snapshot ({len}B).\n{}",
+                        self.team_create_snapshot_summary
+                    ));
                 }
                 crate::team_create::RbxTransportSessionEvent::Finished(report) => {
                     self.team_create_response = report.clone();

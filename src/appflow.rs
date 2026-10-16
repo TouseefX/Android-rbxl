@@ -12,8 +12,32 @@
 //! [`Action`]s. The QUIC session (`team_create.rs`) executes the actions
 //! (open streams, write bytes, flush datagrams) and feeds received data
 //! back in.
+//!
+//! Three planes sit behind opt-in switches here, because a session that has
+//! only completed a handshake and a burst cannot say what any of them should
+//! do on the wire:
+//!
+//! * *Join channels* — [`crate::rbx_channels`]: the fourteen-row profile, the
+//!   staged `openSendChannel` records, and the reconciliation of our opens with
+//!   the peer's announcements. [`ChannelRouter`] is fed by the same control
+//!   records the flow already parses.
+//! * *Replication* — [`crate::rbx_replication`]: channel-1 (and any reliable
+//!   channel) bytes are walked as framed messages into a
+//!   [`ReplicationStream`], which decodes the snapshot schema, the
+//!   `JoinDataItemV2` batches and the live delta chains, and can materialize a
+//!   place the editor opens.
+//! * *Syncing* — [`crate::rbx_sync`]: the flow-control/heartbeat block, the
+//!   reference client's ping and sync periods, and the coalescing queue of
+//!   outbound property changes.
+//!
+//! All three are off by default, so enabling the crate changes no bytes: each
+//! one is listed in the session report together with what it did or refused to
+//! do.
 
 use crate::challenge;
+use crate::rbx_channels::{self, ChannelOpenMode, ChannelRouter, DEFAULT_CHANNEL_PROFILE};
+use crate::rbx_replication::{ReplicationNote, ReplicationStream};
+use crate::rbx_sync::{LivenessTimers, SyncEngine};
 use std::collections::HashMap;
 
 /// BaseClient join application id on the RbxTransport multiplexer.
@@ -98,6 +122,79 @@ pub fn ctrl_app() -> u32 {
     CTRL_APP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) as u32
 }
 
+/// Which of the three post-join planes a flow runs. These are separate switches
+/// on purpose: a session that decodes replication is not a session that sends
+/// liveness traffic, and a report that conflates them cannot be compared with a
+/// previous run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinPlanes {
+    /// Reconcile channel opens against the fourteen-row profile.
+    pub channels: bool,
+    /// Decode the snapshot schema, batches and delta chains.
+    pub replication: bool,
+    /// Send flow control, the reference client's liveness periods, and any
+    /// queued outbound property changes.
+    pub sync: bool,
+}
+
+impl Default for JoinPlanes {
+    fn default() -> Self {
+        Self { channels: false, replication: false, sync: false }
+    }
+}
+
+impl JoinPlanes {
+    fn bits(self) -> u8 {
+        u8::from(self.channels) | (u8::from(self.replication) << 1) | (u8::from(self.sync) << 2)
+    }
+
+    /// One line naming what is on, for the report and the UI.
+    pub fn label(self) -> String {
+        let mut on = Vec::new();
+        if self.channels {
+            on.push(format!(
+                "channels ({})",
+                rbx_channels::channel_open_mode_label(rbx_channels::channel_open_mode())
+            ));
+        }
+        if self.replication {
+            on.push("replication decode".to_string());
+        }
+        if self.sync {
+            on.push("outbound liveness/sync".to_string());
+        }
+        if on.is_empty() {
+            "none (handshake and burst only)".to_string()
+        } else {
+            on.join(", ")
+        }
+    }
+}
+
+static JOIN_PLANES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Select which post-join planes subsequent flows run.
+pub fn set_join_planes(planes: JoinPlanes) {
+    JOIN_PLANES.store(planes.bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The configured post-join planes. Defaults to all off.
+pub fn join_planes() -> JoinPlanes {
+    let bits = JOIN_PLANES.load(std::sync::atomic::Ordering::Relaxed);
+    JoinPlanes {
+        channels: bits & 1 != 0,
+        replication: bits & 2 != 0,
+        sync: bits & 4 != 0,
+    }
+}
+
+/// The unframed route declaration payload for one of the four routes, exposed
+/// so [`crate::rbx_sync`] can splice control blocks and step counters onto the
+/// same bytes the flow sends.
+pub fn route_template(index: usize) -> Vec<u8> {
+    ROUTES.get(index).map(|route| hex(route)).unwrap_or_default()
+}
+
 /// Decoded early-auth material (the base64 fields 2 and 3 of the
 /// `ClientTicket` split on semicolons, plus the trailing version).
 #[derive(Clone, Debug)]
@@ -155,6 +252,16 @@ pub enum FlowEvent {
     /// Channel-1 traffic arrived after a 0x9B frame was seen. This is a local
     /// diagnostic milestone, not confirmation of native BaseClient connection.
     ConnectedStageReached { detail: String },
+    /// A channel open, a peer announcement, or the accounting that followed.
+    /// Carries a sentence, not a claim that the channel was accepted.
+    ChannelUpdate(String),
+    /// One decoded replication note: a schema, a batch, a delta chain, or the
+    /// reason a message was left unparsed.
+    ReplicationStatus(String),
+    /// A replicated place was materialized from the snapshot. `summary` says
+    /// what the applier could and could not type; this is not a statement that
+    /// the session is a live Team Create client.
+    SnapshotReady { bytes: Vec<u8>, summary: String },
 }
 
 fn hex(s: &str) -> Vec<u8> {
@@ -222,14 +329,20 @@ pub fn compact_varint(v: u64) -> Vec<u8> {
     } else if v < 0x4000 {
         out.push(0x40 | (v >> 8) as u8);
         out.push((v & 0xFF) as u8);
-    } else if v < 0x40_0000_0000 {
+    } else if v < 0x4000_0000 {
         out.push(0x80 | (v >> 24) as u8);
         out.push((v >> 16) as u8);
         out.push((v >> 8) as u8);
         out.push((v & 0xFF) as u8);
     } else {
+        // The 8-byte form puts six bits in the tag byte and then the remaining
+        // seven bytes, most significant first. The shift list is written out
+        // because `(8..56).rev().step_by(8)` steps the *reversed* sequence and
+        // lands on 55, 47, 39 - which silently misaligns every frame over
+        // 2^56 bytes and, with the 4-byte bound above set to 2^38, mis-encoded
+        // 2^30..2^32 as an 8-byte varint.
         out.push(0xC0 | (v >> 56) as u8);
-        for shift in (8..56).rev().step_by(8) {
+        for shift in [48u32, 40, 32, 24, 16, 8, 0] {
             out.push((v >> shift) as u8);
         }
     }
@@ -648,6 +761,30 @@ pub struct AppFlow {
     /// only a Status event, so a session that silently dropped the 0x90 read
     /// exactly like one that sent it.
     skipped: Vec<String>,
+    /// Which of the post-join planes this flow runs, captured at construction so
+    /// a report describes the session it belongs to.
+    planes: JoinPlanes,
+    /// Join-channel state: profile, staged opens, peer announcements, bytes.
+    channels: ChannelRouter,
+    replication: ReplicationStream,
+    liveness: LivenessTimers,
+    sync: SyncEngine,
+    /// Editor edits waiting to be addressed. This is the seam between the place the
+    /// editor is showing and this session's outbound queue, held behind a lock so a
+    /// caller that is not the flow can offer one; the flow is the only thing that
+    /// takes them out.
+    edits: std::sync::Arc<std::sync::Mutex<Vec<crate::rbx_sync::SyncEdit>>>,
+    /// How many offered edits this flow has taken out of that outbox, whether or
+    /// not they could be addressed.
+    edits_offered: u64,
+    /// A snapshot is emitted once, however many times the apply is attempted.
+    snapshot_emitted: bool,
+    /// Whether the "nothing decoded to apply" line has been said. It is said
+    /// once and the apply is still retried, because a schema can arrive after
+    /// the marker that first asked for the place.
+    snapshot_empty_reported: bool,
+    /// Channels this client asked to open but that no stream id is bound to yet.
+    unbound_open: std::collections::BTreeSet<u32>,
 }
 
 impl AppFlow {
@@ -677,6 +814,16 @@ impl AppFlow {
             post_answer_reported: false,
             now_ms,
             events: Vec::new(),
+            planes: join_planes(),
+            channels: ChannelRouter::new(APP, &DEFAULT_CHANNEL_PROFILE),
+            replication: ReplicationStream::default(),
+            liveness: LivenessTimers::new(now_ms),
+            sync: SyncEngine::new(now_ms, 1000),
+            edits: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            edits_offered: 0,
+            snapshot_emitted: false,
+            snapshot_empty_reported: false,
+            unbound_open: std::collections::BTreeSet::new(),
         }
     }
 
@@ -713,8 +860,24 @@ impl AppFlow {
         let ctrl_app = ctrl_app();
         let mut ctrl = stream_header(ctrl_app, CTRL_CHANNEL).to_vec();
         ctrl.extend_from_slice(&frame(&[0x00, 0x00]));
-        for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
-            ctrl.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
+        if self.planes.channels {
+            // The fourteen-row profile drives the open records. In the reference
+            // mode this is byte-identical to the hard-coded list in the `else`
+            // arm - a test pins that equality - so the only mode that changes
+            // the wire is `FullProfile`, which also opens the reliable rows.
+            let bodies = self.channels.stage_opens(rbx_channels::channel_open_mode(), APP as u8);
+            for body in &bodies {
+                ctrl.extend_from_slice(&frame(body));
+            }
+            self.log(format!(
+                "channel router staged {} open record(s), mode {}",
+                bodies.len(),
+                rbx_channels::channel_open_mode_label(rbx_channels::channel_open_mode())
+            ));
+        } else {
+            for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
+                ctrl.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
+            }
         }
         // Log the header verbatim: whether the server routes on app 0 or app 4
         // is unresolved, and the only way to compare against a capture is to
@@ -791,12 +954,64 @@ impl AppFlow {
             data: one,
         });
 
+        if self.planes.sync {
+            // The reference client sends its first sync and ping immediately
+            // after connecting, then on their periods. These are the only
+            // outbound frames this flow adds unbidden, and only when the sync
+            // plane is on.
+            let now_ms = self.now_ms;
+            self.liveness.set_enabled(true, now_ms);
+            self.sync.set_enabled(true, now_ms);
+            for tick in self.liveness.initial() {
+                self.send_on_channel(tick.channel, tick.payload, &mut actions, tick.name);
+            }
+        }
         self.log(format!(
             "on_connected: {} actions staged (0x90 {})",
             actions.len(),
             if m90.is_some() { "included" } else { "skipped" }
         ));
         actions
+    }
+
+    /// Put a framed payload on the stream that carries `chan`, opening that
+    /// stream once if this client has not opened it yet.
+    ///
+    /// A stream this client asked for is not writable until the peer has bound an
+    /// id to it, so those frames are counted as skipped rather than answered by a
+    /// second `OpenStream` for the same channel — which is what a naive
+    /// implementation does and what makes a session's byte count meaningless.
+    fn send_on_channel(
+        &mut self,
+        chan: u32,
+        payload: Vec<u8>,
+        actions: &mut Vec<Action>,
+        what: &str,
+    ) {
+        if payload.is_empty() {
+            return;
+        }
+        let bound = self
+            .streams
+            .get(&(APP, chan))
+            .copied()
+            .or(if chan == 1 { self.valid_chan1() } else { None });
+        if let Some(stream) = bound {
+            actions.push(Action::Write { stream, data: payload });
+            return;
+        }
+        if chan == 1 || chan == CTRL_CHANNEL || !self.unbound_open.insert(chan) {
+            self.skipped.push(format!(
+                "{what}: chan{chan} has no bound stream id yet ({} byte(s) not sent)",
+                payload.len()
+            ));
+            return;
+        }
+        let mut data = stream_header(APP, chan).to_vec();
+        data.extend_from_slice(&payload);
+        let written = data.len();
+        actions.push(Action::OpenStream { app: APP, chan, data });
+        self.log(format!("{what}: opening app={APP} chan={chan} ({written}B)"));
     }
 
     /// Queue stream bytes that could not be written yet.
@@ -819,6 +1034,13 @@ impl AppFlow {
     /// Burst pieces that were left out, with reasons.
     pub fn skipped(&self) -> &[String] {
         &self.skipped
+    }
+
+    /// The same notes, consumed. The session report collects them twice - once
+    /// after the initial actions and once after the receive loop - and reading the
+    /// list rather than draining it printed every skipped frame twice.
+    pub fn take_skipped(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.skipped)
     }
 
     /// The session tells us which raw stream id an OpenStream action got.
@@ -894,6 +1116,17 @@ impl AppFlow {
         };
 
         if (app, chan) == (APP, 1) {
+            // The frame count comes from the replication walk, so the channel
+            // report counts messages that were actually delimited rather than
+            // assuming one frame per read.
+            let mut frames = 0usize;
+            if self.planes.replication {
+                frames = self.replication.push(data);
+            }
+            if self.planes.channels {
+                self.channels.note_join_stream(stream);
+                self.channels.note_bytes(1, data.len(), frames);
+            }
             self.chan1_rx.extend_from_slice(data);
             if self.chan1_rx.len() > 16 << 20 {
                 // Challenge/marker parsing needs only a bounded tail; cap
@@ -913,6 +1146,17 @@ impl AppFlow {
             actions.extend(self.try_challenge());
             actions
         } else {
+            let mut frames = 0usize;
+            if self.planes.replication && chan != CTRL_CHANNEL {
+                // A reliable channel the peer opened carries replication data
+                // too; the control channel carries channel announcements, and
+                // framing those as replication messages would be a false read.
+                frames = self.replication.push(data);
+            }
+            if self.planes.channels {
+                self.channels.note_stream(chan, stream);
+                self.channels.note_bytes(chan, data.len(), frames);
+            }
             self.feed_ctrl(stream, app, chan, data);
             Vec::new()
         }
@@ -955,6 +1199,11 @@ impl AppFlow {
                 self.log(format!(
                     "ctrl OpenReliable app={peer_app} chan={peer_chan} (on app={app} chan={chan})"
                 ));
+                if self.planes.channels {
+                    if let Some(note) = self.channels.note_peer_open(peer_app, peer_chan, None) {
+                        self.events.push(FlowEvent::ChannelUpdate(note));
+                    }
+                }
             }
             // OpenUnreliable: type 2, app, channel, wire id - 10 bytes. This is
             // the channel->wire mapping the BaseClient path could not resolve.
@@ -966,6 +1215,15 @@ impl AppFlow {
                 self.log(format!(
                     "ctrl OpenUnreliable app={peer_app} chan={peer_chan} wire={wire} (on app={app} chan={chan})"
                 ));
+                if self.planes.channels {
+                    // The router also checks the parity rule the target uses to
+                    // tell a peer id from one of its own.
+                    if let Some(note) =
+                        self.channels.note_peer_open(peer_app, peer_chan, Some(wire))
+                    {
+                        self.events.push(FlowEvent::ChannelUpdate(note));
+                    }
+                }
             }
             (Some(tag), len) => {
                 let head: Vec<String> =
@@ -1014,6 +1272,12 @@ impl AppFlow {
                 self.markers_acked += 1;
                 let mut ack = vec![0x04u8];
                 ack.extend_from_slice(&id.to_le_bytes());
+                if self.planes.replication {
+                    // The marker is the point the target releases the joining
+                    // client, so it is also where this client asks for the place
+                    // to be materialized from whatever it has decoded.
+                    self.replication.request_apply();
+                }
                 self.log(format!("0x84 marker id={id} acknowledged"));
                 actions.push(Action::Write {
                     stream: chan1,
@@ -1055,9 +1319,10 @@ impl AppFlow {
     /// These settings are user-selectable, so include them in the session report.
     pub fn flow_config_summary(&self) -> String {
         format!(
-            "0xA7 = {}, control stream application = {}",
+            "0xA7 = {}, control stream application = {}, planes = {}",
             a7_mode_label(self.cfg.a7_mode),
-            ctrl_app()
+            ctrl_app(),
+            self.planes.label()
         )
     }
 
@@ -1248,23 +1513,277 @@ impl AppFlow {
         }
     }
 
-    /// Fire route declarations about 60 ms after the local challenge solve.
+    /// Fire route declarations about 60 ms after the local challenge solve, and
+    /// run the opt-in planes' own timers.
     pub fn on_tick(&mut self, now_ms: u64) -> Vec<Action> {
         self.now_ms = now_ms;
+        let mut actions = Vec::new();
         if self.routes_at_ms >= 0 && now_ms as i64 >= self.routes_at_ms {
             self.routes_at_ms = -1;
             let mut data = stream_header(APP, 11).to_vec();
-            for r in ROUTES {
-                data.extend_from_slice(&frame(&hex(r)));
+            for route in ROUTES {
+                data.extend_from_slice(&frame(&hex(route)));
             }
             self.log(format!("routes: 4 declarations ({}B) on chan11", data.len()));
-            return vec![Action::OpenStream {
-                app: APP,
-                chan: 11,
-                data,
-            }];
+            actions.push(Action::OpenStream { app: APP, chan: 11, data });
         }
-        Vec::new()
+        if self.planes.sync {
+            for tick in self.liveness.on_tick(now_ms) {
+                self.send_on_channel(tick.channel, tick.payload, &mut actions, tick.name);
+            }
+            self.pump_edits();
+            if let Some(payload) = self.sync.flush(now_ms) {
+                let framed = frame(&payload);
+                self.log(format!(
+                    "upstream sync: {} byte(s) of property items on chan{}",
+                    framed.len(),
+                    crate::rbx_sync::upstream_channel(true)
+                ));
+                self.send_on_channel(
+                    crate::rbx_sync::upstream_channel(true),
+                    framed,
+                    &mut actions,
+                    "upstream-sync",
+                );
+            }
+        }
+        if self.planes.replication {
+            self.drain_replication(false);
+        }
+        if self.planes.channels {
+            for note in self.channels.notes() {
+                self.events.push(FlowEvent::ChannelUpdate(note));
+            }
+        }
+        actions
+    }
+
+    /// Move replication notes into events, and hand out a built snapshot once.
+    ///
+    /// `at_end` distinguishes the last chance (the session is closing) from a
+    /// marker that merely arrived early: mid-session, an apply that has nothing
+    /// to build from is retried on the next tick in silence, because the schema
+    /// and the batches can still be on their way. At the end of a session the same
+    /// silence would read as success, so it is reported.
+    fn drain_replication(&mut self, at_end: bool) {
+        self.pump_replication_notes();
+        if self.snapshot_emitted || !self.replication.apply_requested() {
+            return;
+        }
+        // `apply` builds the place once and keeps it, so a later tick can still
+        // pick up records that arrived after the marker. It hands back a borrow of
+        // the stream, so reduce it to an owned verdict right here: holding that
+        // borrow across the `&mut self` calls below is what the borrow checker
+        // refuses, and a clone of the place is the one thing this must not do.
+        const NOTHING: u8 = 0;
+        const BUILT: u8 = 1;
+        const REFUSED: u8 = 2;
+        let verdict = match self.replication.apply() {
+            None => NOTHING,
+            Some(Ok(_)) => BUILT,
+            Some(Err(_)) => REFUSED,
+        };
+        self.pump_replication_notes();
+        // Bound before the match for the same reason: a `match` scrutinee keeps
+        // its borrow alive through every arm.
+        let built = self.replication.snapshot_rbxlx();
+        match built {
+            Ok(Some(bytes)) => {
+                self.snapshot_emitted = true;
+                let summary = self.snapshot_summary();
+                self.log(format!(
+                    "snapshot ready: {} byte(s) of rbxlx — {summary}",
+                    bytes.len()
+                ));
+                self.events.push(FlowEvent::SnapshotReady { bytes, summary });
+            }
+            Ok(None) => {
+                // A refused apply has already said why, and will keep refusing on
+                // the same bytes, so it stops being retried; nothing decoded yet
+                // is reported once and retried, because the schema and the
+                // batches may still be on their way.
+                if verdict == REFUSED {
+                    self.snapshot_emitted = true;
+                } else if verdict == NOTHING && !self.snapshot_empty_reported {
+                    self.snapshot_empty_reported = true;
+                    let text = format!(
+                        "{}: {}",
+                        if at_end {
+                            "nothing to build a snapshot from when the session closed"
+                        } else {
+                            "no snapshot to apply yet"
+                        },
+                        self.replication.summary()
+                    );
+                    self.log(text.clone());
+                    self.events.push(FlowEvent::ReplicationStatus(text));
+                }
+            }
+            Err(error) => {
+                self.snapshot_emitted = true;
+                self.events.push(FlowEvent::ReplicationStatus(error));
+            }
+        }
+    }
+
+    /// Forward every queued replication note as a status line.
+    fn pump_replication_notes(&mut self) {
+        for note in self.replication.take_notes() {
+            let text = match note {
+                ReplicationNote::Warning(text) => format!("replication: {text}"),
+                other => format!("replication: {}", other.text()),
+            };
+            self.events.push(FlowEvent::ReplicationStatus(text));
+        }
+    }
+
+    /// What the applier did, plus the property-id binding a caller would need to
+    /// sync local edits back.
+    pub fn snapshot_summary(&self) -> String {
+        let stats = self
+            .replication
+            .snapshot_stats()
+            .map(|stats| stats.summary())
+            .unwrap_or_else(|| "no snapshot applied".to_string());
+        let binding = self
+            .replication
+            .prop_id_report()
+            .unwrap_or_else(|| "no schema arrived, so property ids are unknown".to_string());
+        format!("{stats}; outbound addressing: {binding}")
+    }
+
+    /// Ask for the place to be built now, used when a session ends without ever
+    /// sending a snapshot-done marker. Reports what it could not do.
+    pub fn request_snapshot_apply(&mut self) {
+        if !self.planes.replication {
+            return;
+        }
+        self.replication.request_apply();
+        self.drain_replication(true);
+    }
+
+    /// Channel accounting for the session report.
+    pub fn channel_report(&self) -> String {
+        if !self.planes.channels {
+            return "channel plane off; opens are the four reference unreliable records".to_string();
+        }
+        // The mode is part of the line, so a report can be read without the UI
+        // state that produced it.
+        let mode = rbx_channels::channel_open_mode_label(self.channels.effective_mode());
+        let base = self.channels.summary();
+        let gaps = self.channels.gaps();
+        if gaps.is_empty() {
+            format!("mode {mode}; {base}")
+        } else {
+            format!("mode {mode}; {base}; gaps: {}", gaps.join("; "))
+        }
+    }
+
+    /// Replication accounting for the session report.
+    pub fn replication_report(&self) -> String {
+        if !self.planes.replication {
+            return "replication plane off; channel-1 bytes were scanned for markers and 0x9B only".to_string();
+        }
+        self.replication.summary()
+    }
+
+    /// Outbound accounting for the session report.
+    /// The outbox the editor writes into. Cloning this handle is how a caller that
+    /// is not this flow offers an edit; nothing about it implies the peer will
+    /// accept the edit, only that the flow will try to address it.
+    pub fn edits_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<crate::rbx_sync::SyncEdit>>> {
+        self.edits.clone()
+    }
+
+    /// Offer one edit directly, for a caller holding the flow.
+    pub fn offer_edit(&mut self, edit: crate::rbx_sync::SyncEdit) {
+        if let Ok(mut outbox) = self.edits.lock() {
+            outbox.push(edit);
+        }
+    }
+
+    /// Move whatever the editor offered into the sync engine's queue.
+    ///
+    /// An edit needs two numbers this client only owns once a place has been built:
+    /// the wire instance id the peer assigned and the property id from the peer's
+    /// dictionary. Without them the edit is dropped where the report can see it,
+    /// because an outbox that grows across a whole session would read as a backlog
+    /// rather than as a missing schema.
+    fn pump_edits(&mut self) {
+        let mut outbox = match self.edits.lock() {
+            Ok(outbox) => outbox,
+            Err(_) => return,
+        };
+        if outbox.is_empty() {
+            return;
+        }
+        let edits = std::mem::take(&mut *outbox);
+        drop(outbox);
+        self.edits_offered += edits.len() as u64;
+        let plan = {
+            let schema = self.replication.schema();
+            let ids = self.replication.snapshot_ids();
+            let dom = self.replication.snapshot_dom();
+            match (schema, ids, dom) {
+                (Some(schema), Some(ids), Some(dom)) => {
+                    Some(crate::rbx_sync::plan_edits(schema, dom, ids, &edits))
+                }
+                _ => None,
+            }
+        };
+        match plan {
+            Some(plan) => {
+                for reason in &plan.unencodable {
+                    self.skipped.push(format!("editor edit: {reason}"));
+                }
+                if plan.unmapped > 0 {
+                    self.skipped.push(format!(
+                        "{} editor edit(s) refused: no wire id for that instance, or the peer's dictionary names no such member",
+                        plan.unmapped
+                    ));
+                }
+                let accepted = self.sync.queue_plan(&plan);
+                self.log(format!(
+                    "editor edits: {} offered, {} queued; {}",
+                    edits.len(),
+                    accepted,
+                    plan.summary()
+                ));
+            }
+            None => {
+                let missing = if self.replication.schema().is_some() {
+                    "no applied snapshot to name an instance"
+                } else {
+                    "no snapshot schema to name a property"
+                };
+                self.skipped.push(format!(
+                    "{} editor edit(s) dropped: {missing}",
+                    edits.len()
+                ));
+            }
+        }
+    }
+
+    pub fn sync_report(&self) -> String {
+        if !self.planes.sync {
+            return "outbound plane off; no flow control, liveness or property items were sent".to_string();
+        }
+        format!(
+            "liveness: {}; upstream: {}; queue: {} pending, {} dropped, {} coalesced; editor edits {} offered",
+            self.liveness.summary(),
+            self.sync.summary(),
+            self.sync.pending(),
+            self.sync.dropped(),
+            self.sync.coalesced(),
+            self.edits_offered
+        )
+    }
+
+    /// Which planes this flow was built with.
+    pub fn planes_summary(&self) -> String {
+        self.planes.label()
     }
 }
 
@@ -1632,18 +2151,425 @@ mod tests {
         assert_eq!(A7_REAL.len(), 99);
     }
 
-    #[test]
-    fn routes_parse_as_frames() {
-        for r in ROUTES {
-            let b = hex(r);
-            // Each route is a single compact-varint-framed 0xA6 message.
-            let n = 1usize << (b[0] >> 6);
-            let mut v = u64::from(b[0] & 0x3F);
-            for x in &b[1..n] {
-                v = (v << 8) | u64::from(*x);
-            }
-            assert_eq!(v as usize, b.len() - n, "route {r}");
-            assert_eq!(b[n], 0xA6, "route {r} tag");
+    /// Save and restore the plane switches and the channel mode, because a flow
+    /// captures them when it is constructed.
+    /// The planes are process-wide switches the UI sets, and `cargo test` runs
+    /// cases on parallel threads: any test that reads a byte the channel mode
+    /// decides has to hold this, or another test's mode is what it sees.
+    static PLANE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn plane_serial() -> std::sync::MutexGuard<'static, ()> {
+        PLANE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct PlaneGuard {
+        planes: JoinPlanes,
+        mode: ChannelOpenMode,
+    }
+
+    impl PlaneGuard {
+        fn with(planes: JoinPlanes, mode: ChannelOpenMode) -> Self {
+            let saved = Self {
+                planes: join_planes(),
+                mode: rbx_channels::channel_open_mode(),
+            };
+            set_join_planes(planes);
+            rbx_channels::set_channel_open_mode(mode);
+            saved
         }
+    }
+
+    impl Drop for PlaneGuard {
+        fn drop(&mut self) {
+            set_join_planes(self.planes);
+            rbx_channels::set_channel_open_mode(self.mode);
+        }
+    }
+
+    fn planes_cfg() -> JoinConfig {
+        JoinConfig {
+            user_id: 1,
+            user_name: None,
+            display_name: None,
+            domain_user_id: None,
+            client_ticket: "t;2".into(),
+            session_id: "planes".into(),
+            random_seed1: None,
+            api_security_token: None,
+            serialized_client_fields: None,
+            encrypted_server_fields: None,
+            early_auth: None,
+            a7_mode: A7Mode::Skip,
+        }
+    }
+
+    /// A flow built at t=100, asserting that it captured the switches it was
+    /// built with — a flow that re-read the globals later would let one test's
+    /// toggles leak into another's byte stream.
+    fn flow_with(planes: JoinPlanes) -> AppFlow {
+        let mut flow = AppFlow::new(planes_cfg(), 100);
+        assert_eq!(flow.planes, planes, "the flow must capture the plane switches");
+        flow
+    }
+
+    fn hx(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The control-stream payload the flow wrote at connect time, which is where
+    /// every channel record has to appear.
+    fn ctrl_burst(flow: &mut AppFlow) -> Vec<u8> {
+        flow.on_connected()
+            .into_iter()
+            .find_map(|action| match action {
+                Action::OpenStream { app, chan, data } => {
+                    if chan == CTRL_CHANNEL {
+                        let _ = app;
+                        Some(data)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .expect("the flow opens the control stream at connect")
+    }
+
+    fn events_of(flow: &mut AppFlow, wanted: fn(&FlowEvent) -> Option<String>) -> Vec<String> {
+        flow.drain_events().iter().filter_map(wanted).collect()
+    }
+
+    #[test]
+    fn planes_default_off_and_change_nothing() {
+        let _serial = plane_serial();
+        let _guard = PlaneGuard::with(JoinPlanes::default(), ChannelOpenMode::Off);
+        assert_eq!(join_planes(), JoinPlanes::default());
+        assert_eq!(join_planes().label(), "none (handshake and burst only)");
+        {
+            let all = JoinPlanes { channels: true, replication: true, sync: true };
+            let _guard = PlaneGuard::with(all, ChannelOpenMode::FullProfile);
+            assert_eq!(join_planes(), all);
+            let label = join_planes().label();
+            assert!(
+                label.contains("full profile") && label.contains("replication decode"),
+                "{label}"
+            );
+        }
+
+        let mut flow = flow_with(JoinPlanes::default());
+        assert_eq!(flow.planes_summary(), "none (handshake and burst only)");
+        assert!(flow.channel_report().starts_with("channel plane off"));
+        assert!(flow.replication_report().starts_with("replication plane off"));
+        assert!(flow.sync_report().starts_with("outbound plane off"));
+        // Only the control channel and chan1 are opened, and no timer fires.
+        let data = ctrl_burst(&mut flow);
+        // The handshake logs its own stream header whatever the switches say; the
+        // claim under test is that a disabled plane adds nothing to it.
+        let _ = flow.drain_events();
+        assert!(flow.on_tick(10_000).is_empty(), "no liveness traffic when off");
+        // Bound to channel 1 so the bytes take the join path, not the control
+        // path: the control parser logs unrecognised records whatever the planes
+        // say, and that would be a false pass here.
+        flow.note_opened(APP, 1, 7);
+        flow.on_stream_data(7, &frame(&[0x83, 0x16, 0x09, 0x00]));
+        let events = flow.drain_events();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                FlowEvent::ChannelUpdate(_)
+                    | FlowEvent::ReplicationStatus(_)
+                    | FlowEvent::SnapshotReady { .. }
+            )),
+            "a disabled plane reports nothing: {events:?}"
+        );
+        // And the control burst is the four reference records, untouched. The
+        // 7-byte header is skipped because the application byte inside it is a
+        // global switch other tests are allowed to move.
+        let mut expected = frame(&[0x00, 0x00]);
+        for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
+            expected.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
+        }
+        assert_eq!(&data[7..], &expected[..], "{}", hx(&data));
+    }
+
+    #[test]
+    fn channel_plane_reference_mode_matches_the_hardcoded_burst() {
+        let _serial = plane_serial();
+        let off = {
+            let _guard = PlaneGuard::with(JoinPlanes::default(), ChannelOpenMode::Off);
+            ctrl_burst(&mut flow_with(JoinPlanes::default()))
+        };
+        let on = {
+            let _guard = PlaneGuard::with(
+                JoinPlanes { channels: true, ..JoinPlanes::default() },
+                ChannelOpenMode::ReferenceUnreliable,
+            );
+            ctrl_burst(&mut flow_with(JoinPlanes {
+                channels: true,
+                ..JoinPlanes::default()
+            }))
+        };
+        // Turning the plane on must not move a byte in the reference mode, or a
+        // passing session stops being comparable with the capture before it. The
+        // stream header is excluded for the same reason as above: the control
+        // application byte is a global switch, not part of what this compares.
+        assert_eq!(off[7..], on[7..], "\noff: {}\non:  {}", hx(&off), hx(&on));
+    }
+
+    #[test]
+    fn channel_plane_full_profile_adds_reliable_open_records() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes { channels: true, ..JoinPlanes::default() };
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::FullProfile);
+        let mut flow = flow_with(planes);
+        let data = ctrl_burst(&mut flow);
+        // Rebuild the burst from the profile table independently: one hello,
+        // then one record per row in profile order — an OpenReliable for the ten
+        // reliable rows and an OpenUnreliable carrying the parity-0 series for
+        // the four unreliable ones. The router and the table have to agree.
+        let mut want = frame(&[0x00, 0x00]);
+        let mut next_wire = 2u32;
+        for (index, row) in DEFAULT_CHANNEL_PROFILE.iter().enumerate() {
+            let record = if rbx_channels::is_unreliable(row) {
+                let body = build_open_unreliable(APP, index as u32, next_wire);
+                next_wire += 2;
+                body
+            } else {
+                rbx_channels::reliable_open_body(APP as u8, index as u32)
+            };
+            want.extend_from_slice(&frame(&record));
+        }
+        assert_eq!(hx(&data[7..]), hx(&want));
+        // The mode is in the report, so a run is reproducible from its log alone.
+        assert!(flow.on_tick(10_000).is_empty());
+        let report = flow.channel_report();
+        assert!(report.contains("full profile"), "{report}");
+        assert!(report.contains("staged 14"), "{report}");
+        assert!(
+            report.contains("opened here with no matching peer announcement"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn channel_plane_reconciles_a_peer_announcement() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes { channels: true, ..JoinPlanes::default() };
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::ReferenceUnreliable);
+        let mut flow = flow_with(planes);
+        ctrl_burst(&mut flow);
+        flow.drain_events();
+        // A control record announcing chan 5 unreliable with wire id 10 (the
+        // peer's parity, so it decodes) must be routed and reported.
+        // A peer id must carry the *opposite* parity to ours, so 11 (odd) is a
+        // peer id and 10 would be rejected as one of our own.
+        let mut record = vec![rbx_channels::UNRELIABLE_OPEN_TYPE, APP as u8];
+        record.extend_from_slice(&5u32.to_be_bytes());
+        record.extend_from_slice(&11u32.to_be_bytes());
+        flow.note_control_record(APP, CTRL_CHANNEL, &record);
+        let notes = events_of(&mut flow, |event| match event {
+            FlowEvent::ChannelUpdate(text) => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("chan 5 unreliable wire=11"), "{}", notes[0]);
+        assert!(notes[0].contains("internal id -11"), "{}", notes[0]);
+        let report = flow.channel_report();
+        assert!(report.contains("peer-announced 1"), "{report}");
+    }
+
+    #[test]
+    fn replication_plane_reports_what_it_cannot_parse() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes { replication: true, ..JoinPlanes::default() };
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
+        let mut flow = flow_with(planes);
+        flow.note_opened(APP, 1, 7);
+        flow.on_stream_data(7, &frame(&[0x83, 0x16, 0x09, 0x00]));
+        flow.on_tick(101);
+        let notes = events_of(&mut flow, |event| match event {
+            FlowEvent::ReplicationStatus(text) => Some(text.clone()),
+            FlowEvent::SnapshotReady { summary, .. } => Some(format!("snapshot: {summary}")),
+            _ => None,
+        });
+        assert!(!notes.is_empty(), "a frame must be accounted for");
+        let text = notes.join("\n");
+        // The batch is reported as the sub-code it is, with its byte count, and
+        // not passed off as a decoded record run.
+        assert!(text.contains("JoinDataItemV2"), "{text}");
+        assert!(text.contains("no compressed frame"), "{text}");
+        let report = flow.replication_report();
+        assert!(report.contains("1 frame(s)"), "{report}");
+        assert!(report.contains("1 skipped"), "{report}");
+        assert!(report.contains("schema not received"), "{report}");
+        // No schema arrived, so asking for the place must say so instead of
+        // inventing a DataModel.
+        flow.request_snapshot_apply();
+        let notes = events_of(&mut flow, |event| match event {
+            FlowEvent::ReplicationStatus(text) => Some(text.clone()),
+            _ => None,
+        });
+        assert!(notes.iter().any(|n| n.contains("snapshot")), "{notes:?}");
+        assert!(flow.snapshot_summary().contains("no snapshot applied"));
+    }
+
+    #[test]
+    fn marker_asks_the_replication_stream_for_the_place() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes { replication: true, ..JoinPlanes::default() };
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
+        let mut flow = flow_with(planes);
+        flow.note_opened(APP, 1, 7);
+        let mut body = vec![0x84u8, 0x01, 0x00, 0x00, 0x00];
+        let whole = frame(&body);
+        let actions = flow.on_stream_data(7, &whole);
+        assert_eq!(actions.len(), 1, "the marker is still acknowledged once");
+        assert_eq!(flow.markers_acked(), 1);
+        // The apply was requested, and had nothing to apply.
+        flow.on_tick(101);
+        let notes = events_of(&mut flow, |event| match event {
+            FlowEvent::ReplicationStatus(text) => Some(text.clone()),
+            _ => None,
+        });
+        assert!(
+            notes.iter().any(|n| n.contains("no snapshot to apply yet")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn sync_plane_sends_the_reference_liveness_periods() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes { sync: true, ..JoinPlanes::default() };
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
+        let mut flow = flow_with(planes);
+        let actions = flow.on_connected();
+        // The initial sync rides a fresh chan3 stream, framed exactly as the
+        // reference template plus its compact-varint length.
+        let chan3 = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::OpenStream { app, chan, data } => {
+                    if *chan == 3 {
+                        let _ = app;
+                        Some(data.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .expect("the initial sync opens channel 3");
+        assert_eq!(&chan3[..7], &stream_header(APP, 3)[..], "{}", hx(&chan3));
+        assert_eq!(&chan3[7..], &frame(&crate::rbx_sync::sync_template()));
+        // The ping has nowhere to go yet: chan1 has no bound stream id, and a
+        // second OpenStream for it would corrupt the byte counts the report
+        // compares. It is skipped and named.
+        assert!(
+            flow.skipped().iter().any(|s| s.contains("ping#0") && s.contains("chan1")),
+            "{:?}",
+            flow.skipped()
+        );
+        // Once chan1 is bound, the periods fire on it.
+        flow.note_opened(APP, 1, 10);
+        let at_1100 = flow.on_tick(1_100);
+        assert_eq!(at_1100.len(), 1, "one ping at the ping period");
+        match &at_1100[0] {
+            Action::Write { stream, data } => {
+                assert_eq!(*stream, 10);
+                assert_eq!(data, &frame(&crate::rbx_sync::ping_template()));
+            }
+            other => panic!("expected a chan1 write, got {other:?}"),
+        }
+        // The sync period arrives together with a ping, and channel 3 is still
+        // unacknowledged, so only the ping goes out.
+        let at_5100 = flow.on_tick(5_100);
+        assert_eq!(at_5100.len(), 1, "ping only: {at_5100:?}");
+        let report = flow.sync_report();
+        // One of the three pings and one of the two syncs were produced but not
+        // sent, which the flow's own skip list accounts for separately.
+        assert!(report.contains("3 ping(s)"), "{report}");
+        assert!(report.contains("2 sync(s)"), "{report}");
+        assert!(report.contains("0 flush"), "{report}");
+    }
+
+    #[test]
+    fn sync_plane_does_not_queue_changes_it_cannot_address() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes { sync: true, ..JoinPlanes::default() };
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
+        let flow = flow_with(planes);
+        // Nothing is queued by construction: an editor edit reaches the session
+        // only through the flow's outbox, and the UI does not offer one on the
+        // current path. The report has to say so in the same terms.
+        assert!(flow.sync_report().contains("0 pending"), "{}", flow.sync_report());
+    }
+
+    /// What the route strings actually are: unframed `0xA6` payloads, framed by
+    /// `on_tick` at send time. The assertion this replaces treated the leading
+    /// `a6` as a compact-varint length, which it is not, so it failed against
+    /// bytes that a live session sends unchanged.
+    /// The outbox is the editor's seam into a running session, and an edit this
+    /// client cannot address has to be dropped loudly rather than kept: a queue that
+    /// holds an edit forever reads as pending traffic, while the truth is that no
+    /// place has been built to point at.
+    #[test]
+    fn sync_plane_drops_an_editor_edit_it_cannot_address() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes { sync: true, ..JoinPlanes::default() };
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
+        let mut flow = flow_with(planes);
+        flow.offer_edit(crate::rbx_sync::SyncEdit {
+            entity: 7,
+            property: "Size".to_string(),
+            value: rbx_dom_weak::types::Variant::Vector3(rbx_dom_weak::types::Vector3::new(
+                1.0, 2.0, 4.0,
+            )),
+        });
+        flow.on_tick(10_000);
+        let report = flow.sync_report();
+        assert!(report.contains("0 pending"), "{report}");
+        assert!(report.contains("editor edits 1 offered"), "{report}");
+        assert!(
+            flow.skipped()
+                .iter()
+                .any(|note| note.contains("dropped: no snapshot schema")),
+            "{:?}",
+            flow.skipped()
+        );
+        // Taken out of the outbox, so a second tick cannot resurrect it.
+        flow.on_tick(20_000);
+        assert!(
+            flow.sync_report().contains("editor edits 1 offered"),
+            "the edit was consumed, not queued: {}",
+            flow.sync_report()
+        );
+    }
+
+    #[test]
+    fn routes_are_unframed_payloads_that_frame_to_exactly_one_message() {
+        assert_eq!(ROUTES.len(), 4);
+        for (index, route) in ROUTES.iter().enumerate() {
+            let payload = hex(route);
+            // Every route is one flow-control message whose payload starts with
+            // the 0xA6 tag, followed by its 1-based declaration index.
+            assert_eq!(payload[0], 0xA6, "route {index} tag");
+            assert_eq!(payload[1], (index + 1) as u8, "route {index} declaration index");
+            // Framing it yields exactly one complete frame and no tail, which is
+            // what the flow relies on when it concatenates all four onto chan11.
+            let framed = frame(&payload);
+            let (length, used) = compact_varint_decode(&framed).expect("a length prefix");
+            assert_eq!(length as usize, payload.len(), "route {index} framed length");
+            let offset = used + payload.len();
+            assert_eq!(offset, framed.len(), "route {index} has no tail");
+            // The step words the flow could patch are inside the payload.
+            assert!(crate::rbx_sync::with_steps(&payload, 5, 1, 2).is_some(), "route {index}");
+        }
+        // The reference client's canonical routes and this list agree on three
+        // of four; route 2 differs by one byte. Recorded here because a future
+        // re-capture is the only way to settle it, and silently "fixing" it
+        // would change bytes a live session sends.
+        let third = hex(ROUTES[2]);
+        assert_eq!(&third[1..5], &[0x03, 0x01, 0x01, 0x01], "route 2 head");
     }
 }

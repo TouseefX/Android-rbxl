@@ -80,6 +80,15 @@ pub enum RbxTransportSessionEvent {
     /// Channel-1 traffic arrived after a 0x9B frame was seen; this is a local
     /// diagnostic milestone, not confirmation of native BaseClient connection.
     ConnectedStageReached(String),
+    /// A channel open this client staged, a channel the peer announced, or the
+    /// reconciliation of the two against the recovered profile. A note about
+    /// framing, never a claim that traffic on that channel was accepted.
+    ChannelUpdate(String),
+    /// A place materialized from the replicated snapshot: `bytes` is an
+    /// `.rbxlx` document the editor can open, and `summary` states what the
+    /// applier could type and what it left unresolved. Opening it is a local
+    /// act; it does not mean this session is a joined Team Create client.
+    SnapshotReady { bytes: Vec<u8>, summary: String },
     Finished(String),
 }
 
@@ -523,6 +532,11 @@ const RBX_TRANSPORT_CONTROL_OPEN_RELIABLE_BYTES: usize = 6;
 const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_TYPE: u8 = 2;
 const RBX_TRANSPORT_CONTROL_OPEN_UNRELIABLE_BYTES: usize = 10;
 const RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE: u8 = 3;
+/// The tag this client writes to open a control stream: a two-byte record of
+/// `00 00`. A live 0.741 server sent the same two bytes back on both of its
+/// control streams, so the record is counted as a no-op instead of being reported
+/// as an unknown tag - its content is nothing, which is the whole finding.
+const RBX_TRANSPORT_CONTROL_NOOP_TYPE: u8 = 0;
 const RBX_TRANSPORT_MAX_CONTROL_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(not(test))]
 const RBX_TRANSPORT_MAX_REPORTED_RECEIVE_EVENTS: usize = 24;
@@ -1536,6 +1550,8 @@ enum RbxTransportControlMessage {
     /// Native type 3 is three QUIC-style variable-length integers. Their
     /// exact semantic names are intentionally left unspecified here.
     CloseUnreliable { fields: [u64; 3] },
+    /// A `00`-tagged record: no fields, nothing to dispatch.
+    Noop,
     Unknown { tag: u8 },
 }
 
@@ -1617,6 +1633,7 @@ impl RbxTransportControlDecoder {
                         wire_channel_id: u32::from_be_bytes([body[6], body[7], body[8], body[9]]),
                     })
                 }
+                RBX_TRANSPORT_CONTROL_NOOP_TYPE => Some(RbxTransportControlMessage::Noop),
                 RBX_TRANSPORT_CONTROL_CLOSE_UNRELIABLE_TYPE => {
                     let mut fields = [0u64; 3];
                     let mut offset = 1usize;
@@ -1740,7 +1757,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial minimum; socket fragmentation options are best-effort), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\nEarly-auth metadata: version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted). The app=4 flow results below show whether the post-handshake send was active; the separate BaseClient reliability-2 channel/WireChannelId mapping remains unverified. A handshake or observed flow traffic does not prove native BaseClient connected state or Team Create acceptance.\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial minimum; socket fragmentation options are best-effort), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\nEarly-auth metadata: version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted). The app=4 flow results below show whether the post-handshake send was active; the separate BaseClient reliability-2 channel/WireChannelId mapping remains unverified. A handshake or observed flow traffic does not prove native BaseClient connected state or Team Create acceptance.\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}\nJoin planes: {}\nChannel profile: {}\nReplication: {}\nUpstream sync: {}\nReplicated snapshot: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1764,7 +1781,12 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.flow_drain_summary,
             report.flow_config,
             report.flow_join90_report,
-            report.flow_markers_acked
+            report.flow_markers_acked,
+            report.flow_planes,
+            report.flow_channels,
+            report.flow_replication,
+            report.flow_sync,
+            report.flow_snapshot
         ),
         Err(reason) => format!(
             "\nRbxTransport QUIC session attempt failed: {reason}"
@@ -1822,6 +1844,21 @@ struct RbxTransportConnectionReport {
     flow_config: String,
     /// Snapshot-done markers acknowledged on channel 1.
     flow_markers_acked: u64,
+    /// Which post-join planes this session ran (`none` unless the switches were
+    /// on). A missing plane is a config fact, not a protocol result.
+    flow_planes: String,
+    /// Channel accounting against the recovered fourteen-row profile, including
+    /// the opens that never got a matching peer announcement.
+    flow_channels: String,
+    /// What the replication decoder saw on the join channels: frames, schema,
+    /// batches, delta chains, and every message it refused to interpret.
+    flow_replication: String,
+    /// Outbound accounting: the liveness periods, the flow-control blocks, and
+    /// the property-update queue including its refusals.
+    flow_sync: String,
+    /// The place built from the snapshot, if any, and what the applier could not
+    /// resolve. Opening it in the editor is a separate local action.
+    flow_snapshot: String,
     inbound_summary: String,
 }
 
@@ -2823,15 +2860,15 @@ async fn attempt_rbx_transport_connection_async(
             }
             if let Some(event_tx) = &event_tx {
                 for event in flow.drain_events() {
-                    let _ = event_tx.send(match event {
-                        crate::appflow::FlowEvent::Log(msg) => {
-                            RbxTransportSessionEvent::Status(msg)
-                        }
-                        other => RbxTransportSessionEvent::Status(format!("{other:?}")),
-                    });
+                    // The same translation the receive loop uses, so a snapshot
+                    // that arrives during the burst is not reduced to a debug
+                    // dump of its bytes.
+                    if let Some(event) = rbx_transport_flow_event(event) {
+                        let _ = event_tx.send(event);
+                    }
                 }
             }
-            burst_skipped.extend(flow.skipped().iter().cloned());
+            burst_skipped.extend(flow.take_skipped());
             if !plan.join_ticket_note.is_empty() {
                 burst_skipped.push(plan.join_ticket_note.clone());
             }
@@ -2889,6 +2926,21 @@ async fn attempt_rbx_transport_connection_async(
         )
         .await
     };
+
+    // A session that never saw a snapshot-done marker still gets one chance to
+    // build a place from whatever it decoded, and the notes from that attempt go
+    // out before the report so the log and the report cannot disagree about what
+    // the replication plane did. Nothing here implies the peer asked for it.
+    if let Some(flow) = join_flow.as_mut() {
+        flow.request_snapshot_apply();
+        burst_skipped.extend(flow.take_skipped());
+        for event in flow.drain_events() {
+            if let (Some(tx), Some(event)) = (event_tx.as_ref(), rbx_transport_flow_event(event))
+            {
+                let _ = tx.send(event);
+            }
+        }
+    }
 
     Ok(RbxTransportConnectionReport {
         route_label: route.route_label,
@@ -2955,6 +3007,26 @@ async fn attempt_rbx_transport_connection_async(
             .as_ref()
             .map(|flow| flow.markers_acked())
             .unwrap_or(0),
+        flow_planes: join_flow
+            .as_ref()
+            .map(|flow| flow.planes_summary())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_channels: join_flow
+            .as_ref()
+            .map(|flow| flow.channel_report())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_replication: join_flow
+            .as_ref()
+            .map(|flow| flow.replication_report())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_sync: join_flow
+            .as_ref()
+            .map(|flow| flow.sync_report())
+            .unwrap_or_else(|| "flow inactive".to_string()),
+        flow_snapshot: join_flow
+            .as_ref()
+            .map(|flow| flow.snapshot_summary())
+            .unwrap_or_else(|| "flow inactive".to_string()),
         flow_answered,
         inbound_summary,
     })
@@ -3661,6 +3733,41 @@ async fn send_rbx_transport_stream_data<S: ngnet_quic::Session>(
     Ok(off)
 }
 
+/// Translate one app-flow event into the session event the UI sees.
+///
+/// Both forwarders (the initial burst and the receive loop) go through here, so
+/// a channel note or a built snapshot cannot mean one thing during the burst and
+/// another afterwards. A replicated snapshot is passed on whole: whether the user
+/// opens it in the editor is a separate, local decision.
+fn rbx_transport_flow_event(
+    event: crate::appflow::FlowEvent,
+) -> Option<RbxTransportSessionEvent> {
+    Some(match event {
+        crate::appflow::FlowEvent::Log(message) => RbxTransportSessionEvent::Status(message),
+        crate::appflow::FlowEvent::ChallengeReceived { u1, u2, blob_len } => {
+            RbxTransportSessionEvent::ChallengeReceived { u1, u2, blob_len }
+        }
+        crate::appflow::FlowEvent::ChallengeAnswered { answer, elapsed_ms } => {
+            RbxTransportSessionEvent::ChallengeAnswered { answer, elapsed_ms }
+        }
+        crate::appflow::FlowEvent::ChallengeFailed(message) => {
+            RbxTransportSessionEvent::ChallengeFailed(message)
+        }
+        crate::appflow::FlowEvent::ConnectedStageReached { detail } => {
+            RbxTransportSessionEvent::ConnectedStageReached(detail)
+        }
+        crate::appflow::FlowEvent::ChannelUpdate(message) => {
+            RbxTransportSessionEvent::ChannelUpdate(message)
+        }
+        crate::appflow::FlowEvent::ReplicationStatus(message) => {
+            RbxTransportSessionEvent::Status(message)
+        }
+        crate::appflow::FlowEvent::SnapshotReady { bytes, summary } => {
+            RbxTransportSessionEvent::SnapshotReady { bytes, summary }
+        }
+    })
+}
+
 /// Drain raw stream events into the app=4 flow, execute the resulting
 /// actions (open streams / write bytes), fire flow timers, and forward
 /// flow events to the UI. Called from the receive loop on every wake.
@@ -3789,22 +3896,7 @@ async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
     }
 
     for event in flow.drain_events() {
-        let ui_event = match event {
-            crate::appflow::FlowEvent::Log(msg) => Some(RbxTransportSessionEvent::Status(msg)),
-            crate::appflow::FlowEvent::ChallengeReceived { u1, u2, blob_len } => {
-                Some(RbxTransportSessionEvent::ChallengeReceived { u1, u2, blob_len })
-            }
-            crate::appflow::FlowEvent::ChallengeAnswered { answer, elapsed_ms } => {
-                Some(RbxTransportSessionEvent::ChallengeAnswered { answer, elapsed_ms })
-            }
-            crate::appflow::FlowEvent::ChallengeFailed(msg) => {
-                Some(RbxTransportSessionEvent::ChallengeFailed(msg))
-            }
-            crate::appflow::FlowEvent::ConnectedStageReached { detail } => {
-                Some(RbxTransportSessionEvent::ConnectedStageReached(detail))
-            }
-        };
-        if let (Some(tx), Some(event)) = (event_tx, ui_event) {
+        if let (Some(tx), Some(event)) = (event_tx, rbx_transport_flow_event(event)) {
             let _ = tx.send(event);
         }
     }
@@ -3964,7 +4056,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         "persistent receive/dispatch loop"
     };
     let mut summary = format!(
-        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes, 1 MiB receive-buffer drops {}); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, unknown tags {}); app-body type-1/OpenReliable-shaped candidates {} (second-header semantics unresolved); body-read errors {}.",
+        "RbxTransport {receive_mode}: {} ms; accepted uni streams {}, bidi streams {}; valid stream headers {}, malformed {}; control streams {}, application streams {}, remote stream payload {} bytes; datagrams {} ({} bytes, 1 MiB receive-buffer drops {}); control records {} (type-1 on control {}, type-2 opens {}, type-3 closes {}, type-0 no-ops {}, unknown tags {}); app-body type-1/OpenReliable-shaped candidates {} (second-header semantics unresolved); body-read errors {}.",
         started.elapsed().as_millis(),
         snapshot.accepted_uni_streams,
         snapshot.accepted_bi_streams,
@@ -3980,6 +4072,7 @@ async fn receive_rbx_transport_session<S: ngnet_quic::Session>(
         snapshot.reliable_open_on_control,
         snapshot.unreliable_opens,
         snapshot.unreliable_closes,
+        snapshot.control_noops,
         snapshot.unknown_control_tags,
         snapshot.application_body_open_reliable_candidates,
         snapshot.stream_read_errors,
@@ -4040,6 +4133,7 @@ struct RbxTransportReceiveStats {
     reliable_open_on_control: usize,
     unreliable_opens: usize,
     unreliable_closes: usize,
+    control_noops: usize,
     unknown_control_tags: usize,
     application_body_open_reliable_candidates: usize,
     stream_read_errors: usize,
@@ -4104,10 +4198,16 @@ fn dispatch_rbx_transport_control_message(
                     fields[0], fields[1], fields[2]
                 )
             }
+            RbxTransportControlMessage::Noop => {
+                stats.control_noops += 1;
+                format!(
+                    "stream {stream_id}: type-0 no-op record (the same two bytes this client sends to open a control stream), dispatch continued"
+                )
+            }
             RbxTransportControlMessage::Unknown { tag } => {
                 stats.unknown_control_tags += 1;
                 format!(
-                    "stream {stream_id}: unknown control tag 0x{tag:02x}; dispatch for this control stream stopped"
+                    "stream {stream_id}: unknown control tag 0x{tag:02x}; the record was skipped by length and the stream stays in sync"
                 )
             }
         };
@@ -5988,7 +6088,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}\nJoin planes: {}\nChannel profile: {}\nReplication: {}\nUpstream sync: {}\nReplicated snapshot: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -6008,7 +6108,12 @@ pub fn run_join_config_session(
                     connection_report.flow_drain_summary,
                     connection_report.flow_config,
                     connection_report.flow_join90_report,
-                    connection_report.flow_markers_acked
+                    connection_report.flow_markers_acked,
+                    connection_report.flow_planes,
+                    connection_report.flow_channels,
+                    connection_report.flow_replication,
+                    connection_report.flow_sync,
+                    connection_report.flow_snapshot
                 ));
             }
             Err(reason) => report.push_str(&format!(
@@ -6601,6 +6706,24 @@ mod tests {
             ]
         );
         assert!(decoder.pending.is_empty());
+
+        // A type-0 record is the peer's own control-stream hello: the same two
+        // bytes this client writes. It is named as a no-op, and the stream stays in
+        // sync so the records after it are still read.
+        let mut hello = RbxTransportControlDecoder::default();
+        assert_eq!(
+            hello.push(&framed(&[0x00, 0x00])).unwrap(),
+            vec![RbxTransportControlMessage::Noop]
+        );
+        assert!(!hello.desynchronized);
+        assert!(hello.pending.is_empty());
+        assert_eq!(
+            hello.push(&framed(&[1, 4, 0, 0, 0, 3])).unwrap(),
+            vec![RbxTransportControlMessage::OpenReliable {
+                application: 4,
+                channel_id: 3,
+            }]
+        );
 
         // An unknown tag has no verified inner layout, but the record length is
         // known, so the stream stays in sync instead of being abandoned - which
