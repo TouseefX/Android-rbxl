@@ -2921,6 +2921,311 @@ impl ReplicationStream {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Join/Replication message routing (clean-room reconstruction of the target's
+// JoinDataItemV2 framing). These helpers classify and preserve the observed
+// message shapes without applying them to an invented DataModel.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinDataChunkKind {
+    Kind1 = 1,
+    Kind2 = 2,
+    Kind3 = 3,
+    Kind4 = 4,
+    Kind5 = 5,
+}
+
+impl JoinDataChunkKind {
+    pub fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Kind1),
+            2 => Some(Self::Kind2),
+            3 => Some(Self::Kind3),
+            4 => Some(Self::Kind4),
+            5 => Some(Self::Kind5),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl Default for JoinDataChunkKind {
+    fn default() -> Self {
+        Self::Kind1
+    }
+}
+
+pub fn is_observed_join_data_kind(value: u8) -> bool {
+    (1..=5).contains(&value)
+}
+
+pub fn has_compressed_length_pair(kind: JoinDataChunkKind) -> bool {
+    matches!(kind, JoinDataChunkKind::Kind1 | JoinDataChunkKind::Kind5)
+}
+
+pub fn has_compressed_length_pair_byte(value: u8) -> bool {
+    value == 1 || value == 5
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinDataChunkEnvelope {
+    pub kind: JoinDataChunkKind,
+    pub uncompressed_size: u32,
+    pub compressed_bytes: Vec<u8>,
+    pub append_optional_zero: bool,
+}
+
+impl Default for JoinDataChunkEnvelope {
+    fn default() -> Self {
+        Self {
+            kind: JoinDataChunkKind::Kind1,
+            uncompressed_size: 0,
+            compressed_bytes: Vec::new(),
+            append_optional_zero: false,
+        }
+    }
+}
+
+pub fn serialize_join_data_chunk_envelope(
+    envelope: &JoinDataChunkEnvelope,
+) -> Result<Vec<u8>, String> {
+    let kind = envelope.kind.as_u8();
+    if !matches!(kind, 1 | 5) {
+        return Err("Unsupported target join-data chunk kind".into());
+    }
+    if envelope.compressed_bytes.len() > u32::MAX as usize {
+        return Err("Join-data compressed payload exceeds 32-bit length".into());
+    }
+    let mut bytes = Vec::with_capacity(
+        11 + envelope.compressed_bytes.len() + usize::from(envelope.append_optional_zero),
+    );
+    bytes.push(DELTA_CHAIN_TAG);
+    bytes.push(JOIN_DATA_SUBCODE);
+    bytes.push(kind);
+    bytes.extend_from_slice(&(envelope.compressed_bytes.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&envelope.uncompressed_size.to_le_bytes());
+    bytes.extend_from_slice(&envelope.compressed_bytes);
+    if envelope.append_optional_zero {
+        bytes.push(0);
+    }
+    Ok(bytes)
+}
+
+pub fn parse_join_data_chunk_envelope(data: &[u8]) -> Result<JoinDataChunkEnvelope, String> {
+    if data.len() < 11 {
+        return Err("Compressed join-data envelope is truncated".into());
+    }
+    if data[0] != DELTA_CHAIN_TAG || data[1] != JOIN_DATA_SUBCODE {
+        return Err("Compressed join-data envelope has an unexpected prefix".into());
+    }
+    let kind_byte = data[2];
+    if !matches!(kind_byte, 1 | 5) {
+        return Err(
+            "Compressed length-pair framing is supported only for observed kinds 1 and 5".into(),
+        );
+    }
+    let compressed_size = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+    let expected_size = 11usize
+        .checked_add(compressed_size as usize)
+        .ok_or_else(|| "Compressed join-data length overflows".to_string())?;
+    if expected_size > data.len() {
+        return Err("Compressed join-data payload is shorter than declared".into());
+    }
+    let uncompressed_size = u32::from_le_bytes([data[7], data[8], data[9], data[10]]);
+    let compressed_bytes = data[11..expected_size].to_vec();
+    let append_optional_zero = if data.len() == expected_size {
+        false
+    } else if expected_size + 1 == data.len() && data[expected_size] == 0 {
+        true
+    } else {
+        return Err("Compressed join-data envelope has unexpected trailing bytes".into());
+    };
+    Ok(JoinDataChunkEnvelope {
+        kind: JoinDataChunkKind::from_byte(kind_byte).unwrap(),
+        uncompressed_size,
+        compressed_bytes,
+        append_optional_zero,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinReplicationMessageType {
+    Other,
+    JoinStart,
+    JoinDataItem,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedJoinDataItem {
+    pub kind: JoinDataChunkKind,
+    pub opaque_payload: Vec<u8>,
+    pub compressed_envelope: Option<JoinDataChunkEnvelope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedJoinReplicationMessage {
+    pub ty: JoinReplicationMessageType,
+    pub message_type: JoinReplicationMessageType,
+    pub r#type: JoinReplicationMessageType,
+    pub msg_type: JoinReplicationMessageType,
+    pub raw_bytes: Vec<u8>,
+    pub body: Vec<u8>,
+    pub data_item: Option<ParsedJoinDataItem>,
+}
+
+pub fn parse_join_replication_message(data: &[u8]) -> Result<ParsedJoinReplicationMessage, String> {
+    let mut parsed = ParsedJoinReplicationMessage {
+        ty: JoinReplicationMessageType::Other,
+        message_type: JoinReplicationMessageType::Other,
+        r#type: JoinReplicationMessageType::Other,
+        msg_type: JoinReplicationMessageType::Other,
+        raw_bytes: data.to_vec(),
+        body: Vec::new(),
+        data_item: None,
+    };
+    if data.is_empty() {
+        return Ok(parsed);
+    }
+    if data[0] == JOIN_START_TAG {
+        parsed.ty = JoinReplicationMessageType::JoinStart;
+        parsed.message_type = JoinReplicationMessageType::JoinStart;
+        parsed.r#type = JoinReplicationMessageType::JoinStart;
+        parsed.msg_type = JoinReplicationMessageType::JoinStart;
+        parsed.body = data[1..].to_vec();
+        return Ok(parsed);
+    }
+    if data.len() < 2 || data[0] != DELTA_CHAIN_TAG || data[1] != JOIN_DATA_SUBCODE {
+        return Ok(parsed);
+    }
+    if data.len() < 3 {
+        return Err("Join-data item prefix is truncated".into());
+    }
+    let kind_byte = data[2];
+    if !is_observed_join_data_kind(kind_byte) {
+        return Ok(parsed);
+    }
+    let kind = JoinDataChunkKind::from_byte(kind_byte).unwrap();
+    let opaque_payload = data[3..].to_vec();
+    let mut item = ParsedJoinDataItem {
+        kind,
+        opaque_payload: opaque_payload.clone(),
+        compressed_envelope: None,
+    };
+    if has_compressed_length_pair(kind) {
+        let envelope = parse_join_data_chunk_envelope(data)?;
+        item.compressed_envelope = Some(envelope);
+    }
+    parsed.ty = JoinReplicationMessageType::JoinDataItem;
+    parsed.message_type = JoinReplicationMessageType::JoinDataItem;
+    parsed.r#type = JoinReplicationMessageType::JoinDataItem;
+    parsed.msg_type = JoinReplicationMessageType::JoinDataItem;
+    parsed.body = opaque_payload;
+    parsed.data_item = Some(item);
+    Ok(parsed)
+}
+
+pub fn serialize_join_start_message(opaque_body: &[u8]) -> Result<Vec<u8>, String> {
+    if opaque_body.len() == usize::MAX {
+        return Err("Join-start message is too large".into());
+    }
+    let mut bytes = Vec::with_capacity(opaque_body.len() + 1);
+    bytes.push(JOIN_START_TAG);
+    bytes.extend_from_slice(opaque_body);
+    Ok(bytes)
+}
+
+pub fn serialize_join_data_item_opaque(
+    kind: JoinDataChunkKind,
+    opaque_payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    let kind_byte = kind.as_u8();
+    if !is_observed_join_data_kind(kind_byte) {
+        return Err("Unsupported observed JoinDataItemV2 kind".into());
+    }
+    if opaque_payload.len() > usize::MAX - 3 {
+        return Err("Join-data item is too large".into());
+    }
+    let mut bytes = Vec::with_capacity(opaque_payload.len() + 3);
+    bytes.push(DELTA_CHAIN_TAG);
+    bytes.push(JOIN_DATA_SUBCODE);
+    bytes.push(kind_byte);
+    bytes.extend_from_slice(opaque_payload);
+    Ok(bytes)
+}
+
+pub trait JoinDataZstdDecoder {
+    fn decompress(
+        &mut self,
+        compressed_bytes: &[u8],
+        expected_uncompressed_size: u32,
+    ) -> Result<Vec<u8>, String>;
+}
+
+pub fn decompress_join_data_chunk(
+    envelope: &JoinDataChunkEnvelope,
+    decoder: &mut dyn JoinDataZstdDecoder,
+) -> Result<Vec<u8>, String> {
+    if !has_compressed_length_pair(envelope.kind) {
+        return Err("Only observed JoinDataItemV2 kinds 1 and 5 use this compressed envelope".into());
+    }
+    let decoded = decoder.decompress(&envelope.compressed_bytes, envelope.uncompressed_size)?;
+    if decoded.len() != envelope.uncompressed_size as usize {
+        return Err("Zstandard output size does not match the target envelope".into());
+    }
+    Ok(decoded)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinReplicationDispatchResult {
+    NotHandled,
+    Handled,
+}
+
+pub trait JoinReplicationSink {
+    fn on_join_start(&mut self, opaque_body: &[u8]) -> Result<(), String>;
+    fn on_join_data_item(&mut self, item: &ParsedJoinDataItem) -> Result<(), String>;
+}
+
+pub fn dispatch_join_replication_message(
+    data: &[u8],
+    sink: &mut dyn JoinReplicationSink,
+) -> Result<JoinReplicationDispatchResult, String> {
+    let parsed = parse_join_replication_message(data)?;
+    if parsed.ty == JoinReplicationMessageType::JoinStart {
+        sink.on_join_start(&parsed.body)?;
+        return Ok(JoinReplicationDispatchResult::Handled);
+    }
+    if parsed.ty == JoinReplicationMessageType::JoinDataItem {
+        if let Some(item) = &parsed.data_item {
+            sink.on_join_data_item(item)?;
+            return Ok(JoinReplicationDispatchResult::Handled);
+        }
+    }
+    Ok(JoinReplicationDispatchResult::NotHandled)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicationCacheCategory {
+    CacheableInstances,
+    PartInstances,
+    NonCacheableInstances,
+    CharacterModelRoots,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerJoinBatchPhase {
+    SendNetworkSchemaDefinition,
+    SendGlobalsAndTopContainers,
+    PrebuildReplicationCache,
+    GenerateAndQueueJdiV2,
+    InstallPlayer,
+    CompleteBatch,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

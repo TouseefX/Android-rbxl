@@ -1597,3 +1597,6 @@ mod tests {
         assert_eq!(from_packet, schema);
     }
 }
+
+// Re-export the Mrd wire codec so callers can reach it through the network codec.
+pub use crate::mrd_wire_codec::*;
