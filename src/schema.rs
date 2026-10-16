@@ -40,7 +40,9 @@ pub fn class_is_service(class_name: &str) -> bool {
 }
 
 /// Test Roblox API-dump inheritance, including classes not covered by the
-/// command VM's small set of hand-written fallback aliases.
+/// command VM's small set of hand-written fallback aliases. The chain crosses a
+/// class the reflection database omits, so `Part` is a `BasePart` even though
+/// nothing describes `FormFactorPart`.
 pub fn class_is_subclass_of(class_name: &str, ancestor_name: &str) -> bool {
     // Case-sensitive, like `Instance:IsA` itself.
     class_chain(class_name).iter().any(|name| *name == ancestor_name)
@@ -57,14 +59,16 @@ pub fn class_is_creatable(class_name: &str) -> bool {
 /// explicit default, then synthesize a safe default from its reflected type.
 pub fn default_property_value(class_name: &str, property_name: &str) -> Option<Variant> {
     let db = database();
-    let mut current = Some(class_name);
-    for _ in 0..128 {
-        let Some(name) = current else { break };
-        let Some(class) = db.classes.get(name) else { break };
+    // The same chain as the type lookup: a default declared on `BasePart` has to
+    // survive the `FormFactorPart` gap, or `Part.Transparency` synthesizes a value
+    // the engine never uses.
+    for name in class_chain(class_name) {
+        let Some(class) = db.classes.get(name) else {
+            continue;
+        };
         if let Some(value) = class.default_properties.get(property_name) {
             return Some(value.clone());
         }
-        current = class.superclass.as_deref();
     }
     let data_type = resolve_property_type(class_name, property_name)?;
     default_variant_for(&data_type)
