@@ -312,8 +312,12 @@ pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<Stri
             break;
         };
         for (key, _) in &desc.properties {
-            if key.as_str().eq_ignore_ascii_case(wire_name) {
-                return Some(key.as_str().to_owned());
+            // Bound through a `&str` rather than `key.as_str()`: the property map
+            // is keyed by an interned string type that only derefs to `str`, and
+            // `str::as_str` is not a stable method.
+            let key: &str = key;
+            if key.eq_ignore_ascii_case(wire_name) {
+                return Some(key.to_owned());
             }
         }
         current_class = desc.superclass.as_deref();

@@ -454,8 +454,12 @@ jobs:
           # output above the warnings that a plain tail picks up.
           diag="$(
             {
-              grep -A 10 '^error' /tmp/cargo.log | head -n 45
-              awk '/^(running [0-9]+ tests?|failures:)/{flag=1} flag' /tmp/cargo.log | tail -n 25
+              # Every error line first, so one annotation carries the whole
+              # index instead of only the first diagnostic; then the detail for
+              # what the compiler expanded, and the harness block if tests ran.
+              grep -E '^error' /tmp/cargo.log | head -n 60
+              grep -A 8 '^error' /tmp/cargo.log | head -n 200
+              awk '/^(running [0-9]+ tests?|failures:)/{flag=1} flag' /tmp/cargo.log | tail -n 40
             } 2>/dev/null
           )"
           if [ -z "$diag" ]; then

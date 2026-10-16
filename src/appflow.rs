@@ -2115,11 +2115,16 @@ mod tests {
         let _guard = PlaneGuard::with(JoinPlanes::default(), ChannelOpenMode::Off);
         assert_eq!(join_planes(), JoinPlanes::default());
         assert_eq!(join_planes().label(), "none (handshake and burst only)");
-        let all = JoinPlanes { channels: true, replication: true, sync: true };
-        let _guard = PlaneGuard::with(all, ChannelOpenMode::FullProfile);
-        assert_eq!(join_planes(), all);
-        let label = join_planes().label();
-        assert!(label.contains("full profile") && label.contains("replication decode"), "{label}");
+        {
+            let all = JoinPlanes { channels: true, replication: true, sync: true };
+            let _guard = PlaneGuard::with(all, ChannelOpenMode::FullProfile);
+            assert_eq!(join_planes(), all);
+            let label = join_planes().label();
+            assert!(
+                label.contains("full profile") && label.contains("replication decode"),
+                "{label}"
+            );
+        }
 
         let mut flow = flow_with(JoinPlanes::default());
         assert_eq!(flow.planes_summary(), "none (handshake and burst only)");
@@ -2135,13 +2140,14 @@ mod tests {
         flow.note_opened(APP, 1, 7);
         flow.on_stream_data(7, &frame(&[0x83, 0x16, 0x09, 0x00]));
         assert!(flow.drain_events().is_empty(), "a disabled plane reports nothing");
-        // And the control burst is the four reference records, untouched.
-        let mut expected = stream_header(ctrl_app(), CTRL_CHANNEL).to_vec();
-        expected.extend_from_slice(&frame(&[0x00, 0x00]));
+        // And the control burst is the four reference records, untouched. The
+        // 7-byte header is skipped because the application byte inside it is a
+        // global switch other tests are allowed to move.
+        let mut expected = frame(&[0x00, 0x00]);
         for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
             expected.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
         }
-        assert_eq!(data, expected, "{}", hx(&data));
+        assert_eq!(&data[7..], &expected[..], "{}", hx(&data));
     }
 
     #[test]
@@ -2161,8 +2167,10 @@ mod tests {
             }))
         };
         // Turning the plane on must not move a byte in the reference mode, or a
-        // passing session stops being comparable with the capture before it.
-        assert_eq!(off, on);
+        // passing session stops being comparable with the capture before it. The
+        // stream header is excluded for the same reason as above: the control
+        // application byte is a global switch, not part of what this compares.
+        assert_eq!(off[7..], on[7..], "\noff: {}\non:  {}", hx(&off), hx(&on));
     }
 
     #[test]
@@ -2175,8 +2183,7 @@ mod tests {
         // then one record per row in profile order — an OpenReliable for the ten
         // reliable rows and an OpenUnreliable carrying the parity-0 series for
         // the four unreliable ones. The router and the table have to agree.
-        let mut want = stream_header(ctrl_app(), CTRL_CHANNEL).to_vec();
-        want.extend_from_slice(&frame(&[0x00, 0x00]));
+        let mut want = frame(&[0x00, 0x00]);
         let mut next_wire = 2u32;
         for (index, row) in DEFAULT_CHANNEL_PROFILE.iter().enumerate() {
             let record = if rbx_channels::is_unreliable(row) {
@@ -2188,7 +2195,7 @@ mod tests {
             };
             want.extend_from_slice(&frame(&record));
         }
-        assert_eq!(hx(&data), hx(&want));
+        assert_eq!(hx(&data[7..]), hx(&want));
         // The mode is in the report, so a run is reproducible from its log alone.
         assert!(flow.on_tick(10_000).is_empty());
         let report = flow.channel_report();

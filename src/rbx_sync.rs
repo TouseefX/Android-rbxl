@@ -594,7 +594,7 @@ pub fn plan_changes(
             (None, None) => continue,
             (Some(before), Some(current)) => {
                 plan.compared += 1;
-                let class = current.class.as_str().to_owned();
+                let class = current.class.to_string();
                 if class != before.class {
                     plan.class_changes += 1;
                 }
@@ -613,8 +613,8 @@ pub fn plan_changes(
                 };
                 // The instance name is a DOM field here and a member in the
                 // dictionary, so it is compared separately.
-                if current.name.as_str() != before.name {
-                    let renamed = Variant::String(current.name.as_str().to_owned());
+                if current.name != before.name {
+                    let renamed = Variant::String(current.name.clone());
                     match encode_member(
                         schema,
                         &global,
@@ -633,7 +633,7 @@ pub fn plan_changes(
                     }
                 }
                 for (key, value) in current.properties.iter() {
-                    let name = key.as_str();
+                    let name: &str = key;
                     // Equal means nothing to send, and it is the cheaper test:
                     // an unchanged property that the dictionary does not name
                     // must not be reported as a mapping failure.
@@ -1474,13 +1474,13 @@ mod tests {
             let Some(instance) = dom.get_by_ref(*reference) else { continue };
             let mut properties = BTreeMap::new();
             for (key, value) in &instance.properties {
-                properties.insert(key.as_str().to_ascii_lowercase(), value.clone());
+                properties.insert(key.to_ascii_lowercase(), value.clone());
             }
             entries.insert(
                 *wire_id,
                 BaselineInstance {
-                    class: instance.class.as_str().to_owned(),
-                    name: instance.name.as_str().to_owned(),
+                    class: instance.class.to_string(),
+                    name: instance.name.clone(),
                     properties,
                     parent: None,
                 },

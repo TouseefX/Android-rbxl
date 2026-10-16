@@ -1205,8 +1205,10 @@ fn skip_keypoints(
             "sequence ({context}) declares {count} keypoint(s), above the {maximum} the target accepts"
         ));
     }
-    let bytes = usize::from(count)
-        .checked_mul(stride)
+    // `count` was bounded by `maximum` above, so this cannot truncate on any
+    // platform; the cast is on purpose rather than `usize::from`, which would
+    // not compile on 32-bit targets where usize is not 64 bits.
+    let bytes = (count as usize).checked_mul(stride)
         .ok_or_else(|| "sequence length overflows".to_string())?;
     reader.take(bytes, "sequence keypoints")?;
     Ok(())
@@ -1451,7 +1453,11 @@ pub struct DeltaEntries {
 
 /// One item of a `0x83` delta chain. Types whose grammar is not recovered stop
 /// the walk and are reported as a stop point instead of being guessed at.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// No `PartialEq`: a `Batch` item carries a decoded `JoinDataItem`, whose
+/// decoded-inner shape is deliberately not comparable, and comparing chain items
+/// is never what a caller wants anyway - the counters and stop points are.
+#[derive(Clone, Debug)]
 pub enum ChainItem {
     EntityRef { lo: u64, entity: Option<u32> },
     Spawn(SpawnRecord),
@@ -1993,7 +1999,7 @@ impl SnapshotApply {
             };
             let mut properties = BTreeMap::new();
             for (key, value) in &instance.properties {
-                properties.insert(key.as_str().to_ascii_lowercase(), value.clone());
+                properties.insert(key.to_ascii_lowercase(), value.clone());
             }
             // A parent the snapshot did not create (the DataModel root, or a
             // service that was never replicated) reads as no parent, which is
@@ -2002,8 +2008,8 @@ impl SnapshotApply {
             entries.insert(
                 *id,
                 BaselineInstance {
-                    class: instance.class.as_str().to_owned(),
-                    name: instance.name.as_str().to_owned(),
+                    class: instance.class.to_string(),
+                    name: instance.name.clone(),
                     properties,
                     parent,
                 },

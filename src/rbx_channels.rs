@@ -163,7 +163,7 @@ impl LocalUnreliableIdAllocator {
             return None;
         }
         self.allocations += 1;
-        let magnitude = (2 * self.allocations | u64::from(self.parity)).try_into().ok()?;
+        let magnitude: i32 = (2 * self.allocations | u64::from(self.parity)).try_into().ok()?;
         Some(-magnitude)
     }
 }
