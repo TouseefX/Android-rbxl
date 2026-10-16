@@ -684,14 +684,17 @@ mod tests {
         assert!(
             gaps.iter().any(|gap| {
                 gap.starts_with("peer opened a stream but sent no open record")
-                    && gap.contains(" 2")
+                    && gap.contains("[2]")
             }),
             "{gaps:?}"
         );
+        let unanswered = gaps
+            .iter()
+            .find(|gap| gap.starts_with("opened here with no matching peer announcement"))
+            .map(String::as_str)
+            .unwrap_or("");
         assert!(
-            !gaps
-                .iter()
-                .any(|gap| gap.contains("no matching peer announcement") && gap.contains(" 2")),
+            !unanswered.contains("[2]") && !unanswered.contains(", 2,"),
             "channel 2 has a peer stream, so it is not an unanswered open: {gaps:?}"
         );
     }

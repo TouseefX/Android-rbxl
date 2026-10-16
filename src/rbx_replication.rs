@@ -2211,7 +2211,7 @@ pub fn parse_config_table(body: &[u8]) -> Result<ConfigTable, String> {
     let mut cursor = &rest[3..];
     let mut pairs = Vec::new();
     while pairs.len() < declared {
-        let mark = *cursor;
+        let mark: &[u8] = cursor;
         let Some(key) = read_config_text(&mut cursor) else {
             break;
         };
@@ -3614,7 +3614,7 @@ mod tests {
     #[test]
     fn a_configuration_frame_is_named_by_the_stream_instead_of_counted_unrecognized() {
         let mut stream = ReplicationStream::default();
-        assert_eq!(stream.push(&frame(captured_config_frame())), 1);
+        assert_eq!(stream.push(&frame(&captured_config_frame())), 1);
         assert_eq!(stream.unparsed, 0, "0x93 is a message id this client knows");
         assert_eq!(stream.config_pairs, 1);
         assert_eq!(
