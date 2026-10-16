@@ -177,6 +177,22 @@ pub fn resolve_property_type(class_name: &str, prop_name: &str) -> Option<DataTy
             if let Some(pd) = desc.properties.get(prop_name) {
                 return Some(pd.data_type.clone());
             }
+            // The database keys some properties by the spelling the binary format
+            // uses (`size`) while callers hold the canonical one (`Size`), so a
+            // miss is retried case-insensitively against both the key and the
+            // descriptor's own name before the walk moves to the superclass.
+            if let Some(pd) = desc
+                .properties
+                .iter()
+                .find(|(key, property)| {
+                    let key: &str = *key;
+                    key.eq_ignore_ascii_case(prop_name)
+                        || property.name.eq_ignore_ascii_case(prop_name)
+                })
+                .map(|(_, property)| property)
+            {
+                return Some(pd.data_type.clone());
+            }
             current_class = desc.superclass.as_deref();
         } else {
             break;
@@ -311,13 +327,18 @@ pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<Stri
         let Some(desc) = db.classes.get(cls) else {
             break;
         };
-        for (key, _) in &desc.properties {
+        for (key, property) in &desc.properties {
             // Bound through a `&str` rather than `key.as_str()`: the property map
             // is keyed by an interned string type that only derefs to `str`, and
             // `str::as_str` is not a stable method.
             let key: &str = key;
-            if key.eq_ignore_ascii_case(wire_name) {
-                return Some(key.to_owned());
+            if key.eq_ignore_ascii_case(wire_name) || property.name.eq_ignore_ascii_case(wire_name)
+            {
+                // The descriptor's own name is the canonical spelling; the map key
+                // is not, because a legacy property keeps the tag the binary format
+                // writes (`size` for `Size`). Returning the key here would put a
+                // wire name into the DOM, where both place writers reject it.
+                return Some(property.name.clone());
             }
         }
         current_class = desc.superclass.as_deref();
@@ -332,6 +353,21 @@ mod replication_helpers {
     #[test]
     fn wire_names_resolve_to_canonical_properties() {
         assert_eq!(canonical_property_name("Part", "size").as_deref(), Some("Size"));
+        // The canonical spelling resolves to itself, and the type lookup finds the
+        // same property under either spelling - the database keys `Part`'s size by
+        // the binary tag, so an exact `get("Size")` alone would miss.
+        assert_eq!(
+            canonical_property_name("Part", "Size").as_deref(),
+            Some("Size")
+        );
+        assert!(matches!(
+            resolve_property_type("Part", "Size"),
+            Some(DataType::Value(rbx_dom_weak::types::VariantType::Vector3))
+        ));
+        assert!(matches!(
+            resolve_property_type("Part", "size"),
+            Some(DataType::Value(rbx_dom_weak::types::VariantType::Vector3))
+        ));
         assert_eq!(
             canonical_property_name("Part", "AnChArEd").as_deref(),
             Some("Anchored")
