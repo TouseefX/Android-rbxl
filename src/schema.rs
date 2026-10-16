@@ -42,16 +42,8 @@ pub fn class_is_service(class_name: &str) -> bool {
 /// Test Roblox API-dump inheritance, including classes not covered by the
 /// command VM's small set of hand-written fallback aliases.
 pub fn class_is_subclass_of(class_name: &str, ancestor_name: &str) -> bool {
-    let db = database();
-    let mut current = Some(class_name);
-    for _ in 0..128 {
-        let Some(name) = current else { return false };
-        if name == ancestor_name {
-            return true;
-        }
-        current = db.classes.get(name).and_then(|desc| desc.superclass.as_deref());
-    }
-    false
+    // Case-sensitive, like `Instance:IsA` itself.
+    class_chain(class_name).iter().any(|name| *name == ancestor_name)
 }
 
 pub fn class_is_creatable(class_name: &str) -> bool {
@@ -165,14 +157,43 @@ pub fn get_enum_items_with_values(enum_name: &str) -> Vec<(String, u32)> {
     items
 }
 
+/// One class up, preferring the reflection database's link and falling back to
+/// the built-in API dump. The database omits abstract classes - `Part` reaches
+/// `BasePart` through `FormFactorPart`, which it does not describe - and a walk
+/// that stops at that gap loses every property inherited above it.
+fn superclass_of(class: &str) -> Option<&'static str> {
+    if let Some(desc) = database().classes.get(class) {
+        if let Some(parent) = desc.superclass {
+            return Some(parent);
+        }
+    }
+    crate::roblox_api_data::class_superclass(class)
+}
+
+/// `class` and each of its ancestors, deepest first. A missing entry does not end
+/// the chain (see [`superclass_of`]), and the depth limit is a cycle guard rather
+/// than a real bound: no Roblox class is more than a handful of hops from Instance.
+fn class_chain(class_name: &str) -> Vec<&str> {
+    let mut chain: Vec<&str> = Vec::with_capacity(16);
+    let mut current = Some(class_name);
+    for _ in 0..64 {
+        let Some(name) = current else { break };
+        if chain.contains(&name) {
+            break;
+        }
+        chain.push(name);
+        current = superclass_of(name);
+    }
+    chain
+}
+
 /// Resolve the official type of a property on a class, walking the superclass
 /// chain. Returns the reflection `DataType` (either a concrete `VariantType` or
 /// a named Roblox `Enum`), so the properties editor can render the right
 /// widget (e.g. a dropdown for enums instead of a raw integer).
 pub fn resolve_property_type(class_name: &str, prop_name: &str) -> Option<DataType<'static>> {
     let db = database();
-    let mut current_class = Some(class_name);
-    while let Some(cls) = current_class {
+    for cls in class_chain(class_name) {
         if let Some(desc) = db.classes.get(cls) {
             if let Some(pd) = desc.properties.get(prop_name) {
                 return Some(pd.data_type.clone());
@@ -200,9 +221,6 @@ pub fn resolve_property_type(class_name: &str, prop_name: &str) -> Option<DataTy
                 }
                 return Some(pd.data_type.clone());
             }
-            current_class = desc.superclass.as_deref();
-        } else {
-            break;
         }
     }
     None
@@ -331,10 +349,9 @@ pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<Stri
         return None;
     }
     let db = database();
-    let mut current_class = Some(class_name);
-    while let Some(cls) = current_class {
+    for cls in class_chain(class_name) {
         let Some(desc) = db.classes.get(cls) else {
-            break;
+            continue; // an abstract class the database does not describe
         };
         // An exact hit first, because a capture's wire spelling is a key of this
         // map for every legacy property and a snapshot repeats the lookup per
@@ -351,7 +368,6 @@ pub fn canonical_property_name(class_name: &str, wire_name: &str) -> Option<Stri
                 return Some(canonical_name_for(desc, property));
             }
         }
-        current_class = desc.superclass.as_deref();
     }
     None
 }
@@ -412,11 +428,19 @@ mod replication_helpers {
             resolve_property_type("Part", "size"),
             Some(DataType::Value(rbx_dom_weak::types::VariantType::Vector3))
         ));
+        // `Part`'s link to `BasePart` runs through `FormFactorPart`, which the
+        // reflection database does not describe; the built-in API dump supplies that
+        // step, so a name inherited from above the gap resolves from either
+        // spelling. The failure message carries the chain, because a database that
+        // changes shape should be noticed here rather than in a live session.
+        assert!(class_is_subclass_of("Part", "BasePart"));
         assert_eq!(
             canonical_property_name("Part", "AnChArEd").as_deref(),
             Some("Anchored"),
-            "{}\n{}",
+            "chain: {:?}\n{}\n{}\n{}",
+            class_chain("Part"),
             describe_class("Part"),
+            describe_class("FormFactorPart"),
             describe_class("BasePart")
         );
         // Inherited from BasePart, which is why the walk is needed.
