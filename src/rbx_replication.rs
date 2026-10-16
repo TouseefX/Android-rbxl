@@ -2930,7 +2930,7 @@ mod tests {
         assert_eq!(record.id, Some(7));
         assert_eq!(record.class, 0);
         assert_eq!(record.parent, Some(DATAMODEL_ROOT_ID));
-        assert_eq!(record.properties.len(), 2);
+        assert_eq!(record.properties.len(), 3);
         assert_eq!(record.properties[0].name, "Name");
         assert_eq!(record.properties[0].tag, 49);
         assert_eq!(name_text(&schema, &record.properties[0].raw).as_deref(), Some("Box"));
@@ -2938,6 +2938,9 @@ mod tests {
         // The raw extent is the value alone - tag 15 is 24 bytes - which is what
         // lets the applier re-read it without knowing the loop's framing.
         assert_eq!(record.properties[1].raw.len(), 24);
+        assert_eq!(record.properties[2].name, "Anchored");
+        assert_eq!(record.properties[2].tag, 9);
+        assert_eq!(record.properties[2].raw, &[1u8][..]);
         assert_eq!(record.consumed, data.len(), "the run is exact");
     }
 
@@ -2953,6 +2956,8 @@ mod tests {
         for value in [2.0f32, 1.0, 1.0, 16.0, 16.0, 16.0] {
             data.extend_from_slice(&value.to_le_bytes());
         }
+        data.push(2); // member 2 = Anchored, tag 9: one byte
+        data.push(1);
         data.push(0xFF); // end of the property loop
         data.push(1);
         data.extend_from_slice(&DATAMODEL_ROOT_ID.to_le_bytes());
