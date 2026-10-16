@@ -2056,6 +2056,15 @@ mod tests {
 
     /// Save and restore the plane switches and the channel mode, because a flow
     /// captures them when it is constructed.
+    /// The planes are process-wide switches the UI sets, and `cargo test` runs
+    /// cases on parallel threads: any test that reads a byte the channel mode
+    /// decides has to hold this, or another test's mode is what it sees.
+    static PLANE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn plane_serial() -> std::sync::MutexGuard<'static, ()> {
+        PLANE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct PlaneGuard {
         planes: JoinPlanes,
         mode: ChannelOpenMode,
@@ -2135,6 +2144,7 @@ mod tests {
 
     #[test]
     fn planes_default_off_and_change_nothing() {
+        let _serial = plane_serial();
         let _guard = PlaneGuard::with(JoinPlanes::default(), ChannelOpenMode::Off);
         assert_eq!(join_planes(), JoinPlanes::default());
         assert_eq!(join_planes().label(), "none (handshake and burst only)");
@@ -2187,6 +2197,7 @@ mod tests {
 
     #[test]
     fn channel_plane_reference_mode_matches_the_hardcoded_burst() {
+        let _serial = plane_serial();
         let off = {
             let _guard = PlaneGuard::with(JoinPlanes::default(), ChannelOpenMode::Off);
             ctrl_burst(&mut flow_with(JoinPlanes::default()))
@@ -2210,6 +2221,7 @@ mod tests {
 
     #[test]
     fn channel_plane_full_profile_adds_reliable_open_records() {
+        let _serial = plane_serial();
         let planes = JoinPlanes { channels: true, ..JoinPlanes::default() };
         let _guard = PlaneGuard::with(planes, ChannelOpenMode::FullProfile);
         let mut flow = flow_with(planes);
@@ -2244,6 +2256,7 @@ mod tests {
 
     #[test]
     fn channel_plane_reconciles_a_peer_announcement() {
+        let _serial = plane_serial();
         let planes = JoinPlanes { channels: true, ..JoinPlanes::default() };
         let _guard = PlaneGuard::with(planes, ChannelOpenMode::ReferenceUnreliable);
         let mut flow = flow_with(planes);
@@ -2270,6 +2283,7 @@ mod tests {
 
     #[test]
     fn replication_plane_reports_what_it_cannot_parse() {
+        let _serial = plane_serial();
         let planes = JoinPlanes { replication: true, ..JoinPlanes::default() };
         let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
         let mut flow = flow_with(planes);
@@ -2304,6 +2318,7 @@ mod tests {
 
     #[test]
     fn marker_asks_the_replication_stream_for_the_place() {
+        let _serial = plane_serial();
         let planes = JoinPlanes { replication: true, ..JoinPlanes::default() };
         let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
         let mut flow = flow_with(planes);
@@ -2327,6 +2342,7 @@ mod tests {
 
     #[test]
     fn sync_plane_sends_the_reference_liveness_periods() {
+        let _serial = plane_serial();
         let planes = JoinPlanes { sync: true, ..JoinPlanes::default() };
         let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
         let mut flow = flow_with(planes);
@@ -2382,6 +2398,7 @@ mod tests {
 
     #[test]
     fn sync_plane_does_not_queue_changes_it_cannot_address() {
+        let _serial = plane_serial();
         let planes = JoinPlanes { sync: true, ..JoinPlanes::default() };
         let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
         let flow = flow_with(planes);
