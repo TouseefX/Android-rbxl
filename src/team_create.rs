@@ -678,6 +678,17 @@ struct RbxTransportConnectPlan {
     join_api_security_token: Option<String>,
     join_serialized_client_fields: Option<serde_json::Value>,
     join_encrypted_server_fields: Option<serde_json::Value>,
+    /// `PreloadedVersion` from the gamejoin response, when it carries one. The
+    /// real client echoes this key in the join info; the server logs the value
+    /// it received and diffs it against its own as the first step of the
+    /// join-send, so a missing key is a concrete stall suspect on servers that
+    /// have a preloaded version.
+    join_preloaded_version: Option<String>,
+    /// Which of the join-script keys this flow knows how to consume the
+    /// response carried - names only, never values. The 0x90 report names the
+    /// fields it could not refresh; this says whether the gamejoin response
+    /// carried them at all.
+    join_script_key_report: String,
     /// What the joinTicket lookup actually found. "0x90 needs
     /// SerializedClientFields / EncryptedServerFields" is the same message
     /// whether the ticket is absent or present without those keys, and those
@@ -1134,8 +1145,50 @@ fn extract_rbx_transport_connect_plan(
             .and_then(|v| v.as_str().map(str::to_owned)),
         join_serialized_client_fields: serialized_client_fields,
         join_encrypted_server_fields: encrypted_server_fields,
+        join_preloaded_version: find_field_ci(config, "PreloadedVersion", 0)
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .filter(|value| !value.trim().is_empty()),
+        join_script_key_report: join_script_key_report(config),
         join_ticket_note,
     })
+}
+
+/// The join-script keys the 0x90 build knows how to consume, and which of them
+/// this gamejoin response carried - names only. A field the report calls
+/// "missing" is only a config gap if the response never carried it; this line
+/// says which case a session was.
+fn join_script_key_report(config: &serde_json::Value) -> String {
+    const KEYS: &[&str] = &[
+        "UserId",
+        "UserName",
+        "DisplayName",
+        "DomainUserId",
+        "ClientTicket",
+        "SessionId",
+        "RandomSeed1",
+        "APIsecurityToken",
+        "joinTicket",
+        "PreloadedVersion",
+        "CountryCode",
+        "MembershipType",
+        "AccountAge",
+        "GameLocale",
+        "CharacterAppearanceId",
+    ];
+    let mut present = Vec::new();
+    let mut absent = Vec::new();
+    for key in KEYS {
+        if find_field_ci(config, key, 0).is_some() {
+            present.push(*key);
+        } else {
+            absent.push(*key);
+        }
+    }
+    format!(
+        "gamejoin keys present [{}]; absent [{}]",
+        present.join(", "),
+        absent.join(", ")
+    )
 }
 
 /// The joinTicket field carries the server-issued ticket; across fleet
@@ -1757,7 +1810,7 @@ fn rbx_transport_connection_report(_plan: &RbxTransportConnectPlan, _timeout_ms:
 fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u64) -> String {
     match run_rbx_transport_connection(plan, timeout_ms) {
         Ok(report) => format!(
-            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial minimum; socket fragmentation options are best-effort), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\nEarly-auth metadata: version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted). The app=4 flow results below show whether the post-handshake send was active; the separate BaseClient reliability-2 channel/WireChannelId mapping remains unverified. A handshake or observed flow traffic does not prove native BaseClient connected state or Team Create acceptance.\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}\nJoin: {}\nJoin planes: {}\nChannel profile: {}\nReplication: {}\nUpstream sync: {}\nReplicated snapshot: {}",
+            "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, UDP payload cap {} bytes (RFC 9000 client-Initial minimum; socket fragmentation options are best-effort), RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\nEarly-auth metadata: version {}, pre-auth {} bytes, auth {} bytes, payload {} bytes (contents redacted). The app=4 flow results below show whether the post-handshake send was active; the separate BaseClient reliability-2 channel/WireChannelId mapping remains unverified. A handshake or observed flow traffic does not prove native BaseClient connected state or Team Create acceptance.\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nBurst TX: {}\nMarkers acknowledged: {}\nJoin: {}\nJoin planes: {}\nChannel profile: {}\nReplication: {}\nUpstream sync: {}\nReplicated snapshot: {}",
             report.route_label,
             report.target,
             report.local_addr,
@@ -1781,6 +1834,7 @@ fn rbx_transport_connection_report(plan: &RbxTransportConnectPlan, timeout_ms: u
             report.flow_drain_summary,
             report.flow_config,
             report.flow_join90_report,
+            report.flow_burst_report,
             report.flow_markers_acked,
             report.flow_join_report,
             report.flow_planes,
@@ -1840,6 +1894,9 @@ struct RbxTransportConnectionReport {
     flow_drain_summary: String,
     /// Which 0x90 template fields were refreshed from this session.
     flow_join90_report: String,
+    /// What the post-handshake burst put on the wire: per-frame lengths and
+    /// fingerprints, with ticket-bearing frames redacted to structure.
+    flow_burst_report: String,
     /// Selected 0xA7 mode and control application byte for this flow. These
     /// settings are configurable and are included for interpreting the report.
     flow_config: String,
@@ -2028,6 +2085,7 @@ fn build_join_flow_config(
         api_security_token: plan.join_api_security_token.clone(),
         serialized_client_fields: plan.join_serialized_client_fields.clone(),
         encrypted_server_fields: plan.join_encrypted_server_fields.clone(),
+        preloaded_version: plan.join_preloaded_version.clone(),
         early_auth,
         a7_mode: crate::appflow::a7_mode(),
     })
@@ -3006,7 +3064,11 @@ async fn attempt_rbx_transport_connection_async(
             .unwrap_or_else(|| "flow inactive".to_string()),
         flow_join90_report: join_flow
             .as_ref()
-            .map(|flow| flow.join90_report().to_owned())
+            .map(|flow| format!("{}; {}", flow.join90_report(), plan.join_script_key_report))
+            .unwrap_or_else(|| format!("flow inactive; {}", plan.join_script_key_report)),
+        flow_burst_report: join_flow
+            .as_ref()
+            .map(|flow| flow.burst_report().to_owned())
             .unwrap_or_else(|| "flow inactive".to_string()),
         flow_markers_acked: join_flow
             .as_ref()
@@ -6100,7 +6162,7 @@ pub fn run_join_config_session(
                     )
                 };
                 report.push_str(&format!(
-                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nMarkers acknowledged: {}\nJoin: {}\nJoin planes: {}\nChannel profile: {}\nReplication: {}\nUpstream sync: {}\nReplicated snapshot: {}",
+                    "\n✅ RbxTransport QUIC/TLS handshake completed — route {}, target {}, local {}, ALPN {}, RUPP prefix {} bytes, initial DCID {} bytes, native RUPP/QUIC CID trailer {} bytes, RPK version {}, native handshake timeout {} ms (requested {} ms), handshake completed in {} ms; {}\n{}\n{}\nPeer channel announcements parsed from its control streams: {}\n0x9B challenge: {}\nInitial write backlog: {}\nFlow config: {}\n0x90 identity: {}\nBurst TX: {}\nMarkers acknowledged: {}\nJoin: {}\nJoin planes: {}\nChannel profile: {}\nReplication: {}\nUpstream sync: {}\nReplicated snapshot: {}",
                     connection_report.route_label,
                     connection_report.target,
                     connection_report.local_addr,
@@ -6120,6 +6182,7 @@ pub fn run_join_config_session(
                     connection_report.flow_drain_summary,
                     connection_report.flow_config,
                     connection_report.flow_join90_report,
+                    connection_report.flow_burst_report,
                     connection_report.flow_markers_acked,
                     connection_report.flow_join_report,
                     connection_report.flow_planes,
@@ -6327,6 +6390,7 @@ mod tests {
                 "GameFqdn": "gamejoin.roblox.test",
                 "ClientPublicKeyData": key_ring.to_string(),
                 "ClientTicket": "ticket-prefix;ignored;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=;oKGio6SlpqeoqaqrrK2urw==;6",
+                "PreloadedVersion": "42",
                 "ServerConnections": [
                     { "Address": "10.32.8.208", "Port": 50704 }
                 ],
@@ -6344,6 +6408,16 @@ mod tests {
         assert_eq!(plan.rbx_transport_port, 56000);
         assert_eq!(plan.token_type, RUPP_TOKEN_TYPE_GAME_SERVICE);
         assert!(plan.direct_server_return);
+        // The join-info echo of the server's preloaded version rides the plan
+        // into the 0x90.
+        assert_eq!(plan.join_preloaded_version.as_deref(), Some("42"));
+        // The key report is names only: it says which join-script keys the
+        // response carried without leaking any value that came with them.
+        let keys = &plan.join_script_key_report;
+        assert!(keys.starts_with("gamejoin keys present ["), "{keys}");
+        assert!(keys.contains("ClientTicket, PreloadedVersion"), "{keys}");
+        assert!(keys.contains("absent [") && keys.contains("SessionId"), "{keys}");
+        assert!(!keys.contains("ticket-prefix"), "names only: {keys}");
         assert_eq!(plan.token, [
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
             0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,

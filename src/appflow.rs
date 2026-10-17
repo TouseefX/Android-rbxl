@@ -50,6 +50,15 @@ pub const APP_DUMMY: u32 = 6;
 /// Control channel: the ASCII "ctrl" as a big-endian u32.
 pub const CTRL_CHANNEL: u32 = 0x6374_726C;
 
+/// The BaseClient's own send channel: native `BaseClient::connect` calls
+/// `openSendChannel` with application 1, channel id 0, reliability enum 2,
+/// priority 0 right after the connection opens - outside the fourteen-row
+/// app=4 profile (the "1 accounted outside the profile" the channel report
+/// counts). The wire shape is the same 6-byte OpenReliable the reliable
+/// profile rows use.
+pub const BASECLIENT_SEND_APP: u8 = 1;
+pub const BASECLIENT_SEND_CHANNEL: u32 = 0;
+
 /// App id written into the ctrl stream header.
 ///
 /// Native 0x90 message template (10 432 B capture). The JSON region is
@@ -225,6 +234,13 @@ pub struct JoinConfig {
     /// `as_str()` silently dropped it, which cost the whole 0x90.
     pub serialized_client_fields: Option<serde_json::Value>,
     pub encrypted_server_fields: Option<serde_json::Value>,
+    /// `PreloadedVersion` from the gamejoin response. The real client echoes
+    /// this key in the join info; the server logs the value it received
+    /// (`ClientPreloadedVersion received`) and compares it against its own as
+    /// the first step of the join-send (`Preloaded version mismatch: client={},
+    /// server={}`), so a join info without the key is a concrete stall suspect
+    /// on servers that carry a preloaded version.
+    pub preloaded_version: Option<String>,
     pub early_auth: Option<EarlyAuth>,
     pub a7_mode: A7Mode,
 }
@@ -544,6 +560,124 @@ pub fn build_8a(cfg: &JoinConfig) -> Vec<u8> {
     out
 }
 
+/// A structural, redacted description of a **built** 0x8A frame: lengths and
+/// the non-secret fields only - never the ticket or session bytes. This walks
+/// the actual frame bytes rather than restating intent, so a builder
+/// regression shows up as a parse failure at a named offset instead of a
+/// stale claim that the layout is fine.
+pub fn describe_8a_frame(m: &[u8]) -> String {
+    let mut i = 0usize;
+    let fail = |i: usize, what: &str| -> String {
+        format!("parse stopped at offset {i}: {what}")
+    };
+    if m.first() != Some(&0x8A) {
+        return format!("0x8A {}B: {}", m.len(), fail(0, "first byte is not 0x8A"));
+    }
+    i = 1;
+    let Some((zz, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no user id LEB"));
+    };
+    i += n;
+    let uid = zz >> 1;
+    let Some((tlen, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no ticket length LEB"));
+    };
+    i += n;
+    let tlen_us = tlen as usize;
+    if i + tlen_us > m.len() {
+        return format!(
+            "0x8A {}B: {}",
+            m.len(),
+            fail(i, &format!("ticket claims {tlen_us}B, only {}B remain", m.len() - i))
+        );
+    }
+    i += tlen_us;
+    let Some((device, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no device-id LEB"));
+    };
+    i += n;
+    // build_8a writes this as a raw u32le; LEB of the same value reads it back
+    // only when it is < 0x80, which 36 is - and the four bytes must be
+    // 24 00 00 00.
+    if device != 36 || m.get(i..i + 3) != Some(&[0x00u8, 0x00, 0x00][..]) {
+        return format!(
+            "0x8A {}B: {}",
+            m.len(),
+            fail(i, &format!("device field is {device:#x}, expected u32le 36"))
+        );
+    }
+    i += 3;
+    let Some((clen, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no CONST74 length LEB"));
+    };
+    i += n;
+    if clen != 74 || i + 74 > m.len() {
+        return format!(
+            "0x8A {}B: {}",
+            m.len(),
+            fail(i, &format!("CONST74 claims {clen}B"))
+        );
+    }
+    let const_ok = &m[i..i + 74]
+        == b"2e427f51c4dab762fe9e3471c6cfa1650841723b!6e8e47e92778f00efbb13c7bb151ea88.";
+    i += 74;
+    let Some((olen, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no OS length LEB"));
+    };
+    i += n;
+    if olen != 7 || i + 7 > m.len() || &m[i..i + 7] != b"Android" {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "OS field is not \"Android\""));
+    }
+    i += 7;
+    let Some((qlen, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no '?' length LEB"));
+    };
+    i += n;
+    if qlen != 1 || m.get(i) != Some(&b'?') {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "field after OS is not '?'"));
+    }
+    i += 1;
+    let Some((v31, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no v31 LEB"));
+    };
+    i += n;
+    let Some((v31b, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no v31-0x0BADF00D LEB"));
+    };
+    i += n;
+    let v31_rel_ok = v31b == (v31 as u32).wrapping_sub(0x0BAD_F00D) as u64;
+    if m.get(i) != Some(&0x00) {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "separator is not 0x00"));
+    }
+    i += 1;
+    let Some((slen, n)) = leb128_decode(&m[i..]) else {
+        return format!("0x8A {}B: {}", m.len(), fail(i, "no session length LEB"));
+    };
+    i += n;
+    let slen_us = slen as usize;
+    if i + slen_us > m.len() {
+        return format!(
+            "0x8A {}B: {}",
+            m.len(),
+            fail(i, &format!("session claims {slen_us}B, only {}B remain", m.len() - i))
+        );
+    }
+    i += slen_us;
+    let tail_ok = m.get(i..) == Some(&[0xFE, 0xCA, 0x01, 0xC0][..]);
+    i += 4;
+    let walked = i == m.len();
+    format!(
+        "0x8A {}B xxh32={:#010x}: uid={uid} ticket={tlen_us}B (redacted) device=36 const74={} os=Android v31={:#010x} v31-const={} session={slen_us}B (redacted) tail={}{}",
+        m.len(),
+        challenge::xxh32(m, 0),
+        if const_ok { "ok" } else { "MISMATCH" },
+        v31 as u32,
+        if v31_rel_ok { "ok" } else { "MISMATCH" },
+        if tail_ok { "fe-ca-01-c0" } else { "MISMATCH" },
+        if walked { "" } else { "; trailing bytes after tail" },
+    )
+}
+
 /// A built 0x90 plus an account of how much of it is this session's.
 ///
 /// The 0x90 is a captured template, so every key this struct does not claim to
@@ -556,6 +690,10 @@ pub struct Build90 {
     pub refreshed: Vec<String>,
     /// Template keys still carrying the captured account's values.
     pub frozen: Vec<String>,
+    /// Keys this session added that the template never carried
+    /// (`PreloadedVersion` is the live one). Separate from `refreshed`, which
+    /// only counts substitutions of existing template keys.
+    pub added: Vec<String>,
     /// Identity keys the gamejoin response did not carry at all, so nothing
     /// could replace them. Distinct from `frozen`, which also covers keys whose
     /// live value merely equalled the capture.
@@ -620,6 +758,18 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
             serde_json::to_string(&ticket).map_err(|e| format!("0x90 ticket: {e}"))?,
         ),
     );
+    // The template is a capture of a client whose gamejoin response carried no
+    // `PreloadedVersion`, so the key is absent from it entirely. A live config
+    // that carries one must add it: the server logs the received value at
+    // player creation and diffs it against its own as the first step of the
+    // join-send.
+    if let Some(version) = cfg
+        .preloaded_version
+        .as_ref()
+        .filter(|v| !v.trim().is_empty())
+    {
+        tmpl.insert("PreloadedVersion".into(), serde_json::Value::from(version.clone()));
+    }
 
     for (key, value) in [
         ("UserName", cfg.user_name.as_ref().map(|v| serde_json::Value::from(v.clone()))),
@@ -696,6 +846,14 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
         .filter(|key| tmpl.get(*key) == pristine.get(*key))
         .cloned()
         .collect();
+    // Keys the live config contributed that the template never carried
+    // (`PreloadedVersion` is the live one). Not `refreshed`, which counts
+    // substitutions of existing template keys.
+    let added: Vec<String> = tmpl
+        .keys()
+        .filter(|key| !pristine.contains_key(*key))
+        .cloned()
+        .collect();
     // A field can be untouched either because nothing could source it or because
     // the live value happened to match the capture. Those need telling apart, so
     // name the identity fields the gamejoin response did not carry.
@@ -718,6 +876,7 @@ pub fn build_90(cfg: &JoinConfig) -> Result<Build90, String> {
         bytes: out,
         refreshed,
         frozen,
+        added,
         missing_identity,
     })
 }
@@ -765,6 +924,9 @@ pub struct AppFlow {
     drain_summary: String,
     /// Which 0x90 template fields were refreshed and which are still captured.
     join90_report: String,
+    /// What the post-handshake burst put on the wire: per-frame lengths and
+    /// fingerprints, redacted where the frame carries ticket material.
+    burst_report: String,
     /// Partial control records per stream, since a record can straddle chunks.
     ctrl_rx: HashMap<i64, Vec<u8>>,
     /// Channel opens the peer announced: (app, channel, wire id if unreliable).
@@ -826,6 +988,7 @@ impl AppFlow {
             pending: std::collections::VecDeque::new(),
             drain_summary: String::new(),
             join90_report: String::new(),
+            burst_report: String::new(),
             ctrl_rx: HashMap::new(),
             channel_opens: Vec::new(),
             answered: false,
@@ -880,6 +1043,16 @@ impl AppFlow {
         let ctrl_app = ctrl_app();
         let mut ctrl = stream_header(ctrl_app, CTRL_CHANNEL).to_vec();
         ctrl.extend_from_slice(&frame(&[0x00, 0x00]));
+        // Native `BaseClient::connect` opens its own send channel right after
+        // the connection opens - application 1, channel id 0, reliability enum
+        // 2, priority 0 - outside the fourteen-row app=4 profile. The wire
+        // shape is the same 6-byte OpenReliable the reliable profile rows use
+        // (`[01][app][channel be-u32]`), so the previously withheld "guessed
+        // open-control frame" is that record and nothing more.
+        ctrl.extend_from_slice(&frame(&rbx_channels::reliable_open_body(
+            BASECLIENT_SEND_APP,
+            BASECLIENT_SEND_CHANNEL,
+        )));
         if self.planes.channels {
             // The fourteen-row profile drives the open records. In the reference
             // mode this is byte-identical to the hard-coded list in the `else`
@@ -917,10 +1090,22 @@ impl AppFlow {
             data: ctrl,
         });
 
-        // chan1: early-auth, A7, 0x90, 0x92, 0x8A, 0x8F.
+        // chan1: early-auth, A7, 0x90, 0x92, 0x8A, 0x8F. Each payload is staged
+        // first so the burst digest below describes the bytes that went out,
+        // not the bytes the builders meant to produce.
         let mut one = stream_header(APP, 1).to_vec();
+        let mut staged: Vec<(String, Vec<u8>)> = Vec::new();
         if let Some(early) = &self.cfg.early_auth {
-            one.extend_from_slice(&frame(&build_early_auth(early)));
+            let payload = build_early_auth(early);
+            staged.push((
+                format!(
+                    "A8 version={} pre={}B auth={}B (ticket-derived blobs redacted)",
+                    early.version,
+                    early.pre.len(),
+                    early.auth.len()
+                ),
+                payload,
+            ));
             self.log(format!("early-auth staged ({}B payload)", early.pre.len() + early.auth.len()));
         } else {
             let why = "early-auth material missing — 0xA8 not sent".to_string();
@@ -928,15 +1113,16 @@ impl AppFlow {
             self.log(why);
         }
         match self.cfg.a7_mode {
-            A7Mode::Real => one.extend_from_slice(&frame(A7_REAL)),
-            A7Mode::Empty => one.extend_from_slice(&frame(&[0xA7, 0x00, 0x00])),
+            A7Mode::Real => staged.push(("A7 real capture".to_string(), A7_REAL.to_vec())),
+            A7Mode::Empty => staged.push(("A7 empty".to_string(), vec![0xA7, 0x00, 0x00])),
             A7Mode::Skip => {}
         }
         let m90 = match build_90(&self.cfg) {
             Ok(built) => {
                 self.join90_report = format!(
-                    "refreshed from this session [{}]; not carried by the gamejoin response [{}]; unchanged [{}]",
+                    "refreshed from this session [{}]; added for this session [{}]; not carried by the gamejoin response [{}]; unchanged [{}]",
                     built.refreshed.join(", "),
+                    built.added.join(", "),
                     built.missing_identity.join(", "),
                     built.frozen.join(", ")
                 );
@@ -963,11 +1149,49 @@ impl AppFlow {
             seed_b = 0x8000_0001;
         }
         if let Some(m90) = &m90 {
-            one.extend_from_slice(&frame(m90));
+            staged.push((
+                "0x90 join info (identity JSON, not dumped)".to_string(),
+                m90.clone(),
+            ));
         }
-        one.extend_from_slice(&frame(&build_92(seed_a, seed_b)));
-        one.extend_from_slice(&frame(&build_8a(&self.cfg)));
-        one.extend_from_slice(&frame(&[0x8F, 0x00]));
+        staged.push(("0x92 nonce".to_string(), build_92(seed_a, seed_b)));
+        let m8a = build_8a(&self.cfg);
+        staged.push((describe_8a_frame(&m8a), m8a));
+        staged.push(("0x8F".to_string(), vec![0x8F, 0x00]));
+        for (_desc, payload) in &staged {
+            one.extend_from_slice(&frame(payload));
+        }
+        // The digest is a report artifact: lengths and xxh32 fingerprints are
+        // comparable against a golden build without revealing ticket bytes.
+        // Small frames below the redaction class show their hex outright.
+        let mut lines = vec![format!(
+            "ctrl hello + BaseClient app={}/chan{} OpenReliable + channel open record(s)",
+            BASECLIENT_SEND_APP, BASECLIENT_SEND_CHANNEL
+        )];
+        for (desc, payload) in &staged {
+            if desc.starts_with("0x8A") {
+                lines.push(desc.clone());
+                continue;
+            }
+            let mut line = format!(
+                "{desc} {}B xxh32={:#010x}",
+                payload.len(),
+                challenge::xxh32(payload, 0)
+            );
+            if payload.len() <= 24 && !desc.starts_with("A8") {
+                line.push(' ');
+                line.push_str(
+                    &payload
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+            lines.push(line);
+        }
+        self.burst_report = lines.join("; ");
+        self.log(format!("burst TX: {}", self.burst_report));
         actions.push(Action::OpenStream {
             app: APP,
             chan: 1,
@@ -1447,6 +1671,16 @@ impl AppFlow {
             "0x90 was not built"
         } else {
             &self.join90_report
+        }
+    }
+
+    /// What the post-handshake burst put on the wire: per-frame lengths and
+    /// xxh32 fingerprints, with ticket-bearing frames redacted to structure.
+    pub fn burst_report(&self) -> &str {
+        if self.burst_report.is_empty() {
+            "no burst was staged"
+        } else {
+            &self.burst_report
         }
     }
 
@@ -1981,6 +2215,7 @@ mod tests {
             api_security_token: None,
             serialized_client_fields: None,
             encrypted_server_fields: None,
+            preloaded_version: None,
             early_auth: None,
             a7_mode: A7Mode::Skip,
         };
@@ -2026,6 +2261,120 @@ mod tests {
         assert_eq!(&m[i..i + slen as usize], cfg.session_id.as_bytes());
         i += slen as usize;
         assert_eq!(&m[i..], &[0xFE, 0xCA, 0x01, 0xC0]);
+    }
+
+    #[test]
+    fn describe_8a_frame_walks_and_redacts() {
+        let cfg = JoinConfig {
+            user_id: 2_655_886_518,
+            user_name: None,
+            display_name: None,
+            domain_user_id: None,
+            client_ticket: "SECRET-TICKET-PREFIX;SECRET;AAAA;BBBB;6".into(),
+            session_id: "SECRET-SESSION".into(),
+            random_seed1: None,
+            api_security_token: None,
+            serialized_client_fields: None,
+            encrypted_server_fields: None,
+            preloaded_version: None,
+            early_auth: None,
+            a7_mode: A7Mode::Skip,
+        };
+        let m = build_8a(&cfg);
+        let desc = describe_8a_frame(&m);
+        // The walk validates the bytes actually built, not the layout the
+        // builder claims: every field that survives the redaction is checked.
+        assert!(desc.starts_with(&format!("0x8A {}B", m.len())), "{desc}");
+        assert!(desc.contains("uid=2655886518"), "{desc}");
+        assert!(
+            desc.contains(&format!("ticket={}B (redacted)", cfg.client_ticket.len())),
+            "{desc}"
+        );
+        assert!(desc.contains("device=36"), "{desc}");
+        assert!(desc.contains("const74=ok"), "{desc}");
+        assert!(desc.contains("os=Android"), "{desc}");
+        assert!(desc.contains("v31-const=ok"), "{desc}");
+        assert!(
+            desc.contains(&format!("session={}B (redacted)", cfg.session_id.len())),
+            "{desc}"
+        );
+        assert!(desc.contains("tail=fe-ca-01-c0"), "{desc}");
+        assert!(!desc.contains("SECRET"), "ticket bytes must not leak: {desc}");
+        // A tampered frame fails the walk at a named field instead of
+        // restating the builder's intent.
+        let mut bad = m.clone();
+        let tail = bad.len() - 1;
+        bad[tail] ^= 0xFF;
+        assert!(describe_8a_frame(&bad).contains("MISMATCH"), "{desc}");
+    }
+
+    #[test]
+    fn build_90_injects_preloaded_version() {
+        let mut cfg = JoinConfig {
+            user_id: 2_655_886_518,
+            user_name: None,
+            display_name: None,
+            domain_user_id: None,
+            client_ticket: "t;2".into(),
+            session_id: "s".into(),
+            random_seed1: Some("SEED".into()),
+            api_security_token: Some("TOKEN".into()),
+            serialized_client_fields: Some("SCF".into()),
+            encrypted_server_fields: Some("ESF".into()),
+            preloaded_version: Some("1234".into()),
+            early_auth: None,
+            a7_mode: A7Mode::Skip,
+        };
+        // The template never carried the key, so the injection shows up as
+        // `added`, not `refreshed`.
+        let built = build_90(&cfg).expect("build_90");
+        assert_eq!(built.added, ["PreloadedVersion".to_string()]);
+        let body = json_body_of(&built.bytes);
+        assert_eq!(body["PreloadedVersion"].as_str(), Some("1234"));
+        // Without a value the key must stay absent: an empty echo is not the
+        // same as the server's version and must not be invented here.
+        cfg.preloaded_version = None;
+        let built = build_90(&cfg).expect("build_90");
+        assert!(built.added.is_empty(), "{:?}", built.added);
+        let body = json_body_of(&built.bytes);
+        assert!(body.get("PreloadedVersion").is_none());
+    }
+
+    #[test]
+    fn burst_report_describes_what_went_out() {
+        let _serial = plane_serial();
+        let planes = JoinPlanes::default();
+        let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
+        let mut flow = flow_with(planes);
+        let data = ctrl_burst(&mut flow);
+        // The BaseClient app=1/chan0 open rides the control stream even with
+        // every plane off - it is BaseClient::connect, not a plane action.
+        let open = hx(&frame(&rbx_channels::reliable_open_body(
+            BASECLIENT_SEND_APP,
+            BASECLIENT_SEND_CHANNEL,
+        )));
+        assert!(hx(&data[7..]).contains(&open), "{}", hx(&data));
+        let report = flow.burst_report().to_string();
+        assert!(report.contains("BaseClient app=1/chan0"), "{report}");
+        assert!(report.contains("0x92 nonce"), "{report}");
+        assert!(report.contains("0x8F 2B"), "{report}");
+        // The 0x8A line is the structural walk: lengths and fingerprint only.
+        assert!(report.contains("0x8A "), "{report}");
+        assert!(report.contains("ticket="), "{report}");
+        assert!(report.contains("(redacted)"), "{report}");
+    }
+
+    /// The JSON body of a built 0x90, for tests that assert on its keys.
+    fn json_body_of(frame_bytes: &[u8]) -> serde_json::Value {
+        let raw = TEMPLATE_90;
+        let i = raw.windows(9).position(|w| w == b"{\"UserId\"").unwrap();
+        let mut start = i - 1;
+        while raw[start - 1] & 0x80 != 0 {
+            start -= 1;
+        }
+        let (json_len, k) = leb128_decode(&frame_bytes[start..]).unwrap();
+        let body = &frame_bytes[start + k..start + k + json_len as usize];
+        serde_json::from_slice(body).expect("json")
     }
 
     #[test]
@@ -2078,6 +2427,7 @@ mod tests {
             api_security_token: Some("TOKEN-ABC".into()),
             serialized_client_fields: Some("SCF".into()),
             encrypted_server_fields: Some("ESF".into()),
+            preloaded_version: None,
             early_auth: None,
             a7_mode: A7Mode::Skip,
         };
@@ -2136,6 +2486,7 @@ mod tests {
                     .into(),
             ),
             encrypted_server_fields: Some("ESF".into()),
+            preloaded_version: None,
             early_auth: None,
             a7_mode: A7Mode::Skip,
         };
@@ -2206,6 +2557,7 @@ mod tests {
             api_security_token: None,
             serialized_client_fields: None,
             encrypted_server_fields: None,
+            preloaded_version: None,
             early_auth: None,
             a7_mode: A7Mode::Skip,
         };
@@ -2257,6 +2609,7 @@ mod tests {
             api_security_token: None,
             serialized_client_fields: None,
             encrypted_server_fields: None,
+            preloaded_version: None,
             early_auth: None,
             a7_mode: A7Mode::Skip,
         };
@@ -2304,6 +2657,7 @@ mod tests {
             api_security_token: None,
             serialized_client_fields: None,
             encrypted_server_fields: None,
+            preloaded_version: None,
             early_auth: None,
             a7_mode: A7Mode::Skip,
         };
@@ -2457,6 +2811,7 @@ mod tests {
             api_security_token: None,
             serialized_client_fields: None,
             encrypted_server_fields: None,
+            preloaded_version: None,
             early_auth: None,
             a7_mode: A7Mode::Skip,
         }
@@ -2545,6 +2900,10 @@ mod tests {
         // 7-byte header is skipped because the application byte inside it is a
         // global switch other tests are allowed to move.
         let mut expected = frame(&[0x00, 0x00]);
+        expected.extend_from_slice(&frame(&rbx_channels::reliable_open_body(
+            BASECLIENT_SEND_APP,
+            BASECLIENT_SEND_CHANNEL,
+        )));
         for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
             expected.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
         }
@@ -2587,6 +2946,10 @@ mod tests {
         // reliable rows and an OpenUnreliable carrying the parity-0 series for
         // the four unreliable ones. The router and the table have to agree.
         let mut want = frame(&[0x00, 0x00]);
+        want.extend_from_slice(&frame(&rbx_channels::reliable_open_body(
+            BASECLIENT_SEND_APP,
+            BASECLIENT_SEND_CHANNEL,
+        )));
         let mut next_wire = 2u32;
         for (index, row) in DEFAULT_CHANNEL_PROFILE.iter().enumerate() {
             let record = if rbx_channels::is_unreliable(row) {

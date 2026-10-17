@@ -77,7 +77,7 @@ editor UI, and the bridge does not synchronize the Studio DataModel.
 | `kotlin/LuauLanguage.kt` | Luau language support for the Sora editor. |
 | `src/android_ime.rs` | Android GameTextInput-to-egui keyboard and clipboard bridge. |
 | `src/team_create.rs` | Join-config parsing, legacy RakNet probes, and the RbxTransport QUIC/TLS session and its report. |
-| `src/appflow.rs` | The app=4 post-handshake flow: control hello and channel burst, 0x90/0x92/0x9B/0xA7, route declarations, snapshot markers, and the join gate — every snapshot-done marker shape (`0x84` frames, bare `0x04` frames, `0x04` items in `0x83` runs) is answered with the `0x04`+id ack the server continues the join on, once per id. |
+| `src/appflow.rs` | The app=4 post-handshake flow: control hello, the BaseClient app=1/chan0 open, and channel burst, 0x90/0x92/0x9B/0xA7 (with `PreloadedVersion` echoed from the gamejoin response), route declarations, snapshot markers, and the join gate — every snapshot-done marker shape (`0x84` frames, bare `0x04` frames, `0x04` items in `0x83` runs) is answered with the `0x04`+id ack the server continues the join on, once per id. The report carries a burst TX digest (lengths and xxh32 fingerprints; ticket-bearing frames redacted to structure). |
 | `src/rbx_channels.rs`, `src/rbx_replication.rs`, `src/rbx_sync.rs` | Opt-in join-channel, replication-decode and outbound-sync planes for that flow. |
 | `manifest.yaml` | xbuild Android package, SDK, permission, and Maven dependency configuration. |
 | `assets/companion_plugin.lua` | Optional Roblox Studio companion plugin for the Live Session bridge. |
