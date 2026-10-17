@@ -36,7 +36,9 @@
 
 use crate::challenge;
 use crate::rbx_channels::{self, ChannelOpenMode, ChannelRouter, DEFAULT_CHANNEL_PROFILE};
-use crate::rbx_replication::{ReplicationNote, ReplicationStream};
+use crate::rbx_replication::{
+    join_tag_label, ReplicationNote, ReplicationStream, MARKER_ITEM,
+};
 use crate::rbx_sync::{LivenessTimers, SyncEngine};
 use std::collections::HashMap;
 
@@ -258,6 +260,11 @@ pub enum FlowEvent {
     /// One decoded replication note: a schema, a batch, a delta chain, or the
     /// reason a message was left unparsed.
     ReplicationStatus(String),
+    /// The join gate moved. `stage` names the gate (`marker-ack` when the
+    /// client has answered a snapshot-done marker, `join-data-done` when tag 13
+    /// closed the snapshot); `detail` carries the id or tag. Acking is local —
+    /// it does not claim the server received or accepted the ack.
+    JoinStateChanged { stage: String, detail: String },
     /// A replicated place was materialized from the snapshot. `summary` says
     /// what the applier could and could not type; this is not a statement that
     /// the session is a live Team Create client.
@@ -738,6 +745,16 @@ pub struct AppFlow {
     marker_seen: bool,
     marker_id: u32,
     markers_acked: u64,
+    /// Marker ids already answered with a `0x04` ack (bare or in-run shape).
+    /// Top-level `0x84` frames are acked per frame like the reference; the
+    /// `0x04` shapes are acked once per id so an echo of our own ack - the
+    /// same bytes the server accepts as the reply - cannot loop.
+    acked_marker_ids: std::collections::BTreeSet<u32>,
+    /// `0x04` marker items answered from inside `0x83` item runs.
+    marker_items_acked: u64,
+    /// Whether the join gate has been taken: a snapshot-done marker was
+    /// answered. The server continues the join on that ack.
+    join_gate_taken: bool,
     routes_at_ms: i64,
     // Channel-1 bytes received after the flow has seen a 0x9B frame.
     post_answer_bytes: u64,
@@ -802,6 +819,9 @@ impl AppFlow {
             marker_seen: false,
             marker_id: 0,
             markers_acked: 0,
+            acked_marker_ids: std::collections::BTreeSet::new(),
+            marker_items_acked: 0,
+            join_gate_taken: false,
             skipped: Vec::new(),
             pending: std::collections::VecDeque::new(),
             drain_summary: String::new(),
@@ -1143,6 +1163,7 @@ impl AppFlow {
                 }
             }
             let mut actions = self.try_marker();
+            actions.extend(self.pump_join_items());
             actions.extend(self.try_challenge());
             actions
         } else {
@@ -1158,7 +1179,10 @@ impl AppFlow {
                 self.channels.note_bytes(chan, data.len(), frames);
             }
             self.feed_ctrl(stream, app, chan, data);
-            Vec::new()
+            // Replication-carrying channels can hold marker items too; acking
+            // them here is what lets a channel other than 1 carry the join
+            // gate.
+            self.pump_join_items()
         }
     }
 
@@ -1237,15 +1261,53 @@ impl AppFlow {
         }
     }
 
+    /// Answer one snapshot-done marker with the proven `0x04`+id frame (the
+    /// reply the server parses as `DeserializedMarkerItem`, and the gate it
+    /// keeps the joining client behind). Top-level `0x84` frames are acked per
+    /// frame like the reference; the `0x04` shapes are acked once per id so an
+    /// echo of our own ack - the same bytes the server accepts as the reply -
+    /// cannot turn into a loop. `shape` labels the ack in the log and reports.
+    fn ack_marker(&mut self, id: u32, shape: &str, once_per_id: bool) -> Option<Action> {
+        let chan1 = self.chan1?;
+        if once_per_id && !self.acked_marker_ids.insert(id) {
+            return None;
+        }
+        self.marker_seen = true;
+        self.marker_id = id;
+        self.markers_acked += 1;
+        if shape == "0x04 marker item" {
+            self.marker_items_acked += 1;
+        }
+        let mut ack = vec![0x04u8];
+        ack.extend_from_slice(&id.to_le_bytes());
+        if self.planes.replication {
+            // The marker is the point the target releases the joining
+            // client, so it is also where this client asks for the place to be
+            // materialized from whatever it has decoded.
+            self.replication.request_apply();
+        }
+        self.log(format!("{shape} id={id} acknowledged"));
+        if !self.join_gate_taken {
+            self.join_gate_taken = true;
+            self.events.push(FlowEvent::JoinStateChanged {
+                stage: "marker-ack".to_string(),
+                detail: format!(
+                    "{shape} id={id} answered; the server continues the join on this ack"
+                ),
+            });
+        }
+        Some(Action::Write { stream: chan1, data: frame(&ack) })
+    }
+
     /// Walk channel 1 for the server's snapshot-done marker and acknowledge it.
     ///
-    /// `0x84` carries a little-endian id and the reply is `0x04` followed by the
-    /// same id. Every complete frame is stepped over whether or not it is a
-    /// marker, and each marker is acked exactly once.
+    /// Two five-byte frames carry it: `0x84` with a little-endian id (the 2026
+    /// top-level shape) and a bare `0x04` with the same id (the 2021
+    /// `MarkerItem` shape). The reply is `0x04` followed by the same id either
+    /// way. Every complete frame is stepped over whether or not it is a
+    /// marker; `0x84` markers are acked once per frame like the reference, and
+    /// `0x04` shapes once per id.
     fn try_marker(&mut self) -> Vec<Action> {
-        let Some(chan1) = self.chan1 else {
-            return Vec::new();
-        };
         let mut actions = Vec::new();
         while self.marker_off < self.chan1_rx.len() {
             let Some((len, used)) = compact_varint_decode(&self.chan1_rx[self.marker_off..])
@@ -1257,32 +1319,65 @@ impl AppFlow {
                 break; // partial tail: wait for the rest
             }
             // Scoped so the borrow of `chan1_rx` ends before `self` is mutated.
-            let marker_id = {
+            // Two five-byte shapes carry the same little-endian id: the 2026
+            // top-level `0x84` and the 2021 `MarkerItem`'s bare `[0x04][id]`.
+            let marker = {
                 let body = &self.chan1_rx[self.marker_off + used..end];
-                if body.len() == 5 && body[0] == 0x84 {
-                    Some(u32::from_le_bytes(body[1..5].try_into().unwrap()))
+                if body.len() == 5 && (body[0] == 0x84 || body[0] == MARKER_ITEM) {
+                    Some((u32::from_le_bytes(body[1..5].try_into().unwrap()), body[0]))
                 } else {
                     None
                 }
             };
             self.marker_off = end;
-            if let Some(id) = marker_id {
-                self.marker_seen = true;
-                self.marker_id = id;
-                self.markers_acked += 1;
-                let mut ack = vec![0x04u8];
-                ack.extend_from_slice(&id.to_le_bytes());
-                if self.planes.replication {
-                    // The marker is the point the target releases the joining
-                    // client, so it is also where this client asks for the place
-                    // to be materialized from whatever it has decoded.
-                    self.replication.request_apply();
+            if let Some((id, tag)) = marker {
+                let (shape, once_per_id) = if tag == 0x84 {
+                    ("0x84 marker", false)
+                } else {
+                    ("0x04 marker frame", true)
+                };
+                if let Some(action) = self.ack_marker(id, shape, once_per_id) {
+                    actions.push(action);
                 }
-                self.log(format!("0x84 marker id={id} acknowledged"));
-                actions.push(Action::Write {
-                    stream: chan1,
-                    data: frame(&ack),
-                });
+            }
+        }
+        actions
+    }
+
+    /// Drain what the replication walk decoded from item runs: `0x04` marker
+    /// items (the 2021 join gate, invisible to the top-level `0x84` scan) and
+    /// `0x10` tag items (the join-phase completions). Called right after every
+    /// `replication.push`, so an ack leaves in the same receive turn.
+    fn pump_join_items(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for id in self.replication.take_marker_items() {
+            if let Some(action) = self.ack_marker(id, "0x04 marker item", true) {
+                actions.push(action);
+            }
+        }
+        for raw in self.replication.take_join_tags() {
+            let (value, label, swapped) = join_tag_label(raw);
+            let order = if swapped { " (byte-swapped from the wire order)" } else { "" };
+            self.log(format!("join tag {value}{order}: {label}"));
+            match value {
+                12 => {
+                    self.events.push(FlowEvent::JoinStateChanged {
+                        stage: "replicated-first-done".to_string(),
+                        detail: format!("tag 12{order}: {label}"),
+                    });
+                }
+                13 => {
+                    // Tag 13 is the server's own end-of-snapshot: materialize
+                    // the place now even if no marker came with it.
+                    if self.planes.replication {
+                        self.replication.request_apply();
+                    }
+                    self.events.push(FlowEvent::JoinStateChanged {
+                        stage: "join-data-done".to_string(),
+                        detail: format!("tag 13{order}: {label}"),
+                    });
+                }
+                _ => {}
             }
         }
         actions
@@ -1291,6 +1386,26 @@ impl AppFlow {
     /// How many snapshot-done markers were acknowledged.
     pub fn markers_acked(&self) -> u64 {
         self.markers_acked
+    }
+
+    /// The join gate and the server's join send, for the session report. This
+    /// is the "way to join in": the snapshot-done marker the server continues
+    /// the join on once its `0x04` ack goes out, plus the tag items that close
+    /// the server's own join phases. Every claim here is about bytes this
+    /// client sent or decoded, not about what the server did with them.
+    pub fn join_report(&self) -> String {
+        format!(
+            "{}; join gate: {}; markers acked: {} total ({} via the channel-1 frame scan, {} as 0x04 items in item runs)",
+            self.replication.join_report(),
+            if self.join_gate_taken {
+                "taken (0x04 marker ack sent)"
+            } else {
+                "not taken (no snapshot-done marker arrived)"
+            },
+            self.markers_acked,
+            self.markers_acked.saturating_sub(self.marker_items_acked),
+            self.marker_items_acked,
+        )
     }
 
     /// Every complete framed record on channel 1, as (first body byte, body
@@ -2123,6 +2238,150 @@ mod tests {
         assert_eq!(split_flow.markers_acked(), 0, "a partial frame is not a marker");
         assert_eq!(split_flow.on_stream_data(9, &whole[at..]).len(), 1);
         assert_eq!(split_flow.markers_acked(), 1);
+    }
+
+    #[test]
+    fn marker_item_in_an_item_run_is_acked_once() {
+        // The 2021 server's MarkerItem rides inside a `0x83` item run, where
+        // the top-level `0x84` scan cannot see it. The ack is the join gate:
+        // the server keeps the joining client waiting until the same id comes
+        // back (parsed there as `DeserializedMarkerItem`).
+        let cfg = JoinConfig {
+            user_id: 1,
+            user_name: None,
+            display_name: None,
+            domain_user_id: None,
+            client_ticket: "t;2".into(),
+            session_id: "s".into(),
+            random_seed1: None,
+            api_security_token: None,
+            serialized_client_fields: None,
+            encrypted_server_fields: None,
+            early_auth: None,
+            a7_mode: A7Mode::Skip,
+        };
+        let id: u32 = 0x1122_3344;
+        let mut body = vec![0x83u8, MARKER_ITEM];
+        body.extend_from_slice(&id.to_le_bytes());
+        body.push(0x00); // chain end
+        let whole = frame(&body);
+
+        let mut flow = AppFlow::new(cfg, 0);
+        flow.note_opened(APP, 1, 7);
+        let actions = flow.on_stream_data(7, &whole);
+        assert_eq!(actions.len(), 1, "one marker item, one ack");
+        match &actions[0] {
+            Action::Write { stream, data } => {
+                assert_eq!(*stream, 7, "the ack goes back on channel 1");
+                let (len, used) = compact_varint_decode(data).unwrap();
+                assert_eq!(len as usize, 5);
+                assert_eq!(&data[used..], &[0x04, 0x44, 0x33, 0x22, 0x11]);
+            }
+            other => panic!("expected a Write, got {other:?}"),
+        }
+        assert_eq!(flow.markers_acked(), 1);
+        assert!(flow.join_report().contains("join gate: taken"), "{}", flow.join_report());
+
+        // The same id again - an echo of our own ack is the same bytes the
+        // server accepts as the reply - is not acked twice, and cannot loop.
+        let again = flow.on_stream_data(7, &whole);
+        assert!(again.is_empty(), "an answered marker id is not acked again: {again:?}");
+        assert_eq!(flow.markers_acked(), 1);
+    }
+
+    #[test]
+    fn bare_marker_frame_is_acked_once_per_id() {
+        // A MarkerItem can also arrive bare on channel 1 as `[0x04][id]` - the
+        // exact bytes this client writes as the reply.
+        let cfg = JoinConfig {
+            user_id: 1,
+            user_name: None,
+            display_name: None,
+            domain_user_id: None,
+            client_ticket: "t;2".into(),
+            session_id: "s".into(),
+            random_seed1: None,
+            api_security_token: None,
+            serialized_client_fields: None,
+            encrypted_server_fields: None,
+            early_auth: None,
+            a7_mode: A7Mode::Skip,
+        };
+        let id: u32 = 0x0a0b_0c0d;
+        let mut body = vec![MARKER_ITEM];
+        body.extend_from_slice(&id.to_le_bytes());
+        let whole = frame(&body);
+
+        let mut flow = AppFlow::new(cfg, 0);
+        flow.note_opened(APP, 1, 7);
+        let actions = flow.on_stream_data(7, &whole);
+        assert_eq!(actions.len(), 1, "one bare marker frame, one ack");
+        match &actions[0] {
+            Action::Write { stream, data } => {
+                assert_eq!(*stream, 7);
+                let (len, used) = compact_varint_decode(data).unwrap();
+                assert_eq!(len as usize, 5);
+                assert_eq!(&data[used..], &[0x04, 0x0d, 0x0c, 0x0b, 0x0a]);
+            }
+            other => panic!("expected a Write, got {other:?}"),
+        }
+        assert_eq!(flow.markers_acked(), 1);
+        let echo = flow.on_stream_data(7, &whole);
+        assert!(echo.is_empty(), "a repeated bare marker id is acked once: {echo:?}");
+    }
+
+    #[test]
+    fn join_phase_tags_advance_the_join_report() {
+        // Tag 12 and tag 13 close the server's two join phases (the recovered
+        // `ID_REPLIC_TAG` vocabulary). Tag 13 is the end of the snapshot, so it
+        // also asks for the place to be materialized even if no marker came.
+        let _lock = plane_serial();
+        let _guard = PlaneGuard::with(
+            JoinPlanes { channels: false, replication: true, sync: false },
+            ChannelOpenMode::Off,
+        );
+        let mut body = vec![0x83u8, 0x10];
+        body.extend_from_slice(&12u32.to_le_bytes());
+        body.push(0x10);
+        body.extend_from_slice(&13u32.to_le_bytes());
+        body.push(0x00);
+
+        let mut flow = flow_with(JoinPlanes { channels: false, replication: true, sync: false });
+        flow.note_opened(APP, 1, 7);
+        let _ = flow.on_stream_data(7, &frame(&body));
+        assert!(flow.replication.apply_requested(), "tag 13 closes the snapshot and requests the apply");
+        let report = flow.join_report();
+        assert!(report.contains("tag12=seen"), "{report}");
+        assert!(report.contains("tag13=seen"), "{report}");
+        assert!(report.contains("replicated-first-done(tag 12)"), "{report}");
+        assert!(report.contains("join-data-done(tag 13)"), "{report}");
+        let events = flow.drain_events();
+        let joined: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                FlowEvent::JoinStateChanged { stage, detail } => {
+                    Some(format!("{stage}: {detail}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(joined.len(), 2, "one milestone per phase tag: {joined:?}");
+        assert!(joined[0].contains("replicated-first-done"), "{joined:?}");
+        assert!(joined[1].contains("join-data-done"), "{joined:?}");
+    }
+
+    #[test]
+    fn join_tags_are_named_in_both_byte_orders() {
+        // The 2026 capture reads tag ids little-endian; the 2021 model writes
+        // them big-endian. Both orders name the known tags, and `swapped` says
+        // which one matched.
+        assert_eq!(join_tag_label(13), (13, "JoinData replication finished", false));
+        assert_eq!(
+            join_tag_label(13u32.swap_bytes()),
+            (13, "JoinData replication finished", true)
+        );
+        assert_eq!(join_tag_label(12).1, "ReplicatedFirst replication finished");
+        assert_eq!(join_tag_label(999), (999, "unrecovered tag id", false));
     }
 
     #[test]

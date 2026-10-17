@@ -4,3 +4,4 @@
 *.apk
 keystore.jks
 dump/cache/
+/dump/extracted/
