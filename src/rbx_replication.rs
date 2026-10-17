@@ -60,6 +60,69 @@ pub const CONFIG_TABLE_TAG: u8 = 0x93;
 pub const CHAIN_END: u8 = 0x00;
 /// The implicit DataModel root every snapshot hangs from.
 pub const DATAMODEL_ROOT_ID: u32 = 13;
+/// `MarkerItem` — a snapshot-done barrier the server wants acknowledged. On
+/// the wire it is a four-byte id after the tag, whether it arrives bare on
+/// channel 1 (`[0x04][id]`) or inside a `0x83` item run. The reply the server
+/// processes is the same tag with the same id (`DeserializedMarkerItem`).
+pub const MARKER_ITEM: u8 = 0x04;
+/// `TagItem` — a four-byte phase tag. Values 12 and 13 close the two join
+/// phases (`ID_REPLIC_TAG` in the recovered protocol model: 12 =
+/// "ReplicatedFirst replication finished", 13 = "JoinData replication
+/// finished").
+pub const TAG_ITEM: u8 = 0x10;
+
+/// The recovered `ID_REPLIC_TAG` vocabulary, with the byte order the tag id
+/// arrived in. The 2026 capture's walker reads these ids little-endian; the
+/// 2021 RakNet-era model writes them big-endian, so both orders are named and
+/// `swapped` records which one matched. Values 14 and 15 are named from the
+/// 2026 `TagItem` serializer, which special-cases 13/14/15 but does not label
+/// them; they are reported, not interpreted.
+pub fn join_tag_label(raw: u32) -> (u32, &'static str, bool) {
+    for (value, swapped) in [(raw, false), (raw.swap_bytes(), true)] {
+        let label = match value {
+            12 => "ReplicatedFirst replication finished",
+            13 => "JoinData replication finished",
+            14 => "join-phase tag 14 (2026 TagItem special case)",
+            15 => "join-phase tag 15 (2026 TagItem special case)",
+            _ => continue,
+        };
+        return (value, label, swapped);
+    }
+    (raw, "unrecovered tag id", false)
+}
+
+/// How far the join the decode plane has watched, from the messages that carry
+/// it. The marker ack (the join gate) is tracked separately in the flow: this
+/// only reports what the server has sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JoinStage {
+    /// Nothing join-shaped decoded yet: the burst may still be in flight.
+    Burst,
+    /// `0x81` join start arrived: globals and the top containers.
+    JoinStart,
+    /// `0x97` schema arrived.
+    Schema,
+    /// `0x83`/`0x16` join-data batches arrived.
+    JoinData,
+    /// Tag 12: ReplicatedFirst replication finished.
+    ReplicatedFirstDone,
+    /// Tag 13: JoinData replication finished — the snapshot is complete.
+    JoinDataDone,
+}
+
+impl JoinStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Burst => "burst",
+            Self::JoinStart => "join-start(0x81)",
+            Self::Schema => "schema(0x97)",
+            Self::JoinData => "join-data(0x83/0x16)",
+            Self::ReplicatedFirstDone => "replicated-first-done(tag 12)",
+            Self::JoinDataDone => "join-data-done(tag 13)",
+        }
+    }
+}
+
 /// Zstandard frame magic, checked before anything is allocated on a peer's
 /// advertised length.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -2456,6 +2519,20 @@ pub struct ReplicationStream {
     pub walk_errors: u64,
     /// Chain item types seen, for the histogram in the report.
     pub item_types: BTreeMap<u8, u64>,
+    /// Marker ids seen as `0x04` items in item runs, waiting to be acked and
+    /// cleared by the flow. This is the 2021 `MarkerItem` shape the top-level
+    /// `0x84` scan cannot see.
+    marker_items: Vec<u32>,
+    /// Tag ids (`0x10` items) as read, waiting to be surfaced to the flow.
+    join_tags: Vec<u32>,
+    /// A `0x81` join start was decoded.
+    saw_join_start: bool,
+    /// A `0x97` schema was decoded.
+    saw_schema: bool,
+    /// Tag 12 (`ReplicatedFirst replication finished`) was seen.
+    tag_replicated_first: bool,
+    /// Tag 13 (`JoinData replication finished`) was seen.
+    tag_join_data_done: bool,
 }
 
 impl Default for ReplicationStream {
@@ -2486,6 +2563,12 @@ impl Default for ReplicationStream {
             config_pairs: 0,
             walk_errors: 0,
             item_types: BTreeMap::new(),
+            marker_items: Vec::new(),
+            join_tags: Vec::new(),
+            saw_join_start: false,
+            saw_schema: false,
+            tag_replicated_first: false,
+            tag_join_data_done: false,
         }
     }
 }
@@ -2537,6 +2620,7 @@ impl ReplicationStream {
     fn handle_frame(&mut self, frame: ReplicationFrame) {
         match frame.id {
             JOIN_START_TAG => {
+                self.saw_join_start = true;
                 let note = match parse_peer_init(&frame.body) {
                     Ok(init) => ReplicationNote::PeerInit(format!(
                         "0x81 join start: enabled={} flags={} isr={}/{}/{} conditional={} tail byte={} peer={} ({} byte(s) of unparsed fields)",
@@ -2589,6 +2673,7 @@ impl ReplicationStream {
                                 schema.summary()
                             ));
                             self.schema = Some(schema);
+                            self.saw_schema = true;
                             self.drain_waiting();
                             self.notes.push(note);
                             if had_tail {
@@ -2612,6 +2697,16 @@ impl ReplicationStream {
                 self.notes.push(note);
             }
             DELTA_CHAIN_TAG => self.handle_chain(frame.body),
+            // A bare `[0x04][id]` frame is the 2021 `MarkerItem`'s own shape:
+            // the same barrier the 2026 flow carries as a top-level `0x84`, and
+            // the same join gate. The flow acks it once per id.
+            MARKER_ITEM if frame.body.len() == 5 && frame.body[0] == MARKER_ITEM => {
+                let id = u32::from_le_bytes(frame.body[1..5].try_into().unwrap());
+                self.marker_items.push(id);
+                self.notes.push(ReplicationNote::Deltas(format!(
+                    "bare marker frame id={id} (join gate; waiting for its 0x04 ack)"
+                )));
+            }
             _ => self.unparsed += 1,
         }
     }
@@ -2648,6 +2743,31 @@ impl ReplicationStream {
             if let ChainItem::Entries(entries) = item {
                 let mut records = entries.records.clone();
                 self.records.append(&mut records);
+            }
+            // A `0x04` word item is the 2021 `MarkerItem` shape: the server
+            // sends it where the 2026 flow sends a top-level `0x84`, and the
+            // server keeps the join waiting until the same id comes back.
+            if let ChainItem::Word { kind: MARKER_ITEM, value } = item {
+                self.marker_items.push(*value);
+                self.notes.push(ReplicationNote::Deltas(format!(
+                    "0x83 marker item id={value} (join gate; waiting for its 0x04 ack)"
+                )));
+            }
+            // A `0x10` word item is a `TagItem`: 12 and 13 close the two join
+            // phases. `value` stays as read; `join_tag_label` names both byte
+            // orders because the two eras disagree on which one the wire uses.
+            if let ChainItem::Word { kind: TAG_ITEM, value } = item {
+                let (interpreted, label, swapped) = join_tag_label(*value);
+                self.join_tags.push(*value);
+                match interpreted {
+                    12 => self.tag_replicated_first = true,
+                    13 => self.tag_join_data_done = true,
+                    _ => {}
+                }
+                self.notes.push(ReplicationNote::Deltas(format!(
+                    "0x83 tag item id={interpreted}{}: {label}",
+                    if swapped { " (byte-swapped from the wire order)" } else { "" }
+                )));
             }
         }
         match &chain.stopped_at {
@@ -2798,6 +2918,48 @@ impl ReplicationStream {
 
     pub fn apply_requested(&self) -> bool {
         self.apply_requested
+    }
+
+    /// Marker ids seen as `0x04` items in item runs and not yet reported.
+    /// The flow drains this and acks each id once.
+    pub fn take_marker_items(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.marker_items)
+    }
+
+    /// Tag ids (`0x10` items) as read and not yet reported.
+    pub fn take_join_tags(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.join_tags)
+    }
+
+    /// How far the server's join send this decode plane has watched. The
+    /// marker gate lives in the flow; this is only the server's side.
+    pub fn join_stage(&self) -> JoinStage {
+        if self.tag_join_data_done {
+            JoinStage::JoinDataDone
+        } else if self.tag_replicated_first {
+            JoinStage::ReplicatedFirstDone
+        } else if self.batches > 0 {
+            JoinStage::JoinData
+        } else if self.saw_schema {
+            JoinStage::Schema
+        } else if self.saw_join_start {
+            JoinStage::JoinStart
+        } else {
+            JoinStage::Burst
+        }
+    }
+
+    /// One line on the join phase for the session report: which tags and
+    /// phases the server has sent, in its own byte order.
+    pub fn join_report(&self) -> String {
+        format!(
+            "server join send: stage={}, join-data batches={}, tag12={}, tag13={}, marker items={}",
+            self.join_stage().label(),
+            self.batches,
+            if self.tag_replicated_first { "seen" } else { "not seen" },
+            if self.tag_join_data_done { "seen" } else { "not seen" },
+            self.item_types.get(&MARKER_ITEM).copied().unwrap_or(0),
+        )
     }
 
     /// Build the place from everything decoded so far. Idempotent: once built,
