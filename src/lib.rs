@@ -48,6 +48,12 @@ mod team_create;
 mod rbx_channels;
 mod rbx_replication;
 mod rbx_sync;
+mod mrd_wire_codec;
+mod rbx_mrd_codec;
+mod mrd_codec;
+mod mrd;
+mod rbx_mrd;
+mod rbx_mrd_wire_codec;
 mod templates;
 mod thumbnails;
 
