@@ -6588,7 +6588,19 @@ ui.label("Place ID:");
         self.team_create_session_status = initial_status.clone();
         self.team_create_response = initial_status.clone();
         self.status = initial_status;
-        std::thread::spawn(move || worker(event_tx, cancel));
+        let event_tx_for_panic = event_tx.clone();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker(event_tx, cancel)
+            }));
+            if let Err(_) = outcome {
+                let _ = event_tx_for_panic.send(
+                    crate::team_create::RbxTransportSessionEvent::Finished(
+                        "Team Create transport worker panicked before producing a final report".into(),
+                    ),
+                );
+            }
+        });
     }
 
     fn start_team_create_transport_session(
