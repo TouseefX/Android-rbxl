@@ -404,6 +404,13 @@ pub struct EditorApp {
     team_create_session_rx: Option<Receiver<crate::team_create::RbxTransportSessionEvent>>,
     team_create_session_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     team_create_session_running: bool,
+    /// Generation of the current transport worker, bumped on every worker
+    /// start. A channel disconnect is only meaningful for the generation it
+    /// belongs to: a `Finished` handler can start an auto-retry (a new
+    /// generation) in the same pump that observed the old channel's
+    /// disconnect, and charging the old teardown to the new session is what
+    /// produced the spurious "transport worker exited without a final report".
+    team_create_session_gen: u64,
     /// Which 0xA7 the next join flow sends: 0 = real capture, 1 = empty, 2 = omit.
     a7_mode_choice: u8,
     /// Application byte for the control stream header: 0, 1 or 4.
@@ -590,6 +597,7 @@ impl Default for EditorApp {
             team_create_session_rx: None,
             team_create_session_cancel: None,
             team_create_session_running: false,
+            team_create_session_gen: 0,
             // Two live runs - real 99-byte capture and omitted - closed
             // identically at 161/157 ms with DisconnectNewSecurityKeyMismatch,
             // so the frame is not what the server is checking. Default to
@@ -6445,14 +6453,19 @@ ui.label("Place ID:");
 
     fn pump_team_create_session_events(&mut self) {
         let mut events = Vec::new();
-        let mut disconnected = false;
+        // Which generation's channel the disconnect below belongs to. The
+        // Finished handler can start an auto-retry (a new generation) in this
+        // same pump; the old channel's teardown must not be charged to the new
+        // session.
+        let mut disconnected_gen: Option<u64> = None;
         if let Some(rx) = self.team_create_session_rx.as_ref() {
+            let polled_gen = self.team_create_session_gen;
             loop {
                 match rx.try_recv() {
                     Ok(event) => events.push(event),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
+                        disconnected_gen = Some(polled_gen);
                         break;
                     }
                 }
@@ -6549,7 +6562,11 @@ ui.label("Place ID:");
             }
         }
 
-        if disconnected && self.team_create_session_running {
+        if session_disconnect_is_current(
+            disconnected_gen,
+            self.team_create_session_gen,
+            self.team_create_session_running,
+        ) {
             self.team_create_session_running = false;
             self.team_create_session_quic_handshake_complete = false;
             self.team_create_session_cancel = None;
@@ -6584,20 +6601,28 @@ ui.label("Place ID:");
         self.team_create_session_rx = Some(event_rx);
         self.team_create_session_cancel = Some(std::sync::Arc::clone(&cancel));
         self.team_create_session_running = true;
+        self.team_create_session_gen = self.team_create_session_gen.wrapping_add(1);
         self.team_create_session_quic_handshake_complete = false;
         self.team_create_session_status = initial_status.clone();
         self.team_create_response = initial_status.clone();
         self.status = initial_status;
         let event_tx_for_panic = event_tx.clone();
         std::thread::spawn(move || {
+            install_panic_detail_hook();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker(event_tx, cancel)
             }));
             if let Err(_) = outcome {
+                // The payload alone carries no location; the hook above
+                // recorded both on this thread. A blank "worker panicked" was
+                // all a live run could show for a decode path dying on real
+                // join bytes.
+                let detail = take_panic_detail()
+                    .unwrap_or_else(|| "panic payload/location unavailable".to_owned());
                 let _ = event_tx_for_panic.send(
-                    crate::team_create::RbxTransportSessionEvent::Finished(
-                        "Team Create transport worker panicked before producing a final report".into(),
-                    ),
+                    crate::team_create::RbxTransportSessionEvent::Finished(format!(
+                        "Team Create transport worker panicked before producing a final report: {detail}"
+                    )),
                 );
             }
         });
@@ -8233,6 +8258,64 @@ fn utf16_to_char_index(text: &str, utf16_index: usize) -> usize {
     text.chars().count()
 }
 
+thread_local! {
+    /// Where the panic hook below records the last panic's payload and
+    /// location. The hook runs on the panicking thread and the worker reads it
+    /// after `catch_unwind` returns on that same thread.
+    static PANIC_DETAIL: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+}
+
+/// Install (once) a panic hook that records the payload and location of a
+/// panic and then chains to the default hook, so stderr/logcat keep their
+/// usual panic lines. The payload `catch_unwind` hands back carries no
+/// location, and a blank "worker panicked" message was all a live run could
+/// show when a decode path died on real join bytes.
+fn install_panic_detail_hook() {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            let location = info
+                .location()
+                .map(|where_| format!("{}:{}:{}", where_.file(), where_.line(), where_.column()))
+                .unwrap_or_else(|| "unknown location".to_owned());
+            PANIC_DETAIL.with(|cell| {
+                *cell.borrow_mut() = Some(format!("{message} @ {location}"));
+            });
+            default_hook(info);
+        }));
+    });
+}
+
+/// The recorded panic detail for this thread, taken so a retry cannot reuse it.
+fn take_panic_detail() -> Option<String> {
+    PANIC_DETAIL.with(|cell| cell.borrow_mut().take())
+}
+
+/// Whether a channel disconnect belongs to the session still marked running.
+///
+/// The event pump can observe `Finished` and the same channel's `Disconnected`
+/// in one drain - the worker sends its report and exits. When that report
+/// triggers the DisconnectNewSecurityKeyMismatch auto-retry, a new worker (a
+/// new generation) is already running by the time the pump reaches its tail.
+/// Charging the old channel's teardown to that new session produced the
+/// spurious "Team Create transport worker exited without a final report" and
+/// orphaned the retry that was supposed to replace the failed session.
+fn session_disconnect_is_current(
+    disconnected_gen: Option<u64>,
+    current_gen: u64,
+    running: bool,
+) -> bool {
+    running && disconnected_gen == Some(current_gen)
+}
+
 #[cfg(test)]
 mod format_tests {
     use super::*;
@@ -8262,5 +8345,39 @@ mod format_tests {
     fn brackets_inside_strings_and_comments_do_not_indent() {
         let source = "print(\"{{{\") -- }}} not real\nprint(1)";
         assert_eq!(format_luau_indentation(source), "print(\"{{{\") -- }}} not real\nprint(1)");
+    }
+}
+
+#[cfg(test)]
+mod team_create_session_tests {
+    use super::*;
+
+    #[test]
+    fn stale_disconnect_never_clobbers_a_new_generation() {
+        // The live race: the pump drains Finished + Disconnected from
+        // generation 5 in one pass, the Finished handler auto-retries into
+        // generation 6 before the pump's tail, and the tail must not charge
+        // generation 5's teardown to generation 6.
+        assert!(!session_disconnect_is_current(Some(5), 6, true));
+        // A session that reported and did not retry is no longer running.
+        assert!(!session_disconnect_is_current(Some(5), 5, false));
+        // No disconnect was observed at all.
+        assert!(!session_disconnect_is_current(None, 5, true));
+        // The genuine case stays loud: the current worker died without a
+        // report, and that is the only time the exit message may show.
+        assert!(session_disconnect_is_current(Some(5), 5, true));
+    }
+
+    #[test]
+    fn panic_detail_hook_records_payload_and_location() {
+        install_panic_detail_hook();
+        let outcome = std::panic::catch_unwind(|| {
+            panic!("marker-panic-payload-42");
+        });
+        assert!(outcome.is_err());
+        let detail = take_panic_detail().expect("the hook records the panic detail");
+        assert!(detail.contains("marker-panic-payload-42"), "{detail}");
+        // The location is what a blank "worker panicked" line lacked.
+        assert!(detail.contains("app.rs"), "{detail}");
     }
 }
