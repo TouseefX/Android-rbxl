@@ -119,18 +119,52 @@ pub fn a7_mode_label(mode: A7Mode) -> &'static str {
 }
 
 /// Application byte configured for the control-stream header. The default is
-/// zero; the UI can select 0, 1, or 4 for a flow attempt. This setting is
-/// independent of [`APP`], which identifies the join-data application streams.
-static CTRL_APP_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// four — the value the reference client opens the control stream on
+/// (`openStream(APP, CTRL)`). Zero parsed fine on the server and hid the
+/// difference in every prior run, but the bytes on the wire were not the ones a
+/// working client sends; the UI can still select 0, 1, or 4 to compare. This
+/// setting is independent of [`APP`], which identifies the join-data
+/// application streams.
+static CTRL_APP_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(4);
 
 /// Choose the control stream's application byte for subsequent join flows.
 pub fn set_ctrl_app(app: u8) {
     CTRL_APP_OVERRIDE.store(app, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The control stream's application byte. Defaults to 0.
+/// The control stream's application byte. Defaults to 4, the reference value.
 pub fn ctrl_app() -> u32 {
     CTRL_APP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) as u32
+}
+
+/// Whether the burst includes the guessed BaseClient `app=1/chan0` open record.
+/// The native `BaseClient::connect` opens that send channel (application 1,
+/// channel id 0, reliability enum 2), but its wire-channel assignment is
+/// unresolved: no observed capture pins the control record a reliability-2 open
+/// puts on the wire, and the reference client emits none. Off by default so the
+/// burst carries only records a working client is known to send; the switch
+/// exists so a run can still test the guess.
+static BASECLIENT_OPEN_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Include the guessed BaseClient open record in subsequent bursts.
+pub fn set_baseclient_open(enabled: bool) {
+    BASECLIENT_OPEN_OVERRIDE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the burst includes the guessed BaseClient open record. Defaults off.
+pub fn baseclient_open() -> bool {
+    BASECLIENT_OPEN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One line naming the BaseClient open record's state for the wire-deviation
+/// report: off means the burst sends only observed records.
+pub fn baseclient_open_label() -> &'static str {
+    if baseclient_open() {
+        "guessed app=1/chan0 OpenReliable (unverified wire record)"
+    } else {
+        "off (reliability-2 wire record unresolved)"
+    }
 }
 
 /// Which of the three post-join planes a flow runs. These are separate switches
@@ -410,6 +444,40 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
 /// Stream header: `[06 01 app][channel u32 BE]`.
 pub fn stream_header(app: u32, chan: u32) -> [u8; 7] {
     [0x06, 0x01, app as u8, (chan >> 24) as u8, (chan >> 16) as u8, (chan >> 8) as u8, chan as u8]
+}
+
+/// Split a stream's opening payload into the writes the reference client
+/// performs: the 7-byte stream header as its own write (`openStream`), then one
+/// write per framed message (`sendFramed`). A conformant byte-stream reader
+/// reassembles either arrangement identically, but matching the reference's
+/// write boundaries keeps a side-by-side wire capture comparable and leaves no
+/// room for a per-write reader to glue two messages together.
+pub fn open_write_segments(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    if data.len() <= 7 {
+        if !data.is_empty() {
+            out.push(data);
+        }
+        return out;
+    }
+    out.push(&data[..7]);
+    let mut off = 7;
+    while off < data.len() {
+        match compact_varint_decode(&data[off..]) {
+            Some((len, used)) if off + used + (len as usize) <= data.len() => {
+                let end = off + used + (len as usize);
+                out.push(&data[off..end]);
+                off = end;
+            }
+            // A partial tail (or a length that runs past the buffer) is written
+            // as-is rather than dropped - it is still bytes the peer must see.
+            _ => {
+                out.push(&data[off..]);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Standard-base64 decode with Boblox's `a2b_base64` semantics: every
@@ -964,6 +1032,11 @@ pub struct AppFlow {
     snapshot_empty_reported: bool,
     /// Channels this client asked to open but that no stream id is bound to yet.
     unbound_open: std::collections::BTreeSet<u32>,
+    /// Frames composed before their stream existed (the burst composes the
+    /// chan-1 liveness ping before the chan-1 open action has run). They are
+    /// held - not dropped - and flushed on the first pass after
+    /// [`AppFlow::note_opened`] binds the channel.
+    deferred: Vec<(u32, Vec<u8>, String)>,
 }
 
 impl AppFlow {
@@ -1007,6 +1080,7 @@ impl AppFlow {
             snapshot_emitted: false,
             snapshot_empty_reported: false,
             unbound_open: std::collections::BTreeSet::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -1045,14 +1119,20 @@ impl AppFlow {
         ctrl.extend_from_slice(&frame(&[0x00, 0x00]));
         // Native `BaseClient::connect` opens its own send channel right after
         // the connection opens - application 1, channel id 0, reliability enum
-        // 2, priority 0 - outside the fourteen-row app=4 profile. The wire
-        // shape is the same 6-byte OpenReliable the reliable profile rows use
-        // (`[01][app][channel be-u32]`), so the previously withheld "guessed
-        // open-control frame" is that record and nothing more.
-        ctrl.extend_from_slice(&frame(&rbx_channels::reliable_open_body(
-            BASECLIENT_SEND_APP,
-            BASECLIENT_SEND_CHANNEL,
-        )));
+        // 2, priority 0 - outside the fourteen-row app=4 profile. Its wire
+        // record is NOT settled: reliability 2 maps to no observed control
+        // layout (the captures show OpenReliable 6 bytes for the profile rows
+        // and OpenUnreliable 10 bytes for the unreliable ones, and the
+        // reliability-2 wire-channel assignment stays unresolved), and the
+        // reference client emits no such record at all. So the guessed
+        // `[01][app][channel be-u32]` record is off by default and only goes
+        // out when a run opts in to test it.
+        if baseclient_open() {
+            ctrl.extend_from_slice(&frame(&rbx_channels::reliable_open_body(
+                BASECLIENT_SEND_APP,
+                BASECLIENT_SEND_CHANNEL,
+            )));
+        }
         if self.planes.channels {
             // The fourteen-row profile drives the open records. In the reference
             // mode this is byte-identical to the hard-coded list in the `else`
@@ -1164,10 +1244,14 @@ impl AppFlow {
         // The digest is a report artifact: lengths and xxh32 fingerprints are
         // comparable against a golden build without revealing ticket bytes.
         // Small frames below the redaction class show their hex outright.
-        let mut lines = vec![format!(
-            "ctrl hello + BaseClient app={}/chan{} OpenReliable + channel open record(s)",
-            BASECLIENT_SEND_APP, BASECLIENT_SEND_CHANNEL
-        )];
+        let mut lines = vec![if baseclient_open() {
+            format!(
+                "ctrl hello + BaseClient app={}/chan{} OpenReliable + channel open record(s)",
+                BASECLIENT_SEND_APP, BASECLIENT_SEND_CHANNEL
+            )
+        } else {
+            "ctrl hello + channel open record(s) (no BaseClient open record: reliability-2 wire shape unresolved)".to_string()
+        }];
         for (desc, payload) in &staged {
             if desc.starts_with("0x8A") {
                 lines.push(desc.clone());
@@ -1245,10 +1329,16 @@ impl AppFlow {
             return;
         }
         if chan == 1 || chan == CTRL_CHANNEL || !self.unbound_open.insert(chan) {
+            // Not dropped: the burst composes the chan-1 liveness ping before
+            // its own chan-1 open action has run, and a second OpenStream for
+            // the same channel would corrupt the byte counts the report
+            // compares. Hold the frame and flush it from the first pass after
+            // `note_opened` binds the channel.
             self.skipped.push(format!(
-                "{what}: chan{chan} has no bound stream id yet ({} byte(s) not sent)",
+                "{what}: chan{chan} has no bound stream id yet ({} byte(s) deferred until the stream binds)",
                 payload.len()
             ));
+            self.deferred.push((chan, payload, what.to_string()));
             return;
         }
         let mut data = stream_header(APP, chan).to_vec();
@@ -1294,6 +1384,37 @@ impl AppFlow {
             self.chan1_reset = false;
         }
         self.streams.insert((app, chan), stream);
+    }
+
+    /// Frames composed before their stream existed, now writable. Called at the
+    /// top of every timer pass, which the receive loop runs continuously - so a
+    /// frame held at burst time goes out on the first pass after its channel
+    /// binds instead of never.
+    fn flush_deferred(&mut self) -> Vec<Action> {
+        if self.deferred.is_empty() {
+            return Vec::new();
+        }
+        let mut actions = Vec::new();
+        let mut keep = Vec::new();
+        for (chan, payload, what) in std::mem::take(&mut self.deferred) {
+            let bound = self
+                .streams
+                .get(&(APP, chan))
+                .copied()
+                .or(if chan == 1 { self.valid_chan1() } else { None });
+            match bound {
+                Some(stream) => {
+                    self.log(format!(
+                        "{what}: deferred {} byte(s) flushed on chan{chan} (stream {stream})",
+                        payload.len()
+                    ));
+                    actions.push(Action::Write { stream, data: payload });
+                }
+                None => keep.push((chan, payload, what)),
+            }
+        }
+        self.deferred = keep;
+        actions
     }
 
     /// Whether this stream is already identified (client-opened or a
@@ -1658,9 +1779,10 @@ impl AppFlow {
     /// These settings are user-selectable, so include them in the session report.
     pub fn flow_config_summary(&self) -> String {
         format!(
-            "0xA7 = {}, control stream application = {}, planes = {}",
+            "0xA7 = {}, control stream application = {}, BaseClient open record = {}, planes = {}",
             a7_mode_label(self.cfg.a7_mode),
             ctrl_app(),
+            baseclient_open_label(),
             self.planes.label()
         )
     }
@@ -1866,7 +1988,7 @@ impl AppFlow {
     /// run the opt-in planes' own timers.
     pub fn on_tick(&mut self, now_ms: u64) -> Vec<Action> {
         self.now_ms = now_ms;
-        let mut actions = Vec::new();
+        let mut actions = self.flush_deferred();
         if self.routes_at_ms >= 0 && now_ms as i64 >= self.routes_at_ms {
             self.routes_at_ms = -1;
             let mut data = stream_header(APP, 11).to_vec();
@@ -2169,6 +2291,40 @@ mod tests {
     }
 
     #[test]
+    fn open_write_segments_match_the_reference_write_boundaries() {
+        // Header plus two framed messages: the reference writes the header
+        // alone (`openStream`), then one write per framed message
+        // (`sendFramed`). Concatenation must reproduce the payload exactly.
+        let mut data = stream_header(APP, 1).to_vec();
+        data.extend_from_slice(&frame(&[0xA8, 0x11]));
+        data.extend_from_slice(&frame(&[0x8F, 0x00]));
+        let segments = open_write_segments(&data);
+        assert_eq!(segments.len(), 3, "{segments:?}");
+        assert_eq!(segments[0], &stream_header(APP, 1)[..]);
+        assert_eq!(segments[1], &frame(&[0xA8, 0x11])[..]);
+        assert_eq!(segments[2], &frame(&[0x8F, 0x00])[..]);
+        assert_eq!(segments.concat(), data);
+        // A multi-byte compact-varint length splits at the message boundary,
+        // not inside its payload.
+        let big = vec![0xA7u8; 0x80];
+        let mut data = stream_header(APP, 1).to_vec();
+        data.extend_from_slice(&frame(&big));
+        let segments = open_write_segments(&data);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1], &frame(&big)[..]);
+        // A partial tail is written as-is rather than dropped: it is still
+        // bytes the peer must see.
+        let mut partial = stream_header(APP, 1).to_vec();
+        partial.extend_from_slice(&[0x40]); // 2-byte varint missing its value byte
+        let segments = open_write_segments(&partial);
+        let header = stream_header(APP, 1);
+        assert_eq!(segments, vec![&header[..], &[0x40u8][..]]);
+        // A bare header is one write, and an empty payload writes nothing.
+        assert_eq!(open_write_segments(&header), vec![&header[..]]);
+        assert!(open_write_segments(&[]).is_empty());
+    }
+
+    #[test]
     fn ticket_v31_matches_python_reference() {
         // Vectors from Boblox py/msgbuild.py ticket_v31.
         assert_eq!(ticket_v31(b"test-ticket-12345"), 0x0406_6521);
@@ -2345,15 +2501,27 @@ mod tests {
         let _serial = plane_serial();
         let planes = JoinPlanes::default();
         let _guard = PlaneGuard::with(planes, ChannelOpenMode::Off);
+        // Default: only records a working client is known to send. The guessed
+        // BaseClient open is off, and the digest says so.
+        set_baseclient_open(false);
         let mut flow = flow_with(planes);
         let data = ctrl_burst(&mut flow);
-        // The BaseClient app=1/chan0 open rides the control stream even with
-        // every plane off - it is BaseClient::connect, not a plane action.
         let open = hx(&frame(&rbx_channels::reliable_open_body(
             BASECLIENT_SEND_APP,
             BASECLIENT_SEND_CHANNEL,
         )));
+        assert!(!hx(&data[7..]).contains(&open), "{}", hx(&data));
+        let report = flow.burst_report().to_string();
+        assert!(!report.contains("BaseClient app=1/chan0"), "{report}");
+        assert!(report.contains("no BaseClient open record"), "{report}");
+        // Opted in, the BaseClient app=1/chan0 open rides the control stream
+        // even with every plane off - it is BaseClient::connect, not a plane
+        // action - and the digest names it.
+        set_baseclient_open(true);
+        let mut flow = flow_with(planes);
+        let data = ctrl_burst(&mut flow);
         assert!(hx(&data[7..]).contains(&open), "{}", hx(&data));
+        set_baseclient_open(false);
         let report = flow.burst_report().to_string();
         assert!(report.contains("BaseClient app=1/chan0"), "{report}");
         assert!(report.contains("0x92 nonce"), "{report}");
@@ -2740,14 +2908,24 @@ mod tests {
 
     #[test]
     fn a7_real_template_starts_with_a7() {
-        // The control application byte defaults to 0, which is the value every
-        // multi-second session used.
-        assert_eq!(ctrl_app(), 0, "default ctrl app must stay 0");
+        let _serial = plane_serial();
+        // The control application byte defaults to 4: the reference client
+        // opens the control stream on the application id (`openStream(APP,
+        // CTRL)`). Zero parsed fine on the server and hid the difference in
+        // every prior run, but it is not what a working client sends.
+        assert_eq!(ctrl_app(), 4, "default ctrl app must be the reference value 4");
         for app in [0u8, 1, 4] {
             set_ctrl_app(app);
             assert_eq!(ctrl_app(), app as u32);
         }
-        set_ctrl_app(0);
+        set_ctrl_app(4);
+        // The guessed BaseClient open record stays off until a run opts in:
+        // reliability enum 2 maps to no observed control record and the
+        // reference client emits none.
+        assert!(!baseclient_open(), "the guessed BaseClient record must default off");
+        set_baseclient_open(true);
+        assert!(baseclient_open());
+        set_baseclient_open(false);
         // The UI selector must round-trip, or the three-way test it exists for
         // silently sends the same frame every time.
         for (mode, expect) in [
@@ -2896,14 +3074,12 @@ mod tests {
             )),
             "a disabled plane reports nothing: {events:?}"
         );
-        // And the control burst is the four reference records, untouched. The
-        // 7-byte header is skipped because the application byte inside it is a
-        // global switch other tests are allowed to move.
+        // And the control burst is the four reference records, untouched - the
+        // hello plus the four openU records the reference client sends, with no
+        // guessed BaseClient record among them. The 7-byte header is skipped
+        // because the application byte inside it is a global switch other tests
+        // are allowed to move.
         let mut expected = frame(&[0x00, 0x00]);
-        expected.extend_from_slice(&frame(&rbx_channels::reliable_open_body(
-            BASECLIENT_SEND_APP,
-            BASECLIENT_SEND_CHANNEL,
-        )));
         for &(chan, wire) in &[(3u32, 2u32), (5, 4), (6, 6), (11, 8)] {
             expected.extend_from_slice(&frame(&build_open_unreliable(APP, chan, wire)));
         }
@@ -2946,10 +3122,6 @@ mod tests {
         // reliable rows and an OpenUnreliable carrying the parity-0 series for
         // the four unreliable ones. The router and the table have to agree.
         let mut want = frame(&[0x00, 0x00]);
-        want.extend_from_slice(&frame(&rbx_channels::reliable_open_body(
-            BASECLIENT_SEND_APP,
-            BASECLIENT_SEND_CHANNEL,
-        )));
         let mut next_wire = 2u32;
         for (index, row) in DEFAULT_CHANNEL_PROFILE.iter().enumerate() {
             let record = if rbx_channels::is_unreliable(row) {
@@ -3084,32 +3256,39 @@ mod tests {
             .expect("the initial sync opens channel 3");
         assert_eq!(&chan3[..7], &stream_header(APP, 3)[..], "{}", hx(&chan3));
         assert_eq!(&chan3[7..], &frame(&crate::rbx_sync::sync_template()));
-        // The ping has nowhere to go yet: chan1 has no bound stream id, and a
-        // second OpenStream for it would corrupt the byte counts the report
-        // compares. It is skipped and named.
+        // The ping is held, not dropped: the burst composes it before the
+        // chan-1 open action has run, and a second OpenStream for the channel
+        // would corrupt the byte counts the report compares. It is named as
+        // deferred in the skip list until the stream binds.
         assert!(
-            flow.skipped().iter().any(|s| s.contains("ping#0") && s.contains("chan1")),
+            flow.skipped()
+                .iter()
+                .any(|s| s.contains("ping#0") && s.contains("chan1") && s.contains("deferred")),
             "{:?}",
             flow.skipped()
         );
-        // Once chan1 is bound, the periods fire on it.
+        // Once chan1 is bound, the held ping flushes on the next pass - ahead
+        // of the period's own ping, in send order.
         flow.note_opened(APP, 1, 10);
         let at_1100 = flow.on_tick(1_100);
-        assert_eq!(at_1100.len(), 1, "one ping at the ping period");
-        match &at_1100[0] {
-            Action::Write { stream, data } => {
-                assert_eq!(*stream, 10);
-                assert_eq!(data, &frame(&crate::rbx_sync::ping_template()));
+        assert_eq!(at_1100.len(), 2, "held ping#0 plus the period ping: {at_1100:?}");
+        for action in &at_1100 {
+            match action {
+                Action::Write { stream, data } => {
+                    assert_eq!(*stream, 10);
+                    assert_eq!(data, &frame(&crate::rbx_sync::ping_template()));
+                }
+                other => panic!("expected a chan1 write, got {other:?}"),
             }
-            other => panic!("expected a chan1 write, got {other:?}"),
         }
         // The sync period arrives together with a ping, and channel 3 is still
         // unacknowledged, so only the ping goes out.
         let at_5100 = flow.on_tick(5_100);
         assert_eq!(at_5100.len(), 1, "ping only: {at_5100:?}");
         let report = flow.sync_report();
-        // One of the three pings and one of the two syncs were produced but not
-        // sent, which the flow's own skip list accounts for separately.
+        // Three pings and two syncs were produced; the held ping#0 flushed once
+        // chan1 bound, and the syncs stay unsent while channel 3 is
+        // unacknowledged - which the report's flush count states outright.
         assert!(report.contains("3 ping(s)"), "{report}");
         assert!(report.contains("2 sync(s)"), "{report}");
         assert!(report.contains("0 flush"), "{report}");

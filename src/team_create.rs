@@ -2253,6 +2253,34 @@ const RBX_TRANSPORT_DRAIN_MAX_PASSES: usize = 400;
 #[cfg(not(test))]
 const RBX_TRANSPORT_DRAIN_RETRY_DELAY: Duration = Duration::from_micros(100);
 
+/// Write an open-stream payload the way the reference client does: the 7-byte
+/// stream header as its own write (`openStream`), then one write per framed
+/// message (`sendFramed`). Partial accepts merge into a single queued tail so
+/// nothing is reordered or dropped.
+#[cfg(not(test))]
+async fn send_open_stream_writes<S: ngnet_quic::Session>(
+    connection: &mut ngnet_quic::Conn<'_, S>,
+    socket: &RuppUdpSocket,
+    tx_buf: &mut [u8],
+    origin: Instant,
+    raw: i64,
+    data: &[u8],
+) -> Result<Option<(i64, Vec<u8>)>, String> {
+    let mut tail: Option<(i64, Vec<u8>)> = None;
+    for segment in crate::appflow::open_write_segments(data) {
+        if let Some((_, queued)) = tail.as_mut() {
+            queued.extend_from_slice(segment);
+            continue;
+        }
+        let accepted =
+            send_rbx_transport_stream_data(connection, socket, tx_buf, origin, raw, segment).await?;
+        if accepted < segment.len() {
+            tail = Some((raw, segment[accepted..].to_vec()));
+        }
+    }
+    Ok(tail)
+}
+
 /// Execute one flow action: open a client stream (recording it in the flow)
 /// or write more bytes to an existing stream.
 #[cfg(not(test))]
@@ -2271,10 +2299,7 @@ async fn execute_join_flow_action<S: ngnet_quic::Session>(
             })?;
             let raw = id.get();
             flow.note_opened(app, chan, raw);
-            let accepted =
-                send_rbx_transport_stream_data(connection, socket, tx_buf, origin, raw, &data)
-                    .await?;
-            Ok(unwritten(raw, &data, accepted))
+            send_open_stream_writes(connection, socket, tx_buf, origin, raw, &data).await
         }
         crate::appflow::Action::Write { stream, data } => {
             let accepted =
@@ -3882,12 +3907,14 @@ async fn pump_rbx_transport_app_flow<S: ngnet_quic::Session>(
                             "opened stream {raw} app={app} chan={chan} ({}B)",
                             data.len()
                         ));
-                        if let Err(error) = send_rbx_transport_stream_data(
-                            connection, socket, tx_buf, origin, raw, &data,
-                        )
-                        .await
+                        match send_open_stream_writes(connection, socket, tx_buf, origin, raw, &data)
+                            .await
                         {
-                            emit(format!("stream {raw} first write failed: {error}"));
+                            Ok(Some(entry)) => flow.queue_pending(entry),
+                            Ok(None) => {}
+                            Err(error) => {
+                                emit(format!("stream {raw} first write failed: {error}"));
+                            }
                         }
                     }
                     Err(error) if error.kind() == ngnet_quic::ErrorKind::Blocked => {

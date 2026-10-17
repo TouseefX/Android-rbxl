@@ -415,6 +415,10 @@ pub struct EditorApp {
     a7_mode_choice: u8,
     /// Application byte for the control stream header: 0, 1 or 4.
     ctrl_app_choice: u8,
+    /// Whether the burst includes the guessed BaseClient app=1/chan0 open
+    /// record. Off by default: the reliability-2 wire record is unresolved and
+    /// the reference client emits none.
+    baseclient_open_choice: bool,
     /// QUIC/TLS handshake milestone only; not BaseClient-connected or Team Create-accepted.
     team_create_session_quic_handshake_complete: bool,
     team_create_session_status: String,
@@ -598,12 +602,17 @@ impl Default for EditorApp {
             team_create_session_cancel: None,
             team_create_session_running: false,
             team_create_session_gen: 0,
-            // Two live runs - real 99-byte capture and omitted - closed
-            // identically at 161/157 ms with DisconnectNewSecurityKeyMismatch,
-            // so the frame is not what the server is checking. Default to
-            // omitting it and keep the knob for re-testing.
-            a7_mode_choice: 2,
-            ctrl_app_choice: 0,
+            // The reference client always attests real script hashes - "no
+            // mode, no skip: the A7 always goes out" - so send the captured
+            // frame. The two 161/157 ms runs that closed identically with and
+            // without it died of the security-key kick, a different failure
+            // than this burst; omit stays available for A/B runs.
+            a7_mode_choice: 0,
+            // The reference client opens the control stream on the application
+            // id (openStream(APP, CTRL)). Zero parsed fine on the server and hid
+            // the difference, but it is not what a working client sends.
+            ctrl_app_choice: 4,
+            baseclient_open_choice: false,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
             team_create_channels: false,
@@ -2265,7 +2274,16 @@ ui.label("Place ID:");
                             ui.radio_value(&mut self.ctrl_app_choice, 1u8, "1")
                                 .on_hover_text("Writes application byte 1 in the control-stream header");
                             ui.radio_value(&mut self.ctrl_app_choice, 4u8, "4")
-                                .on_hover_text("Writes application byte 4 in the control-stream header");
+                                .on_hover_text("Writes application byte 4 in the control-stream header — the application id the reference client opens the control stream on");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(
+                                &mut self.baseclient_open_choice,
+                                "BaseClient open record (guessed)",
+                            )
+                            .on_hover_text(
+                                "Emit the guessed 6-byte OpenReliable for BaseClient's app=1/chan0 send channel. The native opens that channel, but reliability enum 2 maps to no observed control record and the reference client sends none — off by default so the burst carries only records a working client is known to send.",
+                            );
                         });
                         ui.label(
                             RichText::new("Post-join planes (off = handshake and burst only)")
@@ -2302,6 +2320,7 @@ ui.label("Place ID:");
                         };
                         crate::appflow::set_a7_mode(a7_mode);
                         crate::appflow::set_ctrl_app(self.ctrl_app_choice);
+                        crate::appflow::set_baseclient_open(self.baseclient_open_choice);
                         crate::appflow::set_join_planes(crate::appflow::JoinPlanes {
                             channels: self.team_create_channels,
                             replication: self.team_create_replication,
@@ -2323,9 +2342,14 @@ ui.label("Place ID:");
                         );
                         ui.label(
                             RichText::new(format!(
-                                "active: 0xA7 = {}, ctrl app byte = {}, planes = {}",
+                                "active: 0xA7 = {}, ctrl app byte = {}, BaseClient open record = {}, planes = {}",
                                 crate::appflow::a7_mode_label(a7_mode),
                                 self.ctrl_app_choice,
+                                if self.baseclient_open_choice {
+                                    "guessed (on)"
+                                } else {
+                                    "off"
+                                },
                                 crate::appflow::join_planes().label()
                             ))
                             .weak(),
