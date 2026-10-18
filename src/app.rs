@@ -689,10 +689,12 @@ impl Default for EditorApp {
             // without it died of the security-key kick, a different failure
             // than this burst; omit stays available for A/B runs.
             a7_mode_choice: 0,
-            // The reference client opens the control stream on the application
-            // id (openStream(APP, CTRL)). Zero parsed fine on the server and hid
-            // the difference, but it is not what a working client sends.
-            ctrl_app_choice: 4,
+            // Zero is what the runs that fully engaged sent. The 4 default
+            // (the reference client's declared openStream(APP, CTRL) value)
+            // produced 1.5-2 s server closes with ConnectionError::OK(0)
+            // before any channel stream or config, with and without the
+            // BaseClient open record.
+            ctrl_app_choice: 0,
             baseclient_open_choice: false,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),

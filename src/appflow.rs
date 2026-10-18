@@ -119,20 +119,25 @@ pub fn a7_mode_label(mode: A7Mode) -> &'static str {
 }
 
 /// Application byte configured for the control-stream header. The default is
-/// four — the value the reference client opens the control stream on
-/// (`openStream(APP, CTRL)`). Zero parsed fine on the server and hid the
-/// difference in every prior run, but the bytes on the wire were not the ones a
-/// working client sends; the UI can still select 0, 1, or 4 to compare. This
-/// setting is independent of [`APP`], which identifies the join-data
-/// application streams.
-static CTRL_APP_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(4);
+/// zero — the value the runs that fully engaged sent (12 channel streams, the
+/// 0x93 join config, and a 22.8 s session). Changing this default to 4 (the
+/// reference client's declared `openStream(APP, CTRL)` value) produced runs
+/// where the server sent only its own two control streams and then closed at
+/// 1.5-2 s with `ConnectionError::OK(0)` before any channel stream or config,
+/// with and without the BaseClient open record — so the record is eliminated
+/// and this byte is the change under suspicion. Until the server's preference
+/// is understood from its own code, the default follows the observed evidence;
+/// the UI can still select 1 or 4 to compare. This setting is independent of
+/// [`APP`], which identifies the join-data application streams.
+static CTRL_APP_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Choose the control stream's application byte for subsequent join flows.
 pub fn set_ctrl_app(app: u8) {
     CTRL_APP_OVERRIDE.store(app, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The control stream's application byte. Defaults to 4, the reference value.
+/// The control stream's application byte. Defaults to 0, the value the fully
+/// engaging runs sent.
 pub fn ctrl_app() -> u32 {
     CTRL_APP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) as u32
 }
@@ -2909,16 +2914,17 @@ mod tests {
     #[test]
     fn a7_real_template_starts_with_a7() {
         let _serial = plane_serial();
-        // The control application byte defaults to 4: the reference client
-        // opens the control stream on the application id (`openStream(APP,
-        // CTRL)`). Zero parsed fine on the server and hid the difference in
-        // every prior run, but it is not what a working client sends.
-        assert_eq!(ctrl_app(), 4, "default ctrl app must be the reference value 4");
-        for app in [0u8, 1, 4] {
+        // The control application byte defaults to 0: the runs that fully
+        // engaged (12 channel streams, 0x93 join config, 22.8 s session) sent
+        // 0, while the 4 default produced server closes at 1.5-2 s with
+        // `ConnectionError::OK(0)` before any channel stream or config, with
+        // and without the BaseClient open record.
+        assert_eq!(ctrl_app(), 0, "default ctrl app must follow the engaging runs (0)");
+        for app in [4u8, 1, 0] {
             set_ctrl_app(app);
             assert_eq!(ctrl_app(), app as u32);
         }
-        set_ctrl_app(4);
+        set_ctrl_app(0);
         // The guessed BaseClient open record stays off until a run opts in:
         // reliability enum 2 maps to no observed control record and the
         // reference client emits none.
