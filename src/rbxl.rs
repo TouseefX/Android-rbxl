@@ -262,26 +262,38 @@ pub fn calculate_stats(dom: &WeakDom) -> PlaceStats {
     }
 }
 
-/// Recursively copies an instance from `source_dom` (including all properties and child subtrees)
-/// into `target_dom` under `target_parent`.
+/// Copies an instance from `source_dom` (including all properties and child
+/// subtrees) into `target_dom` under `target_parent`.
+///
+/// Iterative with an explicit stack: importing a deeply nested model must not
+/// overflow the native call stack, which crashed imports of huge .rbxm files
+/// into huge .rbxl places. Insertion order is unchanged (depth-first,
+/// children left to right).
 pub fn insert_dom_subtree(
     target_dom: &mut WeakDom,
     target_parent: Ref,
     source_dom: &WeakDom,
     source_ref: Ref,
 ) -> Option<Ref> {
-    let source_inst = source_dom.get_by_ref(source_ref)?;
-    let mut builder = InstanceBuilder::new(source_inst.class.as_str())
-        .with_name(&source_inst.name);
-    for (k, v) in &source_inst.properties {
-        builder = builder.with_property(k.as_str(), v.clone());
+    let mut root_ref = None;
+    let mut stack = vec![(source_ref, target_parent)];
+    while let Some((source_ref, target_parent)) = stack.pop() {
+        let Some(source_inst) = source_dom.get_by_ref(source_ref) else {
+            continue;
+        };
+        let mut builder = InstanceBuilder::new(source_inst.class.as_str())
+            .with_name(&source_inst.name);
+        for (k, v) in &source_inst.properties {
+            builder = builder.with_property(k.as_str(), v.clone());
+        }
+        let new_ref = target_dom.insert(target_parent, builder);
+        if root_ref.is_none() {
+            root_ref = Some(new_ref);
+        }
+        // Push children in reverse so they pop in their original order.
+        stack.extend(source_inst.children().iter().rev().map(|&c| (c, new_ref)));
     }
-    let new_ref = target_dom.insert(target_parent, builder);
-
-    for &child_ref in source_inst.children() {
-        insert_dom_subtree(target_dom, new_ref, source_dom, child_ref);
-    }
-    Some(new_ref)
+    root_ref
 }
 
 /// Inserts all top-level children from `source_dom` into `target_dom` under `target_parent`.
@@ -335,6 +347,10 @@ const BINARY_HEADER: [u8; 8] = *b"<roblox!";
 /// that the parser genuinely can't read (e.g. produced by a newer Studio than
 /// the bundled reflection database) produces an actionable message rather than
 /// a generic "unsupported format".
+/// Upper bound on a decompressed model payload (gzip/zstd wrappers). 1 GiB is
+/// far above any legitimate model; a decompression bomb past this is refused.
+const MAX_DECOMPRESSED_MODEL_BYTES: u64 = 1 << 30;
+
 pub fn decode_model_bytes(bytes: &[u8]) -> Result<WeakDom> {
     if bytes.is_empty() {
         bail!("Cannot decode empty model bytes");
@@ -348,9 +364,12 @@ pub fn decode_model_bytes(bytes: &[u8]) -> Result<WeakDom> {
     let payload: &[u8] = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
         use flate2::read::GzDecoder;
         use std::io::Read;
+        // Bounded decompression: a corrupt or hostile gzip stream can expand
+        // enormously; stop instead of exhausting RAM mid-import.
         let mut buf = Vec::new();
-        match GzDecoder::new(bytes).read_to_end(&mut buf) {
-            Ok(_) if !buf.is_empty() => {
+        let mut dec = GzDecoder::new(bytes).take(MAX_DECOMPRESSED_MODEL_BYTES + 1);
+        match dec.read_to_end(&mut buf) {
+            Ok(_) if !buf.is_empty() && buf.len() as u64 <= MAX_DECOMPRESSED_MODEL_BYTES => {
                 decompressed = buf;
                 &decompressed[..]
             }
@@ -477,7 +496,11 @@ fn zstd_decode_all(bytes: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut dec = zstd::Decoder::new(bytes).ok()?;
     let mut out = Vec::new();
-    dec.read_to_end(&mut out).ok()?;
+    // Bounded decompression, mirroring the gzip path.
+    dec.take(MAX_DECOMPRESSED_MODEL_BYTES + 1).read_to_end(&mut out).ok()?;
+    if out.is_empty() || out.len() as u64 > MAX_DECOMPRESSED_MODEL_BYTES {
+        return None;
+    }
     Some(out)
 }
 

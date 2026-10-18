@@ -72,6 +72,55 @@ fn catalog_thumbnail_channel() -> (&'static Sender<HashMap<u64, String>>, &'stat
     (tx, CATALOG_THUMBNAIL_RX.get().unwrap())
 }
 
+/// Which open/insert a background parse belongs to. Parsing a huge place or
+/// model on the UI thread froze the app for seconds and made the system ANR
+/// watchdog look like a crash; the parse now runs on a worker thread and this
+/// tag tells the drain which post-load steps to run when the DOM arrives.
+pub enum PlaceIoJob {
+    /// Picked from the device file picker (`FileEvent::Opened`).
+    LocalPlace { uri: String, format: rbxl::PlaceFormat },
+    /// Downloaded from Roblox (`FileEvent::PlaceBytes`).
+    DownloadedPlace { uri: String },
+    /// Team Create replicated snapshot opened from the session panel.
+    ReplicatedSnapshot { format: rbxl::PlaceFormat },
+    /// A local .rbxm/.rbxmx to merge into the open place.
+    LocalModel { uri: String },
+}
+
+pub struct PlaceIoDone {
+    pub job: PlaceIoJob,
+    pub result: Result<rbx_dom_weak::WeakDom, String>,
+}
+
+static PLACE_IO_TX: OnceLock<Sender<PlaceIoDone>> = OnceLock::new();
+static PLACE_IO_RX: OnceLock<Mutex<Receiver<PlaceIoDone>>> = OnceLock::new();
+
+fn place_io_tx() -> &'static Sender<PlaceIoDone> {
+    PLACE_IO_TX.get_or_init(|| {
+        let (tx, rx) = channel();
+        let _ = PLACE_IO_RX.set(Mutex::new(rx));
+        tx
+    })
+}
+
+fn place_io_rx() -> Option<&'static Mutex<Receiver<PlaceIoDone>>> {
+    PLACE_IO_RX.get()
+}
+
+/// Parse place or model bytes on a worker thread; the finished DOM returns
+/// through `place_io_rx()` and is applied on the UI thread.
+fn spawn_place_io(job: PlaceIoJob, data: Vec<u8>, is_model: bool) {
+    let tx = place_io_tx().clone();
+    std::thread::spawn(move || {
+        let result = if is_model {
+            rbxl::decode_model_bytes(&data).map_err(|error| error.to_string())
+        } else {
+            rbxl::load_place(data).map_err(|error| error.to_string())
+        };
+        let _ = tx.send(PlaceIoDone { job, result });
+    });
+}
+
 /// Consecutive automatic retries allowed for the intermittent
 /// DisconnectNewSecurityKeyMismatch close. Each retry needs a brand-new
 /// one-use join ticket, so this bounds how many negotiations one click costs.
@@ -110,11 +159,16 @@ pub struct OpenScriptTab {
     pub diagnostics: Vec<lua_runtime::SyntaxDiagnostic>,
     /// Cached Roblox/Luau semantic warnings; recomputed only after edits.
     pub semantic_diagnostics: Vec<luau_intelligence::ProjectDiagnostic>,
-    /// Cached syntax highlighting; font layout may run each frame, tokenizing does not.
+    /// Cached syntax highlighting; tokenizing runs only on the debounce, and
+    /// the job is Arc'd so the per-frame hand-off to the layouter is a pointer
+    /// copy instead of a deep clone of every section of a huge script.
     pub highlighted_buffer: String,
     pub highlighted_font_size: f32,
     pub highlighted_search: Option<String>,
-    pub highlighted_job: egui::text::LayoutJob,
+    pub highlighted_job: std::sync::Arc<egui::text::LayoutJob>,
+    /// Bumped whenever `highlighted_job` is rebuilt. The laid-out galley cache
+    /// keys on it so a stale galley can never outlive its job.
+    pub highlight_generation: u64,
     /// Expensive compiler/semantic passes run after typing pauses.
     pub analysis_pending_buffer: String,
     pub analysis_requested_at: Option<std::time::Instant>,
@@ -174,6 +228,19 @@ pub struct EditorApp {
     /// Previous-frame hit targets let us suppress the underlying TextEdit click
     /// before it can collapse the selected range.
     script_selection_handle_rects: Option<[egui::Rect; 2]>,
+    /// Laid-out galley of the active script, keyed by (text, highlight
+    /// generation, wrap width). Laying out a huge script's text every frame is
+    /// the editor's dominant cost; this turns idle frames into a pointer copy
+    /// while still re-laying out immediately after an edit.
+    script_galley_cache: Option<(String, u64, f32, std::sync::Arc<egui::text::Galley>)>,
+    /// Cached line-number gutter job, keyed by (line_count, active_line, font).
+    script_gutter_cache: Option<(usize, usize, f32, std::sync::Arc<egui::text::LayoutJob>)>,
+    /// Cached newline count, keyed by (tab index, byte length).
+    script_line_count_cache: Option<(usize, usize, usize)>,
+    /// Cached active line for the gutter, keyed by (tab, cursor, buffer len).
+    script_active_line_cache: Option<(usize, usize, usize, usize)>,
+    /// Cached selection byte offsets, keyed by (tab, start, end, buffer len).
+    script_selection_bytes_cache: Option<(usize, usize, usize, usize, (usize, usize))>,
     script_references: Vec<luau_intelligence::Reference>,
     show_symbol_rename: bool,
     symbol_rename_input: String,
@@ -233,6 +300,13 @@ pub struct EditorApp {
     project_name: String,
     show_quick_open: bool,
     quick_open_query: String,
+    /// Sorted script list for the quick-open palette (original case + folded
+    /// key). Collected once per palette open instead of scanning the whole DOM
+    /// every frame; cleared when the palette closes or the DOM changes.
+    quick_open_scripts: Option<Vec<(Ref, String, String)>>,
+    /// Asset-panel scan snapshot + when it was taken. Walking the full DOM for
+    /// assets every frame is pure waste on a huge place; refresh on a TTL.
+    place_assets_cache: Option<(Instant, Vec<DiscoveredAsset>)>,
     show_workspace_symbols: bool,
     workspace_symbol_query: String,
     workspace_symbol_catalog: Vec<luau_intelligence::WorkspaceSymbol>,
@@ -477,6 +551,11 @@ impl Default for EditorApp {
             pending_script_selection: None,
             script_active_selection_handle: None,
             script_selection_handle_rects: None,
+            script_galley_cache: None,
+            script_gutter_cache: None,
+            script_line_count_cache: None,
+            script_active_line_cache: None,
+            script_selection_bytes_cache: None,
             script_references: Vec::new(),
             show_symbol_rename: false,
             symbol_rename_input: String::new(),
@@ -516,6 +595,8 @@ impl Default for EditorApp {
             project_name: "RobloxProject".into(),
             show_quick_open: false,
             quick_open_query: String::new(),
+            quick_open_scripts: None,
+            place_assets_cache: None,
             show_workspace_symbols: false,
             workspace_symbol_query: String::new(),
             workspace_symbol_catalog: Vec::new(),
@@ -608,10 +689,12 @@ impl Default for EditorApp {
             // without it died of the security-key kick, a different failure
             // than this burst; omit stays available for A/B runs.
             a7_mode_choice: 0,
-            // The reference client opens the control stream on the application
-            // id (openStream(APP, CTRL)). Zero parsed fine on the server and hid
-            // the difference, but it is not what a working client sends.
-            ctrl_app_choice: 4,
+            // Zero is what the runs that fully engaged sent. The 4 default
+            // (the reference client's declared openStream(APP, CTRL) value)
+            // produced 1.5-2 s server closes with ConnectionError::OK(0)
+            // before any channel stream or config, with and without the
+            // BaseClient open record.
+            ctrl_app_choice: 0,
             baseclient_open_choice: false,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
@@ -761,12 +844,20 @@ impl EditorApp {
         jni_bridge::trigger_copy_to_clipboard(text);
     }
 
+    /// Bounded output log: the Output tab re-lays out every entry each frame,
+    /// so an unbounded log eventually drags the whole UI down.
+    const OUTPUT_LOG_CAP: usize = 300;
+
     fn log_info(&mut self, msg: impl Into<String>) {
         self.output_logs.push(OutputLog {
             level: "INFO",
             message: msg.into(),
             time: "now".into(),
         });
+        if self.output_logs.len() > Self::OUTPUT_LOG_CAP {
+            let excess = self.output_logs.len() - Self::OUTPUT_LOG_CAP;
+            self.output_logs.drain(..excess);
+        }
     }
 
     fn log_error(&mut self, msg: impl Into<String>) {
@@ -775,6 +866,10 @@ impl EditorApp {
             message: msg.into(),
             time: "now".into(),
         });
+        if self.output_logs.len() > Self::OUTPUT_LOG_CAP {
+            let excess = self.output_logs.len() - Self::OUTPUT_LOG_CAP;
+            self.output_logs.drain(..excess);
+        }
     }
 
     fn start_studio_presence_bootstrap(&mut self) {
@@ -1365,13 +1460,35 @@ impl EditorApp {
         }
         let mut jump: Option<(Ref, usize)> = None;
         if self.show_quick_open {
-            let mut scripts = Vec::new();
-            if let Some(dom) = &self.dom {
-                collect_script_paths(dom, dom.root_ref(), &mut Vec::new(), &mut scripts);
+            // Collect and sort the script list once per palette open instead
+            // of walking the whole DOM on every frame while the user types.
+            if self.quick_open_scripts.is_none() {
+                let mut scripts = Vec::new();
+                if let Some(dom) = &self.dom {
+                    collect_script_paths(dom, dom.root_ref(), &mut Vec::new(), &mut scripts);
+                }
+                let mut scripts: Vec<(Ref, String, String)> = scripts
+                    .into_iter()
+                    .map(|(referent, path)| {
+                        let key = path.to_ascii_lowercase();
+                        (referent, path, key)
+                    })
+                    .collect();
+                scripts.sort_by(|a, b| a.2.cmp(&b.2));
+                self.quick_open_scripts = Some(scripts);
             }
             let query = self.quick_open_query.to_ascii_lowercase();
-            scripts.retain(|(_, path)| query.is_empty() || fuzzy_ui_match(&path.to_ascii_lowercase(), &query));
-            scripts.sort_by_key(|(_, path)| path.to_ascii_lowercase());
+            let matched: Vec<(Ref, &str)> = self
+                .quick_open_scripts
+                .as_ref()
+                .map(|scripts| {
+                    scripts
+                        .iter()
+                        .filter(|(_, _, key)| query.is_empty() || fuzzy_ui_match(key, &query))
+                        .map(|(referent, path, _)| (*referent, path.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut open = self.show_quick_open;
             egui::Window::new("⌘ Quick Open")
                 .open(&mut open).collapsible(false).default_width(520.0)
@@ -1380,18 +1497,22 @@ impl EditorApp {
                         .hint_text("Type a script name or DataModel path…").desired_width(f32::INFINITY));
                     response.request_focus();
                     if response.ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
-                        if let Some((referent, _)) = scripts.first() { jump = Some((*referent, 1)); }
+                        if let Some((referent, _)) = matched.first() { jump = Some((*referent, 1)); }
                     }
-                    ui.label(RichText::new(format!("{} matching scripts · Enter opens first · Ctrl+P", scripts.len())).weak());
+                    ui.label(RichText::new(format!("{} matching scripts · Enter opens first · Ctrl+P", matched.len())).weak());
                     egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                        for (referent, path) in scripts.iter().take(100) {
-                            if ui.selectable_label(false, RichText::new(path).monospace()).clicked() {
+                        for (referent, path) in matched.iter().take(100) {
+                            if ui.selectable_label(false, RichText::new(*path).monospace()).clicked() {
                                 jump = Some((*referent, 1));
                             }
                         }
                     });
                 });
             self.show_quick_open = open && jump.is_none();
+            if !self.show_quick_open {
+                // Rebuild on the next open so renames and inserts are seen.
+                self.quick_open_scripts = None;
+            }
         }
 
         if self.show_workspace_symbols {
@@ -1845,8 +1966,19 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         ui.add_space(4.0);
 
         // 3. Place Asset Scanner & Batch Downloader (like studio-lite AssetManager)
-        if let Some(dom) = &self.dom {
-            let place_assets = asset_downloader::scan_place_assets(dom);
+        if self.dom.is_some() {
+            // Walking the whole DOM for assets is expensive on a huge place;
+            // scan on a short TTL and reuse the snapshot between frames.
+            let stale = self
+                .place_assets_cache
+                .as_ref()
+                .map_or(true, |(at, _)| at.elapsed() >= Duration::from_secs(2));
+            if stale {
+                let assets =
+                    asset_downloader::scan_place_assets(self.dom.as_ref().unwrap());
+                self.place_assets_cache = Some((Instant::now(), assets));
+            }
+            let place_assets = self.place_assets_cache.as_ref().unwrap().1.clone();
             ui.collapsing(format!("📦 Place Assets Inspector ({} Found)", place_assets.len()), |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button(RichText::new("⬇️ Download & Cache All Place Assets (.mesh & .png)").strong().color(Color32::from_rgb(100, 255, 120))).clicked() {
@@ -2365,10 +2497,17 @@ ui.label("Place ID:");
                             ui.label(RichText::new(self.team_create_snapshot_summary.clone()).weak());
                             if ui.button("📥 Open replicated snapshot").clicked() {
                                 if let Some(bytes) = self.team_create_snapshot.take() {
-                                    self.load_from_bytes(bytes);
+                                    // Huge snapshots froze the UI thread in
+                                    // load_from_bytes; parse them in the
+                                    // background like every other place open.
+                                    let format = rbxl::PlaceFormat::detect(&bytes);
                                     self.status =
-                                        "Opened the place built from the replicated snapshot (local action; the Team Create session is unchanged)"
-                                            .into();
+                                        "Parsing replicated snapshot in the background…".into();
+                                    spawn_place_io(
+                                        PlaceIoJob::ReplicatedSnapshot { format },
+                                        bytes,
+                                        false,
+                                    );
                                 }
                             }
                         }
@@ -2853,7 +2992,8 @@ ui.label("Place ID:");
             highlighted_buffer: source.clone(),
             highlighted_font_size: self.font_size,
             highlighted_search: None,
-            highlighted_job,
+            highlighted_job: std::sync::Arc::new(highlighted_job),
+            highlight_generation: 1,
             analysis_pending_buffer: source.clone(),
             analysis_requested_at: None,
             analyzed_buffer: source,
@@ -3199,10 +3339,34 @@ ui.label("Place ID:");
                 if anchor != primary {
                     let start = anchor.min(primary);
                     let end = anchor.max(primary);
-                    let start_byte = tab.buffer.char_indices().nth(start)
-                        .map_or(tab.buffer.len(), |(byte, _)| byte);
-                    let end_byte = tab.buffer.char_indices().nth(end)
-                        .map_or(tab.buffer.len(), |(byte, _)| byte);
+                    // Mapping char offsets to bytes walks the whole buffer;
+                    // reuse the cached pair while tab, selection, and length
+                    // hold.
+                    let buffer_len = tab.buffer.len();
+                    let (start_byte, end_byte) = match self.script_selection_bytes_cache {
+                        Some((cached_tab, cached_start, cached_end, cached_len, bytes))
+                            if cached_tab == self.active_script_idx
+                                && cached_start == start
+                                && cached_end == end
+                                && cached_len == buffer_len =>
+                        {
+                            bytes
+                        }
+                        _ => {
+                            let start_byte = tab.buffer.char_indices().nth(start)
+                                .map_or(tab.buffer.len(), |(byte, _)| byte);
+                            let end_byte = tab.buffer.char_indices().nth(end)
+                                .map_or(tab.buffer.len(), |(byte, _)| byte);
+                            self.script_selection_bytes_cache = Some((
+                                self.active_script_idx,
+                                start,
+                                end,
+                                buffer_len,
+                                (start_byte, end_byte),
+                            ));
+                            (start_byte, end_byte)
+                        }
+                    };
                     let selected = tab.buffer[start_byte..end_byte].to_owned();
                     ui.separator();
                     ui.label("Selection:");
@@ -3280,12 +3444,15 @@ ui.label("Place ID:");
         let highlight_due = tab.highlighted_buffer != tab.buffer
             && tab.analysis_requested_at.is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(180));
         if highlight_due || tab.highlighted_font_size != font_size || tab.highlighted_search != search_term {
-            tab.highlighted_job = lua_syntax::highlight_luau(&tab.buffer, font_size, search_term.as_deref());
+            tab.highlighted_job = std::sync::Arc::new(lua_syntax::highlight_luau(&tab.buffer, font_size, search_term.as_deref()));
             tab.highlighted_buffer = tab.buffer.clone();
             tab.highlighted_font_size = font_size;
             tab.highlighted_search = search_term.clone();
+            tab.highlight_generation = tab.highlight_generation.wrapping_add(1);
         }
         let highlighted_job = tab.highlighted_job.clone();
+        let highlight_generation = tab.highlight_generation;
+        let galley_cache = &mut self.script_galley_cache;
 
         // Use the caret reported by the previous text pass to intercept
         // completion-navigation keys before TextEdit treats them as cursor
@@ -3368,9 +3535,30 @@ ui.label("Place ID:");
         let mut cursor_char = self.script_completion_cursor;
         let mut completion_popup_pos = None;
         let mut touch_selection_geometry = None;
-        let active_line = cursor_char.map_or(1, |cursor| {
-            tab.buffer.chars().take(cursor).filter(|c| *c == '\n').count() + 1
-        });
+        // Recomputing the caret's line walks every preceding character of a
+        // huge buffer; reuse the cached line while (tab, caret, length) hold.
+        let buffer_len = tab.buffer.len();
+        let tab_index = self.active_script_idx;
+        let active_line = match cursor_char {
+            Some(cursor) => {
+                if let Some((cached_tab, cached_cursor, cached_len, cached_line)) =
+                    self.script_active_line_cache
+                {
+                    if cached_tab == tab_index && cached_cursor == cursor && cached_len == buffer_len {
+                        cached_line
+                    } else {
+                        let line = tab.buffer.chars().take(cursor).filter(|c| *c == '\n').count() + 1;
+                        self.script_active_line_cache = Some((tab_index, cursor, buffer_len, line));
+                        line
+                    }
+                } else {
+                    let line = tab.buffer.chars().take(cursor).filter(|c| *c == '\n').count() + 1;
+                    self.script_active_line_cache = Some((tab_index, cursor, buffer_len, line));
+                    line
+                }
+            }
+            None => 1,
+        };
         if !ui.input(|input| input.pointer.any_down()) {
             self.script_active_selection_handle = None;
         }
@@ -3379,31 +3567,86 @@ ui.label("Place ID:");
             .drag_to_scroll(self.script_active_selection_handle.is_none())
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
-                    let line_count = tab.buffer.bytes().filter(|b| *b == b'\n').count() + 1;
-                    ui.label(lua_syntax::line_number_gutter(
-                        line_count,
-                        active_line,
-                        self.font_size,
-                    ));
+                    // Both the newline scan and the gutter job build walk the
+                    // whole buffer; cache them and reuse while the buffer
+                    // length, caret line, and font hold still.
+                    let buffer_len = tab.buffer.len();
+                    let line_count = match self.script_line_count_cache {
+                        Some((cached_tab, cached_len, count))
+                            if cached_tab == self.active_script_idx && cached_len == buffer_len =>
+                        {
+                            count
+                        }
+                        _ => {
+                            let count = tab.buffer.bytes().filter(|b| *b == b'\n').count() + 1;
+                            self.script_line_count_cache =
+                                Some((self.active_script_idx, buffer_len, count));
+                            count
+                        }
+                    };
+                    let gutter_job = {
+                        let cached = self
+                            .script_gutter_cache
+                            .as_ref()
+                            .and_then(|(lines, active, font, job)| {
+                                (*lines == line_count
+                                    && *active == active_line
+                                    && *font == self.font_size)
+                                    .then(|| job.clone())
+                            });
+                        cached.unwrap_or_else(|| {
+                            let job = std::sync::Arc::new(lua_syntax::line_number_gutter(
+                                line_count,
+                                active_line,
+                                self.font_size,
+                            ));
+                            self.script_gutter_cache =
+                                Some((line_count, active_line, self.font_size, job.clone()));
+                            job
+                        })
+                    };
+                    ui.label(egui::WidgetText::LayoutJob(gutter_job));
 
                     let word_wrap = self.editor_word_wrap;
                     let mut layouter = move |ui: &egui::Ui, text_buf: &dyn egui::TextBuffer, wrap: f32| {
-                        let mut job = if highlighted_job.text == text_buf.as_str() {
-                            highlighted_job.clone()
+                        let text = text_buf.as_str();
+                        let syntax = highlighted_job.text == text;
+                        let max_width = if word_wrap { wrap } else { f32::INFINITY };
+                        // Laying out a huge script's text every frame is the
+                        // editor's dominant cost. Idle frames (scrolling,
+                        // reading, moving the caret) hand back the cached
+                        // galley; edits re-layout exactly once after the
+                        // highlight debounce rebuilds the job.
+                        if syntax {
+                            if let Some((cached_text, cached_gen, cached_width, galley)) = galley_cache.as_ref() {
+                                if *cached_gen == highlight_generation
+                                    && *cached_width == max_width
+                                    && cached_text.as_str() == text
+                                {
+                                    return galley.clone();
+                                }
+                            }
+                        }
+                        let mut job = if syntax {
+                            (*highlighted_job).clone()
                         } else {
                             // During the short debounce window use a cheap
                             // monochrome job; syntax colours return after idle.
                             let mut job = egui::text::LayoutJob::default();
-                            job.append(text_buf.as_str(), 0.0, egui::TextFormat::simple(
+                            job.append(text, 0.0, egui::TextFormat::simple(
                                 egui::FontId::monospace(font_size), Color32::from_rgb(220, 220, 220)));
                             job
                         };
                         // TextEdit passes its available width even for code
                         // editors. Applying it unconditionally made already
                         // formatted Luau visually reflow like a plain text file.
-                        job.wrap.max_width = if word_wrap { wrap } else { f32::INFINITY };
+                        job.wrap.max_width = max_width;
                         job.wrap.break_anywhere = false;
-                        ui.fonts_mut(|fonts| fonts.layout_job(job))
+                        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                        if syntax {
+                            *galley_cache = Some((text.to_string(), highlight_generation, max_width, galley.clone()));
+                        }
+                        galley
                     };
 
                     // Handle Areas are painted after TextEdit, but their
@@ -5111,6 +5354,9 @@ ui.label("Place ID:");
     }
 
     fn drain_events(&mut self) {
+        // Finished background place/model parses first, so DOM-dependent
+        // events below see the freshly opened document.
+        self.drain_place_io();
         // Poll the live-session bridge (connected Studio companion plugin).
         self.drain_live_session_events();
         self.pump_team_create_session_events();
@@ -5328,30 +5574,11 @@ ui.label("Place ID:");
             match event {
                 FileEvent::Opened { uri, data } => {
                     let format = rbxl::PlaceFormat::detect(&data);
-                    match rbxl::load_place(data) {
-                        Ok(dom) => {
-                            let count = dom.root().children().len();
-                            self.place_format = format;
-                            self.dom = Some(dom);
-                            self.current_uri = Some(uri.clone());
-                            self.selected = None;
-                            self.open_tabs.clear();
-                            self.needs_3d_rebuild = true;
-                            self.status =
-                                format!("Loaded {} ({count} top-level services)", format.label());
-                            self.log_info(format!(
-                                "Opened place: {uri} ({} format, {count} services)",
-                                format.label()
-                            ));
-                            self.active_tab = ActiveTab::Explorer;
-                            lua_runtime::reset_command_history();
-                            self.auto_download_place_assets();
-                        }
-                        Err(e) => {
-                            self.status = format!("Failed to parse: {e}");
-                            self.log_error(format!("Failed to parse rbxl/rbxlx: {e}"));
-                        }
-                    }
+                    // Parse off the UI thread: a huge place used to sit on this
+                    // match arm for seconds and freeze the whole app.
+                    self.status =
+                        format!("Parsing {} in the background…", format.label());
+                    spawn_place_io(PlaceIoJob::LocalPlace { uri, format }, data, false);
                 }
                 FileEvent::ModelOpened { uri, data } => {
                     if jni_bridge::take_next_is_plugin() {
@@ -5362,32 +5589,17 @@ ui.label("Place ID:");
                             &data,
                         );
                     } else {
-                        self.insert_local_model(uri, data);
+                        // Decode off the UI thread; the merge into the open
+                        // DOM happens when the parse finishes.
+                        self.status = format!("Importing model in the background…");
+                        spawn_place_io(PlaceIoJob::LocalModel { uri }, data, true);
                     }
                 }
                 FileEvent::PlaceBytes { uri, data } => {
                     // A place downloaded from Roblox: replace the open
                     // document exactly as if the user picked it locally.
-                    match rbxl::load_place(data) {
-                        Ok(dom) => {
-                            let count = dom.root().children().len();
-                            self.place_format = rbxl::PlaceFormat::Binary;
-                            self.dom = Some(dom);
-                            self.current_uri = Some(uri.clone());
-                            self.selected = None;
-                            self.open_tabs.clear();
-                            self.needs_3d_rebuild = true;
-                            self.status = format!("Opened place from Roblox ({count} services)");
-                            self.log_info(format!("Opened downloaded place: {uri} ({count} services)"));
-                            self.active_tab = ActiveTab::Explorer;
-                            lua_runtime::reset_command_history();
-                            self.auto_download_place_assets();
-                        }
-                        Err(e) => {
-                            self.status = format!("Failed to parse downloaded place: {e}");
-                            self.log_error(format!("Downloaded place parse error: {e}"));
-                        }
-                    }
+                    self.status = "Parsing downloaded place in the background…".into();
+                    spawn_place_io(PlaceIoJob::DownloadedPlace { uri }, data, false);
                 }
                 FileEvent::PlaceError { uri, error } => {
                     self.status = format!("Download failed: {error}");
@@ -5513,11 +5725,16 @@ ui.label("Place ID:");
                                     tab.buffer = text.clone();
                                 }
                                 let cursor_char = utf16_to_char_index(&text, cursor);
-                                let index = self.dom.as_ref().map(|dom| {
-                                    luau_intelligence::ProjectIndex::build_with_overrides(
-                                        dom,
-                                        self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
-                                    )
+                                // Cache-first like every other symbol lookup:
+                                // rebuilding the whole project index on a huge
+                                // place froze the native editor per command.
+                                let index = self.project_index_cache.clone().or_else(|| {
+                                    self.dom.as_ref().map(|dom| std::sync::Arc::new(
+                                        luau_intelligence::ProjectIndex::build_with_overrides(
+                                            dom,
+                                            self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
+                                        )
+                                    ))
                                 });
                                 let definition = index.as_ref().and_then(|index| {
                                     index.definition_at(referent, &text, cursor_char)
@@ -7455,16 +7672,16 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
         jni_bridge::trigger_open_model_document();
     }
 
-    /// Decode local model bytes (binary .rbxm, XML .rbxmx, gzipped, or Luau
-    /// source — all handled by `rbxl::decode_model_bytes`) and merge every
-    /// top-level instance into the active place under the current selection.
-    fn insert_local_model(&mut self, uri: String, data: Vec<u8>) {
+    /// Merge an already-decoded model DOM into the active place under the
+    /// current selection. Decoding runs on a background thread
+    /// (`spawn_place_io`); this runs on the UI thread when the parse finishes.
+    fn insert_local_model_dom(&mut self, uri: &str, source_dom: WeakDom) {
         let Some(dom) = self.dom.as_mut() else {
             self.status = "Open a .rbxl place first, then import a model into it".into();
             return;
         };
 
-        // Snapshot the selection/root before borrowing dom mutably for decode.
+        // Snapshot the selection/root before borrowing dom mutably for insert.
         let parent = self
             .selected
             .and_then(|r| {
@@ -7478,33 +7695,126 @@ if !self.roblosecurity_cookie.is_empty() && ui.button("Clear").clicked() {
             })
             .unwrap_or_else(|| dom.root_ref());
 
-        match rbxl::decode_model_bytes(&data) {
-            Ok(source_dom) => {
-                let (first_ref, count) = rbxl::insert_all_root_children(dom, parent, &source_dom);
-                if count == 0 || first_ref.is_none() {
-                    self.status = "Model file contained no insertable instances".into();
-                    self.log_error(format!("Local model '{uri}' decoded but had 0 instances"));
-                    return;
-                }
-                let first_ref = first_ref.unwrap();
-                let name = dom
-                    .get_by_ref(first_ref)
-                    .map(|i| i.name.clone())
-                    .unwrap_or_else(|| "Model".to_string());
-                self.selected = Some(first_ref);
-                self.needs_3d_rebuild = true;
-                self.status =
-                    format!("✅ Inserted local model '{name}' ({count} instances) from {uri}");
-                self.log_info(format!(
-                    "Imported local model '{name}' ({count} instances) from {uri}"
-                ));
+        let (first_ref, count) = rbxl::insert_all_root_children(dom, parent, &source_dom);
+        if count == 0 || first_ref.is_none() {
+            self.status = "Model file contained no insertable instances".into();
+            self.log_error(format!("Local model '{uri}' decoded but had 0 instances"));
+            return;
+        }
+        let first_ref = first_ref.unwrap();
+        let name = dom
+            .get_by_ref(first_ref)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| "Model".to_string());
+        self.selected = Some(first_ref);
+        self.needs_3d_rebuild = true;
+        self.status =
+            format!("✅ Inserted local model '{name}' ({count} instances) from {uri}");
+        self.log_info(format!(
+            "Imported local model '{name}' ({count} instances) from {uri}"
+        ));
+    }
+
+    /// Reset the document around a freshly parsed DOM (a new place, not an
+    /// edit). Shared by every background place-load completion.
+    fn apply_place_dom(&mut self, dom: WeakDom, format: rbxl::PlaceFormat, uri: Option<String>) {
+        self.place_format = format;
+        self.dom = Some(dom);
+        self.current_uri = uri;
+        self.selected = None;
+        self.open_tabs.clear();
+        self.open_tabs.shrink_to_fit();
+        self.script_galley_cache = None;
+        self.script_gutter_cache = None;
+        self.script_line_count_cache = None;
+        self.script_active_line_cache = None;
+        self.script_selection_bytes_cache = None;
+        self.quick_open_scripts = None;
+        self.place_assets_cache = None;
+        self.needs_3d_rebuild = true;
+        // New document → fresh undo history.
+        lua_runtime::reset_command_history();
+    }
+
+    /// Apply finished background place/model parses on the UI thread.
+    fn drain_place_io(&mut self) {
+        let Some(rx) = place_io_rx() else { return };
+        let mut finished = Vec::new();
+        if let Ok(rx) = rx.lock() {
+            while let Ok(done) = rx.try_recv() {
+                finished.push(done);
             }
-            Err(e) => {
-                self.status = format!("Failed to decode local model: {e}");
-                self.log_error(format!(
-                    "Failed to decode local model '{uri}': {e}. \
-                     Supported: .rbxm (binary), .rbxmx (XML), gzipped, or .lua/.luau source."
-                ));
+        }
+        for done in finished {
+            match done.job {
+                PlaceIoJob::LocalPlace { uri, format } => match done.result {
+                    Ok(dom) => {
+                        let count = dom.root().children().len();
+                        self.apply_place_dom(dom, format, Some(uri.clone()));
+                        self.status = format!("Loaded {} ({count} top-level services)", format.label());
+                        self.log_info(format!(
+                            "Opened place: {uri} ({} format, {count} services)",
+                            format.label()
+                        ));
+                        self.active_tab = ActiveTab::Explorer;
+                        self.auto_download_place_assets();
+                    }
+                    Err(e) => {
+                        self.status = format!("Failed to parse: {e}");
+                        self.log_error(format!("Failed to parse rbxl/rbxlx: {e}"));
+                    }
+                },
+                PlaceIoJob::DownloadedPlace { uri } => match done.result {
+                    Ok(dom) => {
+                        let count = dom.root().children().len();
+                        self.apply_place_dom(dom, rbxl::PlaceFormat::Binary, Some(uri.clone()));
+                        self.status = format!("Opened place from Roblox ({count} services)");
+                        self.log_info(format!("Opened downloaded place: {uri} ({count} services)"));
+                        self.active_tab = ActiveTab::Explorer;
+                        self.auto_download_place_assets();
+                    }
+                    Err(e) => {
+                        self.status = format!("Failed to parse downloaded place: {e}");
+                        self.log_error(format!("Downloaded place parse error: {e}"));
+                    }
+                },
+                PlaceIoJob::ReplicatedSnapshot { format } => match done.result {
+                    Ok(dom) => {
+                        // Mirrors load_from_bytes: the snapshot becomes a new
+                        // local document with a fresh GUI play session.
+                        self.gui_play_session =
+                            match lua_runtime::GuiPlaySession::new(&dom) {
+                                Ok(session) => Some(session),
+                                Err(error) => {
+                                    log::error!("GUI play session: {error}");
+                                    None
+                                }
+                            };
+                        self.gui_textures.clear();
+                        self.gui_scroll_offsets.clear();
+                        self.gui_text_inputs.clear();
+                        self.gui_hovered.clear();
+                        self.gui_runtime_events.clear();
+                        self.apply_place_dom(dom, format, None);
+                        self.status =
+                            "Opened the place built from the replicated snapshot (local action; the Team Create session is unchanged)"
+                                .into();
+                    }
+                    Err(e) => {
+                        self.status = format!("Failed to parse replicated snapshot: {e}");
+                        self.log_error(format!("Replicated snapshot parse error: {e}"));
+                    }
+                },
+                PlaceIoJob::LocalModel { uri } => match done.result {
+                    Ok(source_dom) => self.insert_local_model_dom(&uri, source_dom),
+                    Err(e) => {
+                        self.status = format!("Failed to decode local model: {e}");
+                        self.log_error(format!(
+                            "Failed to decode local model '{uri}': {e}. \
+                             Supported: .rbxm (binary), .rbxmx (XML), gzipped, or .lua/.luau source."
+                        ));
+                    }
+                },
             }
         }
     }
