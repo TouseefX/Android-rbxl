@@ -1711,6 +1711,7 @@ pub fn rebuild_scene(
     let mut tex_keys: Vec<String> = Vec::new();
     type Key = ([u8; 3], u8, Option<u32>, bool, u32, Option<usize>);
     let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
+    let total_parts = parts.len();
     for (part_index, p) in parts.into_iter().enumerate() {
         let part_alpha = p.alpha;
         let part_color = p.color;
@@ -1858,7 +1859,7 @@ pub fn rebuild_scene(
         });
     }
 
-    log::info!("Bevy: rendered {} parts, {} draw calls", parts.len(), draw_call_count);
+    log::info!("Bevy: rendered {} parts, {} draw calls", total_parts, draw_call_count);
 }
 
 /// Keep the viewport camera in sync with the `OrbitCam` resource each frame.
