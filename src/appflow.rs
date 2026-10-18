@@ -2771,6 +2771,19 @@ mod tests {
         // the top-level `0x84` scan cannot see it. The ack is the join gate:
         // the server keeps the joining client waiting until the same id comes
         // back (parsed there as `DeserializedMarkerItem`).
+        //
+        // The item run is only decoded by the replication plane, which a flow
+        // captures from the process-wide switches at construction. Set them
+        // here under the test lock instead of racing whichever test flipped
+        // them last: inside the `appflow::tests::marker` CI filter this raced
+        // `marker_asks_the_replication_stream_for_the_place`, whose
+        // PlaneGuard briefly owns those same switches - win the race and the
+        // item run is decoded, lose it and the ack never fires.
+        let _lock = plane_serial();
+        let _guard = PlaneGuard::with(
+            JoinPlanes { channels: false, replication: true, sync: false },
+            ChannelOpenMode::Off,
+        );
         let cfg = JoinConfig {
             user_id: 1,
             user_name: None,
@@ -2793,6 +2806,11 @@ mod tests {
         let whole = frame(&body);
 
         let mut flow = AppFlow::new(cfg, 0);
+        assert_eq!(
+            flow.planes,
+            JoinPlanes { channels: false, replication: true, sync: false },
+            "the flow must capture the plane switches this test set"
+        );
         flow.note_opened(APP, 1, 7);
         let actions = flow.on_stream_data(7, &whole);
         assert_eq!(actions.len(), 1, "one marker item, one ack");
