@@ -133,6 +133,13 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
             // Enable winit's IME so the soft keyboard / Gboard can
             // commit text (and paste) into egui text fields on Android.
             ime_enabled: true,
+            // Never render faster than the panel can present: uncapped
+            // rendering just burns GPU/CPU (and heats the phone until the
+            // SoC thermal-throttles, which reads as worsening lag).
+            present_mode: bevy::window::PresentMode::AutoVsync,
+            // Two frames in flight instead of the default three: less
+            // queued GPU work and lower input latency on mobile GPUs.
+            desired_maximum_frame_latency: std::num::NonZeroU32::new(2),
             ..default()
         }),
         ..default()
@@ -149,6 +156,16 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
         ..default()
     }));
     bevy_app.add_plugins(EguiPlugin::default());
+    // When the app is backgrounded/unfocused, drop to a reactive
+    // low-power loop instead of rendering at full rate into a surface
+    // nobody sees. Focused mode stays continuous (the editor polls
+    // background channels from the UI pass and animates the viewport).
+    bevy_app.insert_resource(bevy::winit::WinitSettings {
+        focused_mode: bevy::winit::UpdateMode::Continuous,
+        unfocused_mode: bevy::winit::UpdateMode::reactive_low_power(
+            std::time::Duration::from_secs(30),
+        ),
+    });
     // Register the custom flat-colour material (bypasses StandardMaterial,
     // which renders magenta on this device's Adreno GPU).
     bevy_app.add_plugins(bevy_render::FlatMaterialPlugin);

@@ -835,7 +835,12 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
             dom.get_by_ref(*referent).filter(|child| is_gui_object(&child.class) && visible(child)).map(|_| *referent)
         }).collect();
         groups.sort_by(|left, right| {
-            let a = dom.get_by_ref(*left).unwrap(); let b = dom.get_by_ref(*right).unwrap();
+            // No unwrap: a referent can be destroyed between collecting
+            // and sorting, and panicking inside a sort comparator on
+            // the UI thread crashes the whole app.
+            let (Some(a), Some(b)) = (dom.get_by_ref(*left), dom.get_by_ref(*right)) else {
+                return std::cmp::Ordering::Equal;
+            };
             if sort_order == 1 {
                 enum_value(a.properties.get(&rbx_dom_weak::ustr("LayoutOrder")), 0)
                     .cmp(&enum_value(b.properties.get(&rbx_dom_weak::ustr("LayoutOrder")), 0))
@@ -848,7 +853,9 @@ fn collect(dom: &WeakDom, painter: &egui::Painter, referent: Ref,
                 dom.get_by_ref(*referent).filter(|child| is_gui_object(&child.class) && visible(child)).map(|_| *referent)
             }).collect();
             cells.sort_by(|left, right| {
-                let a = dom.get_by_ref(*left).unwrap(); let b = dom.get_by_ref(*right).unwrap();
+                let (Some(a), Some(b)) = (dom.get_by_ref(*left), dom.get_by_ref(*right)) else {
+                    return std::cmp::Ordering::Equal;
+                };
                 if sort_order == 1 {
                     enum_value(a.properties.get(&rbx_dom_weak::ustr("LayoutOrder")), 0)
                         .cmp(&enum_value(b.properties.get(&rbx_dom_weak::ustr("LayoutOrder")), 0))

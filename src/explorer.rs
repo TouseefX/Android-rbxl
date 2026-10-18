@@ -1,6 +1,7 @@
 use bevy_egui::egui;
 use bevy_egui::egui::{CollapsingHeader, Color32, Ui};
 use rbx_dom_weak::{types::Ref, WeakDom};
+use std::collections::HashSet;
 
 /// One user interaction with the Explorer tree. The tree only borrows the DOM
 /// immutably while rendering; the caller applies these afterwards (selection
@@ -32,37 +33,53 @@ pub fn show_tree_filtered(
     }
 
     let filter_lower = filter.trim().to_lowercase();
-    if !filter_lower.is_empty() && !matches_filter(dom, root, &filter_lower) {
-        return actions;
-    }
+    // Performance: the previous implementation re-ran a recursive
+    // `matches_filter` subtree scan (with fresh `to_lowercase()`
+    // allocations for every name/class) for *every node, every frame*.
+    // On a large place that is O(n^2) string allocations per frame while
+    // a filter is typed. Instead compute the visible set (matches plus
+    // their ancestors) once per frame in a single iterative post-order
+    // pass: O(n), and O(1) membership tests while rendering. The
+    // explicit stack also removes recursion-depth overflow risk.
+    let visible: Option<HashSet<Ref>> = if filter_lower.is_empty() {
+        None
+    } else {
+        let mut visible = HashSet::new();
+        let mut stack: Vec<(Ref, bool)> = vec![(root, false)];
+        while let Some((r, expanded)) = stack.pop() {
+            let Some(inst) = dom.get_by_ref(r) else { continue };
+            if !expanded {
+                stack.push((r, true));
+                for child in inst.children() {
+                    stack.push((*child, false));
+                }
+            } else if inst.name.to_lowercase().contains(&filter_lower)
+                || inst.class.to_lowercase().contains(&filter_lower)
+                || inst.children().iter().any(|c| visible.contains(c))
+            {
+                visible.insert(r);
+            }
+        }
+        if !visible.contains(&root) {
+            return actions;
+        }
+        Some(visible)
+    };
+    // `multi` was a slice scanned linearly for every rendered row.
+    let multi_set: HashSet<Ref> = multi.iter().copied().collect();
 
     render_node(
         ui,
         dom,
         root,
         selected,
-        multi,
+        &multi_set,
         multi_mode,
         drag_mode,
-        &filter_lower,
+        visible.as_ref(),
         &mut actions,
     );
     actions
-}
-
-fn matches_filter(dom: &WeakDom, r: Ref, query: &str) -> bool {
-    let Some(inst) = dom.get_by_ref(r) else {
-        return false;
-    };
-    if inst.name.to_lowercase().contains(query) || inst.class.to_lowercase().contains(query) {
-        return true;
-    }
-    for child in inst.children() {
-        if matches_filter(dom, *child, query) {
-            return true;
-        }
-    }
-    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -71,10 +88,10 @@ fn render_node(
     dom: &WeakDom,
     root: Ref,
     selected: Option<Ref>,
-    multi: &[Ref],
+    multi: &HashSet<Ref>,
     multi_mode: bool,
     drag_mode: bool,
-    filter: &str,
+    visible: Option<&HashSet<Ref>>,
     actions: &mut Vec<TreeAction>,
 ) {
     let Some(inst) = dom.get_by_ref(root) else {
@@ -105,17 +122,17 @@ fn render_node(
         }
         resp
     } else {
-        let is_open_default = !filter.is_empty() || root == dom.root_ref();
+        let is_open_default = visible.is_some() || root == dom.root_ref();
 
         let header = CollapsingHeader::new(text)
             .id_salt(root)
             .default_open(is_open_default)
             .show(ui, |ui| {
                 for child in inst.children() {
-                    if filter.is_empty() || matches_filter(dom, *child, filter) {
+                    if visible.map_or(true, |v| v.contains(child)) {
                         render_node(
                             ui, dom, *child, selected, multi, multi_mode, drag_mode,
-                            filter, actions,
+                            visible, actions,
                         );
                     }
                 }
