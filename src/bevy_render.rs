@@ -1811,7 +1811,7 @@ pub fn rebuild_scene(
             ck[2] as f32 / 255.0,
             alpha,
         ).to_linear();
-        let (texture, has_texture) = match &tex_key {
+        let (texture, has_texture) = match tex_key {
             Some(k) => match tex_cache.get(k) {
                 Some(h) => (Some(h.clone()), 1),
                 None => (None, 0),
