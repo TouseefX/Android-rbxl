@@ -52,18 +52,62 @@ fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::new()))
 }
 
+/// Poison-tolerant lock: a single panicking download thread must not
+/// take down every subsequent frame via `lock().unwrap()`.
+fn lock_state() -> std::sync::MutexGuard<'static, State> {
+    state().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Hard cap on cached thumbnails (each holds a GPU texture). The map
+/// previously grew forever while browsing the catalog/toolbox.
+const MAX_ENTRIES: usize = 256;
+
+fn evict_overflow(st: &mut State) {
+    while st.entries.len() > MAX_ENTRIES {
+        // Prefer evicting finished entries; never evict a download in
+        // flight if a completed one can go instead.
+        let victim = st
+            .entries
+            .iter()
+            .find(|(_, e)| !matches!(e, Entry::Pending))
+            .map(|(k, _)| k.clone())
+            .or_else(|| st.entries.keys().next().cloned());
+        let Some(victim) = victim else { break };
+        st.entries.remove(&victim);
+    }
+}
+
+/// One shared blocking client for all thumbnail fetches. Building a
+/// fresh `reqwest::blocking::Client` (new connection pool + TLS config)
+/// for *every thumbnail* was a major catalog-scroll cost.
+fn http_client() -> Option<&'static reqwest::blocking::Client> {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    // `get_or_try_init` is unstable; build outside and race-set instead.
+    if let Some(c) = CLIENT.get() {
+        return Some(c);
+    }
+    let built = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("rbxl-editor")
+        .build()
+        .ok()?;
+    let _ = CLIENT.set(built);
+    CLIENT.get()
+}
+
 /// Ask the cache to fetch `url` if it hasn't already. Safe to call every
 /// frame; subsequent calls are no-ops once the download is queued.
 pub fn prefetch(url: impl Into<String>) {
     let url = url.into();
-    let mut st = state().lock().unwrap();
+    let mut st = lock_state();
     use std::collections::hash_map::Entry as E;
     if let E::Vacant(v) = st.entries.entry(url.clone()) {
         v.insert(Entry::Pending);
+        evict_overflow(&mut st);
         drop(st);
         std::thread::spawn(move || {
             let bytes = fetch_bytes(&url);
-            let _ = state().lock().unwrap().from_main.send((url, bytes));
+            let _ = lock_state().from_main.send((url, bytes));
         });
     }
 }
@@ -71,7 +115,7 @@ pub fn prefetch(url: impl Into<String>) {
 /// Drain any background completions, building textures for successful
 /// downloads via the egui context. Call once per frame.
 pub fn pump(ctx: &egui::Context) {
-    let mut st = state().lock().unwrap();
+    let mut st = lock_state();
     while let Ok((url, bytes)) = st.to_main.try_recv() {
         let entry = match bytes.as_deref().and_then(decode_rgba) {
             Some((w, h, rgba)) => {
@@ -87,6 +131,7 @@ pub fn pump(ctx: &egui::Context) {
         };
         st.entries.insert(url, entry);
     }
+    evict_overflow(&mut st);
 }
 
 /// Returns the texture handle for `url` if it's ready, and triggers a
@@ -97,7 +142,7 @@ pub fn get_or_load(ctx: &egui::Context, url: &str) -> Option<TextureHandle> {
     // If the entry became ready this frame, pump now so the first caller
     // also gets the image without waiting another frame.
     pump(ctx);
-    let st = state().lock().unwrap();
+    let st = lock_state();
     match st.entries.get(url) {
         Some(Entry::Ready(t)) => Some(t.clone()),
         _ => None,
@@ -112,12 +157,7 @@ fn decode_rgba(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
 }
 
 fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("rbxl-editor")
-        .build()
-        .ok()?;
-    let resp = client.get(url).send().ok()?;
+    let resp = http_client()?.get(url).send().ok()?;
     if !resp.status().is_success() {
         return None;
     }

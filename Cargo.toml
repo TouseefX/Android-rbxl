@@ -129,6 +129,9 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 debug = false
+# Release builds are shipped, never resumed incrementally; disabling
+# incremental compilation avoids stale-incremental bloat/corruption.
+incremental = false
 # Command-bar Luau runs are isolated with catch_unwind so a malformed script or
 # VM edge case reports an editor error instead of terminating the Android app.
 panic = "unwind"

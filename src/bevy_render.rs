@@ -204,8 +204,12 @@ pub fn spawn_sky_dome(
 ) {
     // Keep the dome just inside the far plane. A 500-metre dome occluded large
     // Roblox maps after adopting the real 0.28 m/stud scale.
+    // A gradient dome needs almost no tessellation: ico(2) is 320 faces.
+    // ico(8) subdivided to ~5M triangles that the GPU re-vertex-shaded
+    // every frame for a smooth two-colour gradient — pure fill/vertex
+    // waste and a steady frame-rate tax even in a trivial scene.
     let dome = Mesh::from(
-        bevy::math::primitives::Sphere::new(25_000.0).mesh().ico(8).unwrap(),
+        bevy::math::primitives::Sphere::new(25_000.0).mesh().ico(2).unwrap(),
     );
     let mesh_handle = meshes.add(dome);
     // Same sRGB-as-linear bug as FlatMaterial's color, applied to the sky
@@ -854,7 +858,7 @@ fn extract_part(dom: &WeakDom, inst: &rbx_dom_weak::Instance, referent: rbx_dom_
 
     // Mesh part
     if let Some(ref mid) = mesh_id {
-        if let Some(md) = load_mesh_local(mid) {
+        if let Some(md) = load_mesh_shared(mid) {
             let bx = (md.aabb_max[0] - md.aabb_min[0]).max(0.01);
             let by = (md.aabb_max[1] - md.aabb_min[1]).max(0.01);
             let bz = (md.aabb_max[2] - md.aabb_min[2]).max(0.01);
@@ -1344,6 +1348,32 @@ fn load_image_rgba(id: &str) -> Option<(u32, u32, Vec<u8>)> {
     Some((w, h, rgba.into_raw()))
 }
 
+/// Shared, memoized mesh lookup. `load_mesh_local` deep-clones the
+/// whole vertex/face arrays out of the asset cache, and a place may
+/// contain hundreds of MeshParts referencing the *same* mesh — so each
+/// rebuild used to re-clone (and the caller re-walk) identical geometry
+/// per instance. Meshes are immutable once parsed, so share them via
+/// `Rc` for the duration of the process (bounded, like the asset
+/// caches, so it cannot grow without limit).
+fn load_mesh_shared(id_or_path: &str) -> Option<std::rc::Rc<MeshData>> {
+    thread_local! {
+        static SHARED_MESHES: std::cell::RefCell<HashMap<String, std::rc::Rc<MeshData>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    if let Some(hit) = SHARED_MESHES.with(|c| c.borrow().get(id_or_path).cloned()) {
+        return Some(hit);
+    }
+    let mesh = std::rc::Rc::new(load_mesh_local(id_or_path)?);
+    SHARED_MESHES.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(id_or_path.to_string(), mesh.clone());
+    });
+    Some(mesh)
+}
+
 fn load_mesh_local(id_or_path: &str) -> Option<MeshData> {
     // Check the shared asset cache FIRST. This is what `fetch_and_cache_mesh_async`
     // (the "Download & Cache All Place Assets" button) actually populates, and it
@@ -1635,16 +1665,21 @@ pub fn rebuild_scene(
             }
         }
     }
-    for (k, (w, h, rgba)) in &texture_ids {
+    // Consume the decoded textures: the old code cloned every texture's
+    // full RGBA buffer into the Bevy Image, so a place with several
+    // 1024x1024 textures held two copies of each (8+ MB apiece) through
+    // the whole rebuild -- peak-memory pressure that could OOM-kill the
+    // app on Android while opening large places.
+    for (k, (w, h, rgba)) in texture_ids {
         texture_has_alpha.insert(k.clone(), rgba.chunks_exact(4).any(|pixel| pixel[3] < 255));
         let bevy_img = Image::new(
-            Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+            Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             TextureDimension::D2,
-            rgba.clone(),
+            rgba,
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         );
-        tex_cache.insert(k.clone(), images.add(bevy_img));
+        tex_cache.insert(k, images.add(bevy_img));
     }
 
     // Bucket by (color, alpha, texture_key) so each unique look gets one
@@ -1665,35 +1700,55 @@ pub fn rebuild_scene(
     // transparent *entities*, not triangles inside a merged mesh; merging all
     // glass with the same color made distant panes draw over nearby panes.
     // Opaque surfaces remain aggressively batched for Android performance.
-    type Key = ([u8; 3], u8, Option<String>, bool, u32, Option<usize>);
+    // Texture keys are interned to small integer ids before bucketing.
+    // The old key carried `Option<String>`, so bucketing cloned the
+    // texture URI string once *per vertex* (millions of heap allocations
+    // on a large place) and then cloned every `Tri` again into its
+    // bucket. Now each key is resolved once, and the `Tri`s are moved
+    // out of `parts` (which is not needed after this point) instead of
+    // cloned.
+    let mut tex_intern: HashMap<String, u32> = HashMap::new();
+    let mut tex_keys: Vec<String> = Vec::new();
+    type Key = ([u8; 3], u8, Option<u32>, bool, u32, Option<usize>);
     let mut buckets: BTreeMap<Key, Vec<Tri>> = BTreeMap::new();
-    for (part_index, p) in parts.iter().enumerate() {
-        for t in &p.tris {
+    let total_parts = parts.len();
+    for (part_index, p) in parts.into_iter().enumerate() {
+        let part_alpha = p.alpha;
+        let part_color = p.color;
+        for t in p.tris {
             if t.hide_without_texture
                 && t.tex.as_ref().map_or(true, |key| !tex_cache.contains_key(key))
             {
                 continue;
             }
-            let surface_color = t.color_override.unwrap_or(p.color);
+            let surface_color = t.color_override.unwrap_or(part_color);
             let ck = [
                 (surface_color[0] * 255.0).round() as u8,
                 (surface_color[1] * 255.0).round() as u8,
                 (surface_color[2] * 255.0).round() as u8,
             ];
-            let ak = (p.alpha * t.opacity * 255.0).round() as u8;
+            let ak = (part_alpha * t.opacity * 255.0).round() as u8;
             if ak > 0 {
                 let image_alpha = t.tex.as_ref()
                     .and_then(|key| texture_has_alpha.get(key))
                     .copied().unwrap_or(false);
                 let uses_texture_alpha = t.texture_mode == 0;
                 let sort_part = (ak < 255 || (image_alpha && uses_texture_alpha)).then_some(part_index);
-                buckets.entry((ck, ak, t.tex.clone(), t.tint, t.texture_mode, sort_part)).or_default().push(t.clone());
+                let tex_id = t.tex.as_ref().map(|key| {
+                    let next = tex_keys.len() as u32;
+                    *tex_intern.entry(key.clone()).or_insert_with(|| {
+                        tex_keys.push(key.clone());
+                        next
+                    })
+                });
+                buckets.entry((ck, ak, tex_id, t.tint, t.texture_mode, sort_part)).or_default().push(t);
             }
         }
     }
     let draw_call_count = buckets.len();
 
-    for ((ck, ak, tex_key, tint, texture_mode, sort_part), tris) in buckets {
+    for ((ck, ak, tex_id, tint, texture_mode, sort_part), tris) in buckets {
+        let tex_key: Option<&String> = tex_id.map(|id| &tex_keys[id as usize]);
         // Put each transparent entity's origin at its geometric center so
         // Bevy's back-to-front phase has a meaningful distance to sort. Opaque
         // merged buckets stay in world space at the origin.
@@ -1709,10 +1764,10 @@ pub fn rebuild_scene(
         } else {
             [0.0; 3]
         };
-        let mut positions = Vec::new();
-        let mut normals = Vec::new();
-        let mut colors = Vec::new();
-        let mut uvs = Vec::new();
+        let mut positions = Vec::with_capacity(tris.len());
+        let mut normals = Vec::with_capacity(tris.len());
+        let mut colors = Vec::with_capacity(tris.len());
+        let mut uvs = Vec::with_capacity(tris.len());
         let mut indices = Vec::with_capacity(tris.len());
         for (idx, t) in tris.iter().enumerate() {
             positions.push([
@@ -1757,7 +1812,7 @@ pub fn rebuild_scene(
             ck[2] as f32 / 255.0,
             alpha,
         ).to_linear();
-        let (texture, has_texture) = match &tex_key {
+        let (texture, has_texture) = match tex_key {
             Some(k) => match tex_cache.get(k) {
                 Some(h) => (Some(h.clone()), 1),
                 None => (None, 0),
@@ -1779,7 +1834,7 @@ pub fn rebuild_scene(
             texture_mode,
             transparent: alpha < 0.999
                 || (texture_mode == 0
-                    && tex_key.as_ref().and_then(|key| texture_has_alpha.get(key)).copied().unwrap_or(false)),
+                    && tex_key.and_then(|key| texture_has_alpha.get(key)).copied().unwrap_or(false)),
             // Was a flat `1.0` for every material. That pushes ALL surfaces
             // toward the camera by the same amount, so two coincident/
             // overlapping parts (a decal-carrying part stacked directly on
@@ -1804,7 +1859,7 @@ pub fn rebuild_scene(
         });
     }
 
-    log::info!("Bevy: rendered {} parts, {} draw calls", parts.len(), draw_call_count);
+    log::info!("Bevy: rendered {} parts, {} draw calls", total_parts, draw_call_count);
 }
 
 /// Keep the viewport camera in sync with the `OrbitCam` resource each frame.

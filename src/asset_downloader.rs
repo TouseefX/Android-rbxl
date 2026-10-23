@@ -59,9 +59,30 @@ pub fn get_cached_raw(id: &str) -> Option<Vec<u8>> {
     raw_cache().lock().ok()?.get(id).cloned()
 }
 
+/// The asset caches were previously unbounded: every mesh, decoded
+/// texture and raw download stayed resident for the life of the
+/// process, so opening/downloading a few large places grew memory
+/// until Android's low-memory killer took the app down. These caps
+/// keep the working set bounded; eviction is arbitrary-order, which
+/// is fine for a cache (worst case an asset is re-fetched).
+const MAX_CACHED_MESHES: usize = 128;
+const MAX_CACHED_IMAGES: usize = 256;
+const MAX_CACHED_RAW: usize = 64;
+
+fn evict_down_to<K, V>(cache: &mut HashMap<K, V>, cap: usize)
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    while cache.len() > cap {
+        let Some(key) = cache.keys().next().cloned() else { break };
+        cache.remove(&key);
+    }
+}
+
 pub fn store_cached_raw(id: String, bytes: Vec<u8>) {
     if let Ok(mut c) = raw_cache().lock() {
         c.insert(id, bytes);
+        evict_down_to(&mut c, MAX_CACHED_RAW);
     }
 }
 
@@ -337,6 +358,7 @@ pub fn get_cached_mesh(mesh_id: &str) -> Option<MeshData> {
 pub fn store_cached_mesh(mesh_id: String, mesh: MeshData) {
     if let Ok(mut cache) = mesh_cache().lock() {
         cache.insert(mesh_id, mesh);
+        evict_down_to(&mut cache, MAX_CACHED_MESHES);
     }
 }
 
@@ -426,6 +448,7 @@ pub fn get_cached_image(image_id: &str) -> Option<Arc<DecodedImage>> {
 pub fn store_cached_image(image_id: String, img: Arc<DecodedImage>) {
     if let Ok(mut cache) = image_cache().lock() {
         cache.insert(image_id, img);
+        evict_down_to(&mut cache, MAX_CACHED_IMAGES);
     }
 }
 
