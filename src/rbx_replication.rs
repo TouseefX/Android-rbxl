@@ -513,10 +513,10 @@ pub struct SnapshotEnvelope {
 }
 
 /// Capture magics: Crossroads, Brookhaven, and the 0.744 client (`50 d3`).
-/// The parser no longer requires a match: the pair rotates per client build
-/// (Boblox 2026-10-26: 0.744.0.7441076 uses `50 d3`) and the rest of the
-/// codec-magic frame is what actually identifies it.
-#[allow(dead_code)]
+/// Known pairs take the codec-magic path even when a tiny LE length frame
+/// would also fit (compressed < 64KiB zeroes bytes 3-4). Unknown pairs still
+/// parse as codec-magic when the length layouts are not self-consistent, so a
+/// new client build is not stuck at join-start.
 const SNAPSHOT_CODEC_MAGICS: [[u8; 2]; 4] =
     [[0xA3, 0xCF], [0x31, 0x8B], [0x93, 0xD2], [0x50, 0xD3]];
 
@@ -529,23 +529,28 @@ pub fn parse_snapshot_envelope(body: &[u8]) -> Result<SnapshotEnvelope, String> 
         return Err(format!("expected snapshot tag 0x{SNAPSHOT_TAG:02x}, found 0x{tag:02x}"));
     }
     // Shape 1: magic, two zero bytes, u32 LE size, then the frame to the end.
-    // Accept any two-byte magic: refusing unknown pairs (the previous
-    // whitelist) left 0.744 sessions stuck at join-start(0x81) because the
-    // schema frame was counted unparsed.
+    // A little-endian length frame with compressed size < 64KiB has the same
+    // two zero bytes, so only a known magic — or an unknown magic that is not
+    // also a self-consistent length frame — takes this path.
     if body.len() >= 13 {
         let magic = [body[1], body[2]];
         if body[3] == 0
             && body[4] == 0
             && starts_with_zstd_magic(&body[9..])
         {
-            let size = u32::from_le_bytes([body[5], body[6], body[7], body[8]]);
-            let inner = decompress_frame(&body[9..], size, "0x97 snapshot")?;
-            return Ok(SnapshotEnvelope {
-                framing: SnapshotFraming::CodecMagic,
-                codec_magic: Some(magic),
-                uncompressed_size: size,
-                inner,
-            });
+            let known = SNAPSHOT_CODEC_MAGICS.contains(&magic);
+            let length_fits = length_frame_layout_ok(&body[1..], true)
+                || length_frame_layout_ok(&body[1..], false);
+            if known || !length_fits {
+                let size = u32::from_le_bytes([body[5], body[6], body[7], body[8]]);
+                let inner = decompress_frame(&body[9..], size, "0x97 snapshot")?;
+                return Ok(SnapshotEnvelope {
+                    framing: SnapshotFraming::CodecMagic,
+                    codec_magic: Some(magic),
+                    uncompressed_size: size,
+                    inner,
+                });
+            }
         }
     }
     // Shapes 2 and 3: two lengths then the frame. The order that yields a
@@ -572,6 +577,24 @@ pub fn parse_snapshot_envelope(body: &[u8]) -> Result<SnapshotEnvelope, String> 
         body.len(),
         errors.join(" | ")
     ))
+}
+
+/// Whether a length-prefixed frame would consume a zstd payload of exactly the
+/// advertised compressed size. Used to keep tiny LE/BE envelopes from being
+/// claimed as codec-magic.
+fn length_frame_layout_ok(rest: &[u8], big_endian: bool) -> bool {
+    if rest.len() < 8 {
+        return false;
+    }
+    let compressed = if big_endian {
+        u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]])
+    } else {
+        u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]])
+    };
+    let Some(end) = 8usize.checked_add(compressed as usize) else {
+        return false;
+    };
+    end == rest.len() && starts_with_zstd_magic(&rest[8..])
 }
 
 fn parse_length_frame(rest: &[u8], big_endian: bool) -> Result<(u32, Vec<u8>), String> {
