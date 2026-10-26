@@ -75,12 +75,14 @@ class MainActivity : GameActivity() {
     private var activeProjectRoot: File? = null
     private val projectModifiedTimes = HashMap<String, Long>()
     private var nativeEditorDialog: Dialog? = null
+    @Volatile
     private var nativeEditorScriptId: Long = -1
     /** Native editor line-wrap preference; off keeps code on one visual line. */
     private var nativeEditorWordWrap: Boolean = false
 
     /** The script editor and its language, non-null only while one is open. */
     private var soraEditorView: CodeEditor? = null
+    @Volatile
     private var soraLanguage: LuauLanguage? = null
     private var nativeSignatureHelpView: TextView? = null
 
@@ -516,6 +518,10 @@ class MainActivity : GameActivity() {
             // updateNativeCompletions -> deliverCompletions.
             nativeOnNativeEditorChanged(id, text, cursor, cursor)
         }
+        // Publish before setText/setEditorLanguage: those can kick the
+        // completion worker, which answers on this language instance.
+        soraLanguage = language
+        nativeEditorScriptId = scriptId
 
         // Tabs already stored in the script become spaces so on-screen
         // columns match what the indent logic produces.
@@ -738,14 +744,14 @@ class MainActivity : GameActivity() {
     }
 
     fun updateNativeCompletions(scriptId: Long, json: String) {
-        runOnUiThread {
-            // Hand straight to the language, which unparks the worker blocked
-            // in requireAutoComplete. Sora owns the popup, so there is no
-            // ListPopupWindow to build, position or dismiss here.
-            val language = soraLanguage ?: return@runOnUiThread
-            if (nativeEditorScriptId != scriptId) return@runOnUiThread
-            language.deliverCompletions(json)
-        }
+        // Must not hop to the UI thread: requireAutoComplete is blocked on
+        // Sora's worker waiting for this offer, and a posted Runnable can
+        // easily miss the 250 ms poll — especially when the Bevy surface is
+        // unfocused behind this dialog. deliverCompletions only parses JSON
+        // and offers onto a blocking queue, which is thread-safe.
+        val language = soraLanguage ?: return
+        if (nativeEditorScriptId != scriptId) return
+        language.deliverCompletions(json)
     }
 
     fun updateNativeSignatureHelp(scriptId: Long, json: String) {

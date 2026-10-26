@@ -16,8 +16,9 @@
 //!   non-cacheable instances), which the analysis shows being copied rather
 //!   than framed, so this parser *tries* the length pair and falls back to
 //!   lossless pass-through instead of picking a side.
-//! * `0x83 <item>` delta chains — spawns, event invocations, property updates,
-//!   referent lists, clock ticks and nested batches.
+//! * `0x83 <item>` delta chains — spawns, event invocations, property updates
+//!   (`0x03` continues when the 0x97 schema names the tag), `0x0B`/`0x25`
+//!   zstd entry batches, referent lists, clock ticks and nested batches.
 //!
 //! The snapshot body grammar (schema dictionary, then per-instance records whose
 //! property loop is `([u8 member index][value])* [0xFF]`) and the item grammars
@@ -511,8 +512,13 @@ pub struct SnapshotEnvelope {
     pub inner: Vec<u8>,
 }
 
-/// Capture magics: Crossroads and the Brookhaven builds.
-const SNAPSHOT_CODEC_MAGICS: [[u8; 2]; 3] = [[0xA3, 0xCF], [0x31, 0x8B], [0x93, 0xD2]];
+/// Capture magics: Crossroads, Brookhaven, and the 0.744 client (`50 d3`).
+/// The parser no longer requires a match: the pair rotates per client build
+/// (Boblox 2026-10-26: 0.744.0.7441076 uses `50 d3`) and the rest of the
+/// codec-magic frame is what actually identifies it.
+#[allow(dead_code)]
+const SNAPSHOT_CODEC_MAGICS: [[u8; 2]; 4] =
+    [[0xA3, 0xCF], [0x31, 0x8B], [0x93, 0xD2], [0x50, 0xD3]];
 
 /// Decompress a `0x97` body into the schema/snapshot inner buffer.
 pub fn parse_snapshot_envelope(body: &[u8]) -> Result<SnapshotEnvelope, String> {
@@ -523,10 +529,12 @@ pub fn parse_snapshot_envelope(body: &[u8]) -> Result<SnapshotEnvelope, String> 
         return Err(format!("expected snapshot tag 0x{SNAPSHOT_TAG:02x}, found 0x{tag:02x}"));
     }
     // Shape 1: magic, two zero bytes, u32 LE size, then the frame to the end.
+    // Accept any two-byte magic: refusing unknown pairs (the previous
+    // whitelist) left 0.744 sessions stuck at join-start(0x81) because the
+    // schema frame was counted unparsed.
     if body.len() >= 13 {
         let magic = [body[1], body[2]];
-        if SNAPSHOT_CODEC_MAGICS.iter().any(|known| *known == magic)
-            && body[3] == 0
+        if body[3] == 0
             && body[4] == 0
             && starts_with_zstd_magic(&body[9..])
         {
@@ -873,6 +881,45 @@ impl JoinSchema {
             offset += count;
         }
         None
+    }
+
+    /// Value tag for a global 0x03 property id.
+    ///
+    /// Boblox `propTagsForSchema`: the native runtime table is the 0x97
+    /// class/member concatenation in schema order, plus a sentinel entry at
+    /// the member-count bound whose wire tag is 25. Solver-proven live-wire
+    /// overrides are applied by (class, member) name so insertions that shift
+    /// later ids still land on the right shape.
+    pub fn prop_tag(&self, id: u16) -> Option<u8> {
+        self.prop_tag_table().get(usize::from(id)).map(|entry| entry.tag)
+    }
+
+    /// Concatenated member tags plus the sentinel 25. Built once per chain
+    /// walk so 0x03 items can continue instead of pinning the stop point.
+    fn prop_tag_table(&self) -> Vec<PropTagEntry> {
+        let mut tags: Vec<PropTagEntry> = self
+            .classes
+            .iter()
+            .flat_map(|class| {
+                class.members.iter().map(|member| {
+                    let mut entry = PropTagEntry {
+                        tag: member.tag,
+                        prefix: matches!(member.tag, 33 | 61),
+                        fixed_len: 0,
+                        alt_len: 0,
+                    };
+                    if let Some(over) = prop_override(&class.name, &member.name) {
+                        entry.tag = over.tag;
+                        entry.prefix = over.prefix;
+                        entry.fixed_len = over.fixed_len;
+                        entry.alt_len = over.alt_len;
+                    }
+                    entry
+                })
+            })
+            .collect();
+        tags.push(PropTagEntry { tag: 25, prefix: false, fixed_len: 0, alt_len: 0 });
+        tags
     }
 
     /// The distinct property names in the dictionary, in first-appearance order.
@@ -1517,13 +1564,28 @@ pub struct EventInvocation {
 }
 
 /// One `0x03` property update. The id it carries indexes the replicator's
-/// runtime property table rather than a class's member list, so the value's tag
-/// is only known when a caller supplies that table.
+/// runtime property table rather than a class's member list. When a schema is
+/// present that table is the class/member concatenation, so the value can be
+/// measured and the chain can continue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyUpdate {
     pub entity: Option<u32>,
     pub property: u16,
+    /// Schema-derived (or sentinel) value tag, when the walk could name one.
+    pub tag: Option<u8>,
     pub raw: Vec<u8>,
+}
+
+/// A `0x0B` / `0x25` N-entry zstd batch (Boblox 2026-10-26: IDA sub_65C578A /
+/// sub_65C83BE). N==0 is a native null-drop; N!=0 inflates N
+/// `[guid][u16 class][prop loop][guid]` entries.
+#[derive(Clone, Debug, Default)]
+pub struct JoinBatchItem {
+    pub kind: u8,
+    pub n: u32,
+    pub dropped: bool,
+    pub unparsed: bool,
+    pub records: Vec<JoinRecord>,
 }
 
 /// The counted record run inside the `0x0d` item.
@@ -1549,6 +1611,7 @@ pub enum ChainItem {
     Event(EventInvocation),
     Property(PropertyUpdate),
     Batch(JoinDataItem),
+    JoinBatch(JoinBatchItem),
     Clock { value: u32 },
     Word { kind: u8, value: u32 },
     GuidPair { first: (u64, Option<u32>), second: (u64, Option<u32>) },
@@ -1571,6 +1634,7 @@ impl ChainItem {
             Self::Property(_) => 0x03,
             Self::Word { kind, .. } => *kind,
             Self::Event(_) => 0x07,
+            Self::JoinBatch(item) => item.kind,
             Self::Entries(_) => 0x0d,
             Self::Batch(_) => JOIN_DATA_SUBCODE,
             Self::GuidList(_) => 0x1b,
@@ -1689,6 +1753,254 @@ pub fn parse_event_item(data: &[u8], schema: &JoinSchema) -> Result<(EventInvoca
     ))
 }
 
+/// `[u8 flag]([3 x u32] iff flag != 0, else [3 x u8])` — IDA sub_3617A08.
+fn read_triplet(reader: &mut Reader<'_>, what: &str) -> Result<(), String> {
+    let flag = reader.read_u8(what)?;
+    if flag != 0 {
+        reader.take(12, what)?;
+    } else {
+        reader.take(3, what)?;
+    }
+    Ok(())
+}
+
+/// 0x0d / 0x25 element run: continue while `flags & 8`.
+fn skip_flag_elements(reader: &mut Reader<'_>, what: &str) -> Result<(), String> {
+    loop {
+        let flags = reader.read_u8(what)?;
+        if flags & 0xF7 == 0 {
+            let wide = reader.read_u8(&format!("{what} wide"))?;
+            reader.take(if wide != 0 { 12 } else { 3 }, &format!("{what} value"))?;
+        }
+        if flags & 8 == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// `0x0B`/`0x25` N-entry zstd batch. Schema is optional: without one the
+/// payload is consumed and flagged unparsed so the chain can continue.
+fn parse_entry_batch(
+    reader: &mut Reader<'_>,
+    schema: Option<&JoinSchema>,
+    tag_rules: bool,
+) -> Result<JoinBatchItem, String> {
+    let n = reader.read_u32_le("entry batch N")?;
+    let mut item = JoinBatchItem {
+        kind: 0x0B,
+        n,
+        dropped: n == 0,
+        unparsed: false,
+        records: Vec::new(),
+    };
+    if n == 0 {
+        return Ok(item);
+    }
+    if n > 1_000_000 {
+        return Err(format!("entry batch N={n} exceeds the 1_000_000 cap"));
+    }
+    let compressed = reader.read_u32_le("entry batch compressed")?;
+    let uncompressed = reader.read_u32_le("entry batch decompressed")?;
+    let len = usize::try_from(compressed).map_err(|_| "entry batch length overflows".to_string())?;
+    let frame = reader.take(len, "entry batch zstd")?.to_vec();
+    if !starts_with_zstd_magic(&frame) {
+        return Err("entry batch has no Zstandard magic".to_string());
+    }
+    let inner = decompress_frame(&frame, uncompressed, "entry batch")?;
+    let Some(schema) = schema else {
+        item.unparsed = true;
+        return Ok(item);
+    };
+    let mut inner_reader = Reader::new(&inner);
+    let count = usize::try_from(n).map_err(|_| "entry batch N overflows".to_string())?;
+    item.records.reserve(count);
+    for _ in 0..count {
+        let (reference_lo, id) = read_guid(&mut inner_reader, "batch ref1")?;
+        let class = inner_reader.read_u16_le("batch class")?;
+        if schema.class(class).is_none() {
+            return Err(format!(
+                "batch class {class} is outside the schema's {} class(es)",
+                schema.classes.len()
+            ));
+        }
+        let mut properties = Vec::new();
+        read_property_loop(&mut inner_reader, schema, class, false, &mut properties)?;
+        let (parent_lo, parent) = read_guid(&mut inner_reader, "batch ref2")?;
+        if tag_rules {
+            inner_reader.read_u8("batch tag extra")?;
+        }
+        item.records.push(JoinRecord {
+            reference_lo,
+            id,
+            class,
+            properties,
+            parent_lo,
+            parent,
+            consumed: inner_reader.position(),
+        });
+    }
+    Ok(item)
+}
+
+/// One slot in the schema-derived 0x03 property table.
+#[derive(Clone, Copy, Debug)]
+struct PropTagEntry {
+    tag: u8,
+    prefix: bool,
+    fixed_len: u16,
+    alt_len: u16,
+}
+
+/// Solver-proven live-wire shapes that differ from the 0x97 snapshot tag,
+/// keyed by (class, member) so they survive id shifts (Boblox
+/// `kPropOverrides`, 67 rows, 2026-10-26).
+const PROP_OVERRIDES: &[(&str, &str, u8, bool, u16, u16)] = &[
+    ("Animation", "AnimationContent", 68, false, 0, 0),
+    ("AnimationConstraint", "Attachment0", 39, false, 0, 0),
+    ("Attachment", "CFrame", 39, false, 0, 0),
+    ("BallSocketConstraint", "Attachment0", 39, false, 0, 0),
+    ("BillboardGui", "Brightness", 39, false, 0, 0),
+    ("BodyPartDescription", "AttributesReplicate", 65, false, 0, 0),
+    ("BodyPartDescription", "Color", 65, false, 0, 0),
+    ("BodyPartDescription", "Instance", 65, false, 0, 0),
+    ("Folder", "numExpectedDirectChildren", 2, false, 0, 0),
+    ("Humanoid", "HipHeight", 28, false, 0, 0),
+    ("Humanoid", "JumpReplicate", 2, false, 0, 0),
+    ("Humanoid", "MoveDirectionInternal", 65, false, 0, 0),
+    ("Humanoid", "NetworkHumanoidState", 2, false, 0, 0),
+    ("Humanoid", "Tags", 61, true, 0, 0),
+    ("HumanoidDescription", "EmotesDataInternal", 61, false, 0, 0),
+    ("HumanoidDescription", "IdleAnimation", 26, false, 0, 0),
+    ("HumanoidDescription", "ResetIncludesBodyParts", 2, false, 0, 0),
+    ("HumanoidDescription", "RobloxLocked", 2, false, 0, 0),
+    ("HumanoidDescription", "StaticFacialAnimation", 65, false, 0, 0),
+    ("HumanoidDescription", "WalkAnimation", 2, false, 0, 0),
+    ("HumanoidRigDescription", "LeftAnkleSize", 11, false, 17, 0),
+    ("HumanoidRigDescription", "LeftHipRangeMin", 61, false, 0, 0),
+    ("Lighting", "TimeOfDay", 60, false, 0, 0),
+    ("LinearVelocity", "Visible", 60, false, 0, 0),
+    ("LocalScript", "numExpectedDirectChildren", 2, false, 0, 0),
+    ("MeshPart", "NetworkIsSleeping", 2, false, 0, 0),
+    ("MeshPart", "NetworkOwnerV3", 18, false, 0, 0),
+    ("MeshPart", "Transparency", 28, false, 0, 0),
+    ("MeshPart", "numExpectedDirectChildren", 2, false, 0, 0),
+    ("Message", "Text", 61, false, 0, 0),
+    ("MessageBusService", "RobloxLocked", 9, false, 14, 20),
+    ("MessagingService", "Capabilities", 11, false, 0, 0),
+    ("MicroProfilerService", "numExpectedDirectChildren", 2, false, 0, 0),
+    ("Model", "LevelOfDetail", 2, false, 0, 0),
+    ("Model", "numExpectedDirectChildren", 33, true, 0, 0),
+    ("Motor6D", "DefinesCapabilities", 2, false, 0, 0),
+    ("Motor6D", "ReplicateCurrentAngle", 11, false, 15, 0),
+    ("ObjectValue", "Value", 3, false, 0, 0),
+    ("ObjectValue", "numExpectedDirectChildren", 2, false, 0, 0),
+    ("Part", "CFrame", 61, false, 0, 0),
+    ("Part", "Material", 20, false, 0, 0),
+    ("Part", "NetworkIsSleeping", 2, false, 0, 0),
+    ("Part", "NetworkOwnerV3", 18, false, 0, 0),
+    ("PartOperation", "EnableFluidForces", 2, false, 0, 0),
+    ("PartOperation", "FrontParamA", 2, false, 0, 0),
+    ("PartOperation", "FrontParamB", 2, false, 0, 0),
+    ("PartOperation", "UnscaledVolInertiaDiags", 22, false, 14, 0),
+    ("ParticleEmitter", "Enabled", 2, false, 0, 0),
+    ("Path3D", "DefinesCapabilities", 2, false, 0, 0),
+    ("Player", "Character", 3, false, 0, 0),
+    ("Player", "Tags", 46, false, 0, 0),
+    ("PluginCapabilities", "DefinesCapabilities", 3, false, 0, 0),
+    ("PointLight", "Enabled", 2, false, 0, 0),
+    ("RigidConstraint", "Attachment1", 3, false, 0, 0),
+    ("SerializationService", "Archivable", 39, false, 0, 0),
+    ("Sound", "Volume", 28, false, 0, 0),
+    ("SpotLight", "Enabled", 2, false, 0, 0),
+    ("StringValue", "Value", 61, false, 0, 0),
+    ("SurfaceLight", "Enabled", 25, false, 0, 0),
+    ("TeleportOptions", "numExpectedDirectChildren", 25, false, 0, 0),
+    ("TextLabel", "Text", 61, false, 0, 0),
+    ("ThumbnailGenerator", "GraphicsMode", 61, false, 0, 0),
+    ("Tool", "Enabled", 2, false, 0, 0),
+    ("VehicleSeat", "NetworkIsSleeping", 2, false, 0, 0),
+    ("VideoDisplay", "Interactable", 25, false, 0, 0),
+    ("VideoDisplay", "LayoutOrder", 68, false, 0, 0),
+    ("Workspace", "numExpectedDirectChildren", 2, false, 0, 0),
+];
+
+fn prop_override(class: &str, member: &str) -> Option<PropTagEntry> {
+    PROP_OVERRIDES.iter().find_map(|(cls, name, tag, prefix, fixed, alt)| {
+        if cls.eq_ignore_ascii_case(class) && name.eq_ignore_ascii_case(member) {
+            Some(PropTagEntry {
+                tag: *tag,
+                prefix: *prefix,
+                fixed_len: *fixed,
+                alt_len: *alt,
+            })
+        } else {
+            None
+        }
+    })
+}
+
+/// A following 0x03 triple header, used to pick the short form of a two-length
+/// override: peek, never consume.
+fn looks_like_prop_triple(data: &[u8], table_len: usize) -> bool {
+    if data.first() != Some(&0x03) {
+        return false;
+    }
+    let mut reader = Reader::new(&data[1..]);
+    if read_reference(&mut reader, "peek 0x03").is_err() {
+        return false;
+    }
+    match reader.read_u16_le("peek 0x03 id") {
+        Ok(property) => usize::from(property) < table_len,
+        Err(_) => false,
+    }
+}
+
+fn skip_03_value(data: &[u8], entry: PropTagEntry, table_len: usize) -> Result<usize, String> {
+    if entry.fixed_len > 0 {
+        let short = usize::from(entry.fixed_len);
+        let long = usize::from(entry.alt_len);
+        if long > short {
+            if data.len() >= short && looks_like_prop_triple(&data[short..], table_len) {
+                return Ok(short);
+            }
+            if data.len() >= long {
+                return Ok(long);
+            }
+            return Err(format!(
+                "0x03 two-form value needs {long} byte(s), {} left",
+                data.len()
+            ));
+        }
+        if data.len() < short {
+            return Err(format!(
+                "0x03 fixed value needs {short} byte(s), {} left",
+                data.len()
+            ));
+        }
+        return Ok(short);
+    }
+    skip_tagged_value_with_fallback(data, entry.tag, entry.prefix, "0x03 value")
+}
+
+fn skip_tagged_value_with_fallback(
+    data: &[u8],
+    tag: u8,
+    prefer_prefix: bool,
+    context: &str,
+) -> Result<usize, String> {
+    let mut first = Reader::new(data);
+    match skip_tagged_value(&mut first, tag, prefer_prefix, context, 0) {
+        Ok(()) => Ok(first.position()),
+        Err(first_error) => {
+            let mut second = Reader::new(data);
+            match skip_tagged_value(&mut second, tag, !prefer_prefix, context, 0) {
+                Ok(()) => Ok(second.position()),
+                Err(_) => Err(first_error),
+            }
+        }
+    }
+}
+
 /// Parse the item whose type byte is `body[index]`, returning it and the number
 /// of bytes consumed after that type byte.
 fn parse_chain_item(
@@ -1696,6 +2008,7 @@ fn parse_chain_item(
     body: &[u8],
     index: usize,
     schema: Option<&JoinSchema>,
+    prop_tags: Option<&[PropTagEntry]>,
 ) -> Result<ParsedItem, String> {
     let rest = &body[index..];
     let mut reader = Reader::new(rest);
@@ -1873,21 +2186,150 @@ fn parse_chain_item(
         0x03 => {
             let (_, entity) = read_reference(&mut reader, "0x03 entity")?;
             let property = reader.read_u16_le("0x03 property id")?;
-            Ok(ParsedItem {
-                item: ChainItem::Property(PropertyUpdate {
-                    entity,
-                    property,
-                    raw: rest[reader.position()..].to_vec(),
+            let entry = prop_tags.and_then(|table| table.get(usize::from(property)).copied());
+            let Some(entry) = entry else {
+                return Ok(ParsedItem {
+                    item: ChainItem::Property(PropertyUpdate {
+                        entity,
+                        property,
+                        tag: None,
+                        raw: rest[reader.position()..].to_vec(),
+                    }),
+                    used: reader.position(),
+                    stop: Some(
+                        "0x03 property values are typed by the replicator's runtime \
+                         property table, which is not on the wire; the update is \
+                         recorded and the walk stops here"
+                            .to_string(),
+                    ),
+                });
+            };
+            let start = reader.position();
+            let table_len = prop_tags.map(|table| table.len()).unwrap_or(0);
+            match skip_03_value(&rest[start..], entry, table_len) {
+                Ok(used) => {
+                    reader.take(used, "0x03 value")?;
+                    Ok(ParsedItem {
+                        item: ChainItem::Property(PropertyUpdate {
+                            entity,
+                            property,
+                            tag: Some(entry.tag),
+                            raw: rest[start..start + used].to_vec(),
+                        }),
+                        used: reader.position(),
+                        stop: None,
+                    })
+                }
+                Err(error) => Ok(ParsedItem {
+                    item: ChainItem::Property(PropertyUpdate {
+                        entity,
+                        property,
+                        tag: Some(entry.tag),
+                        raw: rest[start..].to_vec(),
+                    }),
+                    used: start,
+                    stop: Some(format!(
+                        "0x03 property {property} tag {} did not measure: {error}",
+                        entry.tag
+                    )),
                 }),
+            }
+        }
+        0x05 | 0x06 => {
+            let flags = reader.read_u8("timing flags")?;
+            if flags & 8 != 0 {
+                return Err(format!(
+                    "item 0x{item:02x} flags&8 is unmapped (native throw)"
+                ));
+            }
+            let t = reader.read_u64_le("timing t")?;
+            let _a = reader.read_u32_le("timing a")?;
+            if flags & 1 != 0 {
+                reader.take(24, "timing extra 6xu32")?;
+            }
+            let _d = reader.read_u32_le("timing d")?;
+            let _e = reader.read_u32_le("timing e")?;
+            let tail = reader.read_u8("timing tail")?;
+            // Native null-drops when tail > 1; the chain continues either way.
+            let value = if tail > 1 { u32::from(tail) } else { t as u32 };
+            Ok(ParsedItem {
+                item: ChainItem::Word { kind: item, value },
                 used: reader.position(),
-                // The value is typed by the replicator's runtime property table,
-                // which is not on the wire, so the walk cannot continue past it.
-                stop: Some(
-                    "0x03 property values are typed by the replicator's runtime \
-                     property table, which is not on the wire; the update is \
-                     recorded and the walk stops here"
-                        .to_string(),
-                ),
+                stop: None,
+            })
+        }
+        0x09 => {
+            let v = reader.read_u8("0x09 version")?;
+            Ok(ParsedItem {
+                item: ChainItem::Word { kind: 0x09, value: u32::from(v) },
+                used: reader.position(),
+                stop: if v == 4 {
+                    None
+                } else {
+                    Some("0x09 v != 4: Client does not receive this item (native drop)".into())
+                },
+            })
+        }
+        0x0B => {
+            let mut batch = parse_entry_batch(&mut reader, schema, false)?;
+            batch.kind = 0x0B;
+            Ok(ParsedItem {
+                item: ChainItem::JoinBatch(batch),
+                used: reader.position(),
+                stop: None,
+            })
+        }
+        0x14 => {
+            read_triplet(&mut reader, "0x14 triplet")?;
+            reader.read_u32_le("0x14 a")?;
+            Ok(ParsedItem {
+                item: ChainItem::Word { kind: 0x14, value: 0 },
+                used: reader.position(),
+                stop: None,
+            })
+        }
+        0x18 => {
+            read_triplet(&mut reader, "0x18 triplet")?;
+            reader.read_u32_le("0x18 a")?;
+            reader.read_u32_le("0x18 b")?;
+            Ok(ParsedItem {
+                item: ChainItem::Word { kind: 0x18, value: 0 },
+                used: reader.position(),
+                stop: None,
+            })
+        }
+        0x19 => {
+            reader.take(24, "0x19 body")?;
+            Ok(ParsedItem {
+                item: ChainItem::Word { kind: 0x19, value: 0 },
+                used: reader.position(),
+                stop: None,
+            })
+        }
+        0x1A => {
+            reader.read_u32_le("0x1a a")?;
+            read_triplet(&mut reader, "0x1a triplet")?;
+            reader.read_u32_le("0x1a b")?;
+            reader.take(4, "0x1a f32")?;
+            reader.read_u8("0x1a b1")?;
+            reader.read_u8("0x1a b2")?;
+            Ok(ParsedItem {
+                item: ChainItem::Word { kind: 0x1A, value: 0 },
+                used: reader.position(),
+                stop: None,
+            })
+        }
+        0x25 => {
+            let mut batch = parse_entry_batch(&mut reader, schema, false)?;
+            batch.kind = 0x25;
+            skip_flag_elements(&mut reader, "0x25 elements")?;
+            read_guid(&mut reader, "0x25 tail guid")?;
+            reader.read_u32_le("0x25 tail u32")?;
+            reader.read_u8("0x25 tail u8")?;
+            Ok(ParsedItem {
+                item: ChainItem::JoinBatch(batch),
+                used: reader.position(),
+                stop: None,
             })
         }
         0x16 => Err("a JoinDataItemV2 batch closes its message and never chains".to_string()),
@@ -1923,6 +2365,7 @@ pub fn walk_delta_chain(body: &[u8], schema: Option<&JoinSchema>) -> Result<Delt
         return Ok(chain);
     }
 
+    let prop_tags = schema.map(|schema| schema.prop_tag_table());
     let mut index = 1usize;
     while index < body.len() {
         let item = body[index];
@@ -1932,13 +2375,14 @@ pub fn walk_delta_chain(body: &[u8], schema: Option<&JoinSchema>) -> Result<Delt
             chain.complete = true;
             break;
         }
-        match parse_chain_item(item, body, index, schema) {
+        match parse_chain_item(item, body, index, schema, prop_tags.as_deref()) {
             Ok(parsed) => {
                 match &parsed.item {
                     ChainItem::Spawn(_) => chain.spawns += 1,
                     ChainItem::Event(_) => chain.events += 1,
                     ChainItem::Property(_) => chain.property_updates += 1,
                     ChainItem::Entries(entries) => chain.records += entries.records.len(),
+                    ChainItem::JoinBatch(batch) => chain.records += batch.records.len(),
                     _ => {}
                 }
                 if parsed.used == 0 {
@@ -2742,6 +3186,10 @@ impl ReplicationStream {
             }
             if let ChainItem::Entries(entries) = item {
                 let mut records = entries.records.clone();
+                self.records.append(&mut records);
+            }
+            if let ChainItem::JoinBatch(batch) = item {
+                let mut records = batch.records.clone();
                 self.records.append(&mut records);
             }
             // A `0x04` word item is the 2021 `MarkerItem` shape: the server
@@ -3730,12 +4178,28 @@ mod tests {
         let envelope = parse_snapshot_envelope(&le).expect("LE envelope");
         assert_eq!(envelope.framing, SnapshotFraming::TargetLittleEndian);
 
-        // An unknown magic with no valid frame behind it is reported, not
-        // guessed at.
+        // Unknown magics still parse when the codec-magic frame is valid: the
+        // pair rotates per client build (0.744 uses 50 d3). A frame with no
+        // Zstandard payload is still refused.
         let mut other = body.clone();
         other[1] = 0x11;
         other[2] = 0x22;
-        assert!(parse_snapshot_envelope(&other).is_err());
+        let envelope = parse_snapshot_envelope(&other).expect("unknown magic with a zstd frame");
+        assert_eq!(envelope.codec_magic, Some([0x11, 0x22]));
+        assert_eq!(envelope.inner, inner.as_slice());
+
+        let mut fresh = body.clone();
+        fresh[1] = 0x50;
+        fresh[2] = 0xD3;
+        let envelope = parse_snapshot_envelope(&fresh).expect("0.744 magic");
+        assert_eq!(envelope.codec_magic, Some([0x50, 0xD3]));
+        assert!(SNAPSHOT_CODEC_MAGICS.contains(&[0x50, 0xD3]));
+
+        let mut broken = body.clone();
+        broken[1] = 0x11;
+        broken[2] = 0x22;
+        broken[9] = 0x00; // smash the zstd magic
+        assert!(parse_snapshot_envelope(&broken).is_err());
     }
 
     #[test]
@@ -4127,5 +4591,152 @@ mod tests {
         assert_eq!(stream.unparsed, 1);
         // The resynchronization is its own fact: it is not an unknown message id.
         assert_eq!(stream.walk_errors, 1);
+    }
+
+    #[test]
+    fn schema_prop_tags_are_the_class_member_concatenation_plus_sentinel() {
+        let schema = build_schema();
+        assert_eq!(schema.prop_tag(0), Some(49), "Part.Name");
+        assert_eq!(schema.prop_tag(1), Some(15), "Part.Size");
+        assert_eq!(schema.prop_tag(2), Some(9), "Part.Anchored");
+        assert_eq!(schema.prop_tag(3), Some(25), "sentinel");
+        assert_eq!(schema.prop_tag(4), None);
+        // A synthetic member inserted ahead of Size shifts later ids, matching
+        // the Boblox insertion proof (Part.CFrame 5446 -> 5447).
+        let mut shifted = schema.clone();
+        shifted.classes[0].members.insert(
+            1,
+            SchemaMember { name: "Extra".into(), tag: 3, extra: None },
+        );
+        assert_eq!(shifted.prop_tag(1), Some(3));
+        assert_eq!(shifted.prop_tag(2), Some(15), "Size shifted by one");
+        assert_eq!(shifted.prop_tag(4), Some(25));
+
+        // Name-keyed live-wire override: Part.CFrame is tag 61 on the wire
+        // even though the snapshot schema lists a CFrame tag, and the id
+        // follows the insertion.
+        shifted.classes[0].members[1] = SchemaMember {
+            name: "CFrame".into(),
+            tag: 27,
+            extra: None,
+        };
+        assert_eq!(shifted.prop_tag(1), Some(61), "Part.CFrame override");
+    }
+
+    #[test]
+    fn a_property_update_with_a_schema_tag_does_not_stop_the_walk() {
+        let schema = build_schema();
+        // id 2 = Anchored, tag 9, one byte, then a clock, then end.
+        let mut body = vec![DELTA_CHAIN_TAG, 0x03];
+        body.push(1);
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.push(1);
+        body.push(0x23);
+        body.extend_from_slice(&9u32.to_le_bytes());
+        body.push(CHAIN_END);
+        let chain = walk_delta_chain(&body, Some(&schema)).expect("walk");
+        assert!(chain.complete, "schema-derived tag lets the walk finish");
+        assert!(chain.stopped_at.is_none());
+        assert_eq!(chain.property_updates, 1);
+        assert_eq!(chain.items.len(), 2);
+        match &chain.items[0] {
+            ChainItem::Property(update) => {
+                assert_eq!(update.entity, Some(4));
+                assert_eq!(update.property, 2);
+                assert_eq!(update.tag, Some(9));
+                assert_eq!(update.raw, vec![1]);
+            }
+            other => panic!("expected a property update, got {other:?}"),
+        }
+        match &chain.items[1] {
+            ChainItem::Clock { value } => assert_eq!(*value, 9),
+            other => panic!("expected a clock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_name_keyed_override_lets_part_cframe_continue() {
+        let mut schema = build_schema();
+        schema.classes[0].members.push(SchemaMember {
+            name: "CFrame".into(),
+            tag: 27,
+            extra: None,
+        });
+        // id 3 = Part.CFrame, live tag 61 content form 0 (empty), then clock.
+        let mut body = vec![DELTA_CHAIN_TAG, 0x03];
+        body.push(1);
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&3u16.to_le_bytes());
+        body.push(0);
+        body.push(0x23);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.push(CHAIN_END);
+        let chain = walk_delta_chain(&body, Some(&schema)).expect("walk");
+        assert!(chain.complete, "{:?}", chain.stopped_at);
+        match &chain.items[0] {
+            ChainItem::Property(update) => {
+                assert_eq!(update.property, 3);
+                assert_eq!(update.tag, Some(61));
+            }
+            other => panic!("expected a property update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_batch_n0_is_a_null_drop() {
+        let schema = build_schema();
+        let mut body = vec![DELTA_CHAIN_TAG, 0x0B];
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.push(CHAIN_END);
+        let chain = walk_delta_chain(&body, Some(&schema)).expect("walk");
+        assert!(chain.complete);
+        assert_eq!(chain.items.len(), 1);
+        match &chain.items[0] {
+            ChainItem::JoinBatch(batch) => {
+                assert!(batch.dropped);
+                assert_eq!(batch.n, 0);
+                assert!(batch.records.is_empty());
+            }
+            other => panic!("expected a join batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_batch_inflates_records_when_a_schema_is_present() {
+        let schema = build_schema();
+        let mut inner = Vec::new();
+        inner.push(1); // guid lo
+        inner.extend_from_slice(&7u32.to_le_bytes());
+        inner.extend_from_slice(&0u16.to_le_bytes()); // class Part
+        inner.push(0xFF); // empty prop loop
+        inner.push(1);
+        inner.extend_from_slice(&DATAMODEL_ROOT_ID.to_le_bytes());
+        let compressed = zstd(&inner);
+        let mut body = vec![DELTA_CHAIN_TAG, 0x0B];
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        body.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+        body.extend_from_slice(&compressed);
+        body.push(CHAIN_END);
+        let chain = walk_delta_chain(&body, Some(&schema)).expect("walk");
+        assert!(chain.complete, "{:?}", chain.stopped_at);
+        assert_eq!(chain.records, 1);
+        match &chain.items[0] {
+            ChainItem::JoinBatch(batch) => {
+                assert_eq!(batch.n, 1);
+                assert_eq!(batch.records[0].id, Some(7));
+                assert_eq!(batch.records[0].parent, Some(DATAMODEL_ROOT_ID));
+            }
+            other => panic!("expected a join batch, got {other:?}"),
+        }
+
+        // Without a schema the payload is consumed, not a stop.
+        let chain = walk_delta_chain(&body, None).expect("walk");
+        assert!(chain.complete);
+        match &chain.items[0] {
+            ChainItem::JoinBatch(batch) => assert!(batch.unparsed),
+            other => panic!("expected an unparsed batch, got {other:?}"),
+        }
     }
 }

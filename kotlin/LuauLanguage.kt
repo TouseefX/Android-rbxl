@@ -55,10 +55,10 @@ class LuauLanguage(
     private var pendingPrefixLength = 0
 
     /**
-     * Called from the UI thread when Rust answers with a completion payload.
-     * Parsing happens here so the generation counter never has to leave this
-     * class; a reply that arrives after its request was superseded is dropped
-     * by the capacity-1 inbox plus the generation check in the waiter.
+     * Called from the JNI/Sora worker when Rust answers with a completion
+     * payload. Parsing happens here so the generation counter never has to
+     * leave this class; a reply that arrives after its request was superseded
+     * is dropped by the capacity-1 inbox plus the generation check in the waiter.
      */
     fun deliverCompletions(json: String) {
         val items = ArrayList<CompletionItem>()
@@ -161,9 +161,8 @@ class LuauLanguage(
 
         // Bounded wait: if Rust is slow or the script was closed underneath us,
         // returning empty-handed is better than pinning sora's worker thread.
-        // The reply is produced by the Rust event loop, which drains the JNI
-        // channel once per frame, so the budget has to cover a few frames
-        // rather than just the indexing cost.
+        // Completions are answered on this same worker via JNI, so the poll
+        // usually returns immediately; the timeout is only a safety net.
         //
         // getInterruptionLevel() is SLIGHT rather than the inherited STRONG,
         // so a superseded request no longer interrupt()s this thread while it

@@ -391,6 +391,10 @@ jobs:
           cargo test --lib rbx_channels::tests:: 2>&1 | tee -a /tmp/cargo.log
           cargo test --lib rbx_replication::tests:: 2>&1 | tee -a /tmp/cargo.log
           cargo test --lib rbx_sync::tests:: 2>&1 | tee -a /tmp/cargo.log
+          # Native Sora completions used to wait on the Bevy UI drain; they are
+          # answered on the JNI thread from a published index, so gate that path.
+          cargo test --lib luau_intelligence::tests::native_completions 2>&1 | tee -a /tmp/cargo.log
+          cargo test --lib luau_intelligence::tests::dotted_roblox 2>&1 | tee -a /tmp/cargo.log
           # The wire-name to canonical-property lookup every encoded change
           # leans on, including the superclass walk.
           cargo test --lib schema::replication_helpers 2>&1 | tee -a /tmp/cargo.log

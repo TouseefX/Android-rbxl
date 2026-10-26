@@ -25,21 +25,24 @@ it is not Roblox Studio or a full Roblox game runtime.
 
 Team Create join and transport support is experimental. The app can negotiate a
 join and run legacy RakNet connection probes or an RbxTransport QUIC/TLS path
-(with an app=4 post-handshake flow when the required fields are available). It
-does not replicate a live place into the editor or provide Studio's full
-connected state. A successful handshake or observed flow traffic does not prove
-native BaseClient connection or Team Create acceptance.
+(with an app=4 post-handshake flow when the required fields are available). The
+join-channel and replication-decode planes default on so a session that reaches
+`0x81` join-start keeps walking: 0x97 schema magics (including the 0.744
+`50 d3` pair), schema-derived `0x03` property tags with name-keyed live-wire
+overrides, and `0x0B`/`0x25` entry batches from the live Boblox client. A successful handshake or observed flow
+traffic does not prove native BaseClient connection or Team Create acceptance.
 
 ## Team Create post-join planes
 
 The RbxTransport path ends at "handshake plus one burst". Three switches extend
-it, and all three are off by default so that a run started without them sends
-byte-for-byte the session it sent before:
+it. Join channels (reference openU, byte-identical to the observed burst) and
+replication decode default on so a session that reaches join-start keeps
+walking; outbound sync stays off:
 
 | Switch | Module | What it does | What it does not claim |
 | --- | --- | --- | --- |
 | Join channels | `src/rbx_channels.rs` | Keeps the recovered fourteen-row `openSendChannel` profile, stages this client's open records on the control stream, decodes the peer's announcements (including the parity rule that separates a peer's unreliable id from this client's own), reports channels opened but never answered or answered but never opened, and calls a channel the peer opened as a bare stream one-direction rather than a gap. | That any channel carries usable traffic. In the default reference mode the staged records are byte-identical to the previous hard-coded burst, so this plane adds accounting rather than behaviour; `full profile` is the only mode that changes bytes. |
-| Replication | `src/rbx_replication.rs` | Walks the join channel's compact-varint frames into the `0x93` configuration table, `0x81` join start, `0x97` schema, `0x83`/`0x16` `JoinDataItemV2` batches, and the live delta chains of spawn, property, event and clock items; recognises the `0x04` marker items and `0x10` tag items that carry the join gate and the join-phase completions (tag 12 = ReplicatedFirst finished, tag 13 = JoinData finished, both byte orders named); decodes the snapshot schema, shared strings and instance records, then builds a `WeakDom` and serializes it so the editor can open the place. | That the place is complete or current, or that this client joined. Messages whose inner layout the analysis does not pin down are counted and reported rather than guessed at, and a snapshot requested without a schema is refused instead of invented. |
+| Replication | `src/rbx_replication.rs` | Walks the join channel's compact-varint frames into the `0x93` configuration table, `0x81` join start, `0x97` schema (any codec-magic pair, including 0.744 `50 d3`), `0x83`/`0x16` `JoinDataItemV2` batches, `0x0B`/`0x25` zstd entry batches, and the live delta chains of spawn, property (`0x03` continues via schema-derived tags), event and clock items; recognises the `0x04` marker items and `0x10` tag items that carry the join gate and the join-phase completions (tag 12 = ReplicatedFirst finished, tag 13 = JoinData finished, both byte orders named); decodes the snapshot schema, shared strings and instance records, then builds a `WeakDom` and serializes it so the editor can open the place. | That the place is complete or current, or that this client joined. Messages whose inner layout the analysis does not pin down are counted and reported rather than guessed at, and a snapshot requested without a schema is refused instead of invented. |
 | Syncing | `src/rbx_sync.rs` | The outbound half: the `0xA6` flow-control block and route step counters, the reference client's 1 s ping and 5 s sync periods, and a coalescing queue of `0x83`/`0x03` property items fed two ways - a diff of the applied DOM against the snapshot baseline, or explicit edits named by the wire instance id the peer assigned. | That the peer wants any of it. The property id an update needs indexes the replicator's runtime table, which the snapshot never sends, so changes are encoded only against the candidate global id table the schema can validate and are otherwise refused and counted. An editor edit reaches a running session only through the flow's outbox (`AppFlow::offer_edit`, `AppFlow::edits_handle`), and an edit no applied snapshot can address is dropped into the session's skip notes instead of waiting there. The UI does not offer one yet, so on the current path the queue still stays empty and only the liveness frames are produced. |
 
 Each plane reports what it refused. The session output carries the channel gaps,

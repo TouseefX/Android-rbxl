@@ -8,6 +8,7 @@ use crate::roblox_api_data as api;
 use crate::{rbxl, schema};
 use rbx_dom_weak::{types::Ref, WeakDom};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
@@ -1303,6 +1304,82 @@ fn has_path(
     graph.get(&node).into_iter().flatten().any(|edge| {
         has_path(edge.target, target, graph, visited)
     })
+}
+
+/// Shared index the native Sora editor uses. Completions used to wait for the
+/// Bevy UI pass to drain a JNI channel; a fullscreen editor dialog unfocuses
+/// that window, so the 250 ms waiter always timed out after the low-power
+/// change. Answering from the JNI callback itself does not need a frame.
+struct NativeIntel {
+    index: Arc<ProjectIndex>,
+    scripts: HashMap<u64, Ref>,
+}
+
+fn native_intel() -> &'static Mutex<NativeIntel> {
+    static STATE: OnceLock<Mutex<NativeIntel>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(NativeIntel {
+            index: Arc::new(ProjectIndex::default()),
+            scripts: HashMap::new(),
+        })
+    })
+}
+
+fn lock_native_intel() -> std::sync::MutexGuard<'static, NativeIntel> {
+    native_intel().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Publish the latest project index so the native editor can complete without
+/// waiting for the next Bevy frame.
+pub fn publish_project_index(index: Arc<ProjectIndex>) {
+    lock_native_intel().index = index;
+}
+
+/// Remember which DataModel node a native-editor session is editing.
+pub fn register_native_script(script_id: u64, referent: Ref) {
+    lock_native_intel().scripts.insert(script_id, referent);
+}
+
+/// Drop a native-editor session id.
+pub fn unregister_native_script(script_id: u64) {
+    lock_native_intel().scripts.remove(&script_id);
+}
+
+/// The Android Sora editor reports UTF-16 offsets; intelligence indexes Unicode
+/// scalar values.
+pub fn cursor_from_utf16(text: &str, utf16_index: usize) -> usize {
+    let mut units = 0;
+    for (index, ch) in text.chars().enumerate() {
+        if units + ch.len_utf16() > utf16_index {
+            return index;
+        }
+        units += ch.len_utf16();
+    }
+    text.chars().count()
+}
+
+/// Completions for a native-editor caret, using the published index (or an
+/// empty one, which still offers keywords, locals, and Roblox globals).
+pub fn complete_native(script_id: u64, source: &str, cursor_utf16: usize) -> Vec<Completion> {
+    let cursor = cursor_from_utf16(source, cursor_utf16);
+    let (index, referent) = {
+        let state = lock_native_intel();
+        let referent = state.scripts.get(&script_id).copied().unwrap_or_else(Ref::none);
+        (state.index.clone(), referent)
+    };
+    index.complete_at(referent, source, cursor)
+}
+
+/// Signature help for a native-editor caret. Same published-index path as
+/// [`complete_native`].
+pub fn signature_native(script_id: u64, source: &str, cursor_utf16: usize) -> Option<SignatureHelp> {
+    let cursor = cursor_from_utf16(source, cursor_utf16);
+    let (index, referent) = {
+        let state = lock_native_intel();
+        let referent = state.scripts.get(&script_id).copied().unwrap_or_else(Ref::none);
+        (state.index.clone(), referent)
+    };
+    index.signature_help_at(referent, source, cursor)
 }
 
 /// Roblox-engine-aware checks layered on top of the Luau parser. Reflection is
@@ -5149,6 +5226,16 @@ mod tests {
         let suggestions = index.complete_at(Ref::none(), "game:F", 6);
         assert!(suggestions.iter().any(|item| item.label == "FindService"));
         assert!(!suggestions.iter().any(|item| item.label == "game"));
+    }
+
+    #[test]
+    fn native_completions_answer_from_the_published_index() {
+        assert_eq!(cursor_from_utf16("a😀b", 3), 2); // emoji is two UTF-16 units
+        publish_project_index(std::sync::Arc::new(ProjectIndex::default()));
+        register_native_script(7, Ref::none());
+        let items = complete_native(7, "game:F", "game:F".encode_utf16().count());
+        assert!(items.iter().any(|item| item.label == "FindService"), "{items:?}");
+        unregister_native_script(7);
     }
 
     #[test]
