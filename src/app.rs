@@ -698,8 +698,8 @@ impl Default for EditorApp {
             baseclient_open_choice: false,
             team_create_session_quic_handshake_complete: false,
             team_create_session_status: String::new(),
-            team_create_channels: false,
-            team_create_replication: false,
+            team_create_channels: true,
+            team_create_replication: true,
             team_create_sync: false,
             team_create_channel_mode: 0,
             team_create_snapshot: None,
@@ -1519,11 +1519,13 @@ impl EditorApp {
             if self.workspace_symbol_catalog.is_empty() {
                 if self.project_index_cache.is_none() {
                     if let Some(dom) = &self.dom {
-                        self.project_index_cache = Some(std::sync::Arc::new(
+                        let rebuilt = std::sync::Arc::new(
                             luau_intelligence::ProjectIndex::build_with_overrides(
                                 dom, self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
                             ),
-                        ));
+                        );
+                        luau_intelligence::publish_project_index(rebuilt.clone());
+                        self.project_index_cache = Some(rebuilt);
                     }
                 }
                 if let Some(index) = &self.project_index_cache {
@@ -3012,6 +3014,7 @@ ui.label("Place ID:");
                 let id = self.next_external_id;
                 self.next_external_id += 1;
                 self.pending_external_edits.insert(id, tab.referent);
+                luau_intelligence::register_native_script(id, tab.referent);
                 jni_bridge::trigger_native_editor_at(id, &tab.name, &tab.buffer, cursor);
             }
         }
@@ -3109,7 +3112,9 @@ ui.label("Place ID:");
                         dom,
                         self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
                     );
-                    self.project_index_cache = Some(std::sync::Arc::new(rebuilt));
+                    let rebuilt = std::sync::Arc::new(rebuilt);
+                    luau_intelligence::publish_project_index(rebuilt.clone());
+                    self.project_index_cache = Some(rebuilt);
                     self.workspace_symbol_catalog.clear();
                     self.project_index_fingerprint = fingerprint;
                     self.project_index_rebuilds += 1;
@@ -3118,6 +3123,9 @@ ui.label("Place ID:");
         } else {
             self.project_index_cache = None;
             self.project_index_fingerprint = 0;
+            luau_intelligence::publish_project_index(std::sync::Arc::new(
+                luau_intelligence::ProjectIndex::default(),
+            ));
         }
         let project_index = self.project_index_cache.clone();
         let mut project_diagnostics = self.project_diagnostics_cache.clone();
@@ -3186,6 +3194,7 @@ ui.label("Place ID:");
                 let id = self.next_external_id;
                 self.next_external_id += 1;
                 self.pending_external_edits.insert(id, tab_ref);
+                luau_intelligence::register_native_script(id, tab_ref);
                 jni_bridge::trigger_native_editor(id, &tab_name, &tab.buffer);
             }
 
@@ -3458,9 +3467,11 @@ ui.label("Place ID:");
         // completion-navigation keys before TextEdit treats them as cursor
         // movement, indentation, or a newline.
         let mut completions = self.script_completion_cursor
-            .and_then(|cursor| project_index.as_ref().map(|index| {
-                index.complete_at(tab_ref, &tab.buffer, cursor)
-            }))
+            .map(|cursor| match project_index.as_ref() {
+                Some(index) => index.complete_at(tab_ref, &tab.buffer, cursor),
+                None => luau_intelligence::ProjectIndex::default()
+                    .complete_at(tab_ref, &tab.buffer, cursor),
+            })
             .unwrap_or_default();
         if self.script_completion_cursor
             .is_some_and(|cursor| self.script_completion_dismissed_at == Some((tab_ref, cursor)))
@@ -3987,9 +3998,11 @@ ui.label("Place ID:");
             Vec::new()
         } else {
             cursor_char
-                .and_then(|cursor| project_index.as_ref().map(|index| {
-                    index.complete_at(tab_ref, &tab.buffer, cursor)
-                }))
+                .map(|cursor| match project_index.as_ref() {
+                    Some(index) => index.complete_at(tab_ref, &tab.buffer, cursor),
+                    None => luau_intelligence::ProjectIndex::default()
+                        .complete_at(tab_ref, &tab.buffer, cursor),
+                })
                 .unwrap_or_default()
         };
 
@@ -5790,26 +5803,9 @@ ui.label("Place ID:");
                         }
                         self.script_completion_cursor = Some(cursor);
                         self.script_selection = Some((anchor, cursor));
-                        let index = self.project_index_cache.clone().or_else(|| {
-                            self.dom.as_ref().map(|dom| std::sync::Arc::new(
-                                luau_intelligence::ProjectIndex::build_with_overrides(
-                                    dom,
-                                    self.open_tabs.iter().map(|tab| (tab.referent, tab.buffer.as_str())),
-                                )
-                            ))
-                        });
-                        let items = index.as_ref()
-                            .map(|index| index.complete_at(referent, &text, cursor))
-                            .unwrap_or_default();
-                        let payload: Vec<_> = items.into_iter().take(24).map(|item| serde_json::json!({
-                            "label": item.label,
-                            "detail": item.detail,
-                            "insertText": item.insert_text,
-                            "replaceChars": item.replace_chars,
-                        })).collect();
-                        if let Ok(json) = serde_json::to_string(&payload) {
-                            jni_bridge::update_native_completions(script_id, &json);
-                        }
+                        luau_intelligence::register_native_script(script_id, referent);
+                        // Completions are answered on the JNI thread. Offering
+                        // again from this UI drain races Sora's capacity-1 inbox.
                     }
                 }
                 FileEvent::NativeEditorSignatureChanged { script_id, text, cursor } => {
@@ -6847,6 +6843,18 @@ ui.label("Place ID:");
         self.team_create_session_status = initial_status.clone();
         self.team_create_response = initial_status.clone();
         self.status = initial_status;
+        // Apply the panel defaults even when this worker is started from a
+        // retry path that does not redraw the Team Create checkboxes.
+        crate::appflow::set_join_planes(crate::appflow::JoinPlanes {
+            channels: self.team_create_channels,
+            replication: self.team_create_replication,
+            sync: self.team_create_sync,
+        });
+        crate::rbx_channels::set_channel_open_mode(match self.team_create_channel_mode {
+            1 => crate::rbx_channels::ChannelOpenMode::FullProfile,
+            2 => crate::rbx_channels::ChannelOpenMode::Off,
+            _ => crate::rbx_channels::ChannelOpenMode::ReferenceUnreliable,
+        });
         let event_tx_for_panic = event_tx.clone();
         std::thread::spawn(move || {
             install_panic_detail_hook();

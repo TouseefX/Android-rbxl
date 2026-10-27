@@ -160,10 +160,17 @@ pub fn run_editor_app(initial_bytes: Option<Vec<u8>>) {
     // low-power loop instead of rendering at full rate into a surface
     // nobody sees. Focused mode stays continuous (the editor polls
     // background channels from the UI pass and animates the viewport).
+    //
+    // The interval has to stay well under the native Luau editor's 250 ms
+    // completion wait: a fullscreen Sora dialog steals window focus, and a
+    // 30 s unfocused timeout made every JNI round-trip miss, so autocomplete
+    // and signature help went blank after the power-saving change. Native
+    // completions are also answered on the JNI thread now; this interval is
+    // the fallback for everything else that still drains from the UI pass.
     bevy_app.insert_resource(bevy::winit::WinitSettings {
         focused_mode: bevy::winit::UpdateMode::Continuous,
         unfocused_mode: bevy::winit::UpdateMode::reactive_low_power(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(50),
         ),
     });
     // Register the custom flat-colour material (bypasses StandardMaterial,

@@ -543,12 +543,27 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeE
 ) {
     if text.is_null() { return; }
     let value: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+    let script_id = script_id as u64;
+    let selection_end = selection_end.max(0) as usize;
+    // Answer on this thread. Sora waits up to 250 ms; the Bevy UI pass that
+    // used to drain this channel does not run while the fullscreen editor
+    // dialog holds window focus.
+    let items = crate::luau_intelligence::complete_native(script_id, &value, selection_end);
+    let payload: Vec<_> = items.into_iter().take(24).map(|item| serde_json::json!({
+        "label": item.label,
+        "detail": item.detail,
+        "insertText": item.insert_text,
+        "replaceChars": item.replace_chars,
+    })).collect();
+    if let Ok(json) = serde_json::to_string(&payload) {
+        update_native_completions(script_id, &json);
+    }
     let (tx, _) = channel();
     let _ = tx.send(FileEvent::NativeEditorChanged {
-        script_id: script_id as u64,
+        script_id,
         text: value,
         selection_start: selection_start.max(0) as usize,
-        selection_end: selection_end.max(0) as usize,
+        selection_end,
     });
 }
 
@@ -562,11 +577,27 @@ pub extern "system" fn Java_com_yourname_rbxleditor_MainActivity_nativeOnNativeE
 ) {
     if text.is_null() { return; }
     let value: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+    let script_id = script_id as u64;
+    let cursor_utf16 = cursor.max(0) as usize;
+    let signature = crate::luau_intelligence::signature_native(script_id, &value, cursor_utf16);
+    let payload = if let Some(help) = signature {
+        serde_json::json!({
+            "name": help.name,
+            "parameters": help.parameters,
+            "activeParameter": help.active_parameter,
+            "cursorUtf16": cursor_utf16,
+        })
+    } else {
+        serde_json::json!({ "cursorUtf16": cursor_utf16 })
+    };
+    if let Ok(json) = serde_json::to_string(&payload) {
+        update_native_signature_help(script_id, &json);
+    }
     let (tx, _) = channel();
     let _ = tx.send(FileEvent::NativeEditorSignatureChanged {
-        script_id: script_id as u64,
+        script_id,
         text: value,
-        cursor: cursor.max(0) as usize,
+        cursor: cursor_utf16,
     });
 }
 
